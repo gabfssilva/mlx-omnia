@@ -76,7 +76,7 @@ private func forcedLogprobs(
     _ = try await model.generate(
         [.image(.file(image)), .text("Describe the image.")],
         options: GenerationOptions(maxTokens: 64, sampler: forcing.sampler, stop: []))
-    let logits = stacked(forcing.rows, axis: 0)
+    let logits = stacked(forcing.rows, axis: 0).asType(.float32)
     return logits - logSumExp(logits, axis: -1, keepDims: true)
 }
 
@@ -88,11 +88,29 @@ private func forcedLogprobs(
     let forcing = LargeTeacherForcing(golden["greedy_ids"]!.asArray(Int32.self))
 
     let logprobs = try await forcedLogprobs(model: model, image: image, forcing: forcing)
-    #expect(logprobs.shape == golden["greedy_logits"]!.shape)
-    #expect(relativeDiff(logprobs, golden["greedy_logits"]!) == 0)
-    #expect(
-        argMax(logprobs, axis: -1).asArray(Int32.self)
-            == argMax(golden["greedy_logits"]!, axis: -1).asArray(Int32.self))
+    let floor = golden["noise.greedy_logits"]!.item(Float.self)
+    #expect(logprobs.shape == golden["forced_logprobs"]!.shape)
+    #expect(relativeDiff(logprobs, golden["forced_logprobs"]!) < 3 * floor)
+    #expect(argMaxMismatchesBeyondTies(logprobs, golden["forced_logprobs"]!, floor: floor) == [])
+}
+
+/// Argmax rows where we and the golden disagree *and* the golden itself separates the two
+/// candidates by more than its own path noise. Where the reference's top-2 sit closer than
+/// what bf16 rounding moves between its prefill and its steps, the argmax is not
+/// identifiable and a flip is a tie, not a bug.
+private func argMaxMismatchesBeyondTies(
+    _ ours: MLXArray, _ golden: MLXArray, floor: Float
+) -> [Int] {
+    let mine = argMax(ours, axis: -1).asArray(Int32.self)
+    let theirs = argMax(golden, axis: -1).asArray(Int32.self)
+    let scale = abs(golden).max().item(Float.self)
+    return mine.indices.filter { index in
+        guard mine[index] != theirs[index] else { return false }
+        let gap = abs(
+            golden[index, Int(mine[index])] - golden[index, Int(theirs[index])]
+        ).item(Float.self)
+        return gap >= 3 * floor * scale
+    }
 }
 
 @Test func qwen35Vision27BDecoderMatchesMLXVLMWithGoldenEmbeddings() throws {
@@ -118,20 +136,11 @@ private func forcedLogprobs(
         cache = next.cache
     }
 
-    let logits = stacked(rows, axis: 0)
+    let logits = stacked(rows, axis: 0).asType(.float32)
     let logprobs = logits - logSumExp(logits, axis: -1, keepDims: true)
-    let ours = argMax(logprobs, axis: -1).asArray(Int32.self)
-    let theirs = argMax(golden["greedy_logits"]!, axis: -1).asArray(Int32.self)
-    for index in ours.indices where ours[index] != theirs[index] {
-        print(
-            "decoder mismatch \(index): \(ours[index]) \(theirs[index]), "
-                + "ours \(logprobs[index, Int(ours[index])].item(Float.self)) "
-                + "\(logprobs[index, Int(theirs[index])].item(Float.self)), "
-                + "reference \(golden["greedy_logits"]![index, Int(ours[index])].item(Float.self)) "
-                + "\(golden["greedy_logits"]![index, Int(theirs[index])].item(Float.self))")
-    }
-    print("decoder relative diff \(relativeDiff(logprobs, golden["greedy_logits"]!))")
-    #expect(ours == theirs)
+    let floor = golden["noise.greedy_logits"]!.item(Float.self)
+    #expect(relativeDiff(logprobs, golden["forced_logprobs"]!) < 3 * floor)
+    #expect(argMaxMismatchesBeyondTies(logprobs, golden["forced_logprobs"]!, floor: floor) == [])
 }
 
 @Test func qwen35Vision27BMatchesMLXVLM() throws {
