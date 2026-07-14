@@ -1,0 +1,25 @@
+# Python-generated files
+__pycache__/
+*.py[oc]
+build/
+dist/
+wheels/
+*.egg-info
+
+# Virtual environments
+.venv
+
+# Swift
+.build/
+.swiftpm/
+*.profraw
+
+# Local-only docs and reference scripts
+reference/
+PLAN.md
+MODELS.md
+DSL.md
+CLAUDE.md
+
+# Regenerable test fixtures (see reference/gen_*.py)
+Tests/SiderosTests/Fixtures/
