@@ -5,21 +5,28 @@ build/
 dist/
 wheels/
 *.egg-info
+.hypothesis/
+.pytest_cache/
+.ruff_cache/
+.DS_Store
 
 # Virtual environments
 .venv
 
-# Swift
-.build/
-.swiftpm/
-*.profraw
+# Swift (aguardando deleção)
+.legacy/
 
-# Local-only docs and reference scripts
-reference/
+# Local-only docs and reference scripts (bench_prompt.txt is a bench dependency)
+reference/*
+!reference/bench_prompt.txt
 PLAN.md
-MODELS.md
 DSL.md
-CLAUDE.md
+MIGRATION.md
+MODELS.md
+APP.md
+.tasks/
+docs/
+plans/
 
-# Regenerable test fixtures (see reference/gen_*.py)
-Tests/SiderosTests/Fixtures/
+# Regenerable test fixtures (see tests/fixtures/generate_*.py)
+packages/sideros/tests/fixtures/*.safetensors

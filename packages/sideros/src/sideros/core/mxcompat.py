@@ -1,0 +1,53 @@
+"""Typed bindings for mlx entry points whose 0.30.6 stubs are stale.
+
+The bundled stubs type `metal_kernel` as returning `object`, omit `softmax`'s
+`precise` flag and require `gather_mm`'s index arguments. The runtime accepts all
+of them (verified by the parity tests). The TYPE_CHECKING declarations below are
+the corrected signatures; at runtime the names bind to the real functions.
+Re-audit on every mlx bump.
+"""
+
+from collections.abc import Sequence
+from typing import TYPE_CHECKING, Protocol
+
+import mlx.core as mx
+
+if TYPE_CHECKING:
+
+    class MetalKernel(Protocol):
+        def __call__(
+            self,
+            *,
+            inputs: Sequence[mx.array],
+            template: Sequence[tuple[str, object]],
+            grid: tuple[int, int, int],
+            threadgroup: tuple[int, int, int],
+            output_shapes: Sequence[tuple[int, ...]],
+            output_dtypes: Sequence[mx.Dtype],
+        ) -> list[mx.array]: ...
+
+    def metal_kernel(
+        name: str,
+        input_names: Sequence[str],
+        output_names: Sequence[str],
+        source: str,
+        header: str = "",
+        ensure_row_contiguous: bool = True,
+    ) -> MetalKernel: ...
+
+    def softmax(a: mx.array, /, axis: int, *, precise: bool = False) -> mx.array: ...
+
+    def gather_mm(
+        a: mx.array,
+        b: mx.array,
+        /,
+        lhs_indices: mx.array | None = None,
+        rhs_indices: mx.array | None = None,
+        *,
+        sorted_indices: bool = False,
+    ) -> mx.array: ...
+
+else:
+    metal_kernel = mx.fast.metal_kernel
+    softmax = mx.softmax
+    gather_mm = mx.gather_mm

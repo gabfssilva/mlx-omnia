@@ -1,0 +1,85 @@
+[project]
+name = "sideros-workspace"
+version = "0.0.0"
+requires-python = ">=3.13"
+dependencies = ["sideros", "sideros-server", "sideros-app"]
+
+[tool.uv]
+package = false
+
+[dependency-groups]
+dev = [
+    "pytest>=8",
+    "hypothesis>=6",
+    "ruff>=0.12",
+    "pyright>=1.1",
+    "transformers>=5.14.1",
+    "openai>=1.60",
+    "numpy>=2",
+    "safetensors>=0.4",
+    "huggingface-hub>=0.30",
+]
+
+[tool.uv.workspace]
+members = ["packages/*"]
+
+[tool.uv.sources]
+sideros = { workspace = true }
+sideros-server = { workspace = true }
+sideros-app = { workspace = true }
+
+[tool.ruff]
+line-length = 100
+src = ["packages/sideros/src", "packages/sideros-server/src", "packages/sideros-app/src"]
+
+[tool.ruff.lint]
+select = [
+    "E", "W",    # pycodestyle
+    "F",         # pyflakes
+    "I",         # isort
+    "UP",        # pyupgrade
+    "B",         # bugbear
+    "SIM",       # simplify
+    "RUF",
+]
+
+[tool.pyright]
+typeCheckingMode = "strict"
+# mlx ships incomplete stubs (mlx.nn has none; array methods take Unknown varargs).
+# Our signatures stay fully annotated; these rules only flag mlx's gap.
+reportMissingTypeStubs = false
+reportUnknownMemberType = false
+pythonVersion = "3.13"
+include = ["packages"]
+exclude = ["**/__pycache__", ".venv", ".legacy", "**/tests/fixtures", "**/build"]
+venvPath = "."
+venv = ".venv"
+
+[[tool.pyright.executionEnvironments]]
+root = "packages/sideros-app/tests"
+reportUnknownMemberType = false
+reportUnknownVariableType = false
+reportUnknownArgumentType = false
+
+# huggingface_hub expõe Unknown nos overloads de download (tqdm genérico).
+[[tool.pyright.executionEnvironments]]
+root = "packages/sideros-server/src"
+reportUnknownVariableType = false
+
+# transformers/huggingface_hub (dev-deps de fixture) expõem Unknown; só nos testes.
+[[tool.pyright.executionEnvironments]]
+root = "packages/sideros-server/tests"
+reportUnknownMemberType = false
+reportUnknownVariableType = false
+reportUnknownArgumentType = false
+reportPrivateUsage = false
+
+[[tool.pyright.executionEnvironments]]
+root = "packages/sideros/tests"
+reportUnknownMemberType = false
+reportUnknownVariableType = false
+reportUnknownArgumentType = false
+reportPrivateUsage = false
+
+[tool.pytest.ini_options]
+testpaths = ["packages/sideros/tests", "packages/sideros-server/tests", "packages/sideros-app/tests"]

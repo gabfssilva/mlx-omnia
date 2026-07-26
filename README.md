@@ -1,71 +1,79 @@
 # Sideros
 
-Model inference engine written in Swift, optimized for Apple Silicon.
+Model inference engine written in Python on raw [MLX](https://github.com/ml-explore/mlx),
+optimized for Apple Silicon.
 
 > **Work in progress.** APIs, model coverage, and internals change without notice.
 > Not ready for production use.
 
-Sideros runs LLMs (and vision-language models) on top of [MLX](https://github.com/ml-explore/mlx-swift),
-with custom Metal kernels on the token-by-token decode path. Every port is validated for
-numerical parity against the reference implementation (transformers / mlx-lm) before it
-counts as supported.
+Sideros runs LLMs with custom Metal kernels (via `mx.fast.metal_kernel`) on the
+token-by-token decode path. mlx-lm is never a runtime dependency — it is the numerical
+reference and the benchmark baseline. Every port is validated for numerical parity
+against the reference implementation (transformers / mlx-lm) before it counts as
+supported.
+
+## Layout
+
+uv workspace with three packages:
+
+- **`packages/sideros`** — the engine: model trees, checkpoint loading (with load-time
+  weight fusions), KV cache, lazy generation pipeline, Metal kernels.
+- **`packages/sideros-server`** — FastAPI server speaking the OpenAI API (streaming
+  included), global FCFS queue.
+- **`packages/sideros-app`** — Flet chat app (web + desktop), talks to the server over
+  HTTP only.
 
 ## Supported architectures
 
 | Family | Variants |
 | --- | --- |
-| Qwen3.5 | dense, MoE, vision |
-| Qwen3 | dense, MoE |
-| Qwen2 / Qwen2.5 | dense |
+| Qwen2.5 | dense (bf16 and 4-bit) |
+| Qwen3 | dense; 30B-A3B MoE (fused quantized decode kernels) |
+| Qwen3.5 / Qwen3.6 | dense; 35B-A3B ultra-sparse MoE; vision — hybrid DeltaNet trunk |
 | Gemma 3 | dense |
-| LFM2 / LFM2.5 | MoE, short-conv |
+| LFM2.5 | 8B-A1B MoE, conv/attention hybrid |
+| gpt-oss | 20B MXFP4 MoE (attention sinks, sliding window, YaRN) |
 | GPT-2 | dense |
 
-Checkpoints load in bf16 or quantized (pre-quantized MLX checkpoints, or quantize-on-load),
-straight from the Hugging Face hub cache.
+The previous Swift incarnation (in `.legacy/`, being retired) covered the same
+families; anything not listed is re-ported on demand.
 
 ## What's inside
 
-- **Custom Metal kernels** for single-token decode: fused quantized MoE MLP, softmax
-  top-k routing, gated delta rule (DeltaNet), fused residual + rmsnorm, RoPE epilogue
-  with q/k-norm, skinny GEMM for speculative verify, gated short-conv step.
-- **Speculative decoding** with a draft model.
-- **`sideros-serve`** — HTTP server speaking the OpenAI, Anthropic, and Gemini APIs
-  (streaming included), so existing SDKs work as-is.
-- **`sideros-bench`** — decode/prefill benchmark CLI.
-- Own tokenizers (BPE) and image preprocessing — no Python at runtime.
+- **Custom Metal kernels** for single-token MoE decode: routed quantized MLP in two
+  dispatches, softmax top-k routing in one (selection bit-exact, ties included).
+- Load-time weight fusions (qkv concat, gate‖up row interleave, stacked experts).
+- Lazy decode loop (`async_eval` pipelining), KV cache with block buffer.
+- Own GPT-2 BPE tokenizer.
 
 ## Requirements
 
-- Apple Silicon Mac, macOS 14+
-- Xcode (the Metal shaders require `xcodebuild`; plain `swift test` won't run the tests)
+- Apple Silicon Mac
+- [uv](https://docs.astral.sh/uv/)
 
 ## Usage
 
-Serve a model from the Hugging Face cache (or a local checkpoint directory):
-
 ```sh
-make serve API_MODEL=mlx-community/Qwen2.5-0.5B-Instruct-4bit
+uv run sideros-server        # OpenAI-compatible API on 127.0.0.1:8642
 ```
 
-Then point any OpenAI/Anthropic/Gemini SDK at `http://127.0.0.1:8080`.
-
-As a library:
-
-```swift
-import Sideros
-```
+Then point any OpenAI SDK at `http://127.0.0.1:8642/api/openai/v1`.
 
 ## Tests
 
 ```sh
-make test
+uv run pytest -q
 ```
 
-Test fixtures are generated from transformers / mlx-lm and are not checked in
-(some exceed GitHub's file size limits); the generator scripts are not yet part of
-the repo. Parity tests compare logits against those fixtures with measured — never
-invented — tolerances.
+Test fixtures are generated from transformers / mlx-lm (`tests/fixtures/generate_*.py`)
+and are not checked in; `SHA256SUMS` is. Parity tests compare logits against those
+fixtures with measured — never invented — tolerances.
+
+Benchmarks are interleaved A/B against mlx-lm git main:
+
+```sh
+uv run --with "mlx-lm @ git+https://github.com/ml-explore/mlx-lm" bench/interleaved.py qwen3-moe
+```
 
 ## License
 
