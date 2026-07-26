@@ -153,9 +153,7 @@ def test_mutation_of_qkv_bias_breaks_parity(model: Qwen2, golden: dict[str, mx.a
 
 @pytest.fixture(scope="module")
 def q4_golden() -> dict[str, mx.array]:
-    loaded = mx.load(str(Q4_FIXTURE))
-    assert isinstance(loaded, dict)
-    return loaded
+    return load_golden(Q4_FIXTURE)
 
 
 @pytest.fixture(scope="module")

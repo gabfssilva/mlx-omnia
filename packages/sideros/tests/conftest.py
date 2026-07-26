@@ -33,6 +33,8 @@ def relative_diff(ours: mx.array, reference: mx.array) -> float:
 
 
 def load_golden(path: Path) -> dict[str, mx.array]:
+    if not path.exists():
+        pytest.skip(f"{path.name} not generated (see fixtures/generate_*.py)")
     loaded = mx.load(str(path))
     assert isinstance(loaded, dict)
     return loaded
