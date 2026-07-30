@@ -80,7 +80,7 @@ from sideros.models.qwen3_5 import (
 from sideros.models.qwen3_5_vision import Grid, ProcessorConfig, Qwen35Vision, process_image
 from sideros.models.qwen3_moe import Qwen3MoE, Qwen3MoEConfig
 from sideros.models.step3p7 import Step3p7, Step3p7Config
-from sideros.task import load
+from sideros.task import load, tree
 from sideros.vision import RGB_IMAGE, Image
 
 __all__ = [
@@ -180,4 +180,5 @@ __all__ = [
     "temperature",
     "top_k",
     "top_p",
+    "tree",
 ]

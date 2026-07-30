@@ -1,9 +1,19 @@
 # pyright: basic
 """Interleaved A/B decode bench: sideros vs mlx-lm, same checkpoint, same prompt.
 
-Only interleaved rounds count (the machine drifts ~8% over a battery); median of 5,
-greedy, EOS ignored. MoE decode also reports % of the physical ceiling
-(active bytes/token ÷ 490 GB/s sustained).
+Only interleaved rounds count; median of 5, greedy, EOS ignored. MoE decode also
+reports % of the physical ceiling (active bytes/token ÷ 490 GB/s sustained).
+
+Two measurement rules ported from the Poolside mlxfast-challenge harness:
+
+- Every timed arm starts with the GPU below 40°C (read via macmon). The drift that
+  used to read as "~8% over a battery" is throttle spikes, not smooth decay: prefill
+  throttles ~2x cool→hot, and sitting idle does not recover the cool state — only a
+  gate does. Without macmon the bench warns and runs ungated.
+- The plain arms decode teacher-forced to one stream (sideros's own greedy ids): a
+  bf16 tie resolved differently by the two implementations can no longer hand them
+  different tokens, so every round times the same computation. The draft arm stays
+  free-running — acceptance needs the draft's own proposals.
 
 A draft name adds a third arm — the same sideros over the same prompt, speculating. The
 rounds rotate the order so no arm always sits where the drift lands, and before the battery
@@ -38,7 +48,11 @@ Usage:
   … bench/interleaved.py <model> [draft] [lookahead]   e.g. qwen3-14b qwen3-4b-4bit 4
 """
 
+import json
+import os
+import shutil
 import statistics
+import subprocess
 import sys
 import time
 from collections.abc import Callable
@@ -48,13 +62,8 @@ import mlx.core as mx
 import mlx.nn as nn
 from huggingface_hub import snapshot_download
 
-from sideros import stream_ids
+from sideros import greedy, stream_ids, tree
 from sideros.footprint import Routed, active_bytes_per_token, ceiling
-from sideros.models.gpt2 import CHECKPOINT as GPT2
-from sideros.models.gpt_oss import CHECKPOINT as GPT_OSS
-from sideros.models.qwen2 import CHECKPOINT as QWEN2
-from sideros.models.qwen3 import CHECKPOINT as QWEN3
-from sideros.models.qwen3_moe import CHECKPOINT as QWEN3_MOE
 from sideros.speculative import Acceptance
 
 TOKENS = 128
@@ -62,7 +71,106 @@ RUNS = 5
 PROMPT = Path(__file__).parent.parent / "reference" / "bench_prompt.txt"
 HUB = Path.home() / ".cache/huggingface/hub"
 
+COOL_GATE_C = 40.0
+COOL_POLL_S = 10
+COOL_ABORT_S = 180  # minimum total wait before a stalled cool-down aborts
+COOL_STALL_S = 90  # abort once no new minimum has been seen for this long
+COOL_MAX_S = 900  # hard ceiling even while still (slowly) cooling
+COOL_EPSILON_C = 0.25  # sensor jitter around a plateau is not progress
+
 type Arm = Callable[[list[int]], tuple[float, float]]
+
+
+def find_macmon() -> str | None:
+    if os.environ.get("SIDEROS_COOL_GATE") == "0":
+        return None
+    found = shutil.which("macmon")
+    if found:
+        return found
+    for candidate in ("/opt/homebrew/bin/macmon", "/usr/local/bin/macmon"):
+        if os.access(candidate, os.X_OK):
+            return candidate
+    print(
+        "cool gate: macmon not found (brew install macmon) — running ungated; hot"
+        " back-to-back rounds are not comparable to gated ones",
+        file=sys.stderr,
+    )
+    return None
+
+
+def gpu_temp(macmon: str) -> float | None:
+    try:
+        out = subprocess.run([macmon, "pipe", "-s1"], capture_output=True, timeout=30, check=True)
+        return float(json.loads(out.stdout.splitlines()[0])["temp"]["gpu_temp_avg"])
+    except (subprocess.SubprocessError, OSError, ValueError, KeyError, IndexError):
+        return None
+
+
+def wait_cool(macmon: str | None) -> None:
+    """Blocks until the GPU is at or below the gate. Hot and not trending down means
+    something else is loading the GPU, and waiting longer will not fix that — abort so
+    a scripted battery stops instead of measuring a loaded machine."""
+    if macmon is None:
+        return
+    waited = flaky = 0
+    minimum: float | None = None
+    progress_at = 0
+    while True:
+        temp = gpu_temp(macmon)
+        if temp is None:
+            flaky += 1
+            if flaky >= 3:
+                print("cool gate: no usable temperature sample, skipping", file=sys.stderr)
+                return
+            time.sleep(2)
+            continue
+        flaky = 0
+        if temp <= 5:
+            # Observed on macmon 0.7.2: a frozen ~3.7°C reading for tens of minutes.
+            print(
+                f"cool gate: {temp:.1f}°C reads implausible; the gate may be decorative",
+                file=sys.stderr,
+            )
+        if temp <= COOL_GATE_C:
+            if waited:
+                print(f"cool gate: passed at {temp:.1f}°C after {waited}s", file=sys.stderr)
+            return
+        if minimum is None or temp <= minimum - COOL_EPSILON_C:
+            minimum, progress_at = temp, waited
+        if waited >= COOL_ABORT_S and waited - progress_at >= COOL_STALL_S:
+            raise SystemExit(
+                f"cool gate: GPU hot and not cooling ({temp:.1f}°C, min {minimum:.1f}°C,"
+                f" waited {waited}s) — something else is loading it; free it up and rerun,"
+                " or SIDEROS_COOL_GATE=0 for an ungated debug run"
+            )
+        if waited >= COOL_MAX_S:
+            raise SystemExit(
+                f"cool gate: GPU did not reach {COOL_GATE_C:.0f}°C within {COOL_MAX_S}s"
+                f" (current {temp:.1f}°C)"
+            )
+        print(
+            f"cool gate: {temp:.1f}°C, waiting for <={COOL_GATE_C:.0f}°C ({waited}s)...",
+            file=sys.stderr,
+        )
+        time.sleep(COOL_POLL_S)
+        waited += COOL_POLL_S
+
+
+def forced(script: list[int]) -> Callable[[mx.array], mx.array]:
+    """A sampler that pins the stream: the argmax still runs (it is part of the step
+    being timed) and the returned id keeps a data dependency on it — without that the
+    forward is dead code the lazy graph never evaluates. The index clamps because both
+    decode loops queue one step past the last id they emit."""
+    ids = mx.array(script, dtype=mx.uint32)
+    last = len(script) - 1
+    n = -1
+
+    def sample(logits: mx.array) -> mx.array:
+        nonlocal n
+        n = min(n + 1, last)
+        return ids[n : n + 1] + mx.argmax(logits, axis=-1) * 0
+
+    return sample
 
 
 def cached(repository: str) -> Path:
@@ -71,23 +179,25 @@ def cached(repository: str) -> Path:
     return next((HUB / f"models--{repository.replace('/', '--')}" / "snapshots").iterdir())
 
 
+def _snapshot(repository: str, *patterns: str) -> Path:
+    return Path(snapshot_download(repository, allow_patterns=list(patterns)))
+
+
+# `sideros.tree` dispatches on the checkpoint's own model_type, so the entries here keep
+# only what the door doesn't decide: which repo, which download patterns, and gpt2's
+# fp16 pin.
+OURS = {
+    "gpt2": lambda: tree(_snapshot("gpt2", "config.json", "model.safetensors"), dtype=mx.float16),
+    "qwen2": lambda: tree(_snapshot("Qwen/Qwen2.5-0.5B", "config.json", "*.safetensors")),
+    "qwen3": lambda: tree(_snapshot("Qwen/Qwen3-0.6B", "config.json", "*.safetensors")),
+    "qwen3-14b": lambda: tree(cached("mlx-community/Qwen3-14b-bf16")),
+    "qwen3-moe": lambda: tree(cached("mlx-community/Qwen3-30B-A3B-4bit")),
+    "gpt-oss-120b": lambda: tree(cached("openai/gpt-oss-120b")),
+}
+
+
 def load_ours(name: str):
-    if name == "gpt2":
-        d = Path(snapshot_download("gpt2", allow_patterns=["config.json", "model.safetensors"]))
-        return GPT2.load(d, mx.float16)
-    if name == "qwen2":
-        patterns = ["config.json", "*.safetensors"]
-        d = Path(snapshot_download("Qwen/Qwen2.5-0.5B", allow_patterns=patterns))
-        return QWEN2.load(d, None)
-    if name == "qwen3":
-        patterns = ["config.json", "*.safetensors"]
-        d = Path(snapshot_download("Qwen/Qwen3-0.6B", allow_patterns=patterns))
-        return QWEN3.load(d, None)
-    if name == "qwen3-14b":
-        return QWEN3.load(cached("mlx-community/Qwen3-14b-bf16"), None)
-    if name == "gpt-oss-120b":
-        return GPT_OSS.load(cached("openai/gpt-oss-120b"), None)
-    return QWEN3_MOE.load(cached("mlx-community/Qwen3-30B-A3B-4bit"), None)
+    return OURS[name]()
 
 
 MLXLM_REPO = {
@@ -112,16 +222,17 @@ WITH_CEILING = ("qwen2", "qwen3", "qwen3-14b", "qwen3-moe", "gpt-oss-120b")
 
 
 def load_draft(name: str):
-    return QWEN3.load(cached(DRAFTS[name]), None)
+    return tree(cached(DRAFTS[name]))
 
 
 def run_ours(
-    model, ids: list[int], *, draft=None, lookahead=4, acceptance=None
+    model, ids: list[int], *, draft=None, lookahead=4, acceptance=None, script=None
 ) -> tuple[float, float]:
     stream = stream_ids(
         model,
         ids,
         max_tokens=TOKENS,
+        sampler=greedy if script is None else forced(script),
         draft=draft,
         lookahead=lookahead,
         acceptance=acceptance,
@@ -138,12 +249,13 @@ def run_ours(
     return first - start, (TOKENS - 1) / (end - first)
 
 
-def run_mlxlm(model, ids: list[int]) -> tuple[float, float]:
+def run_mlxlm(model, ids: list[int], script: list[int] | None = None) -> tuple[float, float]:
     from mlx_lm.generate import generate_step
 
+    sampler = None if script is None else forced(script)
     start = time.perf_counter()
     first = None
-    for n, _ in enumerate(generate_step(mx.array(ids), model), start=1):
+    for n, _ in enumerate(generate_step(mx.array(ids), model, sampler=sampler), start=1):
         if first is None:
             first = time.perf_counter()
         if n == TOKENS:
@@ -171,14 +283,18 @@ def is_sparse(model: nn.Module) -> bool:
     return bool(routed)
 
 
-def battery(arms: dict[str, Arm], ids: list[int]) -> dict[str, list[tuple[float, float]]]:
-    """Alternating rounds, rotated: a fixed order hands the machine's ~8% drift to whichever
-    arm always runs last."""
+def battery(
+    arms: dict[str, Arm], ids: list[int], macmon: str | None
+) -> dict[str, list[tuple[float, float]]]:
+    """Alternating rounds, rotated — a fixed order would hand whatever residual drift
+    survives the gate to whichever arm always runs last — and every arm behind the
+    cool gate, so each measurement starts from the same thermal state."""
     samples: dict[str, list[tuple[float, float]]] = {name: [] for name in arms}
     names = list(arms)
     for i in range(RUNS):
         turn = i % len(names)
         for name in [*names[turn:], *names[:turn]]:
+            wait_cool(macmon)
             samples[name].append(arms[name](ids))
         print(f"round {i + 1}/{RUNS} done", file=sys.stderr)
     return samples
@@ -252,7 +368,7 @@ def main() -> None:
     acceptance = Acceptance()
 
     def plain_arm(prompt: list[int]) -> tuple[float, float]:
-        return run_ours(ours_model, prompt)
+        return run_ours(ours_model, prompt, script=plain)
 
     def draft_arm(prompt: list[int]) -> tuple[float, float]:
         return run_ours(
@@ -260,7 +376,7 @@ def main() -> None:
         )
 
     def mlxlm_arm(prompt: list[int]) -> tuple[float, float]:
-        return run_mlxlm(ref_model, prompt)
+        return run_mlxlm(ref_model, prompt, script=plain)
 
     arms: dict[str, Arm] = {"sideros": plain_arm}
     if draft_model is not None:
@@ -289,7 +405,7 @@ def main() -> None:
         arms["sideros+draft"] = draft_arm
     arms["mlx-lm"] = mlxlm_arm
 
-    samples = battery(arms, ids)
+    samples = battery(arms, ids, find_macmon())
     medians = {arm: report(arm, samples[arm]) for arm in arms}
     ours_decode = medians["sideros"]
     print(f"ratio: {ours_decode / medians['mlx-lm']:.3f}x (sideros/mlx-lm, decode)")

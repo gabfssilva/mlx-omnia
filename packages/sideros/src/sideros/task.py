@@ -7,13 +7,15 @@ from dataclasses import dataclass
 from fnmatch import fnmatch
 from importlib.metadata import version
 from pathlib import Path
-from typing import Protocol, TypedDict
+from typing import Protocol, TypedDict, cast
 
 import huggingface_hub
 import mlx.core as mx
 import mlx.nn as nn
 
 from sideros.checkpoint import Pending, save_quantized
+from sideros.core.cache import LayerCache
+from sideros.generate import CausalLM
 from sideros.language import LanguageModel
 from sideros.model import ModelInput
 from sideros.models import (
@@ -45,7 +47,7 @@ from sideros.quant.quantization import (
     quantize_weights,
 )
 
-__all__ = ["Source", "digest", "load", "provenance", "source", "write_entry"]
+__all__ = ["Source", "digest", "load", "provenance", "source", "tree", "write_entry"]
 
 
 class _Config(TypedDict):
@@ -86,12 +88,16 @@ def _download_snapshot(
 
 
 class _Registered(Protocol):
-    """What `load` reads off an architecture's `Checkpoint`. The tree loader is not part
-    of it — this door only ever hands back a task-level model — and leaving it out is
-    what lets one dict hold declarations typed on nine different trees."""
+    """What `load` and `tree` read off an architecture's `Checkpoint`. The tree loader
+    is typed at `nn.Module`, not at the architecture's own class — a read-only callable
+    return is covariant, and that erasure is what lets one dict hold declarations typed
+    on nine different trees."""
 
     @property
     def patterns(self) -> tuple[str, ...]: ...
+
+    @property
+    def load(self) -> Callable[[Path, mx.Dtype | None], nn.Module]: ...
 
     @property
     def task(self) -> Callable[[Path, mx.Dtype | None], LanguageModel[ModelInput]]: ...
@@ -383,3 +389,44 @@ def load(
             plan,
         )
     return spec.task(entry, None)
+
+
+def tree(
+    model: str | Path,
+    *,
+    dtype: mx.Dtype | None = None,
+    revision: str | None = None,
+    local_files_only: bool = False,
+) -> CausalLM[LayerCache]:
+    """Load the bare model tree — the layer `stream_ids` and the bench consume,
+    without the task-level facade `load` wraps around it.
+
+    Parameters
+    ----------
+    model : str | Path
+        Hugging Face repository identifier or local checkpoint directory.
+    dtype : mx.Dtype | None, optional
+        Weight dtype override. Preserve the checkpoint dtype when omitted.
+    revision : str | None, optional
+        Hugging Face revision used for repository identifiers.
+    local_files_only : bool, optional
+        Restrict repository resolution to the local Hugging Face cache.
+
+    Returns
+    -------
+    CausalLM[LayerCache]
+        The architecture's module tree, loaded and materialized.
+
+    Raises
+    ------
+    ValueError
+        If the checkpoint architecture is unsupported.
+    """
+    directory, spec, _, _ = _resolve(model, revision, local_files_only)
+    # The one erasure point. `CausalLM[C]` is invariant in C (the cache leaves through
+    # `make_cache` and returns through `__call__`), so nine trees with nine concrete
+    # caches share no honest supertype, and nothing in a `str | Path` argument can bind
+    # a type var. The claim the cast makes is wider than the tree (it does not accept
+    # arbitrary `LayerCache` rows) — safe because every consumer round-trips the cache
+    # the model itself handed out, and none constructs a foreign one.
+    return cast(CausalLM[LayerCache], spec.load(directory, dtype))
