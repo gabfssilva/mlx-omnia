@@ -57,18 +57,21 @@ def relative_diff(ours: np.ndarray, reference: np.ndarray) -> float:
 
 
 def forward(model, ids: list[int], internals: bool, last_logit_only: bool = False):
+    # The e2b-it checkpoint is multimodal (Gemma4ForConditionalGeneration); the text
+    # trunk the fixture pins lives under language_model.
+    trunk = model.model.language_model
     captured: dict[str, np.ndarray] = {}
     handles = [
-        model.model.embed_tokens.register_forward_hook(capture_into(captured, "embeddings")),
-        model.model.norm.register_forward_hook(capture_into(captured, "norm")),
+        trunk.embed_tokens.register_forward_hook(capture_into(captured, "embeddings")),
+        trunk.norm.register_forward_hook(capture_into(captured, "norm")),
     ]
     handles += [
         b.register_forward_hook(capture_into(captured, f"block_{i}"))
-        for i, b in enumerate(model.model.layers)
+        for i, b in enumerate(trunk.layers)
     ]
     if internals:
         for index in (SLIDING_LAYER, FULL_LAYER):
-            block = model.model.layers[index]
+            block = trunk.layers[index]
             handles += [
                 getattr(block, name).register_forward_hook(
                     capture_into(captured, f"b{index}_{name}")
@@ -117,12 +120,13 @@ def pass_at(dtype: torch.dtype, ids: list[int], long_ids: list[int]) -> dict[str
 
 def greedy_ids(ids: list[int]) -> np.ndarray:
     model = AutoModelForCausalLM.from_pretrained(MODEL, dtype=torch.float32).eval()
+    eos = model.config.eos_token_id
     with torch.no_grad():
         out = model.generate(
             input_ids=torch.tensor([ids]),
             max_new_tokens=20,
             do_sample=False,
-            pad_token_id=model.config.eos_token_id,
+            pad_token_id=eos[0] if isinstance(eos, list) else eos,
         )
     del model
     gc.collect()

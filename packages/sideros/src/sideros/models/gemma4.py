@@ -181,7 +181,7 @@ def proportional_inv_freq(head_dim: int, partial: float, theta: float) -> mx.arr
     rope_angles = int(partial * head_dim // 2)
     real = mx.power(
         theta,
-        mx.arange(0, rope_angles, dtype=mx.float32) * (2.0 / head_dim),
+        mx.arange(0, rope_angles, dtype=mx.float32) * (-2.0 / head_dim),
     )
     zeros = mx.zeros(head_dim // 2 - rope_angles, dtype=mx.float32)
     return mx.concatenate([real, zeros])
@@ -206,27 +206,18 @@ def manual_rope(
 ) -> mx.array:
     """Apply RoPE manually to `x` of shape `[1, heads, length, head_dim]`.
 
-    The first `2*cos.shape[-1]` dims are rotated as pairs (x_even, x_odd):
-    out_even = x_even*cos - x_odd*sin
-    out_odd  = x_even*sin + x_odd*cos
-    The remaining dims (head_dim - 2*rotated) are identity (cos=1, sin=0 already
-    baked by the zero-frequency inv_freq tail, but we slice to avoid relying on
-    it — the caller passes cos/sin sized to the rotated count only).
+    Split-half (transformers `rotate_half` with `emb = cat(freqs, freqs)`): dim `j`
+    pairs with `j + head_dim//2` and both share frequency `j`. The zero-frequency
+    inv_freq tail makes the nope dims identity (cos=1, sin=0), so `cos`/`sin` span
+    the full `head_dim//2`.
     """
-    rotated = cos.shape[-1] * 2
-    x_rot = x[..., :rotated]
-    x_pass = x[..., rotated:]
-    x_even = x_rot[..., 0::2]
-    x_odd = x_rot[..., 1::2]
-    # cos/sin are [length, rotated//2] — broadcast over heads.
+    half = cos.shape[-1]
+    x1 = x[..., :half]
+    x2 = x[..., half:]
+    # cos/sin are [length, head_dim//2] — broadcast over heads.
     cos_b = cos[mx.newaxis, mx.newaxis, :, :]
     sin_b = sin[mx.newaxis, mx.newaxis, :, :]
-    out_even = x_even * cos_b - x_odd * sin_b
-    out_odd = x_even * sin_b + x_odd * cos_b
-    out_rot = mx.stack([out_even, out_odd], axis=-1).flatten(-2)
-    if x_pass.shape[-1] > 0:
-        return mx.concatenate([out_rot, x_pass], axis=-1)
-    return out_rot
+    return mx.concatenate([x1 * cos_b - x2 * sin_b, x1 * sin_b + x2 * cos_b], axis=-1)
 
 
 # --------------------------------------------------------------------------- #
@@ -291,11 +282,11 @@ class Gemma4Attention(nn.Module):
         self.q_proj = nn.Linear(hidden, queries, bias=False)
         self.o_proj = nn.Linear(queries, hidden, bias=False)
         self.q_norm = nn.RMSNorm(self.head_dim, eps=config.rms_norm_eps)
-        self.k_norm = nn.RMSNorm(self.head_dim, eps=config.rms_norm_eps)
 
         kv_shared = config.is_kv_shared_layer(layer_idx)
         self.kv_shared = kv_shared
         if not kv_shared:
+            self.k_norm = nn.RMSNorm(self.head_dim, eps=config.rms_norm_eps)
             self.k_proj = nn.Linear(hidden, key_values, bias=False)
             if not self.k_eq_v:
                 self.v_proj = nn.Linear(hidden, key_values, bias=False)
@@ -418,29 +409,6 @@ class Gemma4MLP(nn.Module):
 
 
 # --------------------------------------------------------------------------- #
-# PLE residual arm
-# --------------------------------------------------------------------------- #
-
-
-class PLEArm(nn.Module):
-    """The third residual arm: gate → act → mul-by-ple → project → norm → add."""
-
-    def __init__(self, config: Gemma4TextConfig) -> None:
-        super().__init__()
-        hidden = config.hidden_size
-        ple_dim = config.hidden_size_per_layer_input
-        self.per_layer_input_gate = nn.Linear(hidden, ple_dim, bias=False)
-        self.per_layer_projection = nn.Linear(ple_dim, hidden, bias=False)
-        self.post_per_layer_input_norm = nn.RMSNorm(hidden, eps=config.rms_norm_eps)
-
-    def __call__(self, x: mx.array, per_layer_input: mx.array) -> mx.array:
-        gate = _gelu(self.per_layer_input_gate(x))
-        ple = gate * per_layer_input
-        projected = self.per_layer_projection(ple)
-        return self.post_per_layer_input_norm(projected)
-
-
-# --------------------------------------------------------------------------- #
 # Block
 # --------------------------------------------------------------------------- #
 
@@ -456,9 +424,15 @@ class Gemma4Block(nn.Module):
         self.pre_feedforward_layernorm = nn.RMSNorm(config.hidden_size, eps=eps)
         self.post_feedforward_layernorm = nn.RMSNorm(config.hidden_size, eps=eps)
         self.layer_scalar = mx.ones((1,), dtype=mx.float32)
+        # PLE leaves live on the block itself: the checkpoint names them
+        # layers.N.per_layer_input_gate, not under a nested arm module.
         self.has_ple = config.hidden_size_per_layer_input > 0
         if self.has_ple:
-            self.ple_arm = PLEArm(config)
+            hidden = config.hidden_size
+            ple_dim = config.hidden_size_per_layer_input
+            self.per_layer_input_gate = nn.Linear(hidden, ple_dim, bias=False)
+            self.per_layer_projection = nn.Linear(ple_dim, hidden, bias=False)
+            self.post_per_layer_input_norm = nn.RMSNorm(hidden, eps=eps)
 
     def __call__(
         self,
@@ -474,7 +448,9 @@ class Gemma4Block(nn.Module):
         )
         if self.has_ple:
             assert per_layer_input is not None
-            h = h + self.ple_arm(h, per_layer_input)
+            gate = _gelu(self.per_layer_input_gate(h))
+            projected = self.per_layer_projection(gate * per_layer_input)
+            h = h + self.post_per_layer_input_norm(projected)
         return h * self.layer_scalar
 
 
