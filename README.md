@@ -7,10 +7,8 @@ optimized for Apple Silicon.
 > Not ready for production use.
 
 Sideros runs LLMs with custom Metal kernels (via `mx.fast.metal_kernel`) on the
-token-by-token decode path. mlx-lm is never a runtime dependency — it is the numerical
-reference and the benchmark baseline. Every port is validated for numerical parity
-against the reference implementation (transformers / mlx-lm) before it counts as
-supported.
+token-by-token decode path. Every port is validated for numerical parity against a
+reference implementation before it counts as supported.
 
 ## Layout
 
@@ -26,18 +24,22 @@ uv workspace with three packages, plus the desktop app:
 
 ## Supported architectures
 
-| Family | Variants |
-| --- | --- |
-| Qwen2.5 | dense (bf16 and 4-bit) |
-| Qwen3 | dense; 30B-A3B MoE (fused quantized decode kernels) |
-| Qwen3.5 / Qwen3.6 | dense; 35B-A3B ultra-sparse MoE; vision — hybrid DeltaNet trunk |
-| Gemma 3 | dense |
-| LFM2.5 | 8B-A1B MoE, conv/attention hybrid |
-| gpt-oss | 20B MXFP4 MoE (attention sinks, sliding window, YaRN) |
-| GPT-2 | dense |
-
-The previous Swift incarnation (in `.legacy/`, being retired) covered the same
-families; anything not listed is re-ported on demand.
+- Qwen2.5
+- Qwen3 (dense and MoE)
+- Qwen3.5 / Qwen3.6 (dense, MoE, and vision)
+- Gemma 3
+- Gemma 4
+- Llama 4
+- LFM2.5
+- gpt-oss
+- Hunyuan 3
+- Laguna S 2.1
+- LongCat Flash Lite
+- Falcon-H1
+- Mamba2
+- Step 3.7 Flash (vision)
+- BitNet b1.58
+- GPT-2
 
 ## What's inside
 
@@ -66,15 +68,12 @@ Then point any OpenAI SDK at `http://127.0.0.1:8642/api/openai/v1`.
 uv run pytest -q
 ```
 
-Test fixtures are generated from transformers / mlx-lm (`tests/fixtures/generate_*.py`)
+Test fixtures are generated from reference implementations (`tests/fixtures/generate_*.py`)
 and are not checked in; `SHA256SUMS` is. Parity tests compare logits against those
 fixtures with measured — never invented — tolerances.
 
-Benchmarks are interleaved A/B against mlx-lm git main:
-
-```sh
-uv run --with "mlx-lm @ git+https://github.com/ml-explore/mlx-lm" bench/interleaved.py qwen3-moe
-```
+Benchmarks are interleaved A/B against a baseline in the same process — see
+`bench/interleaved.py` for how to run them.
 
 ## License
 
