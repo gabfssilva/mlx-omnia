@@ -13,7 +13,7 @@ ternary matmul runs in the ``bitlinear`` Metal kernel; the per-token int8 activa
 fake-quant transformers' ``AutoBitLinear`` applies runs in the leaf, before the
 dispatch, in fp32. No qkv or gate‖up fusion: each projection carries its own
 ``weight_scale``, so fusing would collapse independent scales. RoPE is split-half
-(``traditional=True``), matching transformers' ``rotate_half``.
+(``traditional=False``), matching transformers' ``rotate_half``.
 """
 
 import json
@@ -146,7 +146,7 @@ class BitNetAttention(nn.Module):
     def rope(self, x: mx.array, offset: int) -> mx.array:
         # Split-half (transformers rotate_half), not mlx-lm's default interleaved.
         return mx.fast.rope(
-            x, self.head_dim, traditional=True, base=self.rope_theta, scale=1.0, offset=offset
+            x, self.head_dim, traditional=False, base=self.rope_theta, scale=1.0, offset=offset
         )
 
     def __call__(self, x: mx.array, cache: KVCache) -> mx.array:

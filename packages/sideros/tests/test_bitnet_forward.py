@@ -136,12 +136,16 @@ def test_block0_sub_norms_within_floor(model: BitNet, golden: dict[str, mx.array
 
 
 def test_stepwise_matches_prefill(model: BitNet, golden: dict[str, mx.array]) -> None:
-    """A wrong cache can survive a degenerate greedy; it does not survive full logits."""
+    """A wrong cache can survive a degenerate greedy; it does not survive full logits.
+
+    The bar is the fixture's measured ``noise.batching`` (transformers fp32, prefill vs
+    step-by-step), not the usual fp32 1e-5: the per-token act-quant round amplifies a
+    mere change in matmul row count chaotically along the 30-layer trunk."""
     ids = golden["greedy_ids"]
     prefill = model(ids[None])
     cache = model.make_cache()
     steps = [model(ids[None, i : i + 1], cache) for i in range(ids.shape[0])]
-    assert relative_diff(mx.concatenate(steps, axis=1), prefill) < 1e-5
+    assert relative_diff(mx.concatenate(steps, axis=1), prefill) < floor(golden, "batching")
 
 
 def test_cached_greedy_matches_fixture(model: BitNet, golden: dict[str, mx.array]) -> None:
@@ -153,12 +157,16 @@ def test_cached_greedy_matches_fixture(model: BitNet, golden: dict[str, mx.array
 
 def test_mutation_breaks_parity(model: BitNet, golden: dict[str, mx.array]) -> None:
     """Perturbing one weight_scale must blow past the fixture floor — it is the only
-    BitLinear parameter that is cheap to mutate (the ternary weight is packed uint8)."""
+    BitLinear parameter that is cheap to mutate (the ternary weight is packed uint8).
+    The target is ``down_proj``: gate/up scales are cancelled by the ``ffn_sub_norm``
+    RMSNorm right after the gated product, so mutating them is a near no-op. The factor
+    is 3x — the downstream layernorms absorb most of a 1.5x on a single layer (measured
+    0.052 against a 0.084 floor; 3x lands at 0.143)."""
     mlp = model.model.layers[13].mlp
-    original = mlp.gate_proj.weight_scale
-    mlp.gate_proj.weight_scale = original * mx.array([1.5], dtype=original.dtype)
+    original = mlp.down_proj.weight_scale
+    mlp.down_proj.weight_scale = original * mx.array([3.0], dtype=original.dtype)
     try:
         logits = model(golden["input_ids"][None])
         assert relative_diff(logits, golden["logits"]) > floor(golden, "logits")
     finally:
-        mlp.gate_proj.weight_scale = original
+        mlp.down_proj.weight_scale = original

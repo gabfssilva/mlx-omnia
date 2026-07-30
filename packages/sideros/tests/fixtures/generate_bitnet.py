@@ -74,6 +74,24 @@ def forward(ids: list[int], dtype: torch.dtype) -> dict[str, np.ndarray]:
     return captured
 
 
+def batching_noise(ids: list[int]) -> float:
+    """Prefill against step-by-step with cache, both transformers fp32: what the
+    act-quant's round amplifies out of a mere change in matmul row count. This is the
+    floor for sideros' own stepwise-vs-prefill gate — a fixed fp32 tolerance is
+    unachievable on this trunk (the fp32-vs-fp64 logits floor is already ~3e-2)."""
+    model = BitNetForCausalLM.from_pretrained(MODEL, dtype=torch.float32)
+    model.eval()
+    with torch.no_grad():
+        prefill = model(input_ids=torch.tensor([ids])).logits.double().numpy()
+        past = None
+        steps = []
+        for token in ids:
+            out = model(input_ids=torch.tensor([[token]]), past_key_values=past, use_cache=True)
+            past = out.past_key_values
+            steps.append(out.logits.double().numpy())
+    return relative_diff(np.concatenate(steps, axis=1), prefill)
+
+
 def greedy_ids(ids: list[int]) -> np.ndarray:
     model = BitNetForCausalLM.from_pretrained(MODEL, dtype=torch.float32)
     model.eval()
@@ -105,6 +123,7 @@ def main() -> None:
             for name, tensor in exact.items()
         }
     )
+    out["noise.batching"] = np.array([batching_noise(ids)], dtype=np.float32)
     out["input_ids"] = np.array(ids, dtype=np.int32)
     out["greedy_ids"] = greedy_ids(ids)
 
