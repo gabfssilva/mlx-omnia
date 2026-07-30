@@ -14,8 +14,7 @@ from conftest import assert_greedy_modulo_ties, floor, load_golden, relative_dif
 from huggingface_hub import snapshot_download
 
 from sideros import KVCache, stream_ids
-from sideros.checkpoint import load_qwen2
-from sideros.models.qwen2 import Qwen2, Qwen2Activations
+from sideros.models.qwen2 import CHECKPOINT, Qwen2, Qwen2Activations
 
 FIXTURE = Path(__file__).parent / "fixtures" / "qwen2_forward.safetensors"
 Q4_FIXTURE = Path(__file__).parent / "fixtures" / "qwen2_q4_mlxlm.safetensors"
@@ -42,7 +41,7 @@ def golden() -> dict[str, mx.array]:
 @pytest.fixture(scope="module")
 def model() -> Qwen2:
     # The fixture is transformers in fp32; the checkpoint's bf16 upcasts losslessly.
-    return load_qwen2(qwen2_dir(), dtype=mx.float32)
+    return CHECKPOINT.load(qwen2_dir(), mx.float32)
 
 
 @pytest.fixture(scope="module")
@@ -158,14 +157,14 @@ def q4_golden() -> dict[str, mx.array]:
 
 @pytest.fixture(scope="module")
 def q4_model() -> Qwen2:
-    return load_qwen2(quantized_dir())
+    return CHECKPOINT.load(quantized_dir(), None)
 
 
 def test_q4_rejects_dtype_cast() -> None:
     """`dtype=` over packed uint32 weights survives the shape check and silently ruins
     the numbers; the loader has to refuse instead."""
     with pytest.raises(ValueError):
-        load_qwen2(quantized_dir(), dtype=mx.float32)
+        CHECKPOINT.load(quantized_dir(), mx.float32)
 
 
 def test_q4_logits_match_mlxlm(q4_model: Qwen2, q4_golden: dict[str, mx.array]) -> None:

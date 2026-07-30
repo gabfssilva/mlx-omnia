@@ -1,4 +1,4 @@
-"""LFM2.5 tokenizer parity against the HF fast tokenizer over the same tokenizer.json."""
+"""LFM2.5 through the shared reader, against the HF fast tokenizer over the same file."""
 
 from dataclasses import replace
 from pathlib import Path
@@ -11,7 +11,7 @@ from hypothesis import given
 from hypothesis import strategies as st
 from transformers import AutoTokenizer
 
-from sideros.tokenizer_lfm2 import LFM2Tokenizer
+from sideros.bpe import ByteLevelBPE
 
 REPO = "LiquidAI/LFM2.5-8B-A1B"
 
@@ -39,8 +39,8 @@ CORPUS = [
 
 
 @pytest.fixture(scope="module")
-def tokenizer() -> LFM2Tokenizer:
-    return LFM2Tokenizer.from_file(Path(hf_hub_download(REPO, "tokenizer.json")))
+def tokenizer() -> ByteLevelBPE:
+    return ByteLevelBPE.from_file(Path(hf_hub_download(REPO, "tokenizer.json")))
 
 
 class Encodes(Protocol):
@@ -53,21 +53,21 @@ def reference() -> Encodes:
 
 
 @pytest.mark.parametrize("text", CORPUS)
-def test_ids_match_transformers(tokenizer: LFM2Tokenizer, reference: Encodes, text: str) -> None:
+def test_ids_match_transformers(tokenizer: ByteLevelBPE, reference: Encodes, text: str) -> None:
     assert tokenizer.encode(text) == reference.encode(text)
 
 
 @pytest.mark.parametrize("text", CORPUS)
-def test_round_trip(tokenizer: LFM2Tokenizer, text: str) -> None:
+def test_round_trip(tokenizer: ByteLevelBPE, text: str) -> None:
     assert tokenizer.decode(tokenizer.encode(text)) == text
 
 
 @given(st.text())
-def test_round_trip_any_text(tokenizer: LFM2Tokenizer, text: str) -> None:
+def test_round_trip_any_text(tokenizer: ByteLevelBPE, text: str) -> None:
     assert tokenizer.decode(tokenizer.encode(text)) == text
 
 
-def test_round_trip_without_added_tokens(tokenizer: LFM2Tokenizer) -> None:
+def test_round_trip_without_added_tokens(tokenizer: ByteLevelBPE) -> None:
     # `"|".join([])` is the empty pattern, which matches at every position.
     bare = replace(tokenizer, added={}, _added_pattern=regex.compile(""))
     assert bare.decode(bare.encode("hello")) == "hello"

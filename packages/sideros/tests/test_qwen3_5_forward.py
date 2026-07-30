@@ -17,12 +17,12 @@ from conftest import floor, load_golden, relative_diff
 from huggingface_hub import snapshot_download
 
 from sideros import stream_ids
-from sideros.checkpoint import load_qwen3_5
 from sideros.core.cache import DeltaCache, KVCache
 from sideros.core.kernels.add_rms_norm import add_rms_norm, add_rms_norm_applies
 from sideros.core.kernels.gated_delta import gated_delta
 from sideros.models import qwen3_5
 from sideros.models.qwen3_5 import (
+    CHECKPOINT,
     Qwen35,
     Qwen35Activations,
     _delta_rule,
@@ -49,7 +49,7 @@ def golden() -> dict[str, mx.array]:
 @pytest.fixture(scope="module")
 def model() -> Qwen35:
     # The fixture is transformers in fp32; the checkpoint's bf16 upcasts losslessly.
-    return load_qwen3_5(qwen3_5_dir(), dtype=mx.float32)
+    return CHECKPOINT.load(qwen3_5_dir(), mx.float32)
 
 
 @pytest.fixture(scope="module")

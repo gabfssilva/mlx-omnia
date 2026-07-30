@@ -45,6 +45,7 @@ CONFIG = GPTOSSConfig(
     swiglu_limit=7.0,
     layer_types=("sliding_attention", "full_attention"),
     rope_scaling=GPTOSSRoPEScaling(32.0, 4096, 32.0, 1.0),
+    eos_token_id=(200002,),
 )
 
 LENGTHS = (129, 600, 1031)

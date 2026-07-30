@@ -15,8 +15,7 @@ from conftest import floor, load_golden, relative_diff
 from huggingface_hub import snapshot_download
 
 from sideros import KVCache, stream_ids
-from sideros.checkpoint import load_gemma3
-from sideros.models.gemma3 import Gemma3, Gemma3Activations
+from sideros.models.gemma3 import CHECKPOINT, Gemma3, Gemma3Activations
 
 FIXTURE = Path(__file__).parent / "fixtures" / "gemma3_forward.safetensors"
 N_LAYER = 18
@@ -37,7 +36,7 @@ def golden() -> dict[str, mx.array]:
 @pytest.fixture(scope="module")
 def model() -> Gemma3:
     # The fixture is transformers in fp32; the checkpoint's bf16 upcasts losslessly.
-    return load_gemma3(gemma3_dir(), dtype=mx.float32)
+    return CHECKPOINT.load(gemma3_dir(), mx.float32)
 
 
 @pytest.fixture(scope="module")

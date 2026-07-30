@@ -11,31 +11,70 @@ Property names are the checkpoint's after the loader normalizes the two dialects
 each mixer are concatenated on the output axis into `fused_proj`, dict-side.
 """
 
+import json
 import math
-from collections.abc import Callable, Iterator, Sequence
+from collections.abc import Callable, Collection, Iterator, Sequence
 from dataclasses import dataclass
 from functools import cache
-from typing import NamedTuple
+from pathlib import Path
+from typing import NamedTuple, NotRequired, TypedDict, TypeIs
 
 import mlx.core as mx
 import mlx.nn as nn
 import numpy as np
 
+from sideros.bpe import ByteLevelBPE
+from sideros.chat import (
+    ChatCapability,
+    MultimodalChatCapability,
+    chat_template,
+)
+from sideros.checkpoint import (
+    checkpoint,
+    drop_tied_head,
+    reject_dtype_cast,
+    stop_tokens,
+)
 from sideros.core.cache import DeltaCache, KVCache
 from sideros.core.kernels.add_rms_norm import add_rms_norm, add_rms_norm_applies
 from sideros.core.kernels.gated_delta import gated_delta, gated_delta_applies
 from sideros.core.kernels.moe_gemv import moe_down_combine, moe_gate_up_act, moe_gemv_applies
 from sideros.core.kernels.moe_route import softmax_topk, softmax_topk_applies
-from sideros.core.layers import SORTED_GATHER_MIN, SwiGLU, sorted_gather
+from sideros.core.layers import (
+    SORTED_GATHER_MIN,
+    QuantizedSwitchLinear,
+    SwiGLU,
+    SwitchLinear,
+    sorted_gather,
+)
 from sideros.core.mxcompat import softmax
-from sideros.generate import Sampler, greedy
+from sideros.core.prompt_cache import PromptCache
+from sideros.generate import Meter, Penalty, Sampler, greedy, stream_ids, stream_text
+from sideros.language import (
+    TEXT,
+    GenerationOptions,
+    LanguageModel,
+    LanguagePrompt,
+    Text,
+    Tokenizer,
+    prefix_cache,
+)
+from sideros.model import CompositeModel, ModelInput, ModelSignature
 from sideros.models.qwen3_5_vision import (
     Grid,
+    ProcessorConfig,
     Qwen35Vision,
     Qwen35VisionConfig,
+    VisionJson,
+    load_processor_config,
     multimodal_positions,
+    normalized_patch_weight,
+    process_image,
+    vision_config,
 )
-from sideros.models.qwen3_moe import QuantizedSwitchLinear, SwitchLinear
+from sideros.suppress import Segment
+from sideros.tools import ToolFamily
+from sideros.vision import RGB_IMAGE, Image
 
 _L2_EPS = 1e-6
 
@@ -102,11 +141,12 @@ class Qwen35Config:
     linear_value_head_dim: int
     linear_conv_kernel_dim: int
     eos_token_id: tuple[int, ...]
-    quantized: bool
     mrope_section: tuple[int, int, int]
     image_token_id: int
     moe: Qwen35MoEParams | None = None
     vision: Qwen35VisionConfig | None = None
+    vision_start_token_id: int = -1
+    vision_end_token_id: int = -1
 
     @property
     def key_dim(self) -> int:
@@ -489,6 +529,8 @@ class Qwen35MoE(nn.Module):
             isinstance(gate_up, QuantizedSwitchLinear)
             and isinstance(down, QuantizedSwitchLinear)
             and isinstance(shared, nn.QuantizedLinear)
+            # The gemv kernels read an affine bias per group; MXFP carries none.
+            and (gate_up.mode, down.mode) == ("affine", "affine")
             and (shared.bits, shared.group_size) == (down.bits, down.group_size)
             and moe_gemv_applies(
                 self.hidden, self.switch_mlp.inner, gate_up.group_size, down.group_size
@@ -506,6 +548,7 @@ class Qwen35MoE(nn.Module):
         assert isinstance(gate_up, QuantizedSwitchLinear)
         assert isinstance(down, QuantizedSwitchLinear)
         assert isinstance(shared, nn.QuantizedLinear)
+        assert gate_up.biases is not None and down.biases is not None
         chosen, weights = softmax_topk(self.gate(x).reshape(-1), self.k, shared=True)
         act = moe_gate_up_act(
             x.reshape(-1), gate_up.weight, gate_up.scales, gate_up.biases, chosen,
@@ -821,17 +864,24 @@ def stream_multimodal_ids(
     *,
     max_tokens: int,
     sampler: Sampler = greedy,
-    stop: int | None = None,
+    stop: Collection[int] = (),
+    penalty: Penalty | None = None,
+    meter: Meter | None = None,
 ) -> Iterator[int]:
     """The chassis' lazy loop with the 3-D clock threaded through: prefill reads the
     prompt's own positions, and every step after it rotates by `row + delta`, which is
     what transformers rebuilds as `arange(past) + rope_delta`."""
     cache = model.make_cache()
     row = len(prompt.ids)
+    history = mx.array(prompt.ids)
+    if meter is not None:
+        # The placeholder run is prompt: those rows are read, and the tower's cost lands
+        # in the prefill mark like any other.
+        meter.prefill(len(prompt.ids))
 
     def step(ids: mx.array, positions: mx.array, embeddings: mx.array | None) -> mx.array:
-        logits = model(ids, cache, positions=positions, embeddings=embeddings)
-        return sampler(logits[:, -1, :])[0]
+        logits = model(ids, cache, positions=positions, embeddings=embeddings)[:, -1, :]
+        return sampler(logits if penalty is None else penalty(logits, history))[0]
 
     def advance(y: mx.array) -> mx.array:
         nonlocal row
@@ -843,11 +893,422 @@ def stream_multimodal_ids(
     y = step(mx.array(prompt.ids)[None], prompt.positions, prompt.embeddings)
     mx.async_eval(y)
     for _ in range(max_tokens):
+        if penalty is not None:
+            history = mx.concatenate([history, y[None]])
         next_y = advance(y)
         mx.async_eval(next_y)
         token = y.item()
         assert isinstance(token, int)
-        if token == stop:
+        if token in stop:
             return
+        if meter is not None:
+            meter.token()
         yield token
         y = next_y
+
+
+type Qwen35Input = Text | Image | LanguagePrompt
+
+
+def _family(input: Qwen35Input) -> ToolFamily | None:
+    """Which envelope this prompt's checkpoint spells a call in, off the prompt itself — the
+    capability put it there when it rendered. Reading it from a field of the facade instead is
+    how this model came to suppress nothing: the loader never set one, and the only writer was
+    a test."""
+    if isinstance(input, Text):
+        return input.tool_family
+    parts = input.parts if isinstance(input, LanguagePrompt) else ()
+    return next((part.tool_family for part in parts if isinstance(part, Text)), None)
+
+
+class Qwen35LanguageModel:
+    def __init__(
+        self,
+        model: Qwen35,
+        tokenizer: Tokenizer,
+        processor: ProcessorConfig | None,
+        *,
+        stop: Collection[int] = (),
+    ) -> None:
+        self.model = model
+        self.tokenizer = tokenizer
+        self.processor = processor
+        self.stop = stop
+        self.prefix: PromptCache[KVCache | DeltaCache] | None = None
+        """What this model kept of the prompts before it. A trunk with a recurrent layer has
+        nothing to cut at a common prefix and `stream_ids` refuses it there — this holds the
+        trie for the all-attention configurations of the same architecture."""
+        config = model.config
+        self._vision = (
+            processor is not None
+            and config.vision is not None
+            and config.image_token_id >= 0
+            and config.vision_start_token_id >= 0
+            and config.vision_end_token_id >= 0
+        )
+
+    @property
+    def native_signature(self) -> ModelSignature:
+        inputs = frozenset({TEXT, RGB_IMAGE}) if self._vision else frozenset({TEXT})
+        return ModelSignature(inputs, frozenset({TEXT}))
+
+    @property
+    def image_marker(self) -> str | None:
+        """What the chat template emits per image, as text: the vision wrapper around one
+        placeholder. Cutting a rendered conversation there gives back the parts this model
+        already knows how to prompt with."""
+        if not self._vision:
+            return None
+        config = self.model.config
+        wrapper = [config.vision_start_token_id, config.image_token_id, config.vision_end_token_id]
+        return self.tokenizer.decode_bytes(wrapper).decode("utf-8")
+
+    def accepts(self, input: ModelInput) -> TypeIs[Qwen35Input]:
+        if isinstance(input, Text):
+            return True
+        if not self._vision:
+            return False
+        if isinstance(input, Image):
+            return True
+        return (
+            isinstance(input, LanguagePrompt)
+            and input.content_types <= self.native_signature.inputs
+        )
+
+    def prepare(self, input: Image | LanguagePrompt) -> MultimodalPrompt:
+        config = self.model.config
+        processor = self.processor
+        vision = config.vision
+        if not self._vision or processor is None or vision is None:
+            raise TypeError("this language model does not accept images")
+
+        parts = input.parts if isinstance(input, LanguagePrompt) else (input,)
+        ids: list[int] = []
+        images: list[tuple[mx.array, Grid]] = []
+        for part in parts:
+            if isinstance(part, Text):
+                ids.extend(self.tokenizer.encode(part.value))
+                continue
+            if not isinstance(part, Image):
+                raise TypeError(f"unsupported prompt part {type(part).__name__}")
+            processed = process_image(part.pixels, processor)
+            _, grid = processed
+            placeholders = grid.t * grid.h * grid.w // vision.spatial_merge_size**2
+            ids.append(config.vision_start_token_id)
+            ids.extend([config.image_token_id] * placeholders)
+            ids.append(config.vision_end_token_id)
+            images.append(processed)
+        return multimodal_prompt(self.model, ids, images)
+
+    def stream(self, input: Qwen35Input, options: GenerationOptions) -> Iterator[Segment]:
+        stop = self.stop if options.stop is None else options.stop
+        family = _family(input)
+        if isinstance(input, Text):
+            rendered = input.value
+            self.prefix = prefix_cache(self.prefix, options.prefix_budget)
+            ids = stream_ids(
+                self.model,
+                self.tokenizer.encode(input.value),
+                max_tokens=options.max_tokens,
+                sampler=options.sampler,
+                stop=stop,
+                penalty=options.penalty,
+                meter=options.meter,
+                prefix=self.prefix,
+                constraint=options.constraint,
+            )
+        else:
+            parts = input.parts if isinstance(input, LanguagePrompt) else ()
+            rendered = "".join(part.value for part in parts if isinstance(part, Text))
+            prompt = self.prepare(input)
+            # No prefix here, and it is not an omission: an image is one id repeated per
+            # patch, so two different pictures on the same grid produce the same ids — a trie
+            # keyed on ids would hand one image's attention to another.
+            ids = stream_multimodal_ids(
+                self.model,
+                prompt,
+                max_tokens=options.max_tokens,
+                sampler=options.sampler,
+                stop=stop,
+                penalty=options.penalty,
+                meter=options.meter,
+            )
+
+        yield from stream_text(ids, self.tokenizer, tools=family, prompt=rendered)
+
+
+class _RoPEJson(TypedDict):
+    rope_theta: float
+    partial_rotary_factor: float
+    mrope_section: list[int]
+
+
+class _TextJson(TypedDict):
+    hidden_size: int
+    num_hidden_layers: int
+    num_attention_heads: int
+    num_key_value_heads: int
+    head_dim: int
+    vocab_size: int
+    rms_norm_eps: float
+    tie_word_embeddings: NotRequired[bool]
+    intermediate_size: NotRequired[int]
+    layer_types: list[str]
+    linear_num_key_heads: int
+    linear_num_value_heads: int
+    linear_key_head_dim: int
+    linear_value_head_dim: int
+    linear_conv_kernel_dim: int
+    eos_token_id: int
+    rope_parameters: _RoPEJson
+    num_experts: NotRequired[int]
+    num_experts_per_tok: NotRequired[int]
+    moe_intermediate_size: NotRequired[int]
+    shared_expert_intermediate_size: NotRequired[int]
+
+
+class _Json(TypedDict):
+    model_type: str
+    text_config: _TextJson
+    tie_word_embeddings: NotRequired[bool]
+    eos_token_id: NotRequired[int | list[int]]
+    vision_config: NotRequired[VisionJson]
+    image_token_id: NotRequired[int]
+    vision_start_token_id: NotRequired[int]
+    vision_end_token_id: NotRequired[int]
+
+
+def _moe_params(text: _TextJson) -> Qwen35MoEParams | None:
+    experts = text.get("num_experts", 0)
+    if not experts:
+        return None
+    inner = text.get("moe_intermediate_size", 0)
+    if text.get("shared_expert_intermediate_size", 0) != inner:
+        raise ValueError("the shared expert must be the width of a routed one")
+    return Qwen35MoEParams(experts, text.get("num_experts_per_tok", 0), inner)
+
+
+def _config(path: Path) -> Qwen35Config:
+    raw: _Json = json.loads(path.read_text())
+    if raw["model_type"] not in ("qwen3_5", "qwen3_5_moe"):
+        raise ValueError(f"expected model_type qwen3_5(_moe), got {raw['model_type']!r}")
+    text = raw["text_config"]
+    rope = text["rope_parameters"]
+    # The 0.8B states tying only at the top level, the 27B in both places.
+    tied = text.get("tie_word_embeddings", raw.get("tie_word_embeddings", False))
+    # The 27B ships two eos ids as an array; the 0.8B a scalar under text_config.
+    eos = raw.get("eos_token_id", text["eos_token_id"])
+    vision = raw.get("vision_config")
+    section = rope["mrope_section"]
+    return Qwen35Config(
+        hidden_size=text["hidden_size"],
+        num_hidden_layers=text["num_hidden_layers"],
+        num_attention_heads=text["num_attention_heads"],
+        num_key_value_heads=text["num_key_value_heads"],
+        head_dim=text["head_dim"],
+        vocab_size=text["vocab_size"],
+        rms_norm_eps=text["rms_norm_eps"],
+        rope_theta=rope["rope_theta"],
+        partial_rotary_factor=rope["partial_rotary_factor"],
+        tie_word_embeddings=tied,
+        # A sparse trunk has no dense MLP width; the field is absent from its config.
+        intermediate_size=text.get("intermediate_size", 0),
+        layer_types=tuple(text["layer_types"]),
+        linear_num_key_heads=text["linear_num_key_heads"],
+        linear_num_value_heads=text["linear_num_value_heads"],
+        linear_key_head_dim=text["linear_key_head_dim"],
+        linear_value_head_dim=text["linear_value_head_dim"],
+        linear_conv_kernel_dim=text["linear_conv_kernel_dim"],
+        eos_token_id=tuple(eos) if isinstance(eos, list) else (eos,),
+        mrope_section=(section[0], section[1], section[2]),
+        image_token_id=raw.get("image_token_id", -1),
+        moe=_moe_params(text),
+        vision=vision_config(vision) if vision is not None else None,
+        vision_start_token_id=raw.get("vision_start_token_id", -1),
+        vision_end_token_id=raw.get("vision_end_token_id", -1),
+    )
+
+
+_ZERO_CENTERED = (
+    "input_layernorm.weight",
+    "post_attention_layernorm.weight",
+    "q_norm.weight",
+    "k_norm.weight",
+)
+
+
+def _renamed(name: str) -> str | None:
+    """Two dialects land here. Raw HF: `model.language_model.*`, tower under
+    `model.visual.*`, MTP head serialized. mlx conversions: `language_model.model.*`,
+    tower under `vision_tower.*`, MTP dropped. Both normalize to the house names — the
+    tower to `visual.*`; the MTP head is not part of the port and leaves."""
+    if name.startswith("mtp."):
+        return None
+    if name.startswith("vision_tower."):
+        return "visual." + name.removeprefix("vision_tower.")
+    if name.startswith("model.visual."):
+        return "visual." + name.removeprefix("model.visual.")
+    if name.startswith("model.language_model."):
+        name = "model." + name.removeprefix("model.language_model.")
+    elif name.startswith("language_model.model."):
+        name = "model." + name.removeprefix("language_model.model.")
+    elif name.startswith("language_model."):
+        name = name.removeprefix("language_model.")
+    return name
+
+
+def _fuse_projections(weights: dict[str, mx.array], config: Qwen35Config) -> dict[str, mx.array]:
+    """One fused projection per mixer instead of three or four, concatenated on the
+    output axis — row-aligned in every representation, so dense and packed fuse alike.
+    The originals leave the dict, otherwise both copies stay resident."""
+    for layer, kind in enumerate(config.layer_types):
+        if kind == "full_attention":
+            prefix, parts = f"model.layers.{layer}.self_attn.", ("q_proj", "k_proj", "v_proj")
+        else:
+            prefix = f"model.layers.{layer}.linear_attn."
+            parts = ("in_proj_qkv", "in_proj_z", "in_proj_b", "in_proj_a")
+        for suffix in ("weight", "scales", "biases"):
+            keys = [f"{prefix}{part}.{suffix}" for part in parts]
+            if not all(key in weights for key in keys):
+                continue
+            fused = mx.concatenate([weights.pop(key) for key in keys], axis=0)
+            mx.eval(fused)
+            weights[f"{prefix}fused_proj.{suffix}"] = fused
+
+    for layer in range(config.num_hidden_layers):
+        prefix = f"model.layers.{layer}.mlp."
+        for suffix in ("weight", "scales", "biases"):
+            keys = [f"{prefix}{part}_proj.{suffix}" for part in ("gate", "up")]
+            if not all(key in weights for key in keys):
+                continue
+            fused = mx.concatenate([weights.pop(key) for key in keys], axis=0)
+            mx.eval(fused)
+            weights[f"{prefix}gate_up_proj.{suffix}"] = fused
+    return weights
+
+
+def _fuse_moe(weights: dict[str, mx.array], config: Qwen35Config) -> dict[str, mx.array]:
+    """Two load-time fusions on the sparse block, both row-aligned so packed weights,
+    scales and biases take the same path:
+
+    - the shared expert's logit becomes row 256 of the router's matrix, so one gemv
+      produces the routing logits and the shared gate together;
+    - gate and up interleave row by row ([g0,u0,g1,…]) into the expert stack, and the
+      shared expert's pair is stacked as slot 256. That stack was already a copy the
+      load paid for; the *down* stack is the one that goes mmap'd from the file into
+      the model, and appending a row to it materializes 5.4 GB.
+    """
+    if config.moe is None:
+        return weights
+    for layer in range(config.num_hidden_layers):
+        prefix = f"model.layers.{layer}.mlp."
+        for suffix in ("weight", "scales", "biases"):
+            router = f"{prefix}gate.{suffix}"
+            shared_gate = f"{prefix}shared_expert_gate.{suffix}"
+            if router in weights and shared_gate in weights:
+                fused = mx.concatenate([weights.pop(router), weights.pop(shared_gate)], axis=0)
+                mx.eval(fused)
+                weights[router] = fused
+
+            keys = [f"{prefix}switch_mlp.{part}_proj.{suffix}" for part in ("gate", "up")]
+            shared = [f"{prefix}shared_expert.{part}_proj.{suffix}" for part in ("gate", "up")]
+            if not all(key in weights for key in keys + shared):
+                continue
+            stacked = [weights.pop(key) for key in keys]
+            experts, rows, cols = stacked[0].shape
+            routed = mx.stack(stacked, axis=2).reshape(experts, 2 * rows, cols)
+            pair = [weights.pop(key) for key in shared]
+            slot = mx.stack(pair, axis=1).reshape(1, 2 * rows, cols)
+            fused = mx.concatenate([routed, slot], axis=0)
+            mx.eval(fused)
+            weights[f"{prefix}switch_mlp.gate_up_proj.{suffix}"] = fused
+    return weights
+
+
+def weights(
+    directory: Path,
+    config: Qwen35Config,
+    dtype: mx.Dtype | None,
+) -> dict[str, mx.array]:
+    """The checkpoint's tensors in the tree's names and layout, up to (not including) the
+    tree itself: the quantizing load needs this dict on its own."""
+    loaded: dict[str, mx.array] = {}
+    for shard in sorted(directory.glob("model*.safetensors")):
+        part = mx.load(str(shard))
+        assert isinstance(part, dict)
+        reject_dtype_cast(dtype, part)
+        for name, array in part.items():
+            renamed = _renamed(name)
+            if renamed is None:
+                continue
+            # A_log stays float32 at every precision: the decay is computed there.
+            cast = dtype is not None and not renamed.endswith("A_log")
+            loaded[renamed] = array.astype(dtype) if dtype is not None and cast else array
+
+    if config.tie_word_embeddings:
+        drop_tied_head(loaded)
+
+    # The torch conv layout `[dim, 1, kernel]` marks a raw HF checkpoint: its RMSNorms
+    # are still zero-centered (scale = 1 + w, as in Gemma), so the shift bakes in here —
+    # after the cast, exactly like transformers' float32 `1.0 + weight`. An mlx
+    # conversion arrives as `[dim, kernel, 1]` with the shift already folded in.
+    first_linear = config.layer_types.index("linear_attention")
+    conv = f"model.layers.{first_linear}.linear_attn.conv1d.weight"
+    raw_hf = loaded[conv].shape[1] == 1
+    for name, array in loaded.items():
+        if name.endswith("conv1d.weight"):
+            loaded[name] = array.squeeze(1 if raw_hf else 2)
+        elif raw_hf and (name == "model.norm.weight" or name.endswith(_ZERO_CENTERED)):
+            loaded[name] = array + 1
+
+    # The tower's Conv3d folds into a matmul, and both weight dialects flatten here.
+    patch = "visual.patch_embed.proj.weight"
+    if config.vision is not None and patch in loaded:
+        loaded[patch] = normalized_patch_weight(loaded[patch], config.vision)
+
+    loaded = _fuse_projections(loaded, config)
+    return _fuse_moe(loaded, config)
+
+
+def _facade(directory: Path, model: Qwen35) -> Qwen35LanguageModel:
+    tokenizer = ByteLevelBPE.from_file(directory / "tokenizer.json")
+    processor_path = directory / "preprocessor_config.json"
+    processor = load_processor_config(processor_path) if processor_path.exists() else None
+    return Qwen35LanguageModel(
+        model, tokenizer, processor, stop=stop_tokens(directory, model.config.eos_token_id)
+    )
+
+
+def _chat(
+    directory: Path, facade: Qwen35LanguageModel
+) -> list[ChatCapability | MultimodalChatCapability]:
+    """Which of the two the checkpoint gets is decided by the vision tower: with one, the
+    template's image marker is what the conversation is cut on."""
+    template = chat_template(directory)
+    if template is None:
+        return []
+    marker = facade.image_marker
+    if marker is None:
+        return [ChatCapability(template)]
+    return [MultimodalChatCapability(template, marker)]
+
+
+def _composite(directory: Path, model: Qwen35) -> LanguageModel[ModelInput]:
+    facade = _facade(directory, model)
+    return CompositeModel(facade, _chat(directory, facade))
+
+
+CHECKPOINT = checkpoint(
+    (
+        "config.json",
+        "model*.safetensors",
+        "tokenizer.json",
+        "preprocessor_config.json",
+        "tokenizer_config.json",
+        "chat_template.jinja",
+    ),
+    _config,
+    Qwen35,
+    weights,
+    _composite,
+)

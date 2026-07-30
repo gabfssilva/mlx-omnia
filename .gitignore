@@ -12,6 +12,7 @@ wheels/
 
 # Virtual environments
 .venv
+node_modules/
 
 # Swift (aguardando deleção)
 .legacy/

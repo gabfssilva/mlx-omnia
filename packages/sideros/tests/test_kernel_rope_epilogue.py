@@ -35,7 +35,7 @@ CONFIG = Qwen3MoEConfig(
     num_experts=128,
     num_experts_per_tok=8,
     norm_topk_prob=True,
-    quantization=(64, 4),
+    eos_token_id=(151645,),
 )
 
 

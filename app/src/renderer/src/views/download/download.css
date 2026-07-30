@@ -1,0 +1,37 @@
+/* Everything the download screen adds to theme.css, and nothing that belongs there.
+   Scoped to .dlbody / .dlsearch so no other view inherits it. */
+
+.dlsearch { width: 180px; }
+
+.dlnote { margin: 0; font-size: 11.5px; color: var(--fg3); }
+.dlnote.bad { color: var(--bad); }
+
+/* The mockup's "Downloading · 2.31 / 4.48 GB" heading, with the cancel beside the count. */
+.dljob h3 { display: flex; align-items: baseline; gap: 10px; }
+.dljob h3 span { float: none; margin-left: auto; }
+.dljob h3 .btn { padding: 3px 9px; font-size: 11.5px; }
+.dljob .sub .mono { min-width: 0; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+.dljob .sub span + span { flex: none; padding-left: 10px; }
+
+/* A search hit opens the repository's detail; only the button pulls. */
+.dlbody .row { cursor: pointer; }
+.dlpull { margin-left: auto; }
+
+/* What the Hub says about the repository, worn beside its name. */
+.hubmeta { font-size: 11.5px; color: var(--fg3); }
+
+.dlbody .btn:disabled,
+.dlform .btn:disabled { cursor: default; opacity: .5; }
+.dlbody .btn:disabled:hover,
+.dlform .btn:disabled:hover { background: none; color: var(--fg2); }
+.dlbody .btn.solid:disabled:hover,
+.dlform .btn.solid:disabled:hover { background: var(--surface2); color: var(--fg); }
+
+/* Bytes with no model to show for them. */
+.staged { display: flex; align-items: center; gap: 14px; padding: 11px 0; }
+.staged + .staged { border-top: 1px solid var(--hair); }
+.staged code {
+  font-family: var(--mono); font-size: 11.5px; flex: 1; min-width: 0;
+  overflow: hidden; text-overflow: ellipsis; white-space: nowrap;
+}
+.staged .meta { flex: none; font-size: 11px; color: var(--fg3); }

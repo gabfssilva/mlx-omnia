@@ -2,12 +2,13 @@
 
 Four things no other ported model has:
 
-- the experts ship **already MXFP4-packed** (group 32, e2m1 + e8m0 scale, *no* biases),
-  so they never go through `nn.quantize`: they are bare leaves read in place by
-  `gather_qmm(mode="mxfp4")`. The load only reinterprets `_blocks` (uint8) as uint32 —
-  a pure view — and each expert carries a bias `SwitchLinear` has no slot for, added
-  after the gather. gate‖up already comes interleaved row by row, the layout the
-  decode kernel wants, so that fusion is free;
+- the experts ship **already MXFP4-packed** (group 32, e2m1 + e8m0 scale, *no* biases):
+  nothing is quantized at load, but the leaves are ordinary `SwitchLinear`s and the
+  format comes off the tensors like every other checkpoint's — `nn.quantize` only
+  swaps in the module that reads them. The load reinterprets `_blocks` (uint8) as
+  uint32 — a pure view — and each expert carries a bias `SwitchLinear` has no slot
+  for, added after the gather. gate‖up already comes interleaved row by row, the
+  layout the decode kernel wants, so that fusion is free;
 - **attention sinks**: one learned logit per head inside the softmax denominator.
   mlx's fast SDPA takes them natively (`sinks=`), so this is the reference kernel;
 - **sliding(128)/full alternating**, expressed as a *mask* over a full cache, not
@@ -18,17 +19,27 @@ Four things no other ported model has:
 
 Routing is top-k over the **raw** router logits (the router has a bias) and then a
 softmax over just those k — not a renormalized softmax over all 32, which rounds
-differently. The config dataclass, the TypedDict and `load_gpt_oss` live here until
-the integration stage relocates them into config.py/checkpoint.py.
+differently.
 """
 
+import json
 import math
 from dataclasses import dataclass
-from typing import NamedTuple
+from pathlib import Path
+from typing import NamedTuple, TypedDict
 
 import mlx.core as mx
 import mlx.nn as nn
 
+from sideros.bpe import ByteLevelBPE
+from sideros.chat import chat_capabilities
+from sideros.checkpoint import (
+    checkpoint,
+    fuse_qkv,
+    load_shards,
+    reject_dtype_cast,
+    stop_tokens,
+)
 from sideros.core.cache import KVCache
 from sideros.core.kernels.mxfp4_moe_gemv import (
     mxfp4_down_combine,
@@ -36,12 +47,16 @@ from sideros.core.kernels.mxfp4_moe_gemv import (
     mxfp4_moe_applies,
 )
 from sideros.core.kernels.sink_attention import sink_attention, sink_attention_applies
-from sideros.core.layers import SORTED_GATHER_MIN, sorted_gather, split_qkv
+from sideros.core.layers import (
+    SORTED_GATHER_MIN,
+    QuantizedSwitchLinear,
+    SwitchLinear,
+    sorted_gather,
+    split_qkv,
+)
 from sideros.core.mxcompat import softmax
-
-_GROUP_SIZE = 32
-_BITS = 4
-_MODE = "mxfp4"
+from sideros.language import LanguageModel, TextLanguageModel
+from sideros.model import CompositeModel, ModelInput
 
 # A/B switches for the bench stage: set either to False (module attribute, no code edit)
 # and the corresponding op path — which is also the parity reference — runs instead.
@@ -79,6 +94,7 @@ class GPTOSSConfig:
     swiglu_limit: float
     layer_types: tuple[str, ...]
     rope_scaling: GPTOSSRoPEScaling
+    eos_token_id: tuple[int, ...]
 
 
 def yarn_rope(head_dim: int, base: float, scaling: GPTOSSRoPEScaling) -> tuple[mx.array, float]:
@@ -107,9 +123,10 @@ def yarn_rope(head_dim: int, base: float, scaling: GPTOSSRoPEScaling) -> tuple[m
 
 
 class GPTOSSExperts(nn.Module):
-    """The 32 experts as MXFP4 stacks read in place. Nothing is quantized at load: the
-    leaves are the checkpoint's packed tensors, and `mode="mxfp4"` has no biases (the
-    per-expert `*_bias` here is the affine bias of the projection, not the quantizer's)."""
+    """The 32 experts as two stacked `SwitchLinear` leaves. Nothing is quantized at load:
+    the checkpoint's packed tensors are what the leaf receives, and the spine reads
+    `mode="mxfp4"` off them — a mode with no quantization biases (the per-expert `*_bias`
+    here is the affine bias of the projection, not the quantizer's)."""
 
     def __init__(self, config: GPTOSSConfig) -> None:
         super().__init__()
@@ -117,29 +134,35 @@ class GPTOSSExperts(nn.Module):
         hidden, inner = config.hidden_size, config.intermediate_size
         self.inner = inner
         self.limit = config.swiglu_limit
-        self.gate_up_proj_weight = mx.zeros((experts, 2 * inner, hidden // 8), dtype=mx.uint32)
-        self.gate_up_proj_scales = mx.zeros(
-            (experts, 2 * inner, hidden // _GROUP_SIZE), dtype=mx.uint8
+        self.gate_up_proj: SwitchLinear | QuantizedSwitchLinear = SwitchLinear(
+            experts, hidden, 2 * inner
         )
         self.gate_up_proj_bias = mx.zeros((experts, 2 * inner), dtype=mx.bfloat16)
-        self.down_proj_weight = mx.zeros((experts, hidden, inner // 8), dtype=mx.uint32)
-        self.down_proj_scales = mx.zeros((experts, hidden, inner // _GROUP_SIZE), dtype=mx.uint8)
+        self.down_proj: SwitchLinear | QuantizedSwitchLinear = SwitchLinear(
+            experts, inner, hidden
+        )
         self.down_proj_bias = mx.zeros((experts, hidden), dtype=mx.bfloat16)
+
+    def mxfp4(self) -> tuple[QuantizedSwitchLinear, QuantizedSwitchLinear] | None:
+        """The pair the decode kernels read `weight`/`scales` off — concrete fields, never
+        an opaque format. Only after the load are the leaves quantized at all."""
+        gate_up, down = self.gate_up_proj, self.down_proj
+        if not isinstance(gate_up, QuantizedSwitchLinear):
+            return None
+        if not isinstance(down, QuantizedSwitchLinear):
+            return None
+        return (gate_up, down) if gate_up.mode == "mxfp4" and down.mode == "mxfp4" else None
 
     def _gather(
         self,
         x: mx.array,
-        weight: mx.array,
-        scales: mx.array,
+        projection: SwitchLinear | QuantizedSwitchLinear,
         bias: mx.array,
         indices: mx.array,
         *,
         sorted_indices: bool,
     ) -> mx.array:
-        projected = mx.gather_qmm(
-            x, weight, scales, None, rhs_indices=indices, transpose=True,
-            group_size=_GROUP_SIZE, bits=_BITS, mode=_MODE, sorted_indices=sorted_indices,
-        )
+        projected = projection(x, indices, sorted_indices=sorted_indices)
         return projected + mx.expand_dims(bias[indices], axis=-2)
 
     def __call__(
@@ -149,16 +172,16 @@ class GPTOSSExperts(nn.Module):
         Under the prefill reorder the pair is flattened instead — [N, 1, hidden] against
         [N] — and `sorted_indices` tells the gather each expert's rows are contiguous."""
         fused = self._gather(
-            x, self.gate_up_proj_weight, self.gate_up_proj_scales, self.gate_up_proj_bias,
-            indices, sorted_indices=sorted_indices,
+            x, self.gate_up_proj, self.gate_up_proj_bias, indices,
+            sorted_indices=sorted_indices,
         )
         pairs = fused.reshape(*fused.shape[:-1], self.inner, 2)
         gate = mx.clip(pairs[..., 0], None, self.limit)
         up = mx.clip(pairs[..., 1], -self.limit, self.limit)
         act = gate * mx.sigmoid(1.702 * gate) * (up + 1)
         return self._gather(
-            act, self.down_proj_weight, self.down_proj_scales, self.down_proj_bias,
-            indices, sorted_indices=sorted_indices,
+            act, self.down_proj, self.down_proj_bias, indices,
+            sorted_indices=sorted_indices,
         )
 
 
@@ -192,29 +215,30 @@ class GPTOSSMLP(nn.Module):
             routed = self.experts(mx.expand_dims(x, (-2, -3)), chosen).squeeze(-2)
         return (routed * mx.expand_dims(weights, -1)).sum(axis=-2)
 
-    def fused_step_applies(self, x: mx.array) -> bool:
-        """T=1 only, and only for the MXFP4 layout the kernel is written for. Routing
-        stays outside: the pick is a top-k over the raw logits and moving it in-kernel
-        flips near-ties."""
-        return USE_MXFP4_MOE_GEMV and self.fusable and x.shape[1] == 1
-
-    def fused_step(self, x: mx.array, residual: mx.array) -> mx.array:
-        """The whole routed MLP plus the residual in two dispatches."""
+    def fused_step(self, x: mx.array, residual: mx.array) -> mx.array | None:
+        """The whole routed MLP plus the residual in two dispatches, or `None` when the
+        step is not what the kernel is written for: T=1 and MXFP4 leaves. Routing stays
+        outside — the pick is a top-k over the raw logits and moving it in-kernel flips
+        near-ties."""
         experts = self.experts
+        leaves = experts.mxfp4()
+        if leaves is None or not (USE_MXFP4_MOE_GEMV and self.fusable and x.shape[1] == 1):
+            return None
+        gate_up, down = leaves
         chosen, weights = self.route(x)
         indices = chosen.reshape(-1).astype(mx.uint32)
         act = mxfp4_gate_up_act(
             x.reshape(-1),
-            experts.gate_up_proj_weight,
-            experts.gate_up_proj_scales,
+            gate_up.weight,
+            gate_up.scales,
             experts.gate_up_proj_bias,
             indices,
             limit=experts.limit,
         )
         return mxfp4_down_combine(
             act,
-            experts.down_proj_weight,
-            experts.down_proj_scales,
+            down.weight,
+            down.scales,
             experts.down_proj_bias,
             indices,
             weights.reshape(-1),
@@ -286,9 +310,8 @@ class GPTOSSBlock(nn.Module):
     def __call__(self, x: mx.array, mask: mx.array | str | None, cache: KVCache) -> mx.array:
         attended = x + self.self_attn(self.input_layernorm(x), mask, cache)
         normed = self.post_attention_layernorm(attended)
-        if self.mlp.fused_step_applies(normed):
-            return self.mlp.fused_step(normed, attended)
-        return attended + self.mlp(normed)
+        fused = self.mlp.fused_step(normed, attended)
+        return fused if fused is not None else attended + self.mlp(normed)
 
 
 class GPTOSSTrunk(nn.Module):
@@ -355,4 +378,108 @@ class GPTOSS(nn.Module):
 
     def __call__(self, ids: mx.array, cache: list[KVCache] | None = None) -> mx.array:
         return self.activations(ids, cache).logits
+
+
+class _RoPEScalingJson(TypedDict):
+    factor: float
+    original_max_position_embeddings: int
+    beta_fast: float
+    beta_slow: float
+
+
+class _Json(TypedDict):
+    model_type: str
+    hidden_size: int
+    num_hidden_layers: int
+    num_attention_heads: int
+    num_key_value_heads: int
+    head_dim: int
+    vocab_size: int
+    rms_norm_eps: float
+    rope_theta: float
+    intermediate_size: int
+    num_local_experts: int
+    num_experts_per_tok: int
+    sliding_window: int
+    swiglu_limit: float
+    layer_types: list[str]
+    rope_scaling: _RoPEScalingJson
+    eos_token_id: int | list[int]
+
+
+def _config(path: Path) -> GPTOSSConfig:
+    raw: _Json = json.loads(path.read_text())
+    if raw["model_type"] != "gpt_oss":
+        raise ValueError(f"expected model_type gpt_oss, got {raw['model_type']!r}")
+    scaling = raw["rope_scaling"]
+    eos = raw["eos_token_id"]
+    return GPTOSSConfig(
+        hidden_size=raw["hidden_size"],
+        num_hidden_layers=raw["num_hidden_layers"],
+        num_attention_heads=raw["num_attention_heads"],
+        num_key_value_heads=raw["num_key_value_heads"],
+        head_dim=raw["head_dim"],
+        vocab_size=raw["vocab_size"],
+        rms_norm_eps=raw["rms_norm_eps"],
+        rope_theta=raw["rope_theta"],
+        intermediate_size=raw["intermediate_size"],
+        num_local_experts=raw["num_local_experts"],
+        num_experts_per_tok=raw["num_experts_per_tok"],
+        sliding_window=raw["sliding_window"],
+        swiglu_limit=raw["swiglu_limit"],
+        layer_types=tuple(raw["layer_types"]),
+        rope_scaling=GPTOSSRoPEScaling(
+            factor=scaling["factor"],
+            original_max_position_embeddings=scaling["original_max_position_embeddings"],
+            beta_fast=scaling["beta_fast"],
+            beta_slow=scaling["beta_slow"],
+        ),
+        eos_token_id=tuple(eos) if isinstance(eos, list) else (eos,),
+    )
+
+
+def _unpack_experts(weights: dict[str, mx.array], layers: int) -> dict[str, mx.array]:
+    """`*_blocks` is [E, out, groups, 16] uint8; `gather_qmm` reads MXFP4 nibbles as
+    uint32 words, so the last two axes are reinterpreted and flattened — a pure view.
+    The checkpoint's flat `{proj}_blocks`/`{proj}_scales` become the `{proj}.weight`/
+    `{proj}.scales` of a leaf, which is what makes the format inferable like any other."""
+    for layer in range(layers):
+        prefix = f"model.layers.{layer}.mlp.experts."
+        for proj in ("gate_up_proj", "down_proj"):
+            blocks = weights.pop(f"{prefix}{proj}_blocks", None)
+            if blocks is None:
+                continue
+            experts, out = blocks.shape[0], blocks.shape[1]
+            weights[f"{prefix}{proj}.weight"] = blocks.view(mx.uint32).reshape(experts, out, -1)
+            weights[f"{prefix}{proj}.scales"] = weights.pop(f"{prefix}{proj}_scales")
+    return weights
+
+
+def _weights(directory: Path, config: GPTOSSConfig, dtype: mx.Dtype | None) -> dict[str, mx.array]:
+    weights = _unpack_experts(load_shards(directory), config.num_hidden_layers)
+    # The checkpoint is MXFP4: a cast keeps the shape and destroys the numbers. Checked
+    # after the unpack, which is what renames `{proj}_scales` into the `.scales` it reads.
+    reject_dtype_cast(dtype, weights)
+    return fuse_qkv(weights, config.num_hidden_layers)
+
+
+def _composite(directory: Path, model: GPTOSS) -> LanguageModel[ModelInput]:
+    return CompositeModel(
+        TextLanguageModel(
+            model,
+            ByteLevelBPE.from_file(directory / "tokenizer.json"),
+            stop=stop_tokens(directory, model.config.eos_token_id),
+        ),
+        chat_capabilities(directory),
+    )
+
+
+CHECKPOINT = checkpoint((
+        "config.json",
+        "model*.safetensors",
+        "tokenizer.json",
+        "tokenizer_config.json",
+        "generation_config.json",
+        "chat_template.jinja",
+    ), _config, GPTOSS, _weights, _composite)
 

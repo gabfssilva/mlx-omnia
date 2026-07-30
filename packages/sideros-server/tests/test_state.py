@@ -1,0 +1,394 @@
+"""/admin/state: what is resident, what it costs, and how deep the queue is.
+
+The number this route exists to get right is the residency total, and the way to get it
+wrong is to trust a live meter: after a model settles both MLX's active memory and the
+process' resident size read below what it occupies, which is how oMLX let a second large
+model in and blew the ceiling. The test that matters here sets both meters below the
+accumulator on purpose — the situation cannot be produced by allocating, only by
+simulating the meters that lie.
+"""
+
+import asyncio
+import time
+from collections.abc import Iterator
+from typing import TypeIs
+
+import httpx
+import mlx.core as mx
+import mlx.nn as nn
+import pytest
+from fastapi import FastAPI
+
+from sideros import (
+    TEXT,
+    CompositeModel,
+    GenerationOptions,
+    KVCache,
+    ModelInput,
+    ModelSignature,
+    Text,
+    TextLanguageModel,
+)
+from sideros.footprint import resident_bytes
+from sideros.suppress import Segment
+from sideros_server import engine as engine_module
+from sideros_server import state
+from sideros_server.engine import Engine, Job, tree
+from sideros_server.state import router
+
+_KV_BYTES = 32 * 1024 * 1024
+
+_SPIKE_BYTES = 256 * 1024 * 1024
+"""Larger than any figure a correct KV reading can produce, and released before the request
+that is measured: it is the peak that must not survive into the next request's number."""
+
+TINY_BYTES = 8 * 4 * 4
+"""The embedding below and nothing else: 8 rows of 4 float32."""
+
+
+class TinyLM(nn.Module):
+    def __init__(self) -> None:
+        super().__init__()
+        self.embed = nn.Embedding(8, 4)
+
+    def make_cache(self) -> list[KVCache]:
+        return [KVCache()]
+
+    def __call__(self, ids: mx.array, cache: list[KVCache] | None = None) -> mx.array:
+        return self.embed(ids)
+
+
+class TinyTokenizer:
+    def encode(self, text: str) -> list[int]:
+        return [0]
+
+    def decode_bytes(self, ids: list[int]) -> bytes:
+        return b"."
+
+
+def tiny() -> CompositeModel[Text, Segment, GenerationOptions]:
+    """The production chain down to the tree: the engine holds a `CompositeModel`, which
+    holds the task-level model, which holds the `nn.Module` the bytes come off."""
+    return CompositeModel(TextLanguageModel(TinyLM(), TinyTokenizer()), [])
+
+
+class HoldingLanguageModel:
+    """Holds an `mx.array` for as long as its stream runs, which is what a KV cache is to
+    the accounting: memory the request takes on top of the settled weights and gives back
+    when it ends."""
+
+    def __init__(self, delay: float = 0.0) -> None:
+        self.delay = delay
+
+    @property
+    def native_signature(self) -> ModelSignature:
+        return ModelSignature(frozenset({TEXT}), frozenset({TEXT}))
+
+    def accepts(self, input: ModelInput) -> TypeIs[Text]:
+        return isinstance(input, Text)
+
+    def stream(self, input: Text, options: GenerationOptions) -> Iterator[Segment]:
+        cache = mx.zeros((_KV_BYTES // 4,), dtype=mx.float32)
+        mx.eval(cache)
+        for index in range(options.max_tokens):
+            time.sleep(self.delay)
+            yield Segment("content", str(index))
+
+
+def holding(delay: float = 0.0) -> CompositeModel[Text, Segment, GenerationOptions]:
+    return CompositeModel(HoldingLanguageModel(delay), [])
+
+
+_BIG_BYTES = 128 * 1024 * 1024
+
+_BIG_ROWS = _BIG_BYTES // (4 * 4)
+
+
+class BigLM(TinyLM):
+    """Weights large enough that charging them to another model's KV is unmistakable."""
+
+    def __init__(self) -> None:
+        super().__init__()
+        self.embed = nn.Embedding(_BIG_ROWS, 4)
+
+
+def big() -> CompositeModel[Text, Segment, GenerationOptions]:
+    model = BigLM()
+    # The load is what allocates: a lazy tree costs nothing, and the point of the test is
+    # the memory landing while another model is decoding.
+    mx.eval(model.parameters())
+    return CompositeModel(TextLanguageModel(model, TinyTokenizer()), [])
+
+
+async def piece(job: Job) -> Segment | None:
+    """Bounded on purpose: a sentinel that stops being pushed has to fail the test, not
+    hang the suite — there is no global pytest timeout."""
+    return await asyncio.wait_for(job.chunks.get(), 30)
+
+
+async def drain(job: Job) -> None:
+    while await piece(job) is not None:
+        pass
+
+
+async def read(engine: Engine) -> dict[str, object]:
+    app = FastAPI()
+    app.state.engine = engine
+    app.include_router(router)
+    transport = httpx.ASGITransport(app=app)
+    async with httpx.AsyncClient(transport=transport, base_url="http://state") as client:
+        response = await asyncio.wait_for(client.get("/admin/state"), 30)
+    assert response.status_code == 200, response.text
+    body = response.json()
+    assert isinstance(body, dict)
+    return body
+
+
+def models_of(body: dict[str, object]) -> list[dict[str, object]]:
+    models = body["models"]
+    assert isinstance(models, list)
+    for entry in models:
+        assert isinstance(entry, dict)
+    return models
+
+
+def test_at_boot_the_list_is_empty_and_the_queue_is_zero() -> None:
+    """The memory rail reads this before any request has named a model, and an engine
+    that reported itself busy at boot would draw a queue that does not exist."""
+    body = asyncio.run(read(Engine(lambda _: tiny())))
+    assert models_of(body) == []
+    assert body["queue"] == {"running": 0, "waiting": 0}
+
+
+def test_the_bytes_come_off_the_tree_under_the_wrappers() -> None:
+    """The engine holds a `LanguageModel`, a protocol over `stream`, and the byte
+    arithmetic wants the `nn.Module`. Lose the walk down the wrappers and every resident
+    model reports zero weights — which is the rail drawing an empty bar over a loaded 30B.
+    """
+
+    async def run() -> dict[str, object]:
+        engine = Engine(lambda _: tiny())
+        await engine.resolve("tiny")
+        return await read(engine)
+
+    body = asyncio.run(run())
+    assert models_of(body)[0]["weights_bytes"] == TINY_BYTES
+    assert tree(CompositeModel(HoldingLanguageModel(), [])) is None, "no tree, no tensors"
+
+
+def test_a_generation_leaves_the_model_with_kv_and_a_recent_last_use() -> None:
+    """KV is counted apart from the weights because it grows per request: a limit that
+    only knows the weights holds until the first long context and then stops holding."""
+
+    async def run() -> tuple[dict[str, object], float]:
+        engine = Engine(lambda _: holding())
+        engine.start()
+        try:
+            # A high-water mark set and released before the request: what is bounded below
+            # is *this* request's cost, and without the peak reset the figure would be
+            # whatever the process happened to touch since it booted.
+            spike = mx.zeros((_SPIKE_BYTES // 4,), dtype=mx.float32)
+            mx.eval(spike)
+            del spike
+            mx.clear_cache()
+            before = time.time()
+            job = await engine.submit("held", Text("hello"), GenerationOptions(max_tokens=4))
+            await drain(job)
+            return await read(engine), before
+        finally:
+            engine.stop()
+
+    body, before = asyncio.run(run())
+    entry = models_of(body)[0]
+    assert entry["id"] == "held"
+    kv_bytes = entry["kv_bytes"]
+    assert isinstance(kv_bytes, int)
+    # Bounded above as well as below: without `reset_peak_memory` the figure is the whole
+    # session's high-water minus this request's settled memory, which is still over the
+    # floor and is not this request's cost.
+    assert _KV_BYTES <= kv_bytes < 2 * _KV_BYTES
+    assert body["kv_bytes"] == kv_bytes, "the total is the sum, and there is one model"
+    last_used = entry["last_used"]
+    assert isinstance(last_used, float)
+    assert before <= last_used <= time.time()
+
+
+def test_a_generation_that_ends_refreshes_the_last_use() -> None:
+    """The stamp the arrival left is the *start* of the request. A TTL sweep reading only
+    that one evicts a model half an hour after it began a generation that just ended."""
+
+    async def run() -> tuple[object, object]:
+        engine = Engine(lambda _: holding(delay=0.01))
+        engine.start()
+        try:
+            job = await engine.submit("held", Text("hi"), GenerationOptions(max_tokens=16))
+            assert await piece(job) is not None, "the job never started"
+            accepted = models_of(await read(engine))[0]["last_used"]
+            await drain(job)
+            return accepted, models_of(await read(engine))[0]["last_used"]
+        finally:
+            engine.stop()
+
+    accepted, finished = asyncio.run(run())
+    assert isinstance(accepted, float) and isinstance(finished, float)
+    assert finished > accepted
+
+
+def test_a_second_request_moves_the_last_use_and_does_not_duplicate_the_entry() -> None:
+    """A model asked for twice is one model. Keying the accounting by anything but the id
+    would double its bytes in the total, which is a ceiling reached at half the memory."""
+    loads: list[str] = []
+
+    async def run() -> tuple[dict[str, object], dict[str, object]]:
+        def loader(model_id: str) -> CompositeModel[Text, Segment, GenerationOptions]:
+            loads.append(model_id)
+            return holding()
+
+        engine = Engine(loader)
+        engine.start()
+        try:
+            first = await engine.submit("held", Text("a"), GenerationOptions(max_tokens=2))
+            await drain(first)
+            before = await read(engine)
+            await asyncio.sleep(0.01)
+            second = await engine.submit("held", Text("b"), GenerationOptions(max_tokens=2))
+            await drain(second)
+            return before, await read(engine)
+        finally:
+            engine.stop()
+
+    before, after = asyncio.run(run())
+    assert loads == ["held"]
+    assert len(models_of(before)) == len(models_of(after)) == 1
+    assert models_of(after)[0]["loaded_at"] == models_of(before)[0]["loaded_at"]
+    earlier = models_of(before)[0]["last_used"]
+    later = models_of(after)[0]["last_used"]
+    assert isinstance(earlier, float) and isinstance(later, float)
+    assert later > earlier
+
+
+def test_two_requests_racing_a_cold_load_leave_one_entry_that_keeps_its_stamps(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Two callers naming the same cold model share one load, and both come back out of it.
+    Only the first may write the entry: the second overwrites `last_used` with `None` for a
+    model a request is already using, and walks the tree of a 30B a second time for bytes
+    that are already known.
+
+    What makes it visible is counting the walk: a stamp can be restored by whatever runs
+    next, and a second walk over a 30B's ~1500 modules cannot be taken back.
+    """
+    loads: list[str] = []
+    walks: list[object] = []
+    def counting(module: nn.Module) -> int:
+        walks.append(module)
+        return resident_bytes(module)
+
+    monkeypatch.setattr(engine_module, "resident_bytes", counting)
+
+    async def run() -> dict[str, object]:
+        def loader(model_id: str) -> CompositeModel[Text, Segment, GenerationOptions]:
+            loads.append(model_id)
+            time.sleep(0.05)
+            return tiny()
+
+        engine = Engine(loader)
+        engine.start()
+        try:
+            job, _ = await asyncio.wait_for(
+                asyncio.gather(
+                    engine.submit("tiny", Text("a"), GenerationOptions(max_tokens=1)),
+                    engine.resolve("tiny"),
+                ),
+                30,
+            )
+            await drain(job)
+            return await read(engine)
+        finally:
+            engine.stop()
+
+    entries = models_of(asyncio.run(run()))
+    assert loads == ["tiny"], "the load was not shared"
+    assert walks == walks[:1], "the tree was walked once per caller instead of once"
+    assert len(entries) == 1
+    assert entries[0]["weights_bytes"] == TINY_BYTES
+    assert isinstance(entries[0]["last_used"], float)
+
+
+def test_a_model_that_lands_mid_generation_is_not_charged_to_the_running_one() -> None:
+    """Generation is serialized by the gate; loading is deliberately outside it. A model
+    that lands while another is decoding puts its whole weight into the same MLX peak, and
+    charging that to the running model's KV counts one allocation twice — on a 30B, tens of
+    gigabytes attributed to the wrong model, and pinned there until its next request."""
+
+    async def run() -> dict[str, object]:
+        engine = Engine(lambda model_id: holding(delay=0.02) if model_id == "held" else big())
+        engine.start()
+        try:
+            job = await engine.submit("held", Text("hi"), GenerationOptions(max_tokens=16))
+            assert await piece(job) is not None, "the generation never started"
+            await asyncio.wait_for(engine.resolve("big"), 30)
+            await drain(job)
+            return await read(engine)
+        finally:
+            engine.stop()
+
+    entries = {str(entry["id"]): entry for entry in models_of(asyncio.run(run()))}
+    kv_bytes = entries["held"]["kv_bytes"]
+    assert isinstance(kv_bytes, int)
+    assert kv_bytes < _BIG_BYTES, "the loaded model's weights landed in the other model's KV"
+
+
+def test_the_total_is_the_maximum_and_never_a_live_meter_alone(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A6, and the only way to reproduce it: once a model settles both live meters read
+    *below* what it occupies, so they are set below the accumulator here on purpose. Drop
+    the accumulator from the maximum and the daemon admits a second large model on a
+    reading that already forgot the first — which is how oMLX blew the ceiling (#1623).
+    """
+
+    async def run() -> dict[str, object]:
+        engine = Engine(lambda _: tiny())
+        await engine.resolve("tiny")
+        return await read(engine)
+
+    monkeypatch.setattr(mx, "get_active_memory", lambda: 1)
+    monkeypatch.setattr(state, "footprint_bytes", lambda: 2)
+    assert asyncio.run(run())["resident_bytes"] == TINY_BYTES
+
+    # And the other side of the maximum: a meter above the accumulator is what gets
+    # reported, because it sees what the headers never do — quantize-on-load, the traces.
+    monkeypatch.setattr(mx, "get_active_memory", lambda: TINY_BYTES * 10)
+    assert asyncio.run(run())["resident_bytes"] == TINY_BYTES * 10
+
+
+def test_the_queue_reports_what_runs_and_what_waits() -> None:
+    """The depth the app prints, which is literal today. The gate serializes generation,
+    so a busy engine is one running and the rest waiting — never two running.
+
+    Read with a request in flight, which is also when a model must not read as idle: the
+    stamp that says so is the one the request's arrival leaves, not the one its end does.
+    """
+
+    async def run() -> dict[str, object]:
+        engine = Engine(lambda _: holding(delay=0.01))
+        engine.start()
+        try:
+            jobs = [
+                await engine.submit("held", Text("hello"), GenerationOptions(max_tokens=64))
+                for _ in range(3)
+            ]
+            assert await piece(jobs[0]) is not None, "the first job never started"
+            body = await read(engine)
+            for job in jobs:
+                job.cancel()
+            for job in jobs:
+                await drain(job)
+            return body
+        finally:
+            engine.stop()
+
+    body = asyncio.run(run())
+    assert body["queue"] == {"running": 1, "waiting": 2}
+    assert models_of(body)[0]["last_used"] is not None, "a model mid-request reads as idle"

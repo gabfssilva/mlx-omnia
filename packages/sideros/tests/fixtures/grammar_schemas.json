@@ -1,0 +1,404 @@
+{
+  "note": "The schemas an OpenAI-compatible server actually receives, written to sit on the line where a grammar compiler either covers a keyword, refuses it, or ignores it in silence. The first four stay inside the subset sideros/schema.py validates; the rest are exactly the keywords 42.1 declared outside it (pattern, string and number bounds, local $ref, oneOf, type as a list), plus the ones Pydantic emits on its own (anyOf for an optional, const for a Literal, format for a datetime, title everywhere). Each entry carries a conforming document and one that violates only the keyword under test: a compiler that accepts both compiled the schema without enforcing it, which no error message reports. Property order in every document follows the schema's declared order, because a compiler is free to fix it (xgrammar's any_order defaults to false).",
+  "serialization": "compact: json.dumps(document, separators=[\",\", \":\"])",
+  "schemas": [
+    {
+      "name": "tool_weather",
+      "keyword": "subset",
+      "why": "the tool-argument shape the OpenAI dialect sends most: enum, required, additionalProperties false",
+      "schema": {
+        "type": "object",
+        "properties": {
+          "location": {"type": "string"},
+          "unit": {"type": "string", "enum": ["celsius", "fahrenheit"]}
+        },
+        "required": ["location", "unit"],
+        "additionalProperties": false
+      },
+      "valid": {"location": "Belo Horizonte", "unit": "celsius"},
+      "invalid": {"location": "Belo Horizonte", "unit": "kelvin"}
+    },
+    {
+      "name": "tool_file_edit",
+      "keyword": "subset",
+      "why": "nested object inside an array — the argument shape of an edit tool, and the deepest stack the pushdown sees in practice",
+      "schema": {
+        "type": "object",
+        "properties": {
+          "path": {"type": "string"},
+          "edits": {
+            "type": "array",
+            "items": {
+              "type": "object",
+              "properties": {
+                "old": {"type": "string"},
+                "new": {"type": "string"}
+              },
+              "required": ["old", "new"],
+              "additionalProperties": false
+            }
+          },
+          "dry_run": {"type": "boolean"}
+        },
+        "required": ["path", "edits"],
+        "additionalProperties": false
+      },
+      "valid": {
+        "path": "packages/sideros/src/sideros/generate.py",
+        "edits": [{"old": "max_tokens=128", "new": "max_tokens=256"}],
+        "dry_run": false
+      },
+      "invalid": {"path": "packages/sideros/src/sideros/generate.py", "dry_run": false}
+    },
+    {
+      "name": "classification_enum",
+      "keyword": "subset",
+      "why": "APP.md's own verification case: an enum with a prompt that pushes the model out of it",
+      "schema": {
+        "type": "object",
+        "properties": {
+          "label": {"type": "string", "enum": ["billing", "technical", "account", "other"]},
+          "confidence": {"type": "number"},
+          "rationale": {"type": "string"}
+        },
+        "required": ["label", "confidence", "rationale"],
+        "additionalProperties": false
+      },
+      "valid": {"label": "billing", "confidence": 0.82, "rationale": "the message is about a duplicated charge"},
+      "invalid": {"label": "refund", "confidence": 0.82, "rationale": "the message is about a duplicated charge"}
+    },
+    {
+      "name": "extraction_invoice",
+      "keyword": "subset",
+      "why": "the longest trajectory in the battery: an array of records is where the per-step mask cost is actually paid",
+      "schema": {
+        "type": "object",
+        "properties": {
+          "vendor": {"type": "string"},
+          "total": {"type": "number"},
+          "items": {
+            "type": "array",
+            "items": {
+              "type": "object",
+              "properties": {
+                "sku": {"type": "string"},
+                "quantity": {"type": "integer"},
+                "unit_price": {"type": "number"}
+              },
+              "required": ["sku", "quantity", "unit_price"],
+              "additionalProperties": false
+            }
+          }
+        },
+        "required": ["vendor", "total", "items"],
+        "additionalProperties": false
+      },
+      "valid": {
+        "vendor": "Apple Distribution International",
+        "total": 4899.5,
+        "items": [
+          {"sku": "MAC-M5MAX-128", "quantity": 1, "unit_price": 4799.0},
+          {"sku": "CBL-TB5-2M", "quantity": 2, "unit_price": 50.25}
+        ]
+      },
+      "invalid": {
+        "vendor": "Apple Distribution International",
+        "total": 4899.5,
+        "items": [
+          {"sku": "MAC-M5MAX-128", "quantity": "1", "unit_price": 4799.0}
+        ]
+      }
+    },
+    {
+      "name": "ref_local_reused",
+      "keyword": "$ref + $defs",
+      "why": "what the OpenAI SDK sends for a Pydantic model with a nested type used twice; strict mode requires additionalProperties false at every level",
+      "schema": {
+        "type": "object",
+        "properties": {
+          "billing": {"$ref": "#/$defs/address"},
+          "shipping": {"$ref": "#/$defs/address"}
+        },
+        "required": ["billing", "shipping"],
+        "additionalProperties": false,
+        "$defs": {
+          "address": {
+            "type": "object",
+            "properties": {
+              "street": {"type": "string"},
+              "city": {"type": "string"},
+              "postal_code": {"type": "string"}
+            },
+            "required": ["street", "city", "postal_code"],
+            "additionalProperties": false
+          }
+        }
+      },
+      "valid": {
+        "billing": {"street": "Rua da Bahia 1000", "city": "Belo Horizonte", "postal_code": "30160-011"},
+        "shipping": {"street": "Rua da Bahia 1000", "city": "Belo Horizonte", "postal_code": "30160-011"}
+      },
+      "invalid": {
+        "billing": {"street": "Rua da Bahia 1000", "city": "Belo Horizonte", "postal_code": "30160-011", "country": "BR"},
+        "shipping": {"street": "Rua da Bahia 1000", "city": "Belo Horizonte", "postal_code": "30160-011"}
+      }
+    },
+    {
+      "name": "ref_recursive",
+      "keyword": "$ref (recursive)",
+      "why": "a self-referencing $def is where a compiler that inlines refs either loops or gives up; a category tree is the honest small case",
+      "schema": {
+        "type": "object",
+        "properties": {
+          "root": {"$ref": "#/$defs/node"}
+        },
+        "required": ["root"],
+        "additionalProperties": false,
+        "$defs": {
+          "node": {
+            "type": "object",
+            "properties": {
+              "name": {"type": "string"},
+              "children": {"type": "array", "items": {"$ref": "#/$defs/node"}}
+            },
+            "required": ["name", "children"],
+            "additionalProperties": false
+          }
+        }
+      },
+      "valid": {
+        "root": {
+          "name": "engine",
+          "children": [
+            {"name": "kernels", "children": []},
+            {"name": "models", "children": [{"name": "qwen3", "children": []}]}
+          ]
+        }
+      },
+      "invalid": {"root": {"name": "engine", "children": [{"name": 42, "children": []}]}}
+    },
+    {
+      "name": "pattern_iso_date",
+      "keyword": "pattern",
+      "why": "the cheapest regex a schema carries and the one every extraction prompt asks for",
+      "schema": {
+        "type": "object",
+        "properties": {
+          "due_date": {"type": "string", "pattern": "^\\d{4}-\\d{2}-\\d{2}$"}
+        },
+        "required": ["due_date"],
+        "additionalProperties": false
+      },
+      "valid": {"due_date": "2026-07-27"},
+      "invalid": {"due_date": "27/07/2026"}
+    },
+    {
+      "name": "pattern_sku",
+      "keyword": "pattern",
+      "why": "alternation, bounded repetition and an optional group — the part of a regex engine a naive compiler does not have",
+      "schema": {
+        "type": "object",
+        "properties": {
+          "sku": {"type": "string", "pattern": "^(SKU|PRD)-[A-Z]{2}[0-9]{4}(-[0-9]{1,2})?$"}
+        },
+        "required": ["sku"],
+        "additionalProperties": false
+      },
+      "valid": {"sku": "SKU-BR1234-7"},
+      "invalid": {"sku": "sku-br1234"}
+    },
+    {
+      "name": "string_bounds",
+      "keyword": "minLength/maxLength",
+      "why": "a fixed-width code and a capped title: the bound has to be counted in bytes while the mask is over tokens",
+      "schema": {
+        "type": "object",
+        "properties": {
+          "code": {"type": "string", "minLength": 8, "maxLength": 8},
+          "title": {"type": "string", "maxLength": 40}
+        },
+        "required": ["code", "title"],
+        "additionalProperties": false
+      },
+      "valid": {"code": "AB123456", "title": "Quarterly report"},
+      "invalid": {"code": "AB12", "title": "Quarterly report"}
+    },
+    {
+      "name": "number_range",
+      "keyword": "minimum/maximum",
+      "why": "a probability and a bounded count: the range is a digit-level automaton, not a check a grammar can run afterwards",
+      "schema": {
+        "type": "object",
+        "properties": {
+          "score": {"type": "number", "minimum": 0, "maximum": 1},
+          "count": {"type": "integer", "minimum": 1, "maximum": 100}
+        },
+        "required": ["score", "count"],
+        "additionalProperties": false
+      },
+      "valid": {"score": 0.75, "count": 3},
+      "invalid": {"score": 1.75, "count": 3}
+    },
+    {
+      "name": "number_multiple",
+      "keyword": "exclusiveMinimum/multipleOf",
+      "why": "a currency amount, where the constraint is on the digits after the point and nothing about it is expressible as a range",
+      "schema": {
+        "type": "object",
+        "properties": {
+          "price": {"type": "number", "exclusiveMinimum": 0, "multipleOf": 0.01}
+        },
+        "required": ["price"],
+        "additionalProperties": false
+      },
+      "valid": {"price": 19.99},
+      "invalid": {"price": 19.999}
+    },
+    {
+      "name": "array_bounds",
+      "keyword": "minItems/maxItems/uniqueItems",
+      "why": "the violating document breaks maxItems; uniqueItems rides along because refusing an unimplemented keyword is itself the measurement",
+      "schema": {
+        "type": "object",
+        "properties": {
+          "tags": {
+            "type": "array",
+            "items": {"type": "string"},
+            "minItems": 1,
+            "maxItems": 3,
+            "uniqueItems": true
+          }
+        },
+        "required": ["tags"],
+        "additionalProperties": false
+      },
+      "valid": {"tags": ["inference", "metal"]},
+      "invalid": {"tags": ["inference", "metal", "mlx", "swift"]}
+    },
+    {
+      "name": "type_list_nullable",
+      "keyword": "type as a list",
+      "why": "how a hand-written schema spells an optional field; the type keyword stops being a string and a compiler either branches or refuses",
+      "schema": {
+        "type": "object",
+        "properties": {
+          "note": {"type": ["string", "null"]},
+          "retries": {"type": ["integer", "null"]}
+        },
+        "required": ["note", "retries"],
+        "additionalProperties": false
+      },
+      "valid": {"note": null, "retries": 2},
+      "invalid": {"note": 7, "retries": 2}
+    },
+    {
+      "name": "anyof_nullable",
+      "keyword": "anyOf + title",
+      "why": "what pydantic's model_json_schema() emits for `str | None`, titles included — the exact document the SDK's parse() puts on the wire",
+      "schema": {
+        "title": "Report",
+        "type": "object",
+        "properties": {
+          "summary": {"anyOf": [{"type": "string"}, {"type": "null"}], "title": "Summary"},
+          "pages": {"type": "integer", "title": "Pages"}
+        },
+        "required": ["summary", "pages"],
+        "additionalProperties": false
+      },
+      "valid": {"summary": "decode is bandwidth bound", "pages": 3},
+      "invalid": {"summary": 7, "pages": 3}
+    },
+    {
+      "name": "oneof_action",
+      "keyword": "oneOf",
+      "why": "a discriminated union at the root, which is what a Union model produces; oneOf's exactly-one rule is not what a grammar naturally expresses",
+      "schema": {
+        "oneOf": [
+          {
+            "type": "object",
+            "properties": {
+              "kind": {"const": "search"},
+              "query": {"type": "string"}
+            },
+            "required": ["kind", "query"],
+            "additionalProperties": false
+          },
+          {
+            "type": "object",
+            "properties": {
+              "kind": {"const": "open"},
+              "url": {"type": "string"}
+            },
+            "required": ["kind", "url"],
+            "additionalProperties": false
+          }
+        ]
+      },
+      "valid": {"kind": "search", "query": "m5 max memory bandwidth"},
+      "invalid": {"kind": "search", "url": "https://example.com"}
+    },
+    {
+      "name": "const_literal",
+      "keyword": "const",
+      "why": "pydantic's spelling of Literal; a tool envelope pins its own name this way",
+      "schema": {
+        "type": "object",
+        "properties": {
+          "kind": {"const": "search"},
+          "query": {"type": "string"}
+        },
+        "required": ["kind", "query"],
+        "additionalProperties": false
+      },
+      "valid": {"kind": "search", "query": "sustained bandwidth"},
+      "invalid": {"kind": "browse", "query": "sustained bandwidth"}
+    },
+    {
+      "name": "format_date_time",
+      "keyword": "format",
+      "why": "pydantic emits it for a datetime field and nobody asked for it; enforcing it is a regex, ignoring it is silent",
+      "schema": {
+        "type": "object",
+        "properties": {
+          "created_at": {"type": "string", "format": "date-time"},
+          "author": {"type": "string"}
+        },
+        "required": ["created_at", "author"],
+        "additionalProperties": false
+      },
+      "valid": {"created_at": "2026-07-27T19:10:00Z", "author": "gabriel"},
+      "invalid": {"created_at": "yesterday", "author": "gabriel"}
+    },
+    {
+      "name": "map_additional_props",
+      "keyword": "additionalProperties as a schema",
+      "why": "a free-form map with typed values — the shape of a scores or headers argument, where the key set is not known in advance",
+      "schema": {
+        "type": "object",
+        "properties": {
+          "scores": {"type": "object", "additionalProperties": {"type": "number"}}
+        },
+        "required": ["scores"],
+        "additionalProperties": false
+      },
+      "valid": {"scores": {"relevance": 0.91, "toxicity": 0.02}},
+      "invalid": {"scores": {"relevance": "high", "toxicity": 0.02}}
+    },
+    {
+      "name": "enum_mixed_types",
+      "keyword": "enum of non-strings",
+      "why": "an enum whose members are numbers and null; the mask has to allow three literal token paths, not a string body",
+      "schema": {
+        "type": "object",
+        "properties": {
+          "threshold": {"enum": [0, 0.5, 1, null]},
+          "strict": {"type": "boolean"}
+        },
+        "required": ["threshold", "strict"],
+        "additionalProperties": false
+      },
+      "valid": {"threshold": 0.5, "strict": true},
+      "invalid": {"threshold": 0.7, "strict": true}
+    }
+  ]
+}

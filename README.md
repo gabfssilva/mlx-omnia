@@ -14,14 +14,15 @@ supported.
 
 ## Layout
 
-uv workspace with three packages:
+uv workspace with three packages, plus the desktop app:
 
 - **`packages/sideros`** — the engine: model trees, checkpoint loading (with load-time
   weight fusions), KV cache, lazy generation pipeline, Metal kernels.
 - **`packages/sideros-server`** — FastAPI server speaking the OpenAI API (streaming
   included), global FCFS queue.
-- **`packages/sideros-app`** — Flet chat app (web + desktop), talks to the server over
-  HTTP only.
+- **`packages/sideros-cli`** — HTTP client for the daemon, no engine dependency.
+- **`app/`** — desktop app (React renderer in a Deno Desktop shell), talks to the
+  server over HTTP only.
 
 ## Supported architectures
 

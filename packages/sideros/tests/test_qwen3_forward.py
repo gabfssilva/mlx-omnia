@@ -14,9 +14,8 @@ from conftest import floor, load_golden, relative_diff
 from huggingface_hub import snapshot_download
 
 from sideros import KVCache, stream_ids
-from sideros.checkpoint import load_qwen3
 from sideros.core.kernels.rope_epilogue import rope_epilogue
-from sideros.models.qwen3 import Qwen3, Qwen3Activations
+from sideros.models.qwen3 import CHECKPOINT, Qwen3, Qwen3Activations
 
 FIXTURE = Path(__file__).parent / "fixtures" / "qwen3_forward.safetensors"
 N_LAYER = 28
@@ -36,7 +35,7 @@ def golden() -> dict[str, mx.array]:
 @pytest.fixture(scope="module")
 def model() -> Qwen3:
     # The fixture is transformers in fp32; the checkpoint's bf16 upcasts losslessly.
-    return load_qwen3(qwen3_dir(), dtype=mx.float32)
+    return CHECKPOINT.load(qwen3_dir(), mx.float32)
 
 
 @pytest.fixture(scope="module")

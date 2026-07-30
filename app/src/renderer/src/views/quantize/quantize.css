@@ -1,0 +1,40 @@
+/* The mockup's quantize block. Everything cross-view it leans on — .card, .fieldcol,
+   .seg, .input, .gauge, .bignum, .kvline, .chip, .btn — is theme.css's. */
+
+.qgrid { display: grid; grid-template-columns: 1fr 320px; gap: 10px; }
+@media (max-width: 980px) { .qgrid { grid-template-columns: 1fr; } }
+.projected { display: flex; flex-direction: column; }
+.projected .bignum { font-size: 46px; }
+.projected.pricing { opacity: .55; }
+
+.leaf { display: flex; align-items: center; gap: 16px; padding: 11px 0; }
+.leaf + .leaf { border-top: 1px solid var(--hair); }
+.leaf code { font-family: var(--mono); font-size: 11.5px; flex: 1; min-width: 0;
+  overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+.leaf .meta { width: 150px; flex: none; text-align: right; font-size: 11px; color: var(--fg3); font-variant-numeric: tabular-nums; }
+.leaf .ovtag { font-size: 10px; font-weight: 600; color: var(--ember-ink); background: color-mix(in srgb, var(--ember1) 12%, transparent);
+  border-radius: 5px; padding: 2px 7px; flex: none; }
+.leaf.frozen { color: var(--fg3); }
+.leaf.frozen code { color: var(--fg3); }
+
+/* The mockup draws a `4-bit ▾` button; the menu behind it is a native select, given the
+   button's geometry and the same caret select.input carries. */
+.leaf .pick {
+  font-family: var(--sans); font-size: 11.5px; font-weight: 500; color: var(--fg);
+  background-color: var(--surface2); border: 1px solid var(--hair2); border-radius: 9px;
+  width: 72px; flex: none; padding: 4px 18px 4px 10px; cursor: pointer; outline: none;
+  font-variant-numeric: tabular-nums; appearance: none; -webkit-appearance: none;
+  background-image: linear-gradient(45deg, transparent 50%, var(--fg3) 50%), linear-gradient(135deg, var(--fg3) 50%, transparent 50%);
+  background-position: calc(100% - 11px) 55%, calc(100% - 8px) 55%;
+  background-size: 4px 4px; background-repeat: no-repeat;
+}
+.leaf .pick:hover { background-color: var(--sunken); }
+.leaf .pick:focus-visible { border-color: var(--ember1); }
+
+/* .btn is `all: unset`, so a disabled one is indistinguishable without this. */
+.qz .btn:disabled { cursor: default; opacity: .45; }
+.qz .btn:disabled:hover { background: none; filter: none; }
+.qz .trail .chip .what { max-width: 260px; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+
+/* What the daemon refused, in its own words. */
+.qz .refusal { margin: 0; font-size: 11.5px; line-height: 1.6; color: var(--bad); }

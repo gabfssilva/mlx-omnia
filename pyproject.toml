@@ -2,7 +2,7 @@
 name = "sideros-workspace"
 version = "0.0.0"
 requires-python = ">=3.13"
-dependencies = ["sideros", "sideros-server", "sideros-app"]
+dependencies = ["sideros", "sideros-server", "sideros-cli"]
 
 [tool.uv]
 package = false
@@ -18,6 +18,8 @@ dev = [
     "numpy>=2",
     "safetensors>=0.4",
     "huggingface-hub>=0.30",
+    "anthropic>=0.40",
+    "google-genai>=1.0",
 ]
 
 [tool.uv.workspace]
@@ -26,11 +28,11 @@ members = ["packages/*"]
 [tool.uv.sources]
 sideros = { workspace = true }
 sideros-server = { workspace = true }
-sideros-app = { workspace = true }
+sideros-cli = { workspace = true }
 
 [tool.ruff]
 line-length = 100
-src = ["packages/sideros/src", "packages/sideros-server/src", "packages/sideros-app/src"]
+src = ["packages/sideros/src", "packages/sideros-server/src", "packages/sideros-cli/src"]
 
 [tool.ruff.lint]
 select = [
@@ -56,10 +58,8 @@ venvPath = "."
 venv = ".venv"
 
 [[tool.pyright.executionEnvironments]]
-root = "packages/sideros-app/tests"
-reportUnknownMemberType = false
+root = "examples"
 reportUnknownVariableType = false
-reportUnknownArgumentType = false
 
 # huggingface_hub expõe Unknown nos overloads de download (tqdm genérico).
 [[tool.pyright.executionEnvironments]]
@@ -82,4 +82,4 @@ reportUnknownArgumentType = false
 reportPrivateUsage = false
 
 [tool.pytest.ini_options]
-testpaths = ["packages/sideros/tests", "packages/sideros-server/tests", "packages/sideros-app/tests"]
+testpaths = ["packages/sideros/tests", "packages/sideros-server/tests", "packages/sideros-cli/tests"]

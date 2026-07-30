@@ -21,8 +21,7 @@ from conftest import (
 )
 
 from sideros import stream_ids
-from sideros.checkpoint import load_qwen3_5
-from sideros.models.qwen3_5 import Qwen35
+from sideros.models.qwen3_5 import CHECKPOINT, Qwen35
 
 FIXTURE = Path(__file__).parent / "fixtures" / "qwen3_5_27b_mlxlm.safetensors"
 REPO = "mlx-community/Qwen3.6-27B-6bit"
@@ -38,7 +37,7 @@ def golden() -> dict[str, mx.array]:
 
 @pytest.fixture(scope="module")
 def model() -> Qwen35:
-    return load_qwen3_5(checkpoint_dir(REPO, REVISION))
+    return CHECKPOINT.load(checkpoint_dir(REPO, REVISION), None)
 
 
 @requires_checkpoint(REPO, REVISION)

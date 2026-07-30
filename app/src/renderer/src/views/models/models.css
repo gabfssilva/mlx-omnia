@@ -1,0 +1,155 @@
+/* What only the models list and the model detail draw. The row, the list, the cards, the
+   gauge and the chips are theme.css's — everything below is the two things the mockup's
+   markup carries inline (the filter's width, the ceiling gauge's offset) plus the controls
+   the screen needs beside them: the fixed action cell, the load bar and a refusal line. */
+
+.vhead .filter { width: 180px; }
+
+/* The action cell is the quantize screen's override button: 72px, whatever the label. */
+.row .act { width: 72px; flex: none; display: flex; justify-content: flex-end; }
+.row .act .btn {
+  width: 72px; padding: 4px 0; text-align: center;
+  font-size: 11.5px; font-variant-numeric: tabular-nums;
+}
+
+/* A load reports a message and no total — the engine does not learn one — so the bar is
+   indeterminate until the job's last frame. */
+.row .gauge .fill.creep { width: 34%; animation: creep 1.3s ease-in-out infinite; }
+@keyframes creep { from { margin-left: 0; } 50% { margin-left: 66%; } to { margin-left: 0; } }
+.row .gauge .sub .msg {
+  min-width: 0; overflow: hidden; text-overflow: ellipsis; white-space: nowrap;
+}
+@media (prefers-reduced-motion: reduce) {
+  .row .gauge .fill.creep { animation: none; width: 100%; opacity: .5; }
+}
+
+.list .empty { padding: 22px 20px; font-size: 12.5px; color: var(--fg3); }
+
+.listfoot .btn { margin-left: auto; }
+
+/* The daemon's own sentence, kept where the action was asked for. */
+.notice {
+  display: flex; align-items: center; gap: 8px;
+  background: color-mix(in srgb, var(--bad) 9%, transparent);
+  border: 1px solid color-mix(in srgb, var(--bad) 26%, transparent);
+  border-radius: 10px; padding: 9px 10px 9px 14px;
+  font-size: 12px; color: var(--bad); line-height: 1.5;
+}
+.notice .iconbtn { margin-left: auto; color: var(--bad); }
+.notice .iconbtn:hover { background: color-mix(in srgb, var(--bad) 14%, transparent); }
+.card .notice { margin: 12px 0; }
+
+/* ── model detail ─────────────────────────────────── */
+.ceilblock .ceil { margin-top: 18px; }
+.hero .eyebrow { align-self: center; }
+.kvline b.unset { color: var(--fg3); font-weight: 400; }
+.kvline b.arch { font-size: 11.5px; }
+.kvline b.prompt {
+  font-weight: 400; color: var(--fg2); max-width: 62%; text-align: right;
+  overflow: hidden; text-overflow: ellipsis; white-space: nowrap;
+}
+
+/* ── the checkpoint's card, files and source ──────── */
+.cardblock { background: var(--surface); border: 1px solid var(--hair); border-radius: 14px; }
+.mdhead {
+  display: flex; align-items: center; gap: 12px; flex-wrap: wrap;
+  padding: 14px 20px; border-bottom: 1px solid var(--hair);
+}
+.mdhead h3 { margin: 0; font-size: 12.5px; font-weight: 600; }
+.mdhead .grow { flex: 1; }
+.hublink {
+  all: unset; cursor: pointer; font-size: 11.5px; color: var(--fg3);
+  overflow: hidden; text-overflow: ellipsis; white-space: nowrap; max-width: 50%;
+}
+.hublink:hover { color: var(--ember-ink); }
+.hublink:focus-visible { outline: 2px solid var(--ember1); outline-offset: 1px; }
+
+/* frontmatter, worn as chips instead of YAML */
+.fm { display: flex; flex-wrap: wrap; gap: 6px; padding: 14px 20px 0; }
+.fm span {
+  display: inline-flex; align-items: center; gap: 5px;
+  font-size: 10.5px; font-family: var(--mono); color: var(--fg2);
+  background: var(--sunken); border-radius: 999px; padding: 3px 10px;
+}
+.fm span i { font-style: normal; color: var(--fg3); }
+.fm .lic { color: var(--ok); }
+.fm .base { color: var(--ember-ink); }
+
+.mdcard { padding: 20px 24px 26px; max-width: 74ch; line-height: 1.65; font-size: 13px; }
+.mdcard > :first-child { margin-top: 0; }
+.mdcard > :last-child { margin-bottom: 0; }
+.mdcard h1 { font-size: 19px; font-weight: 650; letter-spacing: -.02em; margin: 26px 0 10px; }
+.mdcard h2 {
+  font-size: 14.5px; font-weight: 600; letter-spacing: -.01em;
+  margin: 30px 0 10px; padding-top: 18px; border-top: 1px solid var(--hair);
+}
+.mdcard h3, .mdcard h4, .mdcard h5, .mdcard h6 { font-size: 13px; font-weight: 600; margin: 20px 0 8px; }
+.mdcard p { margin: 0 0 12px; }
+.mdcard ul, .mdcard ol { margin: 0 0 12px; padding-left: 22px; }
+.mdcard li { margin: 3px 0; }
+.mdcard li::marker { color: var(--fg3); }
+.mdcard a { color: var(--ember-ink); text-decoration: none; border-bottom: 1px solid color-mix(in srgb, var(--ember-ink) 35%, transparent); }
+.mdcard a:hover { border-bottom-color: var(--ember-ink); }
+.mdcard strong { font-weight: 600; }
+.mdcard code {
+  font-family: var(--mono); font-size: 11.5px; color: var(--fg);
+  background: var(--sunken); border-radius: 5px; padding: 1.5px 5px;
+}
+.mdcard pre {
+  margin: 0 0 14px; background: var(--sunken); border-radius: 10px;
+  padding: 13px 16px; overflow-x: auto;
+}
+.mdcard pre code { background: none; padding: 0; font-size: 11.5px; line-height: 1.7; color: var(--fg2); }
+.mdcard .tablewrap { overflow-x: auto; margin: 0 0 14px; }
+.mdcard table { border-collapse: collapse; font-size: 12px; font-variant-numeric: tabular-nums; }
+.mdcard th {
+  text-align: left; font-size: 10px; font-weight: 500; letter-spacing: .05em;
+  text-transform: uppercase; color: var(--fg3);
+  padding: 6px 14px 6px 0; border-bottom: 1px solid var(--hair2);
+}
+.mdcard td { padding: 7px 14px 7px 0; border-bottom: 1px solid var(--hair); white-space: nowrap; }
+.mdcard img {
+  max-width: 100%; border-radius: 10px; border: 1px solid var(--hair);
+  background: #fff; margin: 4px 0 6px;
+}
+.mdcard blockquote { margin: 0 0 12px; padding: 2px 0 2px 14px; border-left: 3px solid var(--hair2); color: var(--fg2); }
+.mdcard hr { border: none; border-top: 1px solid var(--hair); margin: 18px 0; }
+
+.files { padding: 8px 10px 6px; }
+.frow {
+  display: flex; align-items: center; gap: 10px; padding: 8px 12px; width: 100%;
+  font-family: var(--mono); font-size: 11.5px; color: var(--fg);
+  border-bottom: 1px solid var(--hair); box-sizing: border-box;
+}
+.frow:hover { background: var(--surface2); }
+.frow .size { margin-left: auto; color: var(--fg2); font-variant-numeric: tabular-nums; white-space: nowrap; }
+.frow .tag { font-family: var(--sans); font-size: 10px; color: var(--fg3); letter-spacing: .03em; }
+.frow.group { cursor: pointer; border-top: none; border-left: none; border-right: none; background: none; text-align: left; }
+.frow.group:focus-visible { outline: 2px solid var(--ember1); outline-offset: -2px; border-radius: 8px; }
+.frow .chev { width: 12px; height: 12px; color: var(--fg3); transition: transform .15s ease; flex: none; }
+.frow .chev.open { transform: rotate(90deg); }
+.frow.shard { padding-left: 34px; color: var(--fg2); }
+.filefoot {
+  display: flex; justify-content: space-between; gap: 14px; padding: 12px 12px 8px;
+  font-size: 11px; color: var(--fg3); font-variant-numeric: tabular-nums;
+}
+.filefoot span:last-child { overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+
+.srcview {
+  margin: 0; padding: 20px 24px 26px; font-family: var(--mono);
+  font-size: 11px; line-height: 1.75; color: var(--fg2); overflow-x: auto;
+}
+.srcview .fence { color: var(--fg3); }
+.srcview .k { color: var(--ember-ink); }
+.srcview .h { color: var(--fg); font-weight: 600; }
+
+.profiles .profpick { margin-bottom: 12px; max-width: 100%; flex-wrap: wrap; }
+.profiles .hint { font-weight: 400; line-height: 1.6; margin: 0 0 4px; }
+.profiles .hint code { font-size: 11px; color: var(--fg2); }
+.profiles .knobs { display: grid; grid-template-columns: 1fr 1fr; gap: 10px; margin-top: 16px; }
+.profiles .knobs .fieldcol + .fieldcol { margin-top: 0; }
+.profiles textarea.input {
+  font-family: var(--sans); resize: none; min-height: 58px; line-height: 1.5; width: 100%;
+}
+.profiles textarea.input::placeholder { color: var(--fg3); }
+.profiles footer { display: flex; align-items: center; gap: 8px; margin-top: 16px; }

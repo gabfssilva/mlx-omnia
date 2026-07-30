@@ -5,8 +5,7 @@ import pytest
 from conftest import floor, load_golden, relative_diff
 from huggingface_hub import snapshot_download
 
-from sideros.checkpoint import load_gpt2
-from sideros.models.gpt2 import GPT2, GPT2Activations
+from sideros.models.gpt2 import CHECKPOINT, GPT2, GPT2Activations
 
 FIXTURE = Path(__file__).parent / "fixtures" / "gpt2_forward.safetensors"
 
@@ -29,7 +28,7 @@ def golden() -> dict[str, mx.array]:
 
 @pytest.fixture(scope="module")
 def model() -> GPT2:
-    return load_gpt2(gpt2_dir())
+    return CHECKPOINT.load(gpt2_dir(), None)
 
 
 @pytest.fixture(scope="module")
@@ -83,7 +82,7 @@ def test_greedy_predictions_match(
 
 
 def test_mutation_breaks_parity(golden: dict[str, mx.array]) -> None:
-    model = load_gpt2(gpt2_dir())
+    model = CHECKPOINT.load(gpt2_dir(), None)
     model.h[5].mlp.c_fc.weight = model.h[5].mlp.c_fc.weight * (1 + 1e-3)
     mutated = model.activations(golden["input_ids"][None])
     assert relative_diff(mutated.logits, golden["logits"]) > floor(golden, "logits")

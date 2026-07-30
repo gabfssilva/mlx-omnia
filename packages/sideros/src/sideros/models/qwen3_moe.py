@@ -6,20 +6,40 @@ at load, dict-side. The T=1 step routes through the fused kernels when the shape
 tile (`moe_gemv_applies`); prefill gathers sorted by expert — a pure reorder.
 """
 
+import json
 import math
 from dataclasses import dataclass
-from typing import NamedTuple
+from pathlib import Path
+from typing import NamedTuple, TypedDict
 
 import mlx.core as mx
 import mlx.nn as nn
 
+from sideros.bpe import ByteLevelBPE
+from sideros.chat import chat_capabilities
+from sideros.checkpoint import (
+    checkpoint,
+    fuse_qkv,
+    interleave_gate_up,
+    load_shards,
+    prepare_weights,
+    stop_tokens,
+)
 from sideros.core.cache import KVCache
 from sideros.core.kernels.add_rms_norm import add_rms_norm, add_rms_norm_applies
 from sideros.core.kernels.moe_gemv import moe_down_combine, moe_gate_up_act, moe_gemv_applies
 from sideros.core.kernels.moe_route import softmax_topk, softmax_topk_applies
 from sideros.core.kernels.rope_epilogue import rope_epilogue, rope_epilogue_applies
-from sideros.core.layers import SORTED_GATHER_MIN, sorted_gather, split_qkv
-from sideros.core.mxcompat import gather_mm, softmax
+from sideros.core.layers import (
+    SORTED_GATHER_MIN,
+    QuantizedSwitchLinear,
+    SwitchLinear,
+    sorted_gather,
+    split_qkv,
+)
+from sideros.core.mxcompat import softmax
+from sideros.language import LanguageModel, TextLanguageModel
+from sideros.model import CompositeModel, ModelInput
 
 # Both default off: measured on the M5 Max (Qwen3-30B-A3B-4bit, 435-token prompt,
 # interleaved A/B, median of 5) each kernel LOSES decode here — 150.6 (both on) vs
@@ -45,45 +65,7 @@ class Qwen3MoEConfig:
     num_experts: int
     num_experts_per_tok: int
     norm_topk_prob: bool
-    quantization: tuple[int, int] | None  # (group_size, bits)
-
-
-class SwitchLinear(nn.Module):
-    """The experts stacked one matrix per row: [experts, out, in]."""
-
-    def __init__(self, experts: int, input_dims: int, output_dims: int) -> None:
-        super().__init__()
-        scale = math.sqrt(1.0 / input_dims)
-        self.weight = mx.random.uniform(-scale, scale, (experts, output_dims, input_dims))
-
-    def __call__(self, x: mx.array, indices: mx.array, *, sorted_indices: bool = False) -> mx.array:
-        return gather_mm(
-            x, mx.swapaxes(self.weight, -2, -1), rhs_indices=indices,
-            sorted_indices=sorted_indices,
-        )
-
-    def to_quantized(
-        self, group_size: int = 64, bits: int = 4, mode: str = "affine"
-    ) -> "QuantizedSwitchLinear":
-        assert mode == "affine"
-        return QuantizedSwitchLinear(self.weight, group_size=group_size, bits=bits)
-
-
-class QuantizedSwitchLinear(nn.Module):
-    def __init__(self, weight: mx.array, *, group_size: int, bits: int) -> None:
-        super().__init__()
-        packed, scales, biases = mx.quantize(weight, group_size=group_size, bits=bits)
-        self.weight = packed
-        self.scales = scales
-        self.biases = biases
-        self.group_size = group_size
-        self.bits = bits
-
-    def __call__(self, x: mx.array, indices: mx.array, *, sorted_indices: bool = False) -> mx.array:
-        return mx.gather_qmm(
-            x, self.weight, self.scales, self.biases, rhs_indices=indices, transpose=True,
-            group_size=self.group_size, bits=self.bits, sorted_indices=sorted_indices,
-        )
+    eos_token_id: tuple[int, ...]
 
 
 class SwitchGLU(nn.Module):
@@ -201,7 +183,9 @@ class Qwen3Attention(nn.Module):
             rotated = self._rope(self.k_norm(k), offset)
         keys, values = cache.update_and_fetch(rotated, v)
         attended = mx.fast.scaled_dot_product_attention(
-            queries, keys, values,
+            queries,
+            keys,
+            values,
             scale=1 / math.sqrt(self.head_dim),
             mask=None if length == 1 else "causal",
         )
@@ -227,6 +211,8 @@ class Qwen3MoEBlock(nn.Module):
             mlp.norm_topk
             and isinstance(gate_up, QuantizedSwitchLinear)
             and isinstance(down, QuantizedSwitchLinear)
+            # The gemv kernels read an affine bias per group; MXFP carries none.
+            and (gate_up.mode, down.mode) == ("affine", "affine")
             and moe_gemv_applies(
                 self.hidden, mlp.switch_mlp.inner, gate_up.group_size, down.group_size
             )
@@ -253,14 +239,27 @@ class Qwen3MoEBlock(nn.Module):
             down = self.mlp.switch_mlp.down_proj
             assert isinstance(gate_up, QuantizedSwitchLinear)
             assert isinstance(down, QuantizedSwitchLinear)
+            assert gate_up.biases is not None and down.biases is not None
             chosen, weights = softmax_topk(self.mlp.gate(h).reshape(-1), self.k)
             act = moe_gate_up_act(
-                h.reshape(-1), gate_up.weight, gate_up.scales, gate_up.biases, chosen,
-                group_size=gate_up.group_size, bits=gate_up.bits,
+                h.reshape(-1),
+                gate_up.weight,
+                gate_up.scales,
+                gate_up.biases,
+                chosen,
+                group_size=gate_up.group_size,
+                bits=gate_up.bits,
             )
             return moe_down_combine(
-                act.reshape(-1), down.weight, down.scales, down.biases, chosen, weights,
-                attended.reshape(-1), group_size=down.group_size, bits=down.bits,
+                act.reshape(-1),
+                down.weight,
+                down.scales,
+                down.biases,
+                chosen,
+                weights,
+                attended.reshape(-1),
+                group_size=down.group_size,
+                bits=down.bits,
             ).reshape(1, 1, self.hidden)
 
         return attended + self.mlp(h)
@@ -290,9 +289,7 @@ class Qwen3MoE(nn.Module):
     def make_cache(self) -> list[KVCache]:
         return [KVCache() for _ in self.model.layers]
 
-    def activations(
-        self, ids: mx.array, cache: list[KVCache] | None = None
-    ) -> Qwen3MoEActivations:
+    def activations(self, ids: mx.array, cache: list[KVCache] | None = None) -> Qwen3MoEActivations:
         cache = cache if cache is not None else self.make_cache()
         x = self.model.embed_tokens(ids)
         blocks: list[mx.array] = []
@@ -308,3 +305,79 @@ class Qwen3MoE(nn.Module):
 
     def __call__(self, ids: mx.array, cache: list[KVCache] | None = None) -> mx.array:
         return self.activations(ids, cache).logits
+
+
+class _Json(TypedDict):
+    model_type: str
+    hidden_size: int
+    num_hidden_layers: int
+    num_attention_heads: int
+    num_key_value_heads: int
+    head_dim: int
+    vocab_size: int
+    rms_norm_eps: float
+    rope_theta: float
+    tie_word_embeddings: bool
+    moe_intermediate_size: int
+    num_experts: int
+    num_experts_per_tok: int
+    norm_topk_prob: bool
+    eos_token_id: int | list[int]
+
+
+def _config(path: Path) -> Qwen3MoEConfig:
+    raw: _Json = json.loads(path.read_text())
+    if raw["model_type"] != "qwen3_moe":
+        raise ValueError(f"expected model_type qwen3_moe, got {raw['model_type']!r}")
+    eos = raw["eos_token_id"]
+    return Qwen3MoEConfig(
+        hidden_size=raw["hidden_size"],
+        num_hidden_layers=raw["num_hidden_layers"],
+        num_attention_heads=raw["num_attention_heads"],
+        num_key_value_heads=raw["num_key_value_heads"],
+        head_dim=raw["head_dim"],
+        vocab_size=raw["vocab_size"],
+        rms_norm_eps=raw["rms_norm_eps"],
+        rope_theta=raw["rope_theta"],
+        tie_word_embeddings=raw["tie_word_embeddings"],
+        moe_intermediate_size=raw["moe_intermediate_size"],
+        num_experts=raw["num_experts"],
+        num_experts_per_tok=raw["num_experts_per_tok"],
+        norm_topk_prob=raw["norm_topk_prob"],
+        eos_token_id=tuple(eos) if isinstance(eos, list) else (eos,),
+    )
+
+
+def _weights(
+    directory: Path, config: Qwen3MoEConfig, dtype: mx.Dtype | None
+) -> dict[str, mx.array]:
+    layers = config.num_hidden_layers
+    return prepare_weights(
+        config,
+        load_shards(directory),
+        [
+            lambda weights: fuse_qkv(weights, layers),
+            lambda weights: interleave_gate_up(weights, layers),
+        ],
+        dtype,
+    )
+
+
+def _composite(directory: Path, model: Qwen3MoE) -> LanguageModel[ModelInput]:
+    return CompositeModel(
+        TextLanguageModel(
+            model,
+            ByteLevelBPE.from_file(directory / "tokenizer.json"),
+            stop=stop_tokens(directory, model.config.eos_token_id),
+        ),
+        chat_capabilities(directory),
+    )
+
+
+CHECKPOINT = checkpoint((
+        "config.json",
+        "model*.safetensors",
+        "tokenizer.json",
+        "tokenizer_config.json",
+        "chat_template.jinja",
+    ), _config, Qwen3MoE, _weights, _composite)

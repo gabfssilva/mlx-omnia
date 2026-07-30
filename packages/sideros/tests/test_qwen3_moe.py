@@ -19,13 +19,12 @@ from conftest import (
 )
 
 from sideros import KVCache, stream_ids
-from sideros.checkpoint import load_qwen3_moe
 from sideros.core.kernels.add_rms_norm import add_rms_norm
 from sideros.core.kernels.moe_gemv import moe_down_combine, moe_gate_up_act
 from sideros.core.kernels.moe_route import softmax_topk, softmax_topk_applies
 from sideros.core.kernels.rope_epilogue import rope_epilogue
 from sideros.core.mxcompat import softmax
-from sideros.models.qwen3_moe import Qwen3MoE
+from sideros.models.qwen3_moe import CHECKPOINT, Qwen3MoE
 
 FIXTURE = Path(__file__).parent / "fixtures" / "qwen3_moe_mlxlm.safetensors"
 REPO = "mlx-community/Qwen3-30B-A3B-4bit"
@@ -38,7 +37,7 @@ def golden() -> dict[str, mx.array]:
 
 @pytest.fixture(scope="module")
 def model() -> Qwen3MoE:
-    return load_qwen3_moe(checkpoint_dir(REPO))
+    return CHECKPOINT.load(checkpoint_dir(REPO), None)
 
 
 @requires_checkpoint(REPO)

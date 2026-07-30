@@ -9,16 +9,30 @@ so dense and packed u32 fuse the same way): q‖k‖v into `qkv_proj` and gate�
 `mlp.gate_up_proj`. The tree declares only the fused names.
 """
 
+import json
 import math
 from dataclasses import dataclass
-from typing import NamedTuple
+from pathlib import Path
+from typing import NamedTuple, TypedDict
 
 import mlx.core as mx
 import mlx.nn as nn
 
+from sideros.bpe import ByteLevelBPE
+from sideros.chat import chat_capabilities
+from sideros.checkpoint import (
+    checkpoint,
+    concat_gate_up,
+    fuse_qkv,
+    load_shards,
+    prepare_weights,
+    stop_tokens,
+)
 from sideros.core.cache import KVCache
 from sideros.core.kernels.rope_epilogue import rope_epilogue, rope_epilogue_applies
 from sideros.core.layers import SwiGLU, split_qkv
+from sideros.language import LanguageModel, TextLanguageModel
+from sideros.model import CompositeModel, ModelInput
 
 
 @dataclass(frozen=True)
@@ -33,7 +47,7 @@ class Qwen3Config:
     rope_theta: float
     tie_word_embeddings: bool
     intermediate_size: int
-    quantization: tuple[int, int] | None  # (group_size, bits)
+    eos_token_id: tuple[int, ...]
 
 
 class Qwen3Attention(nn.Module):
@@ -165,3 +179,71 @@ class Qwen3(nn.Module):
 
     def __call__(self, ids: mx.array, cache: list[KVCache] | None = None) -> mx.array:
         return self.activations(ids, cache).logits
+
+
+class _Json(TypedDict):
+    model_type: str
+    hidden_size: int
+    num_hidden_layers: int
+    num_attention_heads: int
+    num_key_value_heads: int
+    head_dim: int
+    vocab_size: int
+    rms_norm_eps: float
+    rope_theta: float
+    tie_word_embeddings: bool
+    intermediate_size: int
+    eos_token_id: int | list[int]
+
+
+def _config(path: Path) -> Qwen3Config:
+    raw: _Json = json.loads(path.read_text())
+    if raw["model_type"] != "qwen3":
+        raise ValueError(f"expected model_type qwen3, got {raw['model_type']!r}")
+    eos = raw["eos_token_id"]
+    return Qwen3Config(
+        hidden_size=raw["hidden_size"],
+        num_hidden_layers=raw["num_hidden_layers"],
+        num_attention_heads=raw["num_attention_heads"],
+        num_key_value_heads=raw["num_key_value_heads"],
+        head_dim=raw["head_dim"],
+        vocab_size=raw["vocab_size"],
+        rms_norm_eps=raw["rms_norm_eps"],
+        rope_theta=raw["rope_theta"],
+        tie_word_embeddings=raw["tie_word_embeddings"],
+        intermediate_size=raw["intermediate_size"],
+        eos_token_id=tuple(eos) if isinstance(eos, list) else (eos,),
+    )
+
+
+def _weights(directory: Path, config: Qwen3Config, dtype: mx.Dtype | None) -> dict[str, mx.array]:
+    layers = config.num_hidden_layers
+    return prepare_weights(
+        config,
+        load_shards(directory),
+        [
+            lambda weights: fuse_qkv(weights, layers),
+            lambda weights: concat_gate_up(weights, layers),
+        ],
+        dtype,
+    )
+
+
+def _composite(directory: Path, model: Qwen3) -> LanguageModel[ModelInput]:
+    return CompositeModel(
+        TextLanguageModel(
+            model,
+            ByteLevelBPE.from_file(directory / "tokenizer.json"),
+            stop=stop_tokens(directory, model.config.eos_token_id),
+        ),
+        chat_capabilities(directory),
+    )
+
+
+CHECKPOINT = checkpoint((
+        "config.json",
+        "model*.safetensors",
+        "tokenizer.json",
+        "tokenizer_config.json",
+        "chat_template.jinja",
+    ), _config, Qwen3, _weights, _composite)

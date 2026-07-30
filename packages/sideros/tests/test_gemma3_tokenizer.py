@@ -13,7 +13,7 @@ from hypothesis import given
 from hypothesis import strategies as st
 from transformers import AutoTokenizer
 
-from sideros.tokenizer_gemma3 import Gemma3Tokenizer
+from sideros.models.gemma3 import Gemma3Tokenizer
 
 MODEL = "google/gemma-3-270m"
 
@@ -56,9 +56,7 @@ def reference() -> Encodes:
 
 
 @pytest.mark.parametrize("text", CORPUS)
-def test_ids_match_transformers(
-    tokenizer: Gemma3Tokenizer, reference: Encodes, text: str
-) -> None:
+def test_ids_match_transformers(tokenizer: Gemma3Tokenizer, reference: Encodes, text: str) -> None:
     assert tokenizer.encode(text) == reference.encode(text)
 
 

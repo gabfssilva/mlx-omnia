@@ -1,0 +1,76 @@
+The corpus is versioned so that a calibration artifact can be reproduced from the
+repository alone: every byte of this file enters the digest recorded next to the
+statistics, and a single edit invalidates every artifact that claims to come from it.
+
+Weight-only post-training quantization replaces a dense matrix by a packed one, a
+scale per group and, in the affine format, a bias per group. The runtime never learns
+which method chose the values.
+
+Round-to-nearest depends on the weights alone. Methods that depend on the data need
+the distribution of the activations that reach each projection, which is what a
+calibration pass records.
+
+The importance matrix accumulates the mean of the squared input per channel. A channel
+that never carries energy costs nothing to round badly, and a channel that carries all
+of it dominates the error of the layer.
+
+An approximation of the Hessian of the layerwise reconstruction error is the second
+moment of the inputs, the matrix X transposed times X. It is symmetric, its size is the
+square of the input dimension, and it is the quantity a sequential rounding method
+consumes.
+
+Sensitivity of a block is measured by running the block twice over the same input, once
+with the float weights and once with weights that were quantized and dequantized, and
+comparing the two outputs. The comparison is a diagnostic, not a transformation: the
+weights are restored afterwards.
+
+Memory is the real limit of a calibration pass. Processing the trunk block by block and
+discarding the activations at the end of each one keeps the peak flat as the number of
+blocks grows.
+
+Determinism is a property of the artifact, not of the run. The seed, the corpus digest
+and the configuration travel with the statistics, and two runs over the same input
+produce the same bytes.
+
+A tokenizer maps text to integers, and the same text under two tokenizers produces two
+different token streams. The corpus is text, so the sampled sequences depend on the
+tokenizer that a calibration pass was given.
+
+Attention projects a hidden state into queries, keys and values, mixes the positions and
+projects the result back. The four projections see very different activation statistics
+even inside a single block.
+
+A feed-forward block gates one projection by the activation of another and projects the
+product back to the hidden size. The gate and the up projection read the same input, so
+their input statistics are identical and their output energies are not.
+
+A mixture of experts routes each token to a small subset of the available experts. The
+statistics an expert accumulates depend on how often the router selected it, which makes
+the effective sample size uneven across the layer.
+
+Normalization rescales a hidden state before it enters a projection, so the statistics a
+projection observes describe the normalized activation and not the residual stream.
+
+The residual stream grows along the trunk. A tolerance measured at the first block is
+vacuous at the last one, and a tolerance measured at the last one is impossible at the
+first.
+
+Bit widths are not interchangeable at equal cost. Two bits per weight and eight bits per
+weight differ by a factor of four in memory and by orders of magnitude in reconstruction
+error, and the interesting question is where the intermediate widths belong.
+
+An allocator that spends a budget needs a ranking. Sensitivity per block, cost per leaf
+and a hard cap are enough to make the ranking a decision rather than a preference.
+
+Group size trades metadata for locality. A group of thirty-two values carries one scale
+for every thirty-two weights, and a group of one hundred and twenty-eight carries a
+quarter of that metadata at a coarser fit.
+
+Exponent-scaled formats store a single byte per group and no bias, so reading that byte
+as a floating point scale is a mode mix-up and not a rounding difference.
+
+Numerical parity is asserted against a reference in the highest precision the machine
+affords, and the tolerance is measured rather than invented.
+
+Text arrives as bytes and leaves as bytes. Everything in between is an integer, a matrix
+and a decision about how many bits each entry of that matrix deserves.

@@ -21,9 +21,11 @@ the same arithmetic in a different summation order; the fixture measures that ga
 carries it in `noise.vision_patch`.
 """
 
+import json
 import math
 from dataclasses import dataclass
-from typing import TYPE_CHECKING, NamedTuple
+from pathlib import Path
+from typing import TYPE_CHECKING, NamedTuple, TypedDict
 
 import mlx.core as mx
 import mlx.nn as nn
@@ -449,3 +451,72 @@ def multimodal_positions(
         raise ValueError("more images than placeholder runs in the prompt")
     positions = np.concatenate(columns, axis=1)
     return positions, int(positions.max()) + 1 - len(ids)
+
+
+class VisionJson(TypedDict):
+    hidden_size: int
+    intermediate_size: int
+    out_hidden_size: int
+    depth: int
+    num_heads: int
+    in_channels: int
+    patch_size: int
+    temporal_patch_size: int
+    spatial_merge_size: int
+    num_position_embeddings: int
+    deepstack_visual_indexes: list[int]
+
+
+def vision_config(raw: VisionJson) -> Qwen35VisionConfig:
+    if raw["deepstack_visual_indexes"]:
+        raise ValueError("deepstack fan-in is not ported; every shipped config has it empty")
+    return Qwen35VisionConfig(
+        hidden_size=raw["hidden_size"],
+        intermediate_size=raw["intermediate_size"],
+        out_hidden_size=raw["out_hidden_size"],
+        depth=raw["depth"],
+        num_heads=raw["num_heads"],
+        in_channels=raw["in_channels"],
+        patch_size=raw["patch_size"],
+        temporal_patch_size=raw["temporal_patch_size"],
+        spatial_merge_size=raw["spatial_merge_size"],
+        num_position_embeddings=raw["num_position_embeddings"],
+    )
+
+
+def normalized_patch_weight(weight: mx.array, config: Qwen35VisionConfig) -> mx.array:
+    """Both Conv3d dialects into the folded `[hidden, patch_dim]` matmul layout. HF ships
+    `[out, C, T, H, W]`, which flattens straight onto the processor's channel-major patch;
+    mlx conversions ship `[out, T, H, W, C]` and need the channel axis moved first."""
+    if weight.ndim != 5:
+        return weight
+    if weight.shape[1] == config.in_channels:
+        return weight.reshape(config.hidden_size, -1)
+    return weight.transpose(0, 4, 1, 2, 3).reshape(config.hidden_size, -1)
+
+
+class _SizeJson(TypedDict):
+    shortest_edge: int
+    longest_edge: int
+
+
+class _ProcessorJson(TypedDict):
+    size: _SizeJson
+    patch_size: int
+    temporal_patch_size: int
+    merge_size: int
+    image_mean: list[float]
+    image_std: list[float]
+
+
+def load_processor_config(path: Path) -> ProcessorConfig:
+    raw: _ProcessorJson = json.loads(path.read_text())
+    return ProcessorConfig(
+        patch_size=raw["patch_size"],
+        temporal_patch_size=raw["temporal_patch_size"],
+        merge_size=raw["merge_size"],
+        min_pixels=raw["size"]["shortest_edge"],
+        max_pixels=raw["size"]["longest_edge"],
+        image_mean=tuple(raw["image_mean"]),
+        image_std=tuple(raw["image_std"]),
+    )

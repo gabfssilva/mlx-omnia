@@ -67,6 +67,53 @@ _KERNEL = metal_kernel(
     name="moe_softmax_topk", input_names=["L"], output_names=["OI", "OW"], source=_SOURCE
 )
 
+_SIGMOID_SOURCE = """
+    uint lane = thread_position_in_threadgroup.x;
+    constexpr uint per_lane = EXPERTS / 32;
+
+    float s[per_lane];
+    float b[per_lane];
+    for (uint i = 0; i < per_lane; i++) {
+        float x = (float)L[lane + i * 32];
+        s[i] = 1.0f / (1.0f + metal::exp(-x));
+        b[i] = s[i] + B[lane + i * 32];
+    }
+
+    float pick[TOPK];
+    for (uint j = 0; j < TOPK; j++) {
+        float local = -INFINITY;
+        for (uint i = 0; i < per_lane; i++) {
+            local = metal::max(local, b[i]);
+        }
+        float best = simd_max(local);
+        int slot = -1;
+        for (int i = (int)per_lane - 1; i >= 0; i--) {
+            if (slot < 0 && b[i] == best) slot = i;
+        }
+        int cand = slot >= 0 ? (int)(lane + (uint)slot * 32) : -1;
+        int winner = simd_max(cand);
+        uint wslot = (uint)winner / 32;
+        pick[j] = simd_broadcast(s[wslot], (ushort)((uint)winner % 32));
+        if (winner == cand && slot >= 0) b[(uint)slot] = -INFINITY;
+        if (lane == 0) OI[j] = (uint)winner;
+    }
+    float total = 0.0f;
+    for (int j = TOPK - 1; j >= 0; j--) {
+        total = total + pick[j];
+    }
+    if (lane < TOPK) {
+        T w = (T)(pick[lane] / total);
+        OW[lane] = (T)((float)w * SC);
+    }
+"""
+
+_SIGMOID_KERNEL = metal_kernel(
+    name="moe_sigmoid_topk",
+    input_names=["L", "B", "SC"],
+    output_names=["OI", "OW"],
+    source=_SIGMOID_SOURCE,
+)
+
 
 def softmax_topk_applies(experts: int, k: int) -> bool:
     """One simdgroup owns the whole row: `experts / 32` entries per lane, and the k
@@ -87,6 +134,26 @@ def softmax_topk(
         grid=(32, 1, 1),
         threadgroup=(32, 1, 1),
         output_shapes=[(slots,), (slots,)],
+        output_dtypes=[mx.uint32, logits.dtype],
+    )
+    return out[0], out[1]
+
+
+def sigmoid_topk(
+    logits: mx.array, bias: mx.array, k: int, *, scale: float
+) -> tuple[mx.array, mx.array]:
+    """One token's sigmoid routing pick (DeepSeek-V3 style): selection by
+    `sigmoid(logits) + bias`, weights from the unbiased scores, renormalized and
+    scaled. Sigmoid and renorm run in fp32; the weight rounds to T before the
+    scale multiplies, matching the stock chain's `astype` placement."""
+    experts = logits.size
+    assert softmax_topk_applies(experts, k)
+    out = _SIGMOID_KERNEL(
+        inputs=[logits, bias.astype(mx.float32), mx.array(scale, dtype=mx.float32)],
+        template=[("T", logits.dtype), ("TOPK", k), ("EXPERTS", experts)],
+        grid=(32, 1, 1),
+        threadgroup=(32, 1, 1),
+        output_shapes=[(k,), (k,)],
         output_dtypes=[mx.uint32, logits.dtype],
     )
     return out[0], out[1]

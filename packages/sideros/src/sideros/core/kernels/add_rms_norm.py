@@ -11,9 +11,11 @@ the materialized tensor between the two ops would.
 simdgroups). At VPT=4 the arithmetic is identical to the original.
 """
 
+from typing import NamedTuple
+
 import mlx.core as mx
 
-from sideros.core.mxcompat import metal_kernel
+from sideros.core.kernels import MetalDispatch, MetalKernel
 
 _SOURCE = """
     uint tid = thread_position_in_threadgroup.x;
@@ -32,7 +34,7 @@ _SOURCE = """
     threadgroup_barrier(mem_flags::mem_threadgroup);
     float sumsq = 0.0f;
     for (uint j = 0; j < HDIM / (VPT * 32); j++) sumsq += part[j];
-    float r = metal::rsqrt(sumsq / (float)HDIM + EPS[0]);
+    float r = metal::rsqrt(sumsq / (float)HDIM + EPS);
     for (uint j = 0; j < VPT; j++) {
         uint i = tid * VPT + j;
         A[i] = (T)vals[i];
@@ -40,11 +42,35 @@ _SOURCE = """
     }
 """
 
-_KERNEL = metal_kernel(
+
+class _Inputs(NamedTuple):
+    X: mx.array
+    Op: mx.array
+    NW: mx.array
+    EPS: float
+
+
+class _Outputs(NamedTuple):
+    A: mx.array
+    HN: mx.array
+
+
+def _dispatch(input: _Inputs) -> MetalDispatch:
+    hidden = input.NW.size
+    vpt = 4 if hidden % 128 == 0 else 5
+    return MetalDispatch(
+        template=(("T", input.X.dtype), ("HDIM", hidden), ("VPT", vpt)),
+        grid=(hidden // vpt, 1, 1),
+        threadgroup=(hidden // vpt, 1, 1),
+        output_shapes=((hidden,), (hidden,)),
+        output_dtypes=(input.X.dtype, input.X.dtype),
+    )
+
+
+_KERNEL = MetalKernel[_Inputs, _Outputs](
     name="add_rmsnorm",
-    input_names=["X", "Op", "NW", "EPS"],
-    output_names=["A", "HN"],
     source=_SOURCE,
+    launch=_dispatch,
 )
 
 
@@ -75,18 +101,12 @@ def add_rms_norm(
     assert x.size == hidden and projected.size == hidden
     assert x.dtype == projected.dtype == weight.dtype
     assert add_rms_norm_applies(hidden)
-    vpt = 4 if hidden % 128 == 0 else 5
     out = _KERNEL(
-        inputs=[
+        _Inputs(
             x.reshape(hidden),
             projected.reshape(hidden),
             weight,
-            mx.array([eps], dtype=mx.float32),
-        ],
-        template=[("T", x.dtype), ("HDIM", hidden), ("VPT", vpt)],
-        grid=(hidden // vpt, 1, 1),
-        threadgroup=(hidden // vpt, 1, 1),
-        output_shapes=[(hidden,), (hidden,)],
-        output_dtypes=[x.dtype, x.dtype],
+            eps,
+        )
     )
-    return out[0].reshape(x.shape), out[1].reshape(x.shape)
+    return out.A.reshape(x.shape), out.HN.reshape(x.shape)

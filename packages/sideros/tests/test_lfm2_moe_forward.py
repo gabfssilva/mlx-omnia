@@ -13,12 +13,12 @@ import pytest
 from conftest import checkpoint_dir, floor, load_golden, relative_diff, requires_checkpoint
 
 from sideros import KVCache, stream_ids
-from sideros.checkpoint import load_lfm2_moe
 from sideros.core.cache import ConvCache
 from sideros.core.kernels.conv_mix import conv_mix
 from sideros.core.kernels.moe_gemv_dense import moe_dense_down
 from sideros.models import lfm2_moe
 from sideros.models.lfm2_moe import (
+    CHECKPOINT,
     LFM2Attention,
     LFM2Conv,
     LFM2MoE,
@@ -40,7 +40,7 @@ def golden() -> dict[str, mx.array]:
 @pytest.fixture(scope="module")
 def model() -> LFM2MoE:
     # The fixture is transformers in fp32; the checkpoint's bf16 upcasts losslessly.
-    return load_lfm2_moe(checkpoint_dir(REPO), dtype=mx.float32)
+    return CHECKPOINT.load(checkpoint_dir(REPO), mx.float32)
 
 
 @pytest.fixture(scope="module")

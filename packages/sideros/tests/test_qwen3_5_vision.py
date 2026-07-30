@@ -18,11 +18,14 @@ import pytest
 from conftest import floor, load_golden, relative_diff
 from huggingface_hub import snapshot_download
 
-from sideros.checkpoint import load_processor_config, load_qwen3_5
+from sideros.bpe import ByteLevelBPE
+from sideros.language import TEXT, GenerationOptions, LanguagePrompt, Text
 from sideros.models.qwen3_5 import (
+    CHECKPOINT,
     MultimodalPrompt,
     Qwen35,
     Qwen35Activations,
+    Qwen35LanguageModel,
     _mrope_sources,
     decode_clock,
     multimodal_prompt,
@@ -34,11 +37,13 @@ from sideros.models.qwen3_5_vision import (
     Qwen35VisionActivations,
     VisionMerger,
     _block_order,
+    load_processor_config,
     multimodal_positions,
     process_image,
     resample,
     smart_resize,
 )
+from sideros.vision import RGB_IMAGE, Image
 
 FIXTURE = Path(__file__).parent / "fixtures" / "qwen3_5_vision.safetensors"
 N_LAYER = 24
@@ -61,7 +66,7 @@ def golden() -> dict[str, mx.array]:
 @pytest.fixture(scope="module")
 def model() -> Qwen35:
     # The fixture is transformers in fp32; the checkpoint's bf16 upcasts losslessly.
-    return load_qwen3_5(qwen3_5_dir(), dtype=mx.float32)
+    return CHECKPOINT.load(qwen3_5_dir(), mx.float32)
 
 
 @pytest.fixture(scope="module")
@@ -78,6 +83,11 @@ def processed(golden: dict[str, mx.array]) -> tuple[mx.array, Grid]:
 
 
 @pytest.fixture(scope="module")
+def tokenizer() -> ByteLevelBPE:
+    return ByteLevelBPE.from_file(qwen3_5_dir() / "tokenizer.json")
+
+
+@pytest.fixture(scope="module")
 def vision(tower: Qwen35Vision, processed: tuple[mx.array, Grid]) -> Qwen35VisionActivations:
     patches, grid = processed
     return tower.activations(patches, grid)
@@ -89,6 +99,15 @@ def prompt(
 ) -> MultimodalPrompt:
     ids = [int(i) for i in np.array(golden["input_ids"])]
     return multimodal_prompt(model, ids, [processed])
+
+
+@pytest.fixture(scope="module")
+def language_model(
+    model: Qwen35,
+    tokenizer: ByteLevelBPE,
+) -> Qwen35LanguageModel:
+    processor = load_processor_config(qwen3_5_dir() / "preprocessor_config.json")
+    return Qwen35LanguageModel(model, tokenizer, processor)
 
 
 # --- the processor -------------------------------------------------------------------
@@ -223,6 +242,71 @@ def test_merger_within_floor(vision: Qwen35VisionActivations, golden: dict[str, 
 
 
 # --- the splice and the clock --------------------------------------------------------
+
+
+def test_language_facade_declares_text_and_image_as_native(
+    language_model: Qwen35LanguageModel,
+) -> None:
+    assert language_model.native_signature.inputs == frozenset({TEXT, RGB_IMAGE})
+    assert language_model.native_signature.outputs == frozenset({TEXT})
+    assert language_model.accepts(Text("describe"))
+    assert language_model.accepts(Image(np.zeros((32, 32, 3), dtype=np.uint8)))
+    assert language_model.accepts(
+        LanguagePrompt(
+            (
+                Text("before"),
+                Image(np.zeros((32, 32, 3), dtype=np.uint8)),
+                Text("after"),
+            )
+        )
+    )
+
+
+def test_language_facade_builds_the_fixture_multimodal_prompt(
+    language_model: Qwen35LanguageModel,
+    golden: dict[str, mx.array],
+) -> None:
+    input = LanguagePrompt(
+        (
+            Image(np.array(golden["image_rgb"])),
+            Text("Describe the image."),
+        )
+    )
+    prepared = language_model.prepare(input)
+    assert prepared.ids == [int(identifier) for identifier in np.array(golden["input_ids"])]
+    assert relative_diff(prepared.embeddings, golden["embeddings"]) < floor(golden, "embeddings")
+    assert mx.array_equal(prepared.positions, golden["position_ids"]).item()
+    assert prepared.delta == golden["rope_delta"].item()
+
+
+def test_language_facade_stream_matches_multimodal_generation(
+    language_model: Qwen35LanguageModel,
+    tokenizer: ByteLevelBPE,
+    golden: dict[str, mx.array],
+) -> None:
+    input = LanguagePrompt(
+        (
+            Image(np.array(golden["image_rgb"])),
+            Text("Describe the image."),
+        )
+    )
+    expected = [int(identifier) for identifier in np.array(golden["greedy_ids"])]
+    prompt_length = len(np.array(golden["input_ids"]))
+    generated = expected[prompt_length:]
+    output = "".join(
+        segment.text
+        for segment in language_model.stream(input, GenerationOptions(max_tokens=len(generated)))
+    )
+    assert output == tokenizer.decode(generated)
+
+
+def test_language_facade_without_processor_declares_only_text(
+    model: Qwen35,
+    tokenizer: ByteLevelBPE,
+) -> None:
+    language_model = Qwen35LanguageModel(model, tokenizer, None)
+    assert language_model.native_signature.inputs == frozenset({TEXT})
+    assert not language_model.accepts(Image(np.zeros((32, 32, 3), dtype=np.uint8)))
 
 
 def test_spliced_embeddings_within_floor(

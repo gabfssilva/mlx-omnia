@@ -6,6 +6,7 @@ bounded by floors measured in the fixture — `noise.logits`, `noise.block_i` (t
 residual grows along the trunk, so the floor is per block) and `noise.batching`.
 """
 
+import json
 from collections.abc import Iterator
 from pathlib import Path
 
@@ -21,11 +22,12 @@ from conftest import (
 )
 
 from sideros import KVCache, stream_ids
-from sideros.checkpoint import load_gpt_oss
+from sideros.checkpoint import stop_tokens
 from sideros.core.kernels.mxfp4_moe_gemv import mxfp4_down_combine
 from sideros.core.kernels.sink_attention import sink_attention
+from sideros.core.layers import QuantizedSwitchLinear
 from sideros.models import gpt_oss as gpt_oss_module
-from sideros.models.gpt_oss import GPTOSS
+from sideros.models.gpt_oss import CHECKPOINT, GPTOSS
 
 FIXTURE = Path(__file__).parent / "fixtures" / "gpt_oss_mlxlm.safetensors"
 REPO = "openai/gpt-oss-20b"
@@ -36,6 +38,13 @@ requires_checkpoint = pytest.mark.skipif(
 )
 
 
+def _mxfp4_leaves(model: GPTOSS) -> tuple[QuantizedSwitchLinear, QuantizedSwitchLinear]:
+    """The first layer's expert pair, as the spine built it."""
+    leaves = model.model.layers[0].mlp.experts.mxfp4()
+    assert leaves is not None
+    return leaves
+
+
 @pytest.fixture(scope="module")
 def golden() -> dict[str, mx.array]:
     return load_golden(FIXTURE)
@@ -43,7 +52,7 @@ def golden() -> dict[str, mx.array]:
 
 @pytest.fixture(scope="module")
 def model() -> GPTOSS:
-    return load_gpt_oss(checkpoint_dir(REPO))
+    return CHECKPOINT.load(checkpoint_dir(REPO), None)
 
 
 @requires_checkpoint
@@ -122,17 +131,16 @@ def test_zeroed_sink_breaks_parity(model: GPTOSS, golden: dict[str, mx.array]) -
 def test_swapped_gate_up_breaks_parity(model: GPTOSS, golden: dict[str, mx.array]) -> None:
     """gate‖up arrives interleaved row by row; reading the pair the other way round is
     a plausible port bug that no shape catches."""
-    experts = model.model.layers[0].mlp.experts
-    original = experts.gate_up_proj_weight
-    assert isinstance(original, mx.array)
-    experts.gate_up_proj_weight = original.reshape(
-        original.shape[0], -1, 2, original.shape[2]
-    )[:, :, ::-1].reshape(original.shape)
+    gate_up = _mxfp4_leaves(model)[0]
+    original = gate_up.weight
+    gate_up.weight = original.reshape(original.shape[0], -1, 2, original.shape[2])[
+        :, :, ::-1
+    ].reshape(original.shape)
     try:
         logits = model(golden["input_ids"][None])
         assert relative_diff(logits, golden["logits"]) > golden["noise.logits"].item()
     finally:
-        experts.gate_up_proj_weight = original
+        gate_up.weight = original
 
 
 @requires_checkpoint
@@ -152,13 +160,13 @@ def test_sliding_layers_must_slide(model: GPTOSS, golden: dict[str, mx.array]) -
 def test_affine_mode_is_rejected(model: GPTOSS, golden: dict[str, mx.array]) -> None:
     """MXFP4 has no biases; the affine path demands them, so a mode mix-up aborts
     instead of quietly computing something else."""
-    experts = model.model.layers[0].mlp.experts
+    gate_up = _mxfp4_leaves(model)[0]
     with pytest.raises(ValueError, match=r"[Bb]iases"):
         mx.eval(
             mx.gather_qmm(
                 mx.zeros((1, 1, 1, 1, model.config.hidden_size), dtype=mx.bfloat16),
-                experts.gate_up_proj_weight,
-                experts.gate_up_proj_scales,
+                gate_up.weight,
+                gate_up.scales,
                 None,
                 rhs_indices=mx.array([[[0]]]),
                 transpose=True,
@@ -173,6 +181,101 @@ def test_affine_mode_is_rejected(model: GPTOSS, golden: dict[str, mx.array]) -> 
 def test_cache_is_trimmable(model: GPTOSS) -> None:
     cache = model.make_cache()
     assert all(isinstance(c, KVCache) and c.is_trimmable for c in cache)
+
+
+def _synthetic_checkpoint(directory: Path) -> dict[str, mx.array]:
+    """A four-expert gpt-oss in the checkpoint's own names, MXFP4 blocks included. The
+    packed tensors are produced here, so the loader has no share in the reference."""
+    experts, hidden, inner, heads, kv_heads, head_dim, vocab = 4, 64, 32, 4, 2, 16, 32
+    config = {
+        "model_type": "gpt_oss",
+        "hidden_size": hidden,
+        "num_hidden_layers": 1,
+        "num_attention_heads": heads,
+        "num_key_value_heads": kv_heads,
+        "head_dim": head_dim,
+        "vocab_size": vocab,
+        "rms_norm_eps": 1e-5,
+        "rope_theta": 150000.0,
+        "intermediate_size": inner,
+        "num_local_experts": experts,
+        "num_experts_per_tok": 2,
+        "sliding_window": 8,
+        "swiglu_limit": 7.0,
+        "layer_types": ["full_attention"],
+        "eos_token_id": 200002,
+        "rope_scaling": {
+            "factor": 32.0,
+            "original_max_position_embeddings": 4096,
+            "beta_fast": 32.0,
+            "beta_slow": 1.0,
+        },
+    }
+    (directory / "config.json").write_text(json.dumps(config))
+
+    def normal(*shape: int) -> mx.array:
+        return mx.random.normal(shape).astype(mx.bfloat16)
+
+    layer = "model.layers.0."
+    weights = {
+        "model.embed_tokens.weight": normal(vocab, hidden),
+        f"{layer}input_layernorm.weight": normal(hidden),
+        f"{layer}post_attention_layernorm.weight": normal(hidden),
+        f"{layer}self_attn.sinks": normal(heads),
+        f"{layer}self_attn.o_proj.weight": normal(hidden, heads * head_dim),
+        f"{layer}self_attn.o_proj.bias": normal(hidden),
+        f"{layer}mlp.router.weight": normal(experts, hidden),
+        f"{layer}mlp.router.bias": normal(experts),
+        "model.norm.weight": normal(hidden),
+        "lm_head.weight": normal(vocab, hidden),
+    }
+    kv_width = kv_heads * head_dim
+    for name, out in (("q", heads * head_dim), ("k", kv_width), ("v", kv_width)):
+        weights[f"{layer}self_attn.{name}_proj.weight"] = normal(out, hidden)
+        weights[f"{layer}self_attn.{name}_proj.bias"] = normal(out)
+    projections = (("gate_up_proj", 2 * inner, hidden), ("down_proj", hidden, inner))
+    for proj, out, contraction in projections:
+        packed, scales, *_ = mx.quantize(
+            normal(experts, out, contraction), group_size=32, bits=4, mode="mxfp4"
+        )
+        # The checkpoint ships the packed words as [E, out, groups, 16] uint8.
+        weights[f"{layer}mlp.experts.{proj}_blocks"] = packed.view(mx.uint8).reshape(
+            experts, out, contraction // 32, 16
+        )
+        weights[f"{layer}mlp.experts.{proj}_scales"] = scales
+        weights[f"{layer}mlp.experts.{proj}_bias"] = normal(experts, out)
+    mx.eval(list(weights.values()))
+    mx.save_safetensors(str(directory / "model.safetensors"), weights)
+    return weights
+
+
+def test_synthetic_experts_load_as_mxfp4_leaves(tmp_path: Path) -> None:
+    """The expert stacks go through the same spine as every other checkpoint: the format
+    is read off the tensors, `nn.quantize` swaps the leaf in, and the packed words reach
+    it untouched."""
+    # mutação: em `_unpack_experts`, deixar `{proj}_scales` com o nome achatado (sem
+    # renomear para `{proj}.scales`) quebra — o load estrito acusa o nome inesperado. A
+    # referência sai do dicionário que este teste escreveu, não do carregador.
+    mx.random.seed(0)
+    weights = _synthetic_checkpoint(tmp_path)
+
+    model = CHECKPOINT.load(tmp_path, None)
+
+    gate_up, down = _mxfp4_leaves(model)
+    assert (gate_up.group_size, gate_up.bits, gate_up.mode) == (32, 4, "mxfp4")
+    assert (down.group_size, down.bits, down.mode) == (32, 4, "mxfp4")
+    assert gate_up.biases is None and down.biases is None
+    blocks = weights["model.layers.0.mlp.experts.gate_up_proj_blocks"]
+    assert mx.array_equal(
+        gate_up.weight, blocks.view(mx.uint32).reshape(blocks.shape[0], blocks.shape[1], -1)
+    ).item()
+    assert mx.array_equal(
+        gate_up.scales, weights["model.layers.0.mlp.experts.gate_up_proj_scales"]
+    ).item()
+    experts = model.model.layers[0].mlp.experts
+    assert mx.array_equal(
+        experts.gate_up_proj_bias, weights["model.layers.0.mlp.experts.gate_up_proj_bias"]
+    ).item()
 
 
 def test_yarn_table_matches_reference() -> None:
@@ -211,7 +314,7 @@ def test_kernels_are_engaged_at_step(model: GPTOSS, monkeypatch: pytest.MonkeyPa
     below silently measures the ops path against itself."""
     block = model.model.layers[0]
     x = mx.zeros((1, 1, model.config.hidden_size), dtype=mx.bfloat16)
-    assert block.mlp.fused_step_applies(x)
+    assert block.mlp.fused_step(x, x) is not None
 
     engaged: list[bool] = []
 
@@ -283,3 +386,24 @@ def test_sink_attention_ignoring_mask_breaks_parity(
     broken = _stepwise(model, ids)
     monkeypatch.undo()
     assert relative_diff(broken, model(ids[None])) > 3 * golden["noise.batching"].item()
+
+
+@pytest.mark.skipif(
+    local_snapshot(REPO) is None, reason="openai/gpt-oss-20b not available locally"
+)
+def test_the_token_that_ends_a_call_is_in_the_stop_set() -> None:
+    """`config.json` declares one eos here — `<|return|>`, 200002 — and the generation config
+    declares three. The one it adds that decides something is `<|call|>` (200012): harmony
+    ends a turn *that called a tool* with it, and a stop set without it means a model offered
+    a function writes the call, does not stop, and spends the rest of the budget writing the
+    result of its own call and an answer based on it.
+
+    The fixture is not needed: the two files are read, not the weights."""
+    directory = checkpoint_dir(REPO)
+    declared = gpt_oss_module._config(directory / "config.json").eos_token_id
+
+    stop = stop_tokens(directory, declared)
+
+    assert declared == (200002,), "the config alone, which is what the trunk carries"
+    assert stop[0] == 200002, "the checkpoint's own first eos stays first"
+    assert set(stop) == {200002, 199999, 200012}

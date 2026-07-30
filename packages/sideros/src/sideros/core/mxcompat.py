@@ -1,7 +1,8 @@
 """Typed bindings for mlx entry points whose 0.30.6 stubs are stale.
 
 The bundled stubs type `metal_kernel` as returning `object`, omit `softmax`'s
-`precise` flag and require `gather_mm`'s index arguments. The runtime accepts all
+`precise` flag, require `gather_mm`'s index arguments and leave `nn.Module`'s dict
+base unparameterized, so subscripting a module is `Unknown`. The runtime accepts all
 of them (verified by the parity tests). The TYPE_CHECKING declarations below are
 the corrected signatures; at runtime the names bind to the real functions.
 Re-audit on every mlx bump.
@@ -11,8 +12,13 @@ from collections.abc import Sequence
 from typing import TYPE_CHECKING, Protocol
 
 import mlx.core as mx
+import mlx.nn as nn
 
 if TYPE_CHECKING:
+
+    def module_item(module: nn.Module, key: str) -> object: ...
+
+    def set_module_item(module: nn.Module, key: str, value: object) -> None: ...
 
     class MetalKernel(Protocol):
         def __call__(
@@ -48,6 +54,8 @@ if TYPE_CHECKING:
     ) -> mx.array: ...
 
 else:
+    module_item = dict.__getitem__
+    set_module_item = dict.__setitem__
     metal_kernel = mx.fast.metal_kernel
     softmax = mx.softmax
     gather_mm = mx.gather_mm

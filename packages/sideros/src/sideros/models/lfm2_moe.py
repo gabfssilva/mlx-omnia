@@ -10,18 +10,27 @@ The conv is unrolled into `kernel` shifted taps accumulated in float32 — bit-e
 `conv1d`, and the only form whose one-token step is a handful of elementwise ops. The
 conv window cannot be rewound; the attention layers keep their KV history and trim
 normally.
-
-Config dataclass, TypedDict and loader live here for now; the integration stage moves
-them into `config.py`/`checkpoint.py`.
 """
 
+import json
 import math
 from dataclasses import dataclass
-from typing import NamedTuple
+from pathlib import Path
+from typing import NamedTuple, TypedDict
 
 import mlx.core as mx
 import mlx.nn as nn
 
+from sideros.bpe import ByteLevelBPE
+from sideros.chat import chat_capabilities
+from sideros.checkpoint import (
+    checkpoint,
+    drop_tied_head,
+    fuse_qkv,
+    load_shards,
+    reject_dtype_cast,
+    stop_tokens,
+)
 from sideros.core.cache import ConvCache, KVCache
 from sideros.core.kernels.conv_mix import conv_mix, conv_mix_applies
 from sideros.core.kernels.moe_gemv_dense import (
@@ -30,8 +39,9 @@ from sideros.core.kernels.moe_gemv_dense import (
     moe_gemv_dense_applies,
     moe_route_sigmoid,
 )
-from sideros.core.layers import SORTED_GATHER_MIN, sorted_gather, split_qkv
-from sideros.models.qwen3_moe import SwitchLinear
+from sideros.core.layers import SORTED_GATHER_MIN, SwitchLinear, sorted_gather, split_qkv
+from sideros.language import LanguageModel, TextLanguageModel
+from sideros.model import CompositeModel, ModelInput
 
 # A/B switches for the bench: set either to False to fall back to the op path, which
 # stays the parity reference. The predicates read them on every call.
@@ -65,6 +75,7 @@ class LFM2MoEConfig:
     tie_word_embeddings: bool
     rope_theta: float
     vocab_size: int
+    eos_token_id: tuple[int, ...]
 
     @property
     def head_dim(self) -> int:
@@ -376,3 +387,133 @@ class LFM2MoE(nn.Module):
     def __call__(self, ids: mx.array, cache: list[KVCache | ConvCache] | None = None) -> mx.array:
         return self.activations(ids, cache).logits
 
+
+class _RoPEJson(TypedDict):
+    rope_theta: float
+
+
+class _Json(TypedDict):
+    model_type: str
+    hidden_size: int
+    intermediate_size: int
+    moe_intermediate_size: int
+    num_hidden_layers: int
+    num_attention_heads: int
+    num_key_value_heads: int
+    num_experts: int
+    num_experts_per_tok: int
+    num_dense_layers: int
+    norm_topk_prob: bool
+    use_expert_bias: bool
+    routed_scaling_factor: float
+    norm_eps: float
+    conv_bias: bool
+    conv_L_cache: int
+    layer_types: list[str]
+    tie_word_embeddings: bool
+    rope_parameters: _RoPEJson
+    vocab_size: int
+    eos_token_id: int | list[int]
+
+
+def _config(path: Path) -> LFM2MoEConfig:
+    raw: _Json = json.loads(path.read_text())
+    if raw["model_type"] != "lfm2_moe":
+        raise ValueError(f"expected model_type lfm2_moe, got {raw['model_type']!r}")
+    eos = raw["eos_token_id"]
+    return LFM2MoEConfig(
+        hidden_size=raw["hidden_size"],
+        intermediate_size=raw["intermediate_size"],
+        moe_intermediate_size=raw["moe_intermediate_size"],
+        num_hidden_layers=raw["num_hidden_layers"],
+        num_attention_heads=raw["num_attention_heads"],
+        num_key_value_heads=raw["num_key_value_heads"],
+        num_experts=raw["num_experts"],
+        num_experts_per_tok=raw["num_experts_per_tok"],
+        num_dense_layers=raw["num_dense_layers"],
+        norm_topk_prob=raw["norm_topk_prob"],
+        use_expert_bias=raw["use_expert_bias"],
+        routed_scaling_factor=raw["routed_scaling_factor"],
+        norm_eps=raw["norm_eps"],
+        conv_bias=raw["conv_bias"],
+        conv_l_cache=raw["conv_L_cache"],
+        layer_types=tuple(raw["layer_types"]),
+        tie_word_embeddings=raw["tie_word_embeddings"],
+        rope_theta=raw["rope_parameters"]["rope_theta"],
+        vocab_size=raw["vocab_size"],
+        eos_token_id=tuple(eos) if isinstance(eos, list) else (eos,),
+    )
+
+
+def _fuse_dense_mlp(weights: dict[str, mx.array], layers: int) -> dict[str, mx.array]:
+    for layer in range(layers):
+        prefix = f"model.layers.{layer}.feed_forward."
+        keys = [f"{prefix}{name}.weight" for name in ("w1", "w3")]
+        if not all(key in weights for key in keys):
+            continue
+        fused = mx.concatenate([weights.pop(key) for key in keys], axis=0)
+        mx.eval(fused)
+        weights[f"{prefix}w13.weight"] = fused
+    return weights
+
+
+def _stack_experts(weights: dict[str, mx.array], config: LFM2MoEConfig) -> dict[str, mx.array]:
+    """One `[experts, out, in]` tensor per projection, w1‖w3 joined on the output axis.
+    The per-expert slices leave the dict, or both copies stay resident."""
+    for layer in range(config.num_dense_layers, config.num_hidden_layers):
+        prefix = f"model.layers.{layer}.feed_forward.experts."
+        parts: dict[str, list[mx.array]] = {}
+        for name in ("w1", "w3", "w2"):
+            parts[name] = [
+                weights.pop(f"{prefix}{expert}.{name}.weight")
+                for expert in range(config.num_experts)
+            ]
+        w13 = mx.stack(
+            [mx.concatenate([g, u], axis=0) for g, u in zip(parts["w1"], parts["w3"], strict=True)]
+        )
+        w2 = mx.stack(parts["w2"])
+        mx.eval(w13, w2)
+        weights[f"{prefix}w13.weight"] = w13
+        weights[f"{prefix}w2.weight"] = w2
+    return weights
+
+
+def _weights(
+    directory: Path, config: LFM2MoEConfig, dtype: mx.Dtype | None
+) -> dict[str, mx.array]:
+    """`expert_bias` ships float32 in a bfloat16 checkpoint and stays float32: the router
+    adds it in float32 whatever the model's precision."""
+    weights = load_shards(directory)
+    reject_dtype_cast(dtype, weights)
+
+    if dtype is not None:
+        weights = {
+            key: value if key.endswith("expert_bias") else value.astype(dtype)
+            for key, value in weights.items()
+        }
+    if config.tie_word_embeddings:
+        drop_tied_head(weights)
+
+    weights = fuse_qkv(weights, config.num_hidden_layers)
+    weights = _fuse_dense_mlp(weights, config.num_dense_layers)
+    return _stack_experts(weights, config)
+
+
+def _composite(directory: Path, model: LFM2MoE) -> LanguageModel[ModelInput]:
+    return CompositeModel(
+        TextLanguageModel(
+            model,
+            ByteLevelBPE.from_file(directory / "tokenizer.json"),
+            stop=stop_tokens(directory, model.config.eos_token_id),
+        ),
+        chat_capabilities(directory),
+    )
+
+
+CHECKPOINT = checkpoint((
+        "config.json",
+        "model*.safetensors",
+        "tokenizer.json",
+        "tokenizer_config.json",
+        "chat_template.jinja",
+    ), _config, LFM2MoE, _weights, _composite)

@@ -21,10 +21,9 @@ from conftest import (
 )
 
 from sideros import stream_ids
-from sideros.checkpoint import load_qwen3_5
 from sideros.core.cache import DeltaCache
-from sideros.models.qwen3_5 import Qwen35, Qwen35MoE
-from sideros.models.qwen3_moe import QuantizedSwitchLinear
+from sideros.core.layers import QuantizedSwitchLinear
+from sideros.models.qwen3_5 import CHECKPOINT, Qwen35, Qwen35MoE
 
 FIXTURE = Path(__file__).parent / "fixtures" / "qwen3_5_35b_mlxlm.safetensors"
 REPO = "mlx-community/Qwen3.6-35B-A3B-6bit"
@@ -46,7 +45,7 @@ def golden() -> dict[str, mx.array]:
 
 @pytest.fixture(scope="module")
 def model() -> Qwen35:
-    return load_qwen3_5(checkpoint_dir(REPO))
+    return CHECKPOINT.load(checkpoint_dir(REPO), None)
 
 
 @pytest.fixture(scope="module")

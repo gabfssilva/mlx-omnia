@@ -31,7 +31,13 @@ import numpy as np
 import pytest
 from conftest import relative_diff
 
-from sideros.core.kernels.moe_route import _SOURCE, softmax_topk, softmax_topk_applies
+from sideros.core.kernels.moe_route import (
+    _SIGMOID_SOURCE,
+    _SOURCE,
+    sigmoid_topk,
+    softmax_topk,
+    softmax_topk_applies,
+)
 from sideros.core.mxcompat import metal_kernel, softmax
 
 SHAPES = [(32, 4), (128, 8), (256, 8)]
@@ -212,5 +218,143 @@ def test_unmutated_replica_of_the_dispatch_agrees_with_the_module() -> None:
     logits, k = tied_logits(mx.float32, shared=True)
     indices, weights = softmax_topk(logits, k, shared=True)
     intact = _route(_SOURCE, "moe_route_intact", logits, k, shared=True)
+    assert mx.array_equal(intact[0], indices)
+    assert mx.array_equal(intact[1], weights)
+
+
+# --- sigmoid routing (laguna): selection by sigmoid+bias, weights unbiased ---
+
+SIGMOID_SCALE = 2.5
+
+
+def sigmoid_bias(experts: int, seed: int) -> mx.array:
+    return mx.array(np.random.default_rng(seed + 100).standard_normal(experts) * 0.1).astype(
+        mx.float32
+    )
+
+
+def sigmoid_op_chain(
+    logits: mx.array, bias: mx.array, k: int, dtype: mx.Dtype
+) -> tuple[mx.array, mx.array]:
+    """Selection on the biased fp32 scores (ties to the higher index, stable argsort
+    reversed), weights from the unbiased scores: renormalized in fp32, rounded to T,
+    then scaled in T — the stock chain's astype placement."""
+    probs = np.array(mx.sigmoid(logits.astype(mx.float32)))
+    biased = probs + np.array(bias)
+    chosen = np.argsort(biased, kind="stable")[::-1][:k]
+    weights = probs[chosen] / probs[chosen].sum()
+    scaled = mx.array(weights.astype(np.float32)).astype(dtype) * SIGMOID_SCALE
+    return mx.array(chosen.astype(np.uint32)), scaled
+
+
+@pytest.mark.parametrize("dtype", [mx.float32, mx.bfloat16])
+@pytest.mark.parametrize("shape", SHAPES)
+def test_sigmoid_matches_op_chain(shape: tuple[int, int], dtype: mx.Dtype) -> None:
+    experts, k = shape
+    for seed in range(4):
+        logits = replica(experts, k, seed, dtype, shared=False)
+        bias = sigmoid_bias(experts, seed)
+        indices, weights = sigmoid_topk(logits, bias, k, scale=SIGMOID_SCALE)
+        ref_indices, ref_weights = sigmoid_op_chain(logits, bias, k, dtype)
+        assert mx.array_equal(mx.sort(indices), mx.sort(ref_indices))
+        ours, theirs = _by_index(indices, weights), _by_index(ref_indices, ref_weights)
+        order = sorted(theirs)
+        assert relative_diff(
+            mx.array([ours[i] for i in order]), mx.array([theirs[i] for i in order])
+        ) < _weight_bound(dtype)
+
+
+@pytest.mark.parametrize("dtype", [mx.float32, mx.bfloat16])
+def test_sigmoid_exact_ties_go_to_the_higher_index(dtype: mx.Dtype) -> None:
+    """Zero bias keeps the sigmoid monotonic in the logits, so the tie group and the
+    promised order are the softmax case's."""
+    logits, k = tied_logits(dtype, shared=False)
+    indices, _ = sigmoid_topk(logits, mx.zeros((logits.size,)), k, scale=SIGMOID_SCALE)
+    assert np.array(indices).tolist() == [0, 1, 2, 120, 99, 67, 35, 11]
+
+
+def test_sigmoid_bias_selects_but_never_weighs() -> None:
+    """Boosting one outsider's bias must pull it in, while its weight still comes from
+    the unbiased score — the biased value must not leak into the renormalization."""
+    logits = replica(256, 8, 2, mx.bfloat16, shared=False)
+    zero = mx.zeros((256,))
+    base_idx, _ = sigmoid_topk(logits, zero, 8, scale=SIGMOID_SCALE)
+    outsider = next(e for e in range(256) if e not in set(np.array(base_idx).tolist()))
+    boosted = mx.where(mx.arange(256) == outsider, 10.0, 0.0)
+    indices, weights = sigmoid_topk(logits, boosted, 8, scale=SIGMOID_SCALE)
+    assert outsider in set(np.array(indices).tolist())
+    ref_indices, ref_weights = sigmoid_op_chain(logits, boosted, 8, mx.bfloat16)
+    ours, theirs = _by_index(indices, weights), _by_index(ref_indices, ref_weights)
+    order = sorted(theirs)
+    assert relative_diff(
+        mx.array([ours[i] for i in order]), mx.array([theirs[i] for i in order])
+    ) < _weight_bound(mx.bfloat16)
+
+
+_SIGMOID_MUTATIONS = {
+    "resolve a lane's tie downwards": (
+        "for (int i = (int)per_lane - 1; i >= 0; i--) {",
+        "for (int i = 0; i < (int)per_lane; i++) {",
+    ),
+    "keep picking the same expert": (
+        "if (winner == cand && slot >= 0) b[(uint)slot] = -INFINITY;",
+        "if (false) b[(uint)slot] = -INFINITY;",
+    ),
+    "drop the renormalization": (
+        "T w = (T)(pick[lane] / total);",
+        "T w = (T)pick[lane];",
+    ),
+    "ignore the bias in selection": (
+        "b[i] = s[i] + B[lane + i * 32];",
+        "b[i] = s[i];",
+    ),
+}
+
+
+def _sigmoid_route(
+    source: str, name: str, logits: mx.array, bias: mx.array, k: int
+) -> list[mx.array]:
+    return metal_kernel(
+        name=name, input_names=["L", "B", "SC"], output_names=["OI", "OW"], source=source
+    )(
+        inputs=[logits, bias, mx.array(SIGMOID_SCALE, dtype=mx.float32)],
+        template=[("T", logits.dtype), ("TOPK", k), ("EXPERTS", logits.size)],
+        grid=(32, 1, 1),
+        threadgroup=(32, 1, 1),
+        output_shapes=[(k,), (k,)],
+        output_dtypes=[mx.uint32, logits.dtype],
+    )
+
+
+@pytest.mark.parametrize("mutation", sorted(_SIGMOID_MUTATIONS))
+def test_sigmoid_mutations_break_the_routing(mutation: str) -> None:
+    """The tie case exercises the pick loop; the boosted-outsider bias makes the bias
+    term decisive, so dropping it changes the selection."""
+    old, new = _SIGMOID_MUTATIONS[mutation]
+    source = _SIGMOID_SOURCE.replace(old, new)
+    assert source != _SIGMOID_SOURCE
+    logits, k = tied_logits(mx.float32, shared=False)
+    bias = mx.where(mx.arange(logits.size) == logits.size - 1, 10.0, 0.0)
+    ref_indices, ref_weights = sigmoid_op_chain(logits, bias, k, mx.float32)
+    broken = _sigmoid_route(
+        source,
+        f"moe_sigmoid_broken_{sorted(_SIGMOID_MUTATIONS).index(mutation)}",
+        logits,
+        bias,
+        k,
+    )
+    picked_changed = not mx.array_equal(mx.sort(broken[0]), mx.sort(ref_indices))
+    ours, theirs = _by_index(broken[0], broken[1]), _by_index(ref_indices, ref_weights)
+    weights_changed = any(
+        e not in theirs or abs(w - theirs[e]) > 1e-2 * abs(theirs[e]) for e, w in ours.items()
+    )
+    assert picked_changed or weights_changed
+
+
+def test_sigmoid_unmutated_replica_agrees_with_the_module() -> None:
+    logits, k = tied_logits(mx.float32, shared=False)
+    bias = sigmoid_bias(logits.size, 0)
+    indices, weights = sigmoid_topk(logits, bias, k, scale=SIGMOID_SCALE)
+    intact = _sigmoid_route(_SIGMOID_SOURCE, "moe_sigmoid_intact", logits, bias, k)
     assert mx.array_equal(intact[0], indices)
     assert mx.array_equal(intact[1], weights)
