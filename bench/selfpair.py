@@ -19,6 +19,10 @@ Decode is teacher-forced to the baseline's greedy stream on both sides. A candid
 whose own greedy stream diverges is reported with the position — ties or a real
 change; the correctness suite, not the bench, decides which.
 
+Prefill and decode are two axes with a 0.95 floor each and no weight between them: the
+run ends in a verdict by dominance, and a candidate that gains one axis while losing
+the other inside the floors is a decision to record, not a number to average.
+
 The baseline's decode s/token is checked against the last calibration stored for
 (model, commit): a slow session hits both sides and the ratio hides it — the
 calibration is what says "this session is not like the others".
@@ -43,6 +47,7 @@ LOADED_RATIO = 0.5
 TELEMETRY_MS = 100
 CALIBRATION = Path.home() / ".cache/sideros/selfpair.json"
 CALIBRATION_BAND = 0.05
+FLOOR = 0.95
 
 
 class Telemetry:
@@ -154,17 +159,57 @@ def run_side(
         return json.loads(out.read_text())
 
 
-def report(label: str, result: dict) -> tuple[float, float]:
+def report(label: str, result: dict, prompt: int) -> tuple[list[float], list[float]]:
+    """The two axes, both as tokens/s so higher is better on each: prompt tokens through
+    prefill and generated tokens through decode. The prefill axis is ttft, which carries
+    the first decode step — the same term on both sides, so the ratio is honest and the
+    absolute number is not prefill alone."""
+    prefills = [prompt / t for t, _ in result["samples"]]
     decodes = [d for _, d in result["samples"]]
-    ttfts = [t for t, _ in result["samples"]]
     clocks = [c for c in result["clocks"] if c is not None]
     clock = f"   min clock {min(clocks)} MHz" if clocks else ""
-    ttft, decode = statistics.median(ttfts), statistics.median(decodes)
+    ttft = statistics.median([t for t, _ in result["samples"]])
+    decode = statistics.median(decodes)
     print(
-        f"{label:<9} ttft {ttft * 1000:7.1f} ms   decode {decode:7.1f} tok/s   "
+        f"{label:<9} ttft {ttft * 1000:7.1f} ms ({ttft * 1000 / prompt:5.2f} ms/prompt tok)   "
+        f"decode {decode:7.1f} tok/s   "
         f"(min {min(decodes):.1f}, max {max(decodes):.1f}, n={len(decodes)}){clock}"
     )
-    return ttft, decode
+    return prefills, decodes
+
+
+def axis(base: list[float], current: list[float]) -> tuple[float, int]:
+    """Speedup and direction. The direction is 0 unless the two batteries' ranges are
+    disjoint — the house rule for a movement that can be trusted — so ordinary noise on
+    one axis does not read as a regression on it."""
+    speedup = statistics.median(current) / statistics.median(base)
+    if min(current) > max(base):
+        return speedup, 1
+    if max(current) < min(base):
+        return speedup, -1
+    return speedup, 0
+
+
+def verdict(decode: tuple[float, int], prefill: tuple[float, int]) -> str:
+    """Two axes, no scalarization: a weighted score would let a prefill regression be
+    bought with decode at a fixed exchange rate nobody chose. Dominated rejects
+    mechanically; a genuine tradeoff is not the bench's call."""
+    axes = (("decode", decode), ("prefill", prefill))
+    below = [name for name, (speedup, _) in axes if speedup < FLOOR]
+    if below:
+        return f"verdict: rejected — {' and '.join(below)} below the {FLOOR:.2f} floor"
+    up = [name for name, (_, direction) in axes if direction > 0]
+    down = [name for name, (_, direction) in axes if direction < 0]
+    if up and down:
+        return (
+            f"verdict: tradeoff — {up[0]} up, {down[0]} down, both inside the floors;"
+            " yours to decide and to record in MIGRATION.md"
+        )
+    if down:
+        return f"verdict: rejected — {' and '.join(down)} down, nothing up"
+    if up:
+        return f"verdict: accepted — {' and '.join(up)} up, neither axis down"
+    return "verdict: neutral — neither axis moved outside its range"
 
 
 def check_calibration(model: str, commit: str, decode: float) -> None:
@@ -224,12 +269,15 @@ def main() -> None:
         )
 
     print()
-    base_ttft, base_decode = report("baseline", baseline)
-    cur_ttft, cur_decode = report("current", current)
+    base_prefill, base_decode = report("baseline", baseline, len(ids))
+    cur_prefill, cur_decode = report("current", current, len(ids))
+    decode = axis(base_decode, cur_decode)
+    prefill = axis(base_prefill, cur_prefill)
     print(
-        f"ratio: decode {cur_decode / base_decode:.3f}x   ttft {base_ttft / cur_ttft:.3f}x"
+        f"ratio: decode {decode[0]:.3f}x   prefill {prefill[0]:.3f}x"
         "   (current/baseline; >1 = current faster)"
     )
+    print(verdict(decode, prefill))
     divergence = next(
         (
             n
@@ -245,7 +293,7 @@ def main() -> None:
             f"streams: diverge at id {divergence} — a tie or a real change; the"
             " correctness suite decides which, not this bench"
         )
-    check_calibration(model, commit, base_decode)
+    check_calibration(model, commit, statistics.median(base_decode))
 
 
 if __name__ == "__main__":

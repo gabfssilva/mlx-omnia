@@ -300,16 +300,17 @@ def battery(
     return samples
 
 
-def report(name: str, samples: list[tuple[float, float]]) -> float:
+def report(name: str, samples: list[tuple[float, float]], prompt: int) -> tuple[float, float]:
     decodes = [d for _, d in samples]
     ttfts = [t for t, _ in samples]
     median = statistics.median(decodes)
+    ttft = statistics.median(ttfts)
     print(
-        f"{name:<14} ttft {statistics.median(ttfts) * 1000:7.1f} ms   "
+        f"{name:<14} ttft {ttft * 1000:7.1f} ms ({ttft * 1000 / prompt:5.2f} ms/prompt tok)   "
         f"decode {median:7.1f} tok/s   "
         f"(min {min(decodes):.1f}, max {max(decodes):.1f}, n={len(samples)})"
     )
-    return median
+    return ttft, median
 
 
 def report_speculation(
@@ -406,9 +407,13 @@ def main() -> None:
     arms["mlx-lm"] = mlxlm_arm
 
     samples = battery(arms, ids, find_macmon())
-    medians = {arm: report(arm, samples[arm]) for arm in arms}
-    ours_decode = medians["sideros"]
-    print(f"ratio: {ours_decode / medians['mlx-lm']:.3f}x (sideros/mlx-lm, decode)")
+    medians = {arm: report(arm, samples[arm], len(ids)) for arm in arms}
+    ours_ttft, ours_decode = medians["sideros"]
+    ref_ttft, ref_decode = medians["mlx-lm"]
+    print(
+        f"ratio: decode {ours_decode / ref_decode:.3f}x   prefill {ref_ttft / ours_ttft:.3f}x"
+        "   (sideros/mlx-lm; >1 = sideros faster)"
+    )
 
     if name in WITH_CEILING:
         active = active_bytes_per_token(ours_model)
@@ -419,7 +424,7 @@ def main() -> None:
             "of ceiling"
         )
     if draft_model is not None:
-        speculated = medians["sideros+draft"]
+        _, speculated = medians["sideros+draft"]
         report_speculation(ours_model, draft_model, lookahead, acceptance, speculated)
         print(f"draft speedup: {speculated / ours_decode:.3f}x (same stream, same prompt)")
 
