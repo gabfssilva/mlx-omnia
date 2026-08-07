@@ -58,7 +58,7 @@ resolution of the sweep observable at all in a test."""
 
 _LATENESS = 1.0
 """How late the sweep may be past a deadline it knew in advance. It is the assertion that
-separates waiting for the deadline from polling on an interval: oMLX's adaptive interval
+separates waiting for the deadline from polling on an interval: an adaptive polling interval
 falls to 10-30s while everything is idle, and nothing else in this test can tell that apart
 from an expiry that fires on time. A second is two orders above the sweep's own path — one
 sqlite read and one trip through the queue — and one order above the 20 ms the poll below

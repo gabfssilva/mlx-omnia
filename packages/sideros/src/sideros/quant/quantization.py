@@ -124,6 +124,34 @@ class AffineWeight:
         )
 
 
+def pack_affine(codes: mx.array, bits: int) -> mx.array:
+    """mlx packs the codes of a row into a bit-contiguous stream of uint32 words, from the
+    lower bits upwards. A width that divides 32 gives every code a fixed shift inside one
+    word; 3, 5 and 6 straddle the boundary, and there the codes go through their own bits.
+
+    Here and not in whoever rounds: the layout belongs to the affine format, and a method
+    that fixes its parameters before the codes — GPTQ compensates a column after its group
+    is closed, oQe searches the group's grid — cannot ask `mx.quantize` to pack for it
+    without having the scales recomputed underneath."""
+    columns = codes.shape[-1]
+    if (columns * bits) % 32:
+        raise ValueError(f"{columns} codes at {bits} bits do not fill whole uint32 words")
+    words = columns * bits // 32
+    grouped = codes.astype(mx.uint32)
+    if 32 % bits == 0:
+        per_word = 32 // bits
+        shifts = (bits * mx.arange(per_word)).astype(mx.uint32)
+        packed = mx.left_shift(
+            grouped.reshape(*codes.shape[:-1], words, per_word), shifts
+        )
+        return packed.sum(axis=-1).astype(mx.uint32)
+    stream = mx.bitwise_and(
+        mx.right_shift(grouped[..., None], mx.arange(bits, dtype=mx.uint32)), 1
+    )
+    stream = stream.reshape(*codes.shape[:-1], words, 32)
+    return mx.left_shift(stream, mx.arange(32, dtype=mx.uint32)).sum(axis=-1).astype(mx.uint32)
+
+
 class AffineRTN:
     def quantize(
         self,

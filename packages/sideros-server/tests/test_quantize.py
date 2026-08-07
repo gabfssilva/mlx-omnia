@@ -65,8 +65,8 @@ _IDS = mx.array([[3, 1, 4, 1, 5]])
 _LEAVES = ("attn", "embed", "head", "mlp")
 """Every quantizable leaf of the model below, in the order `inventory` sorts them."""
 
-_CALIBRATED = ("awq", "gptq", "oq")
-"""The three that read a calibration pass. They run here — over the blocked model below,
+_CALIBRATED = ("awq", "gptq", "oq", "oqe")
+"""The four that read a calibration pass. They run here — over the blocked model below,
 which is the one with a trunk to intercept."""
 
 _HIDDEN = 64
@@ -737,6 +737,42 @@ def test_oq_allocates_by_the_sensitivity_it_measured_and_says_why_leaf_by_leaf(
     assert {declared[path]["bits"] for path in _BLOCK_LEAVES} != {4}, "the plan is uniform"
 
 
+def test_oqe_keeps_oq_s_plan_and_changes_only_what_the_imatrix_rounds(
+    client: TestClient, blocked: Path
+) -> None:
+    """The two halves are independent: the widths are the same allocator's over the same
+    sensitivities — the `quantization` block of the two entries is identical leaf by leaf —
+    and what oQe replaces is the grid each group is rounded against. Outside the trunk there
+    is no imatrix to round against, so those leaves are RTN's in both and the entry says so.
+    """
+    request: dict[str, object] = {
+        "source": str(blocked),
+        "bits": 4,
+        "group_size": 64,
+        **_CALIBRATION,
+    }
+    directory = _finish(client, repo=REPO, method="oqe", **request)
+    plain = _finish(client, repo="local/oq", method="oq", **request)
+
+    block = _recorded(directory)["oqe"]
+    assert isinstance(block, dict)
+    assert block["rtn_fallback"] == list(_OUTSIDE)
+
+    config = json.loads((directory / "config.json").read_text())
+    assert config["quantization"] == json.loads((plain / "config.json").read_text())[
+        "quantization"
+    ], "the imatrix moved a width: oQe's plan is oQ's"
+    assert config["oq"]["recipe_identifier"] == "oQ4"
+
+    written, reference = _written(directory), _written(plain)
+    for path in _OUTSIDE:
+        assert mx.array_equal(written[f"{path}.weight"], reference[f"{path}.weight"]).item()
+    assert any(
+        not mx.array_equal(written[f"{path}.weight"], reference[f"{path}.weight"]).item()
+        for path in _BLOCK_LEAVES
+    ), "the imatrix never reached the rounding: every leaf came out RTN's"
+
+
 def test_a_source_without_a_trunk_fails_the_calibrated_job_and_writes_nothing(
     client: TestClient, source: Path, caches: Path
 ) -> None:
@@ -785,7 +821,9 @@ def test_awq_and_gptq_are_priced_as_rtn_and_oq_by_the_scoreless_allocator(
     packing, the other replaces the rounding inside it — so the bytes are RTN's and the price
     is the same number. oQ is priced by the allocator with no scores: the sensitivity only
     orders the spending, so the reserved decisions and the budget the greedy fills to are the
-    same numbers the job reaches — what moves is which free leaf gets the promotion."""
+    same numbers the job reaches — what moves is which free leaf gets the promotion. oQe is
+    that same price: its plan is oQ's, and a searched grid weighs what a rounded one weighs.
+    """
     baseline = price(client, source=str(blocked), bits=4)
 
     for method in ("awq", "gptq"):
@@ -793,6 +831,9 @@ def test_awq_and_gptq_are_priced_as_rtn_and_oq_by_the_scoreless_allocator(
 
     projected = price(client, source=str(blocked), bits=4, method="oq")
 
+    assert price(client, source=str(blocked), bits=4, method="oqe") == projected, (
+        "oQe was priced as something other than the plan it shares with oQ"
+    )
     assert projected["entry_bytes"] > baseline["entry_bytes"]
     assert baseline["bits_per_weight"] < projected["bits_per_weight"] <= (
         baseline["bits_per_weight"] + 1.0

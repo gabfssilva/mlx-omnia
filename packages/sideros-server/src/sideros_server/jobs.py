@@ -10,8 +10,8 @@ Cancellation is cooperative and has to reach inside the blocking work. The job b
 a thread of this module's own pool (see `Jobs`), where an `asyncio.Task.cancel()` interrupts
 neither an MLX load nor a socket read: `DELETE` sets a `threading.Event` and `report` — the
 same call the work already makes to publish progress — raises `Cancelled` when it finds it
-set. That is oMLX's way out of a download callback, and it is the only piece of theirs worth
-inheriting.
+set. That is the one way out of a download callback that has survived contact with
+production, and it is worth inheriting.
 
 The row in `store.jobs` is written on every frame, so `GET` is answered from the file: a job
 that outlived the process still reports where it stopped. What stays in memory is only what

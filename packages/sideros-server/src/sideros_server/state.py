@@ -2,8 +2,8 @@
 
 The residency figure is the **maximum** of three numbers and never one of them alone.
 Once a model settles, both MLX's active memory and the process' resident size read
-*below* what it actually occupies; oMLX admitted a second large model on that reading and
-blew the ceiling (issue #1623), and the form that survived there is the one A6 adopts —
+*below* what it actually occupies; another MLX server once admitted a second large model
+on that reading and blew the ceiling, and the form that survived there is the one A6 adopts —
 the accumulator summed off the trees is the floor neither live meter is allowed to
 undershoot.
 

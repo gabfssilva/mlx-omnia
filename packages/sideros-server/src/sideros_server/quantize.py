@@ -27,7 +27,7 @@ already owns, and a repository nobody downloaded is `POST /admin/models`, not th
 also what keeps the provenance a hub model deserves — repository plus commit sha, the
 fingerprint `load` writes — instead of the anonymous directory heuristic a path would get.
 
-All four methods run here. Three of them read a calibration pass, and that pass no longer
+All five methods run here. Four of them read a calibration pass, and that pass no longer
 asks an architecture to describe its own trunk: `intercepted_collect` finds the blocks in
 the tree and stands in for each one, so what supplies a block's arguments — the mask, the
 rope pair, the cache — is the model's own prefill. What this route adds is the rest of the
@@ -38,21 +38,25 @@ The dense model is loaded a second time for the pass. The lazy tree a plan resol
 carries no weights and the pass runs the real forward; the loaded model is dropped before
 the weight dict is read, so the two copies are never resident together.
 
-What each method does with what it measured is where the three part. oQ turns the block
+What each method does with what it measured is where the four part. oQ turns the block
 sensitivities into a plan and the packing is the ordinary one. AWQ rewrites the dense
 weights before that same packing, over the pairs the tree admits exactly. GPTQ replaces the
 packing leaf by leaf, and a leaf the pass never observed — the embedding and the head sit
 outside the trunk — falls back to RTN and is named in the provenance instead of dropped in
-silence. Everything the three refused or measured leaves as the entry's provenance, which
-is the only place a job has to say it: nothing here writes to stdout.
+silence. oQe is oQ's plan with GPTQ's shape of packing: the same pass carries the imatrix
+along with the sensitivities, the grid of every group is searched against it, and what was
+never observed falls back to RTN by the same rule. Everything the four refused or measured
+leaves as the entry's provenance, which is the only place a job has to say it: nothing here
+writes to stdout.
 
 `POST /admin/quantizations/plan` prices that same selection and writes nothing. It resolves
 against the same lazy tree the job does, so a source the job would refuse is a source it
 refuses too — today, any architecture whose `Checkpoint` declares no `quantize`. AWQ and
 GPTQ are priced as RTN and by the same code, because their plan *is* RTN's: neither moves a
-leaf's format, and the bytes of an entry are the formats alone. oQ is refused there — its
-plan is the measured sensitivity, and the only number available before the pass is the
-budget the request already carries.
+leaf's format, and the bytes of an entry are the formats alone. oQ and oQe are priced by the
+allocator the job runs, handed no scores: the reserved decisions and the budget the greedy
+fills to are known before the pass, so the totals hold and only which free leaf takes the
+promotion is the job's to decide.
 """
 
 import json
@@ -91,6 +95,7 @@ from sideros.quant.oq import (
     plan_provenance,
     provenance_json,
 )
+from sideros.quant.oqe import ImportanceMatrixAffine
 from sideros.quant.quantization import (
     Affine,
     ByPath,
@@ -153,16 +158,16 @@ class PlanRequest(BaseModel):
     """Width per group of leaves, keyed by the same `fullmatch` pattern the engine's
     selection takes; `null` says dense. A pattern matching no leaf fails the job, which is
     the engine's own rule about a selection that does not resolve."""
-    method: Literal["rtn", "awq", "gptq", "oq"] = "rtn"
-    """The engine's four, and all four run. What separates them is the calibration pass the
-    last three read; `rtn` reads none, which is why every field below is refused with it."""
+    method: Literal["rtn", "awq", "gptq", "oq", "oqe"] = "rtn"
+    """The engine's five, and all five run. What separates them is the calibration pass the
+    last four read; `rtn` reads none, which is why every field below is refused with it."""
     sequences: int = Field(default=16, gt=0)
     """How many windows of the corpus the pass runs. The corpus itself is not a field: it is
     the engine's `CORPUS_V1` at seed 0, so two identical requests observe identical rows."""
     sequence_length: int = Field(default=256, gt=0)
     target_bpw: float | None = None
-    """oQ's budget in effective bits per weight — physical bytes, scales and biases
-    included. Absent, it is the RTN plan this same request would have produced plus
+    """The allocator's budget in effective bits per weight — physical bytes, scales and
+    biases included. Absent, it is the RTN plan this same request would have produced plus
     `_HEADROOM`: a budget under what RTN costs is a request for a smaller checkpoint, and
     the allocator can only refuse it."""
     hard_cap_bpw: float | None = None
@@ -177,6 +182,10 @@ class QuantizeRequest(PlanRequest):
 
 _CALIBRATION_FIELDS = ("sequences", "sequence_length")
 _BUDGET_FIELDS = ("target_bpw", "hard_cap_bpw")
+
+_ALLOCATED = ("oq", "oqe")
+"""The two methods whose plan is the allocator's rather than the selection's: what oQe adds
+to oQ is the rounding, not the widths."""
 
 _GPTQ_BITS = (2, 4, 8)
 """The widths whose uint32 packing is verified against `mx.quantize`. GPTQ packs its own
@@ -207,14 +216,14 @@ def _admissible(request: PlanRequest) -> None:
                 status_code=400,
                 detail=f"'rtn' reads no calibration, so it takes none of {named}",
             )
-    if request.method != "oq":
+    if request.method not in _ALLOCATED:
         named = sorted(set_fields.intersection(_BUDGET_FIELDS))
         if named:
             raise HTTPException(
                 status_code=400,
                 detail=(
                     f"{request.method!r} keeps the plan the selection asked for, so it "
-                    f"allocates no budget: {named} is oQ's alone"
+                    f"allocates no budget: {named} is the allocator's alone"
                 ),
             )
     if request.method == "gptq" and request.bits not in _GPTQ_BITS:
@@ -373,6 +382,29 @@ def _pack_gptq(
     return {"reconstruction_error": errors, "rtn_fallback": fallback}
 
 
+def _pack_oqe(
+    job: Job,
+    weights: dict[str, mx.array],
+    plan: QuantizationPlan,
+    statistics: Mapping[str, mx.array],
+) -> dict[str, object]:
+    """`_pack`, with the grid of each group searched against the leaf's own imatrix instead
+    of read off its extremes. The fallback rule is GPTQ's, and for the same reason: a leaf
+    the pass never observed has no statistic to round against, so it is packed by RTN and
+    named — which leaves are oQe's is a fact about the file."""
+    total = len(plan)
+    fallback: list[str] = []
+    for index, (path, format) in enumerate(plan.items()):
+        job.report(Progress(message=path, completed=index, total=total))
+        mean_square = statistics.get(f"{path}.mean_square")
+        if mean_square is None or not isinstance(format, Affine):
+            fallback.append(path)
+            quantize_weights(weights, {path: format})
+            continue
+        quantize_weights(weights, {path: format}, method=ImportanceMatrixAffine(mean_square))
+    return {"rtn_fallback": fallback}
+
+
 @dataclass(frozen=True)
 class _Calibrated:
     """What the pass leaves behind for the packing that follows it: the plan (oQ's is not
@@ -393,17 +425,23 @@ def _calibrated(
     plan: QuantizationPlan,
 ) -> _Calibrated:
     match request.method:
-        case "oq":
+        case "oq" | "oqe":
             base = Affine(group_size=request.group_size, bits=request.bits)
             sensitivity = OqSensitivity()
-            calibration = _observe(job, source, request, [sensitivity], _candidates(base))
+            # One pass for both: the block sensitivities order the promotions and the
+            # imatrix rounds the leaves, and neither is worth a second forward.
+            imatrix = ImportanceMatrix() if request.method == "oqe" else None
+            collectors: list[Collector] = [sensitivity]
+            if imatrix is not None:
+                collectors.append(imatrix)
+            calibration = _observe(job, source, request, collectors, _candidates(base))
             leaves = _leaves(checkpoint.directory, checkpoint.pending.model)
             intent = _intent(request, selection, plan_cost(leaves, plan).bits_per_weight)
             allocation = OQAllocator(intent, RECIPE_OQ4_V1).allocate(leaves, sensitivity.scores())
             provenance = plan_provenance(allocation, RECIPE_OQ4_V1, intent, calibration)
             return _Calibrated(
                 allocation.plan,
-                {},
+                {} if imatrix is None else imatrix.statistics(),
                 {"calibration": json.loads(calibration.to_json())},
                 {"oq": provenance_json(provenance)},
             )
@@ -463,6 +501,8 @@ def _quantize(source: str, repo: str, selection: ByPath, request: QuantizeReques
                 recorded["awq"] = [_outcome_json(outcome) for outcome in outcomes]
             if request.method == "gptq":
                 recorded["gptq"] = _pack_gptq(job, weights, plan, calibrated.statistics)
+            elif request.method == "oqe":
+                recorded["oqe"] = _pack_oqe(job, weights, plan, calibrated.statistics)
             else:
                 _pack(job, weights, plan)
             job.report(Progress(message=f"writing {repo}", completed=total, total=total))
@@ -588,7 +628,7 @@ def price(request: PlanRequest) -> PricedPlan:
     try:
         leaves = [replace(leaf, dtype=dtype) for leaf in inventory(resolved.pending.model)]
         plan = expand_plan(resolved.pending.model, selection)
-        if request.method == "oq":
+        if request.method in _ALLOCATED:
             intent = _intent(request, selection, plan_cost(leaves, plan).bits_per_weight)
             plan = OQAllocator(intent, RECIPE_OQ4_V1).allocate(leaves, ()).plan
         costs = {leaf.path: leaf_cost(leaf, plan.get(leaf.path)) for leaf in leaves}

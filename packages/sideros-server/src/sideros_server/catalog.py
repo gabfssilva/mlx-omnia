@@ -12,8 +12,14 @@ shards, and listing it turns a failed download into a load error at request time
 `bytes_per_token` is priced per entry, not cached: the arithmetic reads the safetensors
 headers and never a shard, which on this machine's cache is 0.9 ms per entry warm (5.4 ms
 cold on a 4-shard 17 GB checkpoint) against the 25 ms the walk already costs for 74
-entries. The lazy tree would have been the other source, and it cannot be: it is built
-before `nn.quantize`, so a 4-bit checkpoint would be priced at its dense fp32 shapes.
+entries. The bytes have to come off the headers and not off the lazy tree, which is built
+before `nn.quantize` and would price a 4-bit checkpoint at its dense shapes; what does come
+off that tree is how many rows of an expert stack a step reads (`_slots`), because that is
+the architecture's to say and no config key is a reliable name for it. Building one costs
+3 ms on the median entry and 21 ms on the deepest, so it is cached per config.
+
+Priced this way the number is still an estimate, and a resident entry does not use it: the
+engine walked the real tree at load, and that is what the handlers answer with.
 
 The handlers are sync on purpose: the scan stats a few hundred files and a delete can
 unlink tens of gigabytes, so they run in the threadpool instead of stalling the loop —
@@ -23,7 +29,7 @@ and with it the token stream of whatever is generating.
 import json
 import re
 import shutil
-from collections.abc import Iterator
+from collections.abc import Iterator, Mapping
 from dataclasses import dataclass, replace
 from functools import lru_cache
 from pathlib import Path, PurePosixPath
@@ -34,6 +40,8 @@ from fastapi import APIRouter, Depends, HTTPException, Request
 from fastapi.responses import FileResponse, PlainTextResponse
 
 from sideros.checkpoint import QuantizationJson
+from sideros.footprint import expert_slots
+from sideros.task import source as checkpoint_source
 from sideros_server.engine import Engine
 
 HUB_CACHE = Path(huggingface_hub.constants.HF_HUB_CACHE)
@@ -43,7 +51,7 @@ QUANTIZED_CACHE = Path.home() / ".cache" / "sideros" / "quantized"
 class _QuantizationJson(TypedDict):
     """Both shapes the block is written in: mlx's global one and the per-leaf plan
     `save_quantized` writes. Neither key is required — a dense config has no block at all,
-    and mlx-lm's per-path overrides sit next to the global keys under names we do not
+    and other engines' per-path overrides sit next to the global keys under names we do not
     read."""
 
     bits: NotRequired[int]
@@ -58,9 +66,6 @@ class _TextConfigJson(TypedDict):
     max_position_embeddings: NotRequired[int]
     vocab_size: NotRequired[int]
     tie_word_embeddings: NotRequired[bool]
-    num_experts: NotRequired[int]
-    num_local_experts: NotRequired[int]
-    num_experts_per_tok: NotRequired[int]
 
 
 class _ConfigJson(TypedDict):
@@ -70,9 +75,6 @@ class _ConfigJson(TypedDict):
     torch_dtype: NotRequired[str]
     vocab_size: NotRequired[int]
     tie_word_embeddings: NotRequired[bool]
-    num_experts: NotRequired[int]
-    num_local_experts: NotRequired[int]
-    num_experts_per_tok: NotRequired[int]
     quantization: NotRequired[_QuantizationJson]
     text_config: NotRequired[_TextConfigJson]
 
@@ -176,34 +178,54 @@ def weights_dtype(directory: Path) -> str | None:
     return max(floating)[1] if floating else None
 
 
-def _bytes_per_token(directory: Path, config: _ConfigJson) -> int | None:
-    """What one decode step reads, summed from the headers: `k` of the `E` experts and never
-    the whole stack, the untied lm_head whole, the embedding table only when it is also the
-    head — a step gathers one row of it, which is free — and never the vision tower's
-    position table, which a text step does not reach.
+@lru_cache(maxsize=256)
+def _slots(directory: Path, stamp: int) -> Mapping[int, int] | None:
+    """How many rows of an expert stack a step reads, by the stack's depth, off the tree the
+    architecture builds from its own config — no tensor is read and no key is guessed at.
 
-    Three facts the tensors do not carry come off the config. How many experts a token
-    reaches. Whether the head is tied, which transformers defaults to true and gpt2 leaves
-    unsaid. And the vocabulary, which is what tells the embedding table apart from the head:
-    both are `[vocab, ·]`, and only one of them is named `lm_head`.
+    `None` when there is no such tree: an architecture this engine does not load, or a
+    config it cannot parse. Then a checkpoint that stacks anything is not priced at all,
+    because the alternative is what reading a key and defaulting to zero used to do
+    silently — every expert of the stack charged on every token, and a decode rate reported
+    against a ceiling an order of magnitude too low.
+
+    Keyed by the config's mtime, which is what the tree is a function of. Every failure is
+    the same answer, so the catch is total: a directory the catalog lists is not a directory
+    the engine promised to load.
+    """
+    del stamp
+    try:
+        return expert_slots(checkpoint_source(directory, local_files_only=True).pending.model)
+    except Exception:
+        return None
+
+
+def _bytes_per_token(directory: Path, config: _ConfigJson) -> int | None:
+    """What one decode step reads, summed from the headers: `k` of the `E` rows of a stack
+    and never the whole pile, the untied lm_head whole, the embedding table only when it is
+    also the head — a step gathers one row of it, which is free — and never the vision
+    tower's position table, which a text step does not reach.
+
+    A stack is priced by `_slots`, keyed by its leading dimension; a checkpoint that ships
+    one tensor per expert instead of the stack is grouped back into one and priced by how
+    many of them there are. Something stacked that no tree answers for is not priced at all
+    — that is the difference between an estimate and an invented number.
+
+    Two facts stay with the config, and neither is any architecture's own. Whether the head
+    is tied, which transformers defaults to true and gpt2 leaves unsaid. And the vocabulary,
+    which is what tells the embedding table apart from the head: both are `[vocab, ·]`, and
+    only one of them is named `lm_head`.
     """
     text = config.get("text_config", _NO_TEXT)
     vocab = text.get("vocab_size") or config.get("vocab_size") or 0
     nested = text.get("tie_word_embeddings")
     tied = config.get("tie_word_embeddings", True) if nested is None else nested
-    reached = text.get("num_experts_per_tok") or config.get("num_experts_per_tok") or 0
-    experts = (
-        text.get("num_experts")
-        or config.get("num_experts")
-        or text.get("num_local_experts")
-        or config.get("num_local_experts")
-        or 0
-    )
     tensors = _tensors(directory)
     if tensors is None:
         return None
     read = 0
-    routed = 0
+    stacked: list[tuple[int, int]] = []
+    sliced: dict[str, list[int]] = {}
     for name, entry, size in tensors:
         shape = entry["shape"]
         # gpt2's causal-mask buffer, which its loader drops before the tree ever sees it.
@@ -219,12 +241,27 @@ def _bytes_per_token(directory: Path, config: _ConfigJson) -> int | None:
             continue
         if not tied and not head and len(shape) >= 2 and shape[0] == vocab:
             continue
-        stacked = len(shape) >= 3 and shape[0] == experts
-        if experts and (stacked or _EXPERT_SLICE.search(name)):
-            routed += size
+        if _EXPERT_SLICE.search(name):
+            sliced.setdefault(_EXPERT_SLICE.sub(".experts.", name), []).append(size)
+        elif len(shape) >= 3:
+            stacked.append((shape[0], size))
         else:
             read += size
-    return read + (routed * reached // experts if experts else 0)
+    if not stacked and not sliced:
+        return read
+    slots = _slots(directory, (directory / "config.json").stat().st_mtime_ns)
+    if slots is None:
+        return None
+    for rows, size in stacked:
+        # A depth no stack has is not a stack: a conv1d's weight is three-dimensional too,
+        # and a step reads it whole.
+        read += size * slots[rows] // rows if rows in slots else size
+    for group in sliced.values():
+        rows = len(group)
+        if rows not in slots:
+            return None
+        read += sum(group) * slots[rows] // rows
+    return read
 
 
 def _complete(directory: Path) -> bool:
@@ -322,17 +359,33 @@ def context_of(model_id: str) -> int | None:
     return None
 
 
-async def resident_ids(request: Request) -> frozenset[str]:
-    """The ids the engine holds loaded — the one runtime fact a disk catalog needs. Async
-    so it reads the engine's dict on the loop that mutates it."""
+async def resident_models(request: Request) -> Mapping[str, int | None]:
+    """The ids the engine holds loaded, each with what its own tree says a decode step reads
+    — the runtime facts a disk catalog does not have. Async so it reads the engine's dict on
+    the loop that mutates it."""
     engine = request.app.state.engine
     assert isinstance(engine, Engine)
-    return frozenset(engine.resident)
+    return {model_id: entry.active_bytes for model_id, entry in engine.residency.items()}
 
 
-Resident = Annotated[frozenset[str], Depends(resident_ids)]
+Resident = Annotated[Mapping[str, int | None], Depends(resident_models)]
 
 router = APIRouter()
+
+
+def _loaded(entry: CatalogEntry, resident: Mapping[str, int | None]) -> CatalogEntry:
+    """A resident entry answers with the walk over the tree that is serving the requests,
+    not with the estimate off the headers: a checkpoint ships blocks the loader drops
+    (speculative-decoding heads) and tensors it fuses, and the headers cannot know which.
+    `None` is a model with no tree under it, and there the estimate is all there is."""
+    if entry.id not in resident:
+        return entry
+    active = resident[entry.id]
+    return replace(
+        entry,
+        resident=True,
+        bytes_per_token=entry.bytes_per_token if active is None else active,
+    )
 
 
 def _find(model_id: str) -> CatalogEntry:
@@ -344,7 +397,7 @@ def _find(model_id: str) -> CatalogEntry:
 
 @router.get("/admin/models")
 def models(loaded: Resident, resident: bool = False) -> list[CatalogEntry]:
-    entries = [replace(entry, resident=entry.id in loaded) for entry in scan()]
+    entries = [_loaded(entry, loaded) for entry in scan()]
     return [entry for entry in entries if entry.resident or not resident]
 
 
@@ -391,7 +444,7 @@ def asset(model_id: str, asset: str) -> FileResponse:
 
 @router.get("/admin/models/{model_id:path}")
 def model(model_id: str, loaded: Resident) -> CatalogEntry:
-    return replace(_find(model_id), resident=model_id in loaded)
+    return _loaded(_find(model_id), loaded)
 
 
 @router.delete("/admin/models/{model_id:path}", status_code=204)

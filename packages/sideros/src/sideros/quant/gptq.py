@@ -9,15 +9,15 @@ columns of the group at the moment the group opens, so no parameter search is
 reimplemented here. What cannot go through `mx.quantize` is the *packing*: it would
 recompute scales and biases from the already compensated columns, and those differ from
 the ones the codes were rounded against (a column is compensated after its group's
-parameters are fixed). The codes are therefore packed here and handed to `AffineWeight`
-directly.
+parameters are fixed). The codes therefore go through the format's own `pack_affine` and
+are handed to `AffineWeight` directly.
 """
 
 from dataclasses import dataclass
 
 import mlx.core as mx
 
-from sideros.quant.quantization import Affine, AffineWeight
+from sideros.quant.quantization import Affine, AffineWeight, pack_affine
 
 _CPU = mx.Device(mx.cpu)
 """The three factorizations below have no Metal implementation in mlx 0.30."""
@@ -81,6 +81,11 @@ def to_affine(weight: AffineWeight | PermutedAffineWeight) -> AffineWeight:
     contiguous changes which weights share a scale."""
     if isinstance(weight, AffineWeight):
         return weight
+    if 32 % weight.format.bits:
+        raise ValueError(
+            f"{weight.format.bits}-bit codes do not fill a uint32 word evenly; only 2, 4 "
+            "and 8 have a GPTQ layout verified against mx.quantize"
+        )
     columns = weight.codes.shape[-1]
     contiguous = mx.arange(columns) // weight.format.group_size
     if not mx.array_equal(weight.g_idx, contiguous).item():
@@ -94,22 +99,6 @@ def to_affine(weight: AffineWeight | PermutedAffineWeight) -> AffineWeight:
         weight.biases,
         weight.format,
     )
-
-
-def pack_affine(codes: mx.array, bits: int) -> mx.array:
-    """mlx packs the codes of a row into uint32 words from the lower to the upper bits."""
-    if 32 % bits:
-        raise ValueError(
-            f"{bits}-bit codes do not fill a uint32 word evenly; only 2, 4 and 8 have a "
-            "layout verified against mx.quantize"
-        )
-    per_word = 32 // bits
-    columns = codes.shape[-1]
-    if columns % per_word:
-        raise ValueError(f"{columns} codes at {bits} bits do not fill whole uint32 words")
-    grouped = codes.astype(mx.uint32).reshape(*codes.shape[:-1], columns // per_word, per_word)
-    shifts = (bits * mx.arange(per_word)).astype(mx.uint32)
-    return mx.left_shift(grouped, shifts).sum(axis=-1).astype(mx.uint32)
 
 
 def reconstruction_error(

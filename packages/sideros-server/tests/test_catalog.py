@@ -25,8 +25,10 @@ from fastapi.testclient import TestClient
 from mlx.utils import tree_flatten
 
 from sideros.footprint import active_bytes_per_token, ceiling
-from sideros.models.qwen3_moe import CHECKPOINT as QWEN3_MOE
-from sideros.models.qwen3_moe import Qwen3MoE, Qwen3MoEConfig
+from sideros.models.glm4_moe import CHECKPOINT as GLM4_MOE
+from sideros.models.qwen3.moe import CHECKPOINT as QWEN3_MOE
+from sideros.models.qwen3.moe import Qwen3MoE, Qwen3MoEConfig
+from sideros.task import source
 from sideros_server import catalog
 
 QUANTIZED = "mlx-community/Qwen3-0.6B-4bit"
@@ -54,6 +56,34 @@ TINY = Qwen3MoEConfig(
 """Small enough to build, quantize and load inside a unit test, and shaped so that no
 projection's output width collides with the vocabulary — the only 2-D leaves of that height
 are the embedding table and the head, which is what tells them apart from each other."""
+
+GLM_LAYERS = 2
+GLM_CONFIG: dict[str, object] = {
+    "model_type": "glm4_moe",
+    "hidden_size": 64,
+    "num_hidden_layers": GLM_LAYERS,
+    "num_attention_heads": 4,
+    "num_key_value_heads": 2,
+    "head_dim": 16,
+    "vocab_size": 96,
+    "rms_norm_eps": 1e-6,
+    "rope_theta": 1000000.0,
+    "intermediate_size": 48,
+    "moe_intermediate_size": 32,
+    "n_routed_experts": 8,
+    "num_experts_per_tok": 2,
+    "n_group": 1,
+    "topk_group": 1,
+    "routed_scaling_factor": 1.0,
+    "norm_topk_prob": True,
+    "first_k_dense_replace": 0,
+    "n_shared_experts": 1,
+    "eos_token_id": 0,
+    "max_position_embeddings": 128,
+}
+"""A MoE that names its expert count `n_routed_experts` — no key the scan reads — and that
+ships an MTP block one layer past the trunk, which the loader drops. The two things a
+config alone cannot price."""
 
 CONFIG: dict[str, object] = {
     "model_type": "qwen3",
@@ -148,6 +178,28 @@ def _moe_checkpoint(directory: Path, *, bits: int | None) -> Path:
     return directory
 
 
+def _glm_checkpoint(directory: Path) -> int:
+    """The tiny glm4_moe on disk, plus the MTP block GLM ships one layer past the trunk and
+    the loader drops. Answers with the bytes of that block, which is what the headers price
+    and the tree does not.
+
+    The tree it saves is the one the config builds — `source` stops the load exactly there —
+    so the names on disk are the ones `load_weights(strict=True)` asks for; this
+    architecture's fusions are all no-ops when the pre-fusion tensors are absent."""
+    directory.mkdir(parents=True, exist_ok=True)
+    (directory / "config.json").write_text(json.dumps(GLM_CONFIG))
+    mx.random.seed(0)
+    model = source(directory, local_files_only=True).pending.model
+    mx.eval(model.parameters())
+    extra = {
+        f"model.layers.{GLM_LAYERS}.mlp.gate_proj.weight": mx.zeros((32, 64)),
+        f"model.layers.{GLM_LAYERS}.input_layernorm.weight": mx.zeros((64,)),
+    }
+    weights = dict(tree_flatten(model.parameters()))
+    mx.save_safetensors(str(directory / "model.safetensors"), {**weights, **extra})
+    return sum(value.nbytes for value in extra.values())
+
+
 def _installed(hub: Path, model_id: str, config: Mapping[str, object] = CONFIG) -> Path:
     """A repository at a single revision, which is what `refs/main` points at."""
     snapshot = _checkpoint(_repository(hub, model_id) / "snapshots" / "head", config)
@@ -155,10 +207,12 @@ def _installed(hub: Path, model_id: str, config: Mapping[str, object] = CONFIG) 
     return snapshot
 
 
-def _client(*resident: str) -> TestClient:
+def _client(*resident: str, active: int | None = None) -> TestClient:
+    """`active` is what the engine's own walk over the loaded tree says each of them reads —
+    `None` is a resident model with no tree under it, which is what a test double is."""
     app = FastAPI()
     app.include_router(catalog.router)
-    app.dependency_overrides[catalog.resident_ids] = lambda: frozenset(resident)
+    app.dependency_overrides[catalog.resident_models] = lambda: dict.fromkeys(resident, active)
     return TestClient(app)
 
 
@@ -405,6 +459,70 @@ def test_the_scan_prices_a_step_at_what_the_loaded_tree_reads(
     assert entry.bytes_per_token == active_bytes_per_token(QWEN3_MOE.load(directory, None))
     assert entry.bytes_per_token is not None
     assert entry.bytes_per_token * 2 < (directory / "model.safetensors").stat().st_size
+
+
+def test_the_rows_a_step_reads_come_off_the_tree_and_not_off_a_config_key(
+    caches: tuple[Path, Path],
+) -> None:
+    """The regression this pricing exists for. This checkpoint's expert count is under
+    `n_routed_experts`, a name the scan does not read and never will: the count comes from
+    the architecture's own tree, so the family that spells it differently is priced like
+    every other one. Reading a key and falling back to zero when it is absent is what
+    charged all 256 experts of a 2.4-bit DeepSeek-V4 on every token — 92 GB against 8, and
+    a chat that reported 372% of its own ceiling.
+
+    What the headers cannot know is on the other side of the equality: the MTP block ships
+    in the shard and the loader drops it, so the estimate is over the tree's number by
+    exactly that block and by nothing else.
+    """
+    hub, _ = caches
+    directory = _repository(hub, MOE_TINY) / "snapshots" / "head"
+    dropped = _glm_checkpoint(directory)
+    _main(hub, MOE_TINY, "head")
+
+    (entry,) = catalog.scan()
+
+    assert entry.bytes_per_token == active_bytes_per_token(GLM4_MOE.load(directory, None)) + dropped
+    assert entry.bytes_per_token * 2 < (directory / "model.safetensors").stat().st_size
+
+
+def test_a_resident_entry_is_priced_by_the_tree_that_is_answering_the_requests(
+    caches: tuple[Path, Path],
+) -> None:
+    """The estimate off the headers is what an entry carries until it is loaded; from then
+    on the number is the engine's walk over the real tree, which is the one that knows what
+    the loader dropped. A resident model with no tree under it keeps the estimate."""
+    hub, _ = caches
+    directory = _repository(hub, MOE_TINY) / "snapshots" / "head"
+    dropped = _glm_checkpoint(directory)
+    _main(hub, MOE_TINY, "head")
+    estimate = active_bytes_per_token(GLM4_MOE.load(directory, None)) + dropped
+
+    listed = _client(MOE_TINY, active=estimate - dropped).get("/admin/models").json()
+    assert [entry["bytes_per_token"] for entry in listed] == [estimate - dropped]
+
+    untreed = _client(MOE_TINY).get(f"/admin/models/{quote(MOE_TINY, safe='')}").json()
+    assert untreed["bytes_per_token"] == estimate
+    assert catalog.scan()[0].bytes_per_token == estimate
+
+
+def test_an_architecture_with_no_tree_leaves_a_stacked_checkpoint_unpriced(
+    caches: tuple[Path, Path],
+) -> None:
+    """A checkpoint the engine cannot load can still be listed, and its stacks are still
+    stacks — but how many of their rows a step reads is the tree's to say, and there is no
+    tree. The entry reports no number rather than an invented one."""
+    hub, _ = caches
+    directory = _repository(hub, MOE_TINY) / "snapshots" / "head"
+    _glm_checkpoint(directory)
+    (directory / "config.json").write_text(json.dumps({**GLM_CONFIG, "model_type": "glm9_moe"}))
+    _main(hub, MOE_TINY, "head")
+
+    (entry,) = catalog.scan()
+
+    assert entry.architecture == "glm9_moe"
+    assert entry.bytes_on_disk > 0
+    assert entry.bytes_per_token is None
 
 
 def test_the_thirty_billion_moe_prices_at_the_gigabyte_the_house_measured() -> None:

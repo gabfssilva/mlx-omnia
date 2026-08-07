@@ -13,7 +13,8 @@ text it always did.
 """
 
 from sideros.suppress import Segment
-from sideros.tools import QWEN, ToolCall
+from sideros.tools import ToolCall
+from sideros.tools.families.qwen import FAMILY as QWEN
 from sideros_server.responses import Calls
 
 CALL = '<tool_call>{"name": "f", "arguments": {"x": 1}}</tool_call>'

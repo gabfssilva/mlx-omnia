@@ -2,9 +2,9 @@
 
 The number this route exists to get right is the residency total, and the way to get it
 wrong is to trust a live meter: after a model settles both MLX's active memory and the
-process' resident size read below what it occupies, which is how oMLX let a second large
-model in and blew the ceiling. The test that matters here sets both meters below the
-accumulator on purpose — the situation cannot be produced by allocating, only by
+process' resident size read below what it occupies, which is how another MLX server once
+let a second large model in and blew the ceiling. The test that matters here sets both
+meters below the accumulator on purpose — the situation cannot be produced by allocating, only by
 simulating the meters that lie.
 """
 
@@ -345,7 +345,8 @@ def test_the_total_is_the_maximum_and_never_a_live_meter_alone(
     """A6, and the only way to reproduce it: once a model settles both live meters read
     *below* what it occupies, so they are set below the accumulator here on purpose. Drop
     the accumulator from the maximum and the daemon admits a second large model on a
-    reading that already forgot the first — which is how oMLX blew the ceiling (#1623).
+    reading that already forgot the first — which is how another MLX server once blew
+    its ceiling.
     """
 
     async def run() -> dict[str, object]:

@@ -97,7 +97,7 @@ def _config(store: Store) -> _Settings:
 
 def _measured() -> int:
     """What the process holds now, by the two live meters. Both read *below* the real
-    residency once a model has settled (oMLX #1623), which is why the accumulator is maxed
+    residency once a model has settled, which is why the accumulator is maxed
     in over them instead of checked against them."""
     from sideros_server.state import footprint_bytes
 
@@ -416,7 +416,8 @@ class Engine:
 
         What it decides against is `max(both live meters, the accumulator) + KV`, never a
         meter on its own: once a model settles both meters read below what it holds, and that
-        reading is what let oMLX admit a second large model over its own ceiling. The KV
+        reading is what once let another MLX server admit a second large model over its
+        own ceiling. The KV
         counts on top because it grows per request, and the limit has to keep holding with the
         next request's cache inside it.
 
