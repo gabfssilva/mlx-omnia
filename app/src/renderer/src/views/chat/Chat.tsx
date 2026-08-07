@@ -11,6 +11,7 @@ import {
   completion,
   createSession,
   deleteSession,
+  getCatalogEntry,
   getSession,
   listCatalog,
   listModels,
@@ -153,6 +154,11 @@ export function Chat(): JSX.Element {
     let completed: number | null = null
     let finish: string | null = null
     let flushed = 0
+    /* The entry read again, asked for on the first token and awaited after the last: by
+       then the model is resident, and a resident entry is priced by the tree that is
+       generating instead of by an estimate off the headers — a checkpoint carries blocks
+       the loader drops. Asking here is what keeps the round trip off the end of the turn. */
+    let priced: Promise<CatalogEntry | null> | null = null
     const paint = (force: boolean): void => {
       const at = performance.now()
       /* A token a frame is a render a frame; 30 a second is what the eye reads. */
@@ -166,10 +172,12 @@ export function Chat(): JSX.Element {
         switch (frame.kind) {
           case 'reasoning':
             first ??= performance.now()
+            priced ??= getCatalogEntry(model).catch(() => null)
             reasoning += frame.text
             break
           case 'content':
             first ??= performance.now()
+            priced ??= getCatalogEntry(model).catch(() => null)
             content += frame.text
             break
           case 'usage':
@@ -196,7 +204,7 @@ export function Chat(): JSX.Element {
       completed !== null && first !== null && ended > first
         ? completed / ((ended - first) / 1000)
         : null
-    const perToken = entry?.bytes_per_token ?? null
+    const perToken = (await priced)?.bytes_per_token ?? entry?.bytes_per_token ?? null
     const fraction = rate !== null && perToken ? rate / (SUSTAINED / perToken) : null
     const answer: StoredMessage = {
       role: 'assistant',

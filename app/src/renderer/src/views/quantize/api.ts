@@ -21,16 +21,18 @@ export interface CatalogEntry {
   resident: boolean
 }
 
-/* The engine's four. AWQ and GPTQ price as RTN — neither moves a leaf's format. oQ is
-   priced by the same allocator the job runs, handed no scores: the totals hold, and the
-   calibration decides which free leaf the promotion lands on. */
-export type Method = 'rtn' | 'awq' | 'gptq' | 'oq'
+/* The engine's five. AWQ and GPTQ price as RTN — neither moves a leaf's format. oQ and oQe
+   are priced by the same allocator the job runs, handed no scores: the totals hold, and the
+   calibration decides which free leaf the promotion lands on. oQe is oQ's plan with the grid
+   of every group searched against the imatrix, so it prices the same and rounds better. */
+export type Method = 'rtn' | 'awq' | 'gptq' | 'oq' | 'oqe'
 
 export const METHODS: readonly { id: Method; label: string }[] = [
   { id: 'rtn', label: 'RTN' },
   { id: 'awq', label: 'AWQ' },
   { id: 'gptq', label: 'GPTQ' },
-  { id: 'oq', label: 'oQ' }
+  { id: 'oq', label: 'oQ' },
+  { id: 'oqe', label: 'oQe' }
 ]
 
 /* `Affine.__post_init__`: anything else raises out of the engine and comes back 400. */

@@ -137,6 +137,11 @@ export const listModels = (): Promise<string[]> =>
 
 export const listCatalog = (): Promise<CatalogEntry[]> => json<CatalogEntry[]>('/admin/models')
 
+/* One entry, read again when a turn ends: by then the model is resident, and a resident
+   entry is priced by the tree that answered instead of by an estimate off the headers. */
+export const getCatalogEntry = (id: string): Promise<CatalogEntry> =>
+  json<CatalogEntry>(`/admin/models/${encodeURIComponent(id)}`)
+
 /* ── completions ──────────────────────────────────────────────────────── */
 
 export interface Params {

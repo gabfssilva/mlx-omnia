@@ -324,7 +324,7 @@ async function handle(request: Request): Promise<Response> {
     return ok({
       method:
         'One measurement of this machine against itself, over the daemon queue. It is not a ' +
-        'comparison against mlx-lm: that is bench/interleaved.py.',
+        'cross-engine comparison: that is bench/interleaved.py.',
       benches: wanted === null ? BENCHES : BENCHES.filter((b) => b.model === wanted)
     })
   }

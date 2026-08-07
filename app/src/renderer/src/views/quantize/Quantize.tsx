@@ -248,7 +248,7 @@ export function Quantize(): JSX.Element {
                 ))}
               </div>
               <span className="eyebrow" style={{ fontWeight: 400 }}>
-                AWQ, GPTQ and oQ run a calibration pass before writing.
+                AWQ, GPTQ, oQ and oQe run a calibration pass before writing.
               </span>
             </div>
 
@@ -351,7 +351,7 @@ export function Quantize(): JSX.Element {
               </>
             )}
             <p className="eyebrow" style={{ lineHeight: 1.6, margin: 'auto 0 0', paddingTop: 12 }}>
-              {method === 'oq' && plan !== null
+              {(method === 'oq' || method === 'oqe') && plan !== null
                 ? 'The size and budget hold; which leaves the calibration promotes is measured by the job, not projected here.'
                 : 'Priced by the daemon against the checkpoint’s own leaves — nothing written yet. Parity is measured after the job, never predicted.'}
             </p>
