@@ -10,6 +10,11 @@ wheels/
 .ruff_cache/
 .DS_Store
 
+# IDE / agent state / local config
+.idea/
+.actor/
+config.json
+
 # Virtual environments
 .venv
 node_modules/
