@@ -13,7 +13,7 @@ wheels/
 # IDE / agent state / local config
 .idea/
 .actor/
-config.json
+/config.json
 
 # Virtual environments
 .venv
