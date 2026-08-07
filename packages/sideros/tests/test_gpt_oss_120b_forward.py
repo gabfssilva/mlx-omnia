@@ -1,7 +1,7 @@
-"""GPT-OSS 120B parity against mlx-lm over the same MXFP4 checkpoint.
+"""GPT-OSS 120B parity against the reference implementation over the same MXFP4 checkpoint.
 
 Config-only instance of the 20B port (128 experts vs 32, 36 layers vs 24); the model
-tree, both kernels and the loader are unchanged. The golden is mlx-lm's "exact"
+tree, both kernels and the loader are unchanged. The golden is the reference's "exact"
 forward — the same packed MXFP4 weights with everything else in float32 — which stays
 feasible at ~70 GB because the MXFP4 expert weights (~61 GB) are not upcast. A full
 fp32 forward (~480 GB) is infeasible on 128 GB. Bounded by floors measured in the
@@ -28,11 +28,13 @@ from conftest import (
 
 from sideros import KVCache, stream_ids
 from sideros.checkpoint import stop_tokens
+from sideros.core.config import load_config
 from sideros.core.kernels.mxfp4_moe_gemv import mxfp4_down_combine
 from sideros.core.kernels.sink_attention import sink_attention
 from sideros.core.layers import QuantizedSwitchLinear
-from sideros.models import gpt_oss as gpt_oss_module
-from sideros.models.gpt_oss import CHECKPOINT, GPTOSS
+from sideros.models.gpt_oss import CHECKPOINT, GPTOSS, GPTOSSConfig
+from sideros.models.gpt_oss.layers import attention as attention_module
+from sideros.models.gpt_oss.layers import flags, moe
 
 FIXTURE = Path(__file__).parent / "fixtures" / "gpt_oss_120b_mlxlm.safetensors"
 REPO = "openai/gpt-oss-120b"
@@ -75,9 +77,9 @@ def test_config_is_120b(model: GPTOSS) -> None:
 @requires_checkpoint
 def test_logits_match_mlxlm(model: GPTOSS, golden: dict[str, mx.array]) -> None:
     """2x the floor, same triangle inequality as the blocks test: the golden is the
-    fp32-dense forward, `noise.logits` is what mlx-lm's own bf16 rendering costs against
+    fp32-dense forward, `noise.logits` is what the reference's own bf16 rendering costs against
     it, and ours is a different bf16 rendering — the sorted prefill gather batches each
-    expert's rows into one gemm (`sorted_indices=True`, mlx-lm does the same), which does
+    expert's rows into one gemm (`sorted_indices=True`, the reference does the same), which does
     not round like N single-row gemvs."""
     logits = model(golden["input_ids"][None])
     assert relative_diff(logits, golden["logits"]) < 2 * golden["noise.logits"].item()
@@ -88,9 +90,9 @@ def test_blocks_match_mlxlm(model: GPTOSS, golden: dict[str, mx.array]) -> None:
     """Every block against its own measured floor: a failure names the layer.
 
     Bound is 2x the floor, and the reason is the triangle inequality: the golden is the
-    fp32-dense forward, and `noise.block_i` is what mlx-lm's own bf16 rendering costs
+    fp32-dense forward, and `noise.block_i` is what the reference's own bf16 rendering costs
     against it. Our bf16 rendering is a different one (fused projections do not round
-    like separate ones), so what we can bound is |ours - fp32| <= |ours - mlx-lm bf16| +
+    like separate ones), so what we can bound is |ours - fp32| <= |ours - reference bf16| +
     floor, and the first term is a quantity of the same class.
     """
     blocks = model.activations(golden["input_ids"][None]).blocks
@@ -102,7 +104,7 @@ def test_blocks_match_mlxlm(model: GPTOSS, golden: dict[str, mx.array]) -> None:
 @requires_checkpoint
 def test_stepwise_matches_prefill(model: GPTOSS, golden: dict[str, mx.array]) -> None:
     """The sliding mask over a full cache against the one-shot prefill mask, across the
-    128-token window. Floor: 3x mlx-lm's own measured batching noise."""
+    128-token window. Floor: 3x the reference's own measured batching noise."""
     ids = golden["greedy_ids"]
     prefill = model(ids[None])
     cache = model.make_cache()
@@ -114,7 +116,7 @@ def test_stepwise_matches_prefill(model: GPTOSS, golden: dict[str, mx.array]) ->
 
 @requires_checkpoint
 def test_greedy_matches_mlxlm(model: GPTOSS, golden: dict[str, mx.array]) -> None:
-    """The reference ids were decoded by mlx-lm in bf16, so they compare modulo ties."""
+    """The reference ids were decoded in bf16, so they compare modulo ties."""
     prompt = [int(i) for i in np.array(golden["input_ids"])]
     expected = [int(i) for i in np.array(golden["greedy_ids"])]
     generated = list(stream_ids(model, prompt, max_tokens=len(expected) - len(prompt)))
@@ -184,8 +186,8 @@ def _stepwise(model: GPTOSS, ids: mx.array) -> mx.array:
 @pytest.fixture
 def kernels_off(monkeypatch: pytest.MonkeyPatch) -> Iterator[None]:
     """The A/B switch the bench stage uses: two module attributes, no code edit."""
-    monkeypatch.setattr(gpt_oss_module, "USE_MXFP4_MOE_GEMV", False)
-    monkeypatch.setattr(gpt_oss_module, "USE_SINK_ATTENTION", False)
+    monkeypatch.setattr(flags, "USE_MXFP4_MOE_GEMV", False)
+    monkeypatch.setattr(flags, "USE_SINK_ATTENTION", False)
     yield
 
 
@@ -206,8 +208,8 @@ def test_kernels_are_engaged_at_step(model: GPTOSS, monkeypatch: pytest.MonkeyPa
         engaged.append(True)
         return sink_attention(queries, keys, values, sinks, mask, scale)
 
-    monkeypatch.setattr(gpt_oss_module, "USE_SINK_ATTENTION", True)
-    monkeypatch.setattr(gpt_oss_module, "sink_attention", spy)
+    monkeypatch.setattr(flags, "USE_SINK_ATTENTION", True)
+    monkeypatch.setattr(attention_module, "sink_attention", spy)
     mx.eval(model(mx.array([[1]])))
     assert len(engaged) == len(model.model.layers)
 
@@ -217,7 +219,7 @@ def test_kernel_step_matches_ops_step(
     model: GPTOSS, golden: dict[str, mx.array], request: pytest.FixtureRequest
 ) -> None:
     """The kernels' decode path against the same path with both switches off — the ops
-    chain is the parity reference. Floor: mlx-lm's own measured batching noise, since
+    chain is the parity reference. Floor: the reference's own measured batching noise, since
     both sides are bf16 renderings of the same graph."""
     ids = golden["greedy_ids"]
     ours = _stepwise(model, ids)
@@ -242,7 +244,7 @@ def test_fused_mlp_dropping_residual_breaks_parity(
             act, weight, scales, bias, indices, routing, mx.zeros_like(residual)
         )
 
-    monkeypatch.setattr(gpt_oss_module, "mxfp4_down_combine", without_residual)
+    monkeypatch.setattr(moe, "mxfp4_down_combine", without_residual)
     broken = _stepwise(model, ids)
     monkeypatch.undo()
     assert relative_diff(broken, model(ids[None])) > 3 * golden["noise.batching"].item()
@@ -262,8 +264,8 @@ def test_sink_attention_ignoring_mask_breaks_parity(
     ) -> mx.array:
         return sink_attention(queries, keys, values, sinks, None, scale)
 
-    monkeypatch.setattr(gpt_oss_module, "USE_SINK_ATTENTION", True)
-    monkeypatch.setattr(gpt_oss_module, "sink_attention", without_mask)
+    monkeypatch.setattr(flags, "USE_SINK_ATTENTION", True)
+    monkeypatch.setattr(attention_module, "sink_attention", without_mask)
     broken = _stepwise(model, ids)
     monkeypatch.undo()
     assert relative_diff(broken, model(ids[None])) > 3 * golden["noise.batching"].item()
@@ -283,7 +285,9 @@ def test_the_token_that_ends_a_call_is_in_the_stop_set() -> None:
     `generation_config.json` in the snapshot (not in the CHECKPOINT patterns — see the
     report's shared-file change request)."""
     directory = checkpoint_dir(REPO)
-    declared = gpt_oss_module._config(directory / "config.json").eos_token_id
+    declared = load_config(
+        GPTOSSConfig, directory / "config.json", allowed_model_types=("gpt_oss",)
+    ).eos
 
     stop = stop_tokens(directory, declared)
 

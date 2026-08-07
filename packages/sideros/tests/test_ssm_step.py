@@ -1,6 +1,6 @@
 """Parity and mutation gates for the SSD decode kernel.
 
-The reference is the model's own ops implementation (`models.mamba2._ssm_step_ref`)
+The reference is the ops implementation (`core.kernels.ssm.ssm_step_ref`)
 — the same recurrence transformers' naive `torch_forward` runs token-by-token.
 Shapes are the Codestral-Mamba-7B's: 128 heads, 64 head_dim, 128 state, 8 groups
 (heads_per_group = 16). Magnitudes are checkpoint-like: x out of conv+silu, B/C
@@ -14,9 +14,9 @@ import numpy as np
 import pytest
 from conftest import relative_diff
 
+from sideros.core.kernels.ssm import ssm_step_ref
 from sideros.core.kernels.ssm_step import _KERNEL, _SOURCE, ssm_step, ssm_step_applies
 from sideros.core.mxcompat import metal_kernel
-from sideros.models.mamba2 import _ssm_step_ref
 
 if TYPE_CHECKING:
     from sideros.core.mxcompat import MetalKernel
@@ -51,7 +51,7 @@ class SSMInputs:
         self.state = normal(1, HEADS, HEAD_DIM, STATE) * 0.1
 
     def reference(self) -> tuple[mx.array, mx.array]:
-        return _ssm_step_ref(
+        return ssm_step_ref(
             self.x, self.A_log, self.B, self.C, self.D,
             self.dt, self.dt_bias, self.state, LIMIT,
         )

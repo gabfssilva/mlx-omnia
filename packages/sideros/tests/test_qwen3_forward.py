@@ -15,7 +15,8 @@ from huggingface_hub import snapshot_download
 
 from sideros import KVCache, stream_ids
 from sideros.core.kernels.rope_epilogue import rope_epilogue
-from sideros.models.qwen3 import CHECKPOINT, Qwen3, Qwen3Activations
+from sideros.models.qwen3.dense import CHECKPOINT
+from sideros.models.qwen3.model import Qwen3, Qwen3Activations
 
 FIXTURE = Path(__file__).parent / "fixtures" / "qwen3_forward.safetensors"
 N_LAYER = 28
@@ -161,7 +162,7 @@ def test_rope_epilogue_matches_op_path(
     falsifying the predicate (that is also the A/B switch for the bench)."""
     ids = golden["greedy_ids"]
     fused = stepwise(model, ids)
-    monkeypatch.setattr("sideros.models.qwen3.rope_epilogue_applies", never)
+    monkeypatch.setattr("sideros.models.qwen3.layers.attention.rope_epilogue_applies", never)
     assert relative_diff(fused, stepwise(model, ids)) < 1e-5
 
 
@@ -191,6 +192,6 @@ def test_rope_epilogue_mutation_breaks_stepwise(
             q_norm=k_norm, k_norm=q_norm, offset=offset, base=base, eps=eps,
         )
 
-    monkeypatch.setattr("sideros.models.qwen3.rope_epilogue", swapped)
+    monkeypatch.setattr("sideros.models.qwen3.layers.attention.rope_epilogue", swapped)
     ids = golden["greedy_ids"]
     assert relative_diff(stepwise(model, ids), model(ids[None])) > 1e-5

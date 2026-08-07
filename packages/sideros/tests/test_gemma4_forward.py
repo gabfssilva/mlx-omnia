@@ -242,15 +242,16 @@ def test_mutation_of_softcap_breaks_parity(
     model: Gemma4, golden: dict[str, mx.array]
 ) -> None:
     """The logit softcap tanh(logits/30)*30 must be applied (in fp32)."""
-    original = model.config.final_logit_softcapping
-    model.config = dataclasses.replace(model.config, final_logit_softcapping=None)
+    original = model.config.text_config
+    model.config = dataclasses.replace(
+        model.config,
+        text_config=dataclasses.replace(original, final_logit_softcapping=None),
+    )
     try:
         logits = model(golden["input_ids"][None])
         assert relative_diff(logits, golden["logits"]) > floor(golden, "logits")
     finally:
-        model.config = dataclasses.replace(
-            model.config, final_logit_softcapping=original
-        )
+        model.config = dataclasses.replace(model.config, text_config=original)
 
 
 def test_mutation_of_layer_scalar_breaks_parity(

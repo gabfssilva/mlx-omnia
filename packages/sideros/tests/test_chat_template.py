@@ -32,7 +32,9 @@ from sideros.chat import (
 from sideros.language import TEXT, GenerationOptions, LanguagePrompt, Text
 from sideros.model import CompositeModel, ModelInput, ModelSignature, UnsupportedInput
 from sideros.suppress import Segment
-from sideros.tools import QWEN, ToolFamily
+from sideros.tools import ToolFamily
+from sideros.tools.families.qwen import FAMILY as QWEN
+from sideros.tools.families.qwen_xml import FAMILY as QWEN_XML
 from sideros.vision import Image
 
 FIXTURE = Path(__file__).parent / "fixtures" / "chat_template.json"
@@ -195,10 +197,10 @@ QWEN36 = "mlx-community/Qwen3.6-35B-A3B-6bit"
 
 FAMILIES = [
     pytest.param(QWEN3, QWEN, id="qwen3"),
-    # The same `<tool_call>` marker, filled with `<function=...>` XML instead of JSON:
-    # `tool_family` answers `None` for it, and a prompt that carried QWEN would have the
-    # envelope held for a parser that cannot read it.
-    pytest.param(QWEN36, None, id="qwen3.6"),
+    # The same `<tool_call>` marker, filled with `<function=...>` XML instead of JSON. Two
+    # families, and a prompt carrying the wrong one would have the envelope read by a machine
+    # that cannot spell it — which is why the recognizers look past the marker.
+    pytest.param(QWEN36, QWEN_XML, id="qwen3.6"),
 ]
 
 
@@ -261,6 +263,27 @@ def test_the_family_is_reachable_from_the_model_alone(repo: str, family: ToolFam
     # A model that takes no conversation answers nothing rather than a family by default.
     assert tool_family_of(CompositeModel(_Echo(), [])) is None
     assert tool_family_of(_Echo()) is None
+
+
+def test_a_call_that_arrived_as_text_reaches_the_template_as_data() -> None:
+    """`from_json` is the one filter here that transformers does not ship. The OpenAI dialect
+    delivers `arguments` as text and the server forwards it unchanged, so a template that
+    reads the arguments key by key has to parse them first; without the filter the render
+    raises instead of producing the prompt."""
+    template = ChatTemplate.from_source(
+        "{% for call in messages[0]['tool_calls'] %}"
+        "{{ (call['function']['arguments'] | from_json)['city'] }}"
+        "{% endfor %}"
+    )
+    message = cast(
+        ChatMessage,
+        {
+            "role": "assistant",
+            "content": "",
+            "tool_calls": [{"function": {"name": "weather", "arguments": '{"city": "Recife"}'}}],
+        },
+    )
+    assert template.render(Chat((message,))) == "Recife"
 
 
 def test_generation_prompt_is_optional() -> None:

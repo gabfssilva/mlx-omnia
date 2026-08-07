@@ -28,7 +28,7 @@ SUSTAINED_GBS = 490.0
 
 def ceiling(active_bytes: int) -> float:
     """The decode tok/s the bandwidth allows. Every measured number is reported as a
-    percentage of this one — beating mlx-lm is not a conclusion."""
+    percentage of this one — beating the baseline is not a conclusion."""
     return SUSTAINED_GBS * 1e9 / active_bytes
 
 
@@ -138,9 +138,49 @@ def _routing_above(path: str, routing: Mapping[str, _Routing]) -> _Routing:
     raise ValueError(f"{path}: expert stack with no routing module above it")
 
 
+class _Stack(NamedTuple):
+    """One stack of experts and what a step does with it: how deep it is, and how many of
+    those rows are read."""
+
+    rows: int
+    slots: int
+
+
+def _stacks(modules: Mapping[str, nn.Module]) -> dict[str, _Stack]:
+    routing = {
+        path: _Routing(module.k, _candidates(module))
+        for path, module in modules.items()
+        if isinstance(module, Routed)
+    }
+    found: dict[str, _Stack] = {}
+    for path, module in modules.items():
+        if isinstance(module, SwitchLinear | QuantizedSwitchLinear):
+            rows = module.weight.shape[0]
+            found[path] = _Stack(rows, _routing_above(path, routing).slots(rows))
+    return found
+
+
 def resident_bytes(model: nn.Module) -> int:
     """Every tensor the tree holds — what the model occupies once loaded."""
     return sum(_own_bytes(module) for module in _modules(model).values())
+
+
+def expert_slots(model: nn.Module) -> dict[int, int]:
+    """How many rows of a stack a decode step reads, by the stack's depth.
+
+    What it is for is pricing a checkpoint nobody loaded: the bytes come off the
+    safetensors headers, and the two numbers the tensors do not carry come from here —
+    a stacked tensor finds its stack by its own leading dimension. The tree may be the
+    lazily-initialized one, since nothing below reads a value.
+
+    Two stacks of the same depth that are read differently keep the larger count: the
+    alternative is pricing a stack that is read whole as if something routed between its
+    rows.
+    """
+    slots: dict[int, int] = {}
+    for stack in _stacks(_modules(model)).values():
+        slots[stack.rows] = max(slots.get(stack.rows, 0), stack.slots)
+    return slots
 
 
 def active_bytes_per_token(model: nn.Module) -> int:
@@ -153,18 +193,13 @@ def active_bytes_per_token(model: nn.Module) -> int:
     quantized one does not subclass the dense one.
     """
     modules = _modules(model)
-    routing = {
-        path: _Routing(module.k, _candidates(module))
-        for path, module in modules.items()
-        if isinstance(module, Routed)
-    }
+    stacks = _stacks(modules)
     tied = "lm_head" not in modules
     total = 0
     for path, module in modules.items():
         own = _own_bytes(module)
-        if isinstance(module, SwitchLinear | QuantizedSwitchLinear):
-            rows = module.weight.shape[0]
-            total += own * _routing_above(path, routing).slots(rows) // rows
+        if (stack := stacks.get(path)) is not None:
+            total += own * stack.slots // stack.rows
         elif tied or not isinstance(module, nn.Embedding | nn.QuantizedEmbedding):
             total += own
     return total

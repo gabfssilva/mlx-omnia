@@ -1,6 +1,7 @@
-"""Qwen3.6-27B 6-bit against mlx-lm (git main) over the same packed weights.
+"""Qwen3.6-27B 6-bit against the reference implementation over the same packed weights.
 
-No transformers ground truth exists at this size: the reference is mlx-lm, bounded by
+No transformers ground truth exists at this size: the reference implementation is the
+golden, bounded by
 the floors the fixture measured (`noise.logits`, `noise.batching`). This is also the
 only checkpoint of the pair with kv-ratio 3 (16 key heads into 48 value heads) and with
 the mlx dialect of the checkpoint (`language_model.model.*`, conv `[dim, kernel, 1]`,
@@ -44,11 +45,12 @@ def model() -> Qwen35:
 def test_dialect_and_shapes(model: Qwen35) -> None:
     """The mlx dialect: untied head, ratio 3, conv squeezed off the trailing axis."""
     config = model.config
-    assert not config.tie_word_embeddings
-    assert config.eos_token_id == (248046, 248044)
-    assert config.linear_num_value_heads // config.linear_num_key_heads == 3
+    assert not config.tied
+    assert config.eos == (248046, 248044)
+    text = config.text_config
+    assert text.linear_num_value_heads // text.linear_num_key_heads == 3
     conv = model.model.layers[0].linear_attn.conv1d.weight
-    assert conv.shape == (config.conv_dim, config.linear_conv_kernel_dim)
+    assert conv.shape == (text.conv_dim, text.linear_conv_kernel_dim)
 
 
 @requires_checkpoint(REPO, REVISION)
@@ -57,8 +59,8 @@ def test_logits_match_mlxlm(model: Qwen35, golden: dict[str, mx.array]) -> None:
     measured, not slack: `noise.logits` is one graph against itself in fp32, while two
     bf16 implementations of the *same* graph also differ by evaluation order — three
     projections fused into one matmul do not round like three. `noise.batching` is
-    exactly that class of difference, measured on mlx-lm against itself (3.7e-2); we sit
-    at 1.2e-2. Swapping our l2norm for mlx-lm's moves it to 1.1e-2, so the deliberate
+    exactly that class of difference, measured on the reference against itself (3.7e-2); we sit
+    at 1.2e-2. Swapping our l2norm for the reference's moves it to 1.1e-2, so the deliberate
     transformers eps-in-the-sum is not what the gap is made of; mutating one packed
     scale by 1.5 takes it to 8.7e-2."""
     logits = model(golden["input_ids"][None])
@@ -91,7 +93,7 @@ def test_teacher_forced_argmax_matches_mlxlm(
 @requires_checkpoint(REPO, REVISION)
 def test_stepwise_matches_prefill(model: Qwen35, golden: dict[str, mx.array]) -> None:
     """A stale conv window or recurrent state does not survive a full-logits
-    comparison. The floor is 3x mlx-lm's own measured batching noise."""
+    comparison. The floor is 3x the reference's own measured batching noise."""
     ids = golden["greedy_ids"]
     prefill = model(ids[None])
     cache = model.make_cache()

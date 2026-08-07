@@ -169,13 +169,13 @@ def test_q4_rejects_dtype_cast() -> None:
 
 def test_q4_logits_match_mlxlm(q4_model: Qwen2, q4_golden: dict[str, mx.array]) -> None:
     """Pre-quantized path (`quantization` in config.json, tied head): only the leaves
-    the dict packed get quantized. Floor is mlx-lm's own measured rounding cost."""
+    the dict packed get quantized. Floor is the reference's own measured rounding cost."""
     logits = q4_model(q4_golden["input_ids"][None])
     assert relative_diff(logits, q4_golden["logits"]) < q4_golden["noise.logits"].item()
 
 
 def test_q4_greedy_matches_mlxlm(q4_model: Qwen2, q4_golden: dict[str, mx.array]) -> None:
-    """The reference is quantized mlx-lm, so the ids compare modulo ties."""
+    """The reference is quantized, so the ids compare modulo ties."""
     prompt = [int(i) for i in np.array(q4_golden["input_ids"])]
     expected = [int(i) for i in np.array(q4_golden["greedy_ids"])]
     generated = list(stream_ids(q4_model, prompt, max_tokens=len(expected) - len(prompt)))
@@ -188,7 +188,7 @@ def test_q4_greedy_matches_mlxlm(q4_model: Qwen2, q4_golden: dict[str, mx.array]
 
 
 def test_q4_stepwise_matches_prefill(q4_model: Qwen2, q4_golden: dict[str, mx.array]) -> None:
-    """3x mlx-lm's own prefill-vs-stepwise noise over this checkpoint; 1e-5 is an fp32
+    """3x the reference's own prefill-vs-stepwise noise over this checkpoint; 1e-5 is an fp32
     tolerance and would fail here for the wrong reason."""
     ids = q4_golden["greedy_ids"]
     prefill = q4_model(ids[None])

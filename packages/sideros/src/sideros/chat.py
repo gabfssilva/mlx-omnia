@@ -10,6 +10,11 @@ arguments is the special-token map from `tokenizer_config.json`
 (`template_kwargs = {**self.special_tokens_map, **kwargs}`,
 `tokenization_utils_base.py:3120`).
 
+One filter is ours and not transformers': `from_json`, for a template that reads a tool
+call's `arguments` key by key and gets them as text — the shape the OpenAI dialect
+delivers and the server forwards unchanged. Without it that render raises instead of
+producing the prompt.
+
 A base model has no template and gets no guessed one: an invented template produces
 fluent, wrong text.
 """
@@ -193,6 +198,7 @@ def _compile(source: str, now: Callable[[], datetime]) -> jinja2.Template:
         trim_blocks=True, lstrip_blocks=True, extensions=[_Generation, jinja2.ext.loopcontrols]
     )
     environment.filters["tojson"] = tojson
+    environment.filters["from_json"] = json.loads
     # Through `globals=` rather than `environment.globals[...]`: the environment's map is
     # inferred from jinja2's default namespace and rejects any other signature.
     return environment.from_string(

@@ -1,8 +1,8 @@
-"""Parity gate for Laguna S 2.1: logits vs mlx-lm, prefill vs stepwise, mutation.
+"""Parity gate for Laguna S 2.1: logits vs the reference, prefill vs stepwise, mutation.
 
-No transformers ground truth exists at this size (fp32 of 118B is far beyond
-memory): mlx-lm over the same checkpoint is the reference, bounded by measured
-floors carried in the fixture (noise.logits, noise.batching).
+No transformers ground truth exists at this size (fp32 of 118B is far beyond memory):
+the reference implementation over the same checkpoint is the golden, bounded by
+measured floors carried in the fixture (noise.logits, noise.batching).
 """
 
 from pathlib import Path
@@ -19,7 +19,8 @@ from conftest import (
 )
 
 from sideros import KVCache, stream_ids
-from sideros.models.laguna import CHECKPOINT, Laguna, LagunaSparseMoe
+from sideros.models.laguna import CHECKPOINT, Laguna
+from sideros.models.laguna.layers.moe import LagunaSparseMoe
 
 FIXTURE = Path(__file__).parent / "fixtures" / "laguna_mlxlm.safetensors"
 REPO = "local/Laguna-S-2.1-mlx-oQ3e-fast-gs128"
@@ -46,7 +47,7 @@ def test_sorted_gather_matches_stepwise(
     model: Laguna, golden: dict[str, mx.array]
 ) -> None:
     """Prefill takes the argsort/unsort reorder (10 routed rows/token); stepwise
-    takes the per-token path. The floor is 3x mlx-lm's own measured batching noise."""
+    takes the per-token path. The floor is 3x the reference's own measured batching noise."""
     ids = golden["greedy_ids"]
     assert ids.shape[0] * 10 >= 64
     prefill = model(ids[None])
@@ -58,7 +59,7 @@ def test_sorted_gather_matches_stepwise(
 
 @requires_checkpoint(REPO)
 def test_greedy_matches_mlxlm(model: Laguna, golden: dict[str, mx.array]) -> None:
-    """The reference is quantized mlx-lm, so the ids compare modulo ties."""
+    """The reference is quantized, so the ids compare modulo ties."""
     prompt = [int(i) for i in np.array(golden["input_ids"])]
     expected = [int(i) for i in np.array(golden["greedy_ids"])]
     generated = list(stream_ids(model, prompt, max_tokens=len(expected) - len(prompt)))

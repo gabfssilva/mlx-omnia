@@ -26,12 +26,12 @@ from sideros.models.qwen3_5 import (
     Qwen35,
     Qwen35Activations,
     Qwen35LanguageModel,
-    _mrope_sources,
     decode_clock,
     multimodal_prompt,
     stream_multimodal_ids,
 )
-from sideros.models.qwen3_5_vision import (
+from sideros.models.qwen3_5.layers.attention import _mrope_sources
+from sideros.models.qwen3_5.vision import (
     Grid,
     Qwen35Vision,
     Qwen35VisionActivations,
@@ -329,7 +329,7 @@ def test_mrope_degenerates_to_plain_rope(model: Qwen35) -> None:
     attention = next(
         block.self_attn for block in model.model.layers if block.attends
     )
-    config = model.config
+    config = model.config.text_config
     length, offset = 7, 5
     rng = np.random.default_rng(3)
     shape = (1, length, config.num_attention_heads, config.head_dim)
@@ -342,12 +342,12 @@ def test_mrope_degenerates_to_plain_rope(model: Qwen35) -> None:
 def test_mrope_sections_are_interleaved(model: Qwen35) -> None:
     """[11, 11, 10] interleaved: frequency i reads section i % 3 until its quota runs
     out. A chunked [TTT...HHH...WWW] layout would put 11 contiguous T frequencies first."""
-    sources = np.array(_mrope_sources(model.config))
-    half = model.config.rope_dims // 2
+    sources = np.array(_mrope_sources(model.config.text_config))
+    half = model.config.text_config.rope_dims // 2
     assert sources[:half][:6].tolist() == [0, 1, 2, 0, 1, 2]
     assert sources[:half].tolist() == sources[half : 2 * half].tolist()
     assert [int((sources[:half] == s).sum()) for s in range(3)] == list(
-        model.config.mrope_section
+        model.config.text_config.rope_parameters.mrope_section
     )
 
 

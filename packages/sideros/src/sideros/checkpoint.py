@@ -17,7 +17,8 @@ from typing import Literal, NotRequired, Protocol, TypedDict, assert_never
 import mlx.core as mx
 import mlx.nn as nn
 
-from sideros.core.layers import SegmentedQKV, SwitchLinear
+from sideros.core.config import load_config
+from sideros.core.layers import MultiLinear, SegmentedQKV, SwitchLinear
 from sideros.language import LanguageModel
 from sideros.model import ModelInput
 from sideros.quant.quantization import (
@@ -183,35 +184,97 @@ def fuse_qkv(weights: dict[str, mx.array], layers: int) -> dict[str, mx.array]:
     return weights
 
 
-def concat_gate_up(weights: dict[str, mx.array], layers: int) -> dict[str, mx.array]:
+def concat_gate_up(
+    weights: dict[str, mx.array], layers: int, *, prefix: str = "mlp"
+) -> dict[str, mx.array]:
     """Dense sibling of `interleave_gate_up`: one matmul, split at the midpoint. The
     MoE variant interleaves row by row instead, because its decode kernel reads pairs."""
     for layer in range(layers):
-        prefix = f"model.layers.{layer}.mlp."
+        leaf = f"model.layers.{layer}.{prefix}."
         for suffix in ("weight", "scales", "biases"):
-            keys = [f"{prefix}{name}_proj.{suffix}" for name in ("gate", "up")]
+            keys = [f"{leaf}{name}_proj.{suffix}" for name in ("gate", "up")]
             if not all(key in weights for key in keys):
                 continue
             fused = mx.concatenate([weights.pop(key) for key in keys], axis=0)
             mx.eval(fused)
-            weights[f"{prefix}gate_up_proj.{suffix}"] = fused
+            weights[f"{leaf}gate_up_proj.{suffix}"] = fused
     return weights
 
 
-def interleave_gate_up(weights: dict[str, mx.array], layers: int) -> dict[str, mx.array]:
+def stack_experts(
+    weights: dict[str, mx.array], layers: int, experts: int, *, prefix: str = "mlp"
+) -> dict[str, mx.array]:
+    """Per-expert leaves (`{prefix}.experts.{e}.gate_proj.weight`) stacked into the
+    `[experts, out, in]` tensors `SwitchLinear` declares, under `{prefix}.switch_mlp.*`.
+
+    Two layouts ship for the same architecture: HuggingFace writes one leaf per expert,
+    the mlx conversions write the stack. A checkpoint already in the second form has no
+    per-expert key and passes through untouched, so both load through one path."""
+    for layer in range(layers):
+        source = f"model.layers.{layer}.{prefix}.experts."
+        target = f"model.layers.{layer}.{prefix}.switch_mlp."
+        for name in ("gate_proj", "up_proj", "down_proj"):
+            for suffix in ("weight", "scales", "biases"):
+                if f"{source}0.{name}.{suffix}" not in weights:
+                    continue
+                stacked = mx.stack(
+                    [weights.pop(f"{source}{expert}.{name}.{suffix}") for expert in range(experts)]
+                )
+                mx.eval(stacked)
+                weights[f"{target}{name}.{suffix}"] = stacked
+    return weights
+
+
+def split_stacked_gate_up(weights: dict[str, mx.array], layers: int) -> dict[str, mx.array]:
+    """`experts.gate_up_proj` is `[E, in, 2·inner]` with gate and up in halves; the tree
+    wants `[E, out, in]` per projection, which `interleave_gate_up` then pairs."""
+    for layer in range(layers):
+        source = f"model.layers.{layer}.mlp.experts."
+        target = f"model.layers.{layer}.mlp.switch_mlp."
+        fused = weights.pop(f"{source}gate_up_proj", None)
+        if fused is None:
+            continue
+        middle = fused.shape[-1] // 2
+        weights[f"{target}gate_proj.weight"] = fused[..., :middle].swapaxes(-2, -1)
+        weights[f"{target}up_proj.weight"] = fused[..., middle:].swapaxes(-2, -1)
+        weights[f"{target}down_proj.weight"] = weights.pop(f"{source}down_proj").swapaxes(-2, -1)
+        mx.eval(
+            weights[f"{target}gate_proj.weight"],
+            weights[f"{target}up_proj.weight"],
+            weights[f"{target}down_proj.weight"],
+        )
+    return weights
+
+
+def fold_norm_scales(weights: dict[str, mx.array]) -> dict[str, mx.array]:
+    """Gemma stores the norm weight centred on zero (`scale = 1 + w`). Folding the sum
+    on the dict side keeps the tree on plain `nn.RMSNorm`; left per call it is one extra
+    kernel per norm per token (6 per block plus the final one)."""
+    for key, value in weights.items():
+        if key.endswith(("layernorm.weight", "q_norm.weight", "k_norm.weight")) or (
+            key == "model.norm.weight"
+        ):
+            weights[key] = value + 1
+    mx.eval(list(weights.values()))
+    return weights
+
+
+def interleave_gate_up(
+    weights: dict[str, mx.array], layers: int, *, prefix: str = "mlp"
+) -> dict[str, mx.array]:
     """Gate and up row-interleaved into one stack ([g0,u0,g1,u1,…]) and the originals
     dropped — otherwise both copies stay resident."""
     for layer in range(layers):
-        prefix = f"model.layers.{layer}.mlp.switch_mlp."
+        leaf = f"model.layers.{layer}.{prefix}.switch_mlp."
         for suffix in ("weight", "scales", "biases"):
-            keys = [f"{prefix}{name}_proj.{suffix}" for name in ("gate", "up")]
+            keys = [f"{leaf}{name}_proj.{suffix}" for name in ("gate", "up")]
             if not all(key in weights for key in keys):
                 continue
             parts = [weights.pop(key) for key in keys]
             experts, rows, cols = parts[0].shape
             fused = mx.stack(parts, axis=2).reshape(experts, 2 * rows, cols)
             mx.eval(fused)
-            weights[f"{prefix}gate_up_proj.{suffix}"] = fused
+            weights[f"{leaf}gate_up_proj.{suffix}"] = fused
     return weights
 
 
@@ -319,7 +382,7 @@ def _quantization(
     numbers. The 35B overrides `mlp.gate` and `shared_expert_gate` to 8 bits inside the
     config's `quantization` block, keyed by weight path — deriving the parameters from
     the tensors keeps that out of the config reader entirely."""
-    if not isinstance(module, nn.Linear | nn.Embedding | SwitchLinear):
+    if not isinstance(module, nn.Linear | nn.Embedding | SwitchLinear | MultiLinear):
         if f"{path}.scales" in weights:
             raise TypeError(f"{path} carries scales but is a {type(module).__name__}")
         return False
@@ -425,10 +488,12 @@ class Checkpoint[M: nn.Module]:
 
 def checkpoint[M: nn.Module, C](
     patterns: tuple[str, ...],
-    config: Callable[[Path], C],
+    config: Callable[[Path], C] | type[C],
     build: Callable[[C], M],
     weights: Callable[[Path, C, mx.Dtype | None], dict[str, mx.array]],
     composite: Callable[[Path, M], LanguageModel[ModelInput]],
+    *,
+    model_types: tuple[str, ...] = (),
 ) -> Checkpoint[M]:
     """`load`, `task` and `quantize` derived from the four parts an architecture actually
     owns: the config reader (handed `config.json`), the lazy tree, the checkpoint's tensors
@@ -438,7 +503,18 @@ def checkpoint[M: nn.Module, C](
     A directory whose config carries the leaf-by-leaf `quantization` block was written by
     `save_quantized`: its tensors *are* a prepared dict, so the preparation does not run
     again — it is the one step allowed to be non-idempotent over values (gemma3 folds +1
-    into its norm scales, gpt2 transposes Conv1D)."""
+    into its norm scales, gpt2 transposes Conv1D).
+
+    `config` is either a reader over `config.json`'s path or the mirror dataclass itself —
+    the latter goes through `load_config`, gated on `model_types`."""
+
+    if isinstance(config, type):
+        cls = config
+
+        def parse(path: Path) -> C:
+            return load_config(cls, path, allowed_model_types=model_types)
+    else:
+        parse = config
 
     def prepared(
         directory: Path, parsed: C, dtype: mx.Dtype | None, declared: QuantizationPlan | None
@@ -450,7 +526,7 @@ def checkpoint[M: nn.Module, C](
         return tensors
 
     def load(directory: Path, dtype: mx.Dtype | None) -> M:
-        parsed = config(directory / "config.json")
+        parsed = parse(directory / "config.json")
         declared = declared_plan(directory / "config.json")
         return attach_weights(
             build(parsed),
@@ -462,7 +538,7 @@ def checkpoint[M: nn.Module, C](
         return composite(directory, load(directory, dtype))
 
     def quantize(directory: Path, dtype: mx.Dtype | None) -> Pending:
-        parsed = config(directory / "config.json")
+        parsed = parse(directory / "config.json")
         tree = build(parsed)
         return Pending(
             tree,

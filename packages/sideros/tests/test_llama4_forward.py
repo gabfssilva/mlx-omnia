@@ -1,8 +1,8 @@
-"""Llama 4 Scout: parity vs mlx-lm over the same 4-bit checkpoint, mutation, cache.
+"""Llama 4 Scout: parity vs the reference over the same 4-bit checkpoint, mutation, cache.
 
-No transformers ground truth exists at this size (fp32 of 109B is ~436GB): mlx-lm
-over the same packed weights is the reference, bounded by measured floors carried
-in the fixture (noise.logits, noise.batching, per-block noise.block_i).
+No transformers ground truth exists at this size (fp32 of 109B is ~436GB): the
+reference implementation over the same packed weights is the golden, bounded by
+measured floors carried in the fixture (noise.logits, noise.batching, per-block noise.block_i).
 
 The prompt is short (64 tokens, within the 8192 chunk), so the chunked mask is
 equivalent to the causal mask and the chunk-boundary mutation is not exercised
@@ -25,7 +25,9 @@ from conftest import (
 )
 
 from sideros import KVCache, stream_ids
-from sideros.models.llama4 import CHECKPOINT, Llama4, Llama4Attention, Llama4Block
+from sideros.models.llama4 import CHECKPOINT, Llama4
+from sideros.models.llama4.layers.attention import Llama4Attention
+from sideros.models.llama4.layers.block import Llama4Block
 
 FIXTURE = Path(__file__).parent / "fixtures" / "llama4_mlxlm.safetensors"
 REPO = "mlx-community/Llama-4-Scout-17B-16E-Instruct-4bit"
@@ -56,7 +58,7 @@ def test_logits_match_mlxlm(model: Llama4, golden: dict[str, mx.array]) -> None:
 
 @requires_checkpoint(REPO)
 def test_stepwise_matches_prefill(model: Llama4, golden: dict[str, mx.array]) -> None:
-    """Prefill vs step-by-step. The floor is 3x mlx-lm's own measured batching noise."""
+    """Prefill vs step-by-step. The floor is 3x the reference's own measured batching noise."""
     ids = golden["greedy_ids"]
     prefill = model(ids[None])
     steps = stepwise(model, ids)
@@ -66,7 +68,7 @@ def test_stepwise_matches_prefill(model: Llama4, golden: dict[str, mx.array]) ->
 
 @requires_checkpoint(REPO)
 def test_greedy_matches_mlxlm(model: Llama4, golden: dict[str, mx.array]) -> None:
-    """The reference is 4-bit mlx-lm, so the ids compare modulo ties."""
+    """The reference is 4-bit, so the ids compare modulo ties."""
     prompt = [int(i) for i in np.array(golden["input_ids"])]
     expected = [int(i) for i in np.array(golden["greedy_ids"])]
     generated = list(stream_ids(model, prompt, max_tokens=len(expected) - len(prompt)))

@@ -25,6 +25,8 @@ type QuantizeMode = Literal["affine", "mxfp4", "mxfp8", "nvfp4"]
 # for Qwen3-MoE and carried by every routed prefill since.
 SORTED_GATHER_MIN = 64
 
+_L2_EPS = 1e-6
+
 
 def split_qkv(
     fused: mx.array, *, heads: int, kv_heads: int, head_dim: int
@@ -152,6 +154,57 @@ class QuantizedSwitchLinear(nn.Module):
         )
 
 
+class MultiLinear(nn.Module):
+    """One matrix per head, stacked `[heads, out, in]`, applied to every head at once.
+
+    `SwitchLinear`'s shape without the gather: MLA's `kv_b_proj` split per head is a batch
+    of matmuls over the head axis, not a selection of a few rows of it. `transpose=False`
+    is the form that reads the stack as `[in, out]` — the key side wants the transpose of
+    what the value side wants, and both come from the same split.
+    """
+
+    def __init__(self, input_dims: int, output_dims: int, heads: int) -> None:
+        super().__init__()
+        scale = math.sqrt(1.0 / input_dims)
+        self.weight = mx.random.uniform(-scale, scale, (heads, output_dims, input_dims))
+
+    def __call__(self, x: mx.array, *, transpose: bool = True) -> mx.array:
+        return x @ (mx.swapaxes(self.weight, -2, -1) if transpose else self.weight)
+
+    def to_quantized(
+        self, group_size: int = 64, bits: int = 4, mode: QuantizeMode = "affine"
+    ) -> "QuantizedMultiLinear":
+        return QuantizedMultiLinear(self.weight, group_size=group_size, bits=bits, mode=mode)
+
+
+class QuantizedMultiLinear(nn.Module):
+    """`biases` is `None` outside affine, for the reason `QuantizedSwitchLinear` says."""
+
+    def __init__(
+        self, weight: mx.array, *, group_size: int, bits: int, mode: QuantizeMode = "affine"
+    ) -> None:
+        super().__init__()
+        packed, scales, *rest = mx.quantize(weight, group_size=group_size, bits=bits, mode=mode)
+        self.weight = packed
+        self.scales = scales
+        self.biases = rest[0] if rest else None
+        self.group_size = group_size
+        self.bits = bits
+        self.mode = mode
+
+    def __call__(self, x: mx.array, *, transpose: bool = True) -> mx.array:
+        return mx.quantized_matmul(
+            x,
+            self.weight,
+            scales=self.scales,
+            biases=self.biases,
+            transpose=transpose,
+            group_size=self.group_size,
+            bits=self.bits,
+            mode=self.mode,
+        )
+
+
 def swish(x: mx.array) -> mx.array:
     return x * mx.sigmoid(x)
 
@@ -173,3 +226,50 @@ class SwiGLU(nn.Module):
     def __call__(self, x: mx.array) -> mx.array:
         gate, up = mx.split(self.gate_up_proj(x), [self.inner], axis=-1)
         return self.down_proj(self._activation(gate) * up)
+
+
+class SwitchGLU(nn.Module):
+    """Gate and up fused row-interleaved ([g0,u0,g1,u1,…]) at load: one gather reads both."""
+
+    def __init__(self, experts: int, hidden: int, inner: int) -> None:
+        super().__init__()
+        self.gate_up_proj = SwitchLinear(experts, hidden, 2 * inner)
+        self.down_proj = SwitchLinear(experts, inner, hidden)
+        self.inner = inner
+
+    def activate(self, fused: mx.array) -> mx.array:
+        pairs = fused.reshape(*fused.shape[:-1], self.inner, 2)
+        gated = pairs[..., 0]
+        return gated * mx.sigmoid(gated) * pairs[..., 1]
+
+    def __call__(self, tokens: mx.array, indices: mx.array, *, sorted_indices: bool) -> mx.array:
+        projected = self.gate_up_proj(tokens, indices, sorted_indices=sorted_indices)
+        return self.down_proj(self.activate(projected), indices, sorted_indices=sorted_indices)
+
+
+class SharedMLP(nn.Module):
+    """The always-on expert, gate and up kept as two leaves."""
+
+    def __init__(self, hidden: int, inner: int) -> None:
+        super().__init__()
+        self.gate_proj = nn.Linear(hidden, inner, bias=False)
+        self.up_proj = nn.Linear(hidden, inner, bias=False)
+        self.down_proj = nn.Linear(inner, hidden, bias=False)
+
+    def __call__(self, x: mx.array) -> mx.array:
+        return self.down_proj(swish(self.gate_proj(x)) * self.up_proj(x))
+
+
+def l2norm(x: mx.array, scale: float = 1.0, *, dtype: mx.Dtype | None = None) -> mx.array:
+    """transformers' l2norm: the eps sits inside the sum, not in a mean.
+
+    `scale` folds a rule's `1/sqrt(Dk)` into the query, and `dtype` skips the trip back to
+    the model dtype: the gated-delta kernel takes `q` pre-scaled and in float32, which is
+    where the ops path does this same arithmetic anyway — rounding it to bfloat16 first is
+    a rounding the ops path never pays, and on Qwen3.5-35B it costs 4.3e-2 against a
+    3.9e-2 bound.
+    """
+    lifted = x.astype(mx.float32)
+    inv = mx.rsqrt((lifted * lifted).sum(axis=-1, keepdims=True) + _L2_EPS)
+    normed = lifted * inv if scale == 1.0 else lifted * inv * scale
+    return normed.astype(x.dtype if dtype is None else dtype)

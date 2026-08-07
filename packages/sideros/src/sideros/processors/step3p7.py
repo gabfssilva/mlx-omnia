@@ -24,7 +24,7 @@ import mlx.core as mx
 import numpy as np
 
 if TYPE_CHECKING:
-    from sideros.models.step3p7 import Step3p7Config
+    from sideros.models.step3p7.config import Step3p7Config
     from sideros.vision import Image
 
 CLIP_MEAN = np.array([0.48145466, 0.4578275, 0.40821073], dtype=np.float32)
@@ -193,7 +193,7 @@ class Step3p7Processor:
     def from_directory(
         cls, directory: Path, config: Step3p7Config
     ) -> Step3p7Processor | None:
-        if config.vision is None:
+        if config.vision_config is None:
             return None
 
         tc_path = directory / "tokenizer_config.json"

@@ -19,15 +19,10 @@ from huggingface_hub import snapshot_download
 from sideros import stream_ids
 from sideros.core.cache import DeltaCache, KVCache
 from sideros.core.kernels.add_rms_norm import add_rms_norm, add_rms_norm_applies
-from sideros.core.kernels.gated_delta import gated_delta
-from sideros.models import qwen3_5
-from sideros.models.qwen3_5 import (
-    CHECKPOINT,
-    Qwen35,
-    Qwen35Activations,
-    _delta_rule,
-    _l2norm,
-)
+from sideros.core.kernels.gated_delta import delta_rule, gated_delta
+from sideros.models.qwen3_5 import CHECKPOINT, Qwen35, Qwen35Activations
+from sideros.models.qwen3_5.layers import block, deltanet, flags
+from sideros.models.qwen3_5.layers.deltanet import l2norm
 
 FIXTURE = Path(__file__).parent / "fixtures" / "qwen3_5_forward.safetensors"
 N_LAYER = 24
@@ -92,7 +87,7 @@ def test_deltanet_internals_within_floor(model: Qwen35, golden: dict[str, mx.arr
     rule, the rule's own decay and write strength, its output and its final state."""
     block = model.model.layers[LINEAR_LAYER]
     delta = block.linear_attn
-    config = model.config
+    config = model.config.text_config
     x = model.model.embed_tokens(golden["input_ids"][None])
     normed = block.input_layernorm(x)
     assert relative_diff(normed, golden["b0_ln_1"]) < floor(golden, "b0_ln_1")
@@ -125,7 +120,7 @@ def test_deltanet_internals_within_floor(model: Qwen35, golden: dict[str, mx.arr
     state = mx.zeros(
         (1, heads, config.linear_key_head_dim, config.linear_value_head_dim), dtype=mx.float32
     )
-    out, state = _delta_rule(_l2norm(q.reshape(shape)), _l2norm(k.reshape(shape)), v, g, beta,
+    out, state = delta_rule(l2norm(q.reshape(shape)), l2norm(k.reshape(shape)), v, g, beta,
                              state)
     assert relative_diff(out, golden["b0_rule_out"]) < floor(golden, "b0_rule_out")
     assert relative_diff(state, golden["b0_rule_state"]) < floor(golden, "b0_rule_state")
@@ -175,7 +170,7 @@ def test_cached_greedy_matches_fixture(model: Qwen35, golden: dict[str, mx.array
 
 def test_delta_cache_is_not_trimmable(model: Qwen35) -> None:
     cache = model.make_cache()
-    kinds = model.config.layer_types
+    kinds = model.config.text_config.layer_types
     for layer, entry in zip(kinds, cache, strict=True):
         assert entry.is_trimmable == (layer == "full_attention")
     with pytest.raises(NotImplementedError):
@@ -199,7 +194,7 @@ def test_key_head_broadcast_is_interleaved() -> None:
     beta = mx.sigmoid(array(1, length, heads))
     state = mx.zeros((1, heads, dk, dv))
 
-    out, _ = _delta_rule(mx.repeat(q, ratio, axis=2), mx.repeat(k, ratio, axis=2), v, g, beta,
+    out, _ = delta_rule(mx.repeat(q, ratio, axis=2), mx.repeat(k, ratio, axis=2), v, g, beta,
                          state)
 
     # Reference: every value head runs its own recurrence with the key head it belongs
@@ -253,7 +248,9 @@ def test_mutation_of_attention_gate_breaks_parity(
     model that still runs."""
     attention = model.model.layers[ATTN_LAYER].self_attn
     original = attention.fused_proj.weight
-    queries = model.config.num_attention_heads * model.config.head_dim
+    queries = (
+        model.config.text_config.num_attention_heads * model.config.text_config.head_dim
+    )
     mutated = mx.array(original)
     mutated[:queries] = original[queries : 2 * queries]
     attention.fused_proj.weight = mutated
@@ -264,19 +261,19 @@ def test_mutation_of_attention_gate_breaks_parity(
         attention.fused_proj.weight = original
 
 
-def test_l2norm_eps_is_inside_the_sum() -> None:
-    """mlx-lm normalizes with rms_norm x sqrt(dim), which puts the eps in a mean —
-    128x larger here. Sub-ulp in bf16, but the fp32 fixture pins the transformers
+def testl2norm_eps_is_inside_the_sum() -> None:
+    """The reference normalizes with rms_norm x sqrt(dim), which puts the eps in a
+    mean — 128x larger here. Sub-ulp in bf16, but the fp32 fixture pins the transformers
     semantics, so the two must be distinguishable."""
     x = mx.full((1, 1, 1, 128), 1e-3)
-    ours = _l2norm(x)
+    ours = l2norm(x)
     mlxlm = mx.fast.rms_norm(x, None, 1e-6) / math.sqrt(128)
     assert relative_diff(ours, mlxlm) > 1e-3
     # Where the eps is negligible the two agree and the vector is unit-length.
     large = mx.full((1, 1, 1, 128), 1.0)
     theirs = mx.fast.rms_norm(large, None, 1e-6) / math.sqrt(128)
-    assert relative_diff(_l2norm(large), theirs) < 1e-6
-    assert abs(float(mx.sum(_l2norm(large) * _l2norm(large)).item()) - 1.0) < 1e-6
+    assert relative_diff(l2norm(large), theirs) < 1e-6
+    assert abs(float(mx.sum(l2norm(large) * l2norm(large)).item()) - 1.0) < 1e-6
 
 
 
@@ -284,7 +281,7 @@ def test_l2norm_eps_is_inside_the_sum() -> None:
 #
 # `gated_delta` replaces the recurrence in every DeltaNet layer (all sizes) and
 # `add_rms_norm` the residual join of every block at T=1. Both are on by default where
-# their predicate holds; `qwen3_5.GATED_DELTA_KERNEL` / `qwen3_5.ADD_RMS_NORM_KERNEL`
+# their predicate holds; `flags.GATED_DELTA_KERNEL` / `flags.ADD_RMS_NORM_KERNEL`
 # are read on every call, so an A/B needs no edit — only a fresh cache, since the
 # recurrent state's layout is the transpose of the op chain's.
 
@@ -300,8 +297,8 @@ def test_kernels_are_the_default_path(
     model: Qwen35, golden: dict[str, mx.array], monkeypatch: pytest.MonkeyPatch
 ) -> None:
     """A silent fallback would leave every parity test here measuring the op chain."""
-    assert qwen3_5.GATED_DELTA_KERNEL and qwen3_5.ADD_RMS_NORM_KERNEL
-    assert add_rms_norm_applies(model.config.hidden_size)
+    assert flags.GATED_DELTA_KERNEL and flags.ADD_RMS_NORM_KERNEL
+    assert add_rms_norm_applies(model.config.text_config.hidden_size)
 
     calls = {"delta": 0, "join": 0}
 
@@ -315,10 +312,10 @@ def test_kernels_are_the_default_path(
         calls["join"] += 1
         return add_rms_norm(x, projected, weight, eps)
 
-    monkeypatch.setattr(qwen3_5, "gated_delta", counted_delta)
-    monkeypatch.setattr(qwen3_5, "add_rms_norm", counted_join)
+    monkeypatch.setattr(deltanet, "gated_delta", counted_delta)
+    monkeypatch.setattr(block, "add_rms_norm", counted_join)
     mx.eval(model(golden["input_ids"][None, :1]))
-    linear = sum(1 for kind in model.config.layer_types if kind != "full_attention")
+    linear = sum(1 for kind in model.config.text_config.layer_types if kind != "full_attention")
     assert calls == {"delta": linear, "join": N_LAYER}
 
 
@@ -329,7 +326,7 @@ def test_gated_delta_kernel_matches_ops(
     arithmetic in a different reduction order."""
     ids = golden["input_ids"][None]
     with_kernel = model(ids)
-    monkeypatch.setattr(qwen3_5, "GATED_DELTA_KERNEL", False)
+    monkeypatch.setattr(flags, "GATED_DELTA_KERNEL", False)
     assert relative_diff(with_kernel, model(ids)) < 1e-5
 
 
@@ -339,7 +336,7 @@ def test_add_rms_norm_kernel_matches_ops(
     """Single-token only, so it is the stepwise path that has to agree."""
     ids = golden["greedy_ids"]
     with_kernel = stepwise(model, ids)
-    monkeypatch.setattr(qwen3_5, "ADD_RMS_NORM_KERNEL", False)
+    monkeypatch.setattr(flags, "ADD_RMS_NORM_KERNEL", False)
     assert relative_diff(with_kernel, stepwise(model, ids)) < 1e-5
 
 
@@ -347,14 +344,14 @@ def test_mutation_of_decay_exponentiation_breaks_parity(
     model: Qwen35, golden: dict[str, mx.array], monkeypatch: pytest.MonkeyPatch
 ) -> None:
     """The wiring's own step: the kernel takes the decay *past* the exp, where
-    `_delta_rule` takes the log decay. Handing it the log form must not survive."""
+    `delta_rule` takes the log decay. Handing it the log form must not survive."""
 
     def mutated(
         q: mx.array, k: mx.array, v: mx.array, g: mx.array, beta: mx.array, state: mx.array
     ) -> tuple[mx.array, mx.array]:
         return gated_delta(q, k, v, mx.log(g), beta, state)
 
-    monkeypatch.setattr(qwen3_5, "gated_delta", mutated)
+    monkeypatch.setattr(deltanet, "gated_delta", mutated)
     logits = model(golden["input_ids"][None])
     assert relative_diff(logits, golden["logits"]) > floor(golden, "logits")
 
@@ -374,7 +371,7 @@ def test_mutation_of_state_layout_breaks_stepwise(
 
     ids = golden["greedy_ids"]
     prefill = model(ids[None])
-    monkeypatch.setattr(qwen3_5, "gated_delta", mutated)
+    monkeypatch.setattr(deltanet, "gated_delta", mutated)
     assert relative_diff(stepwise(model, ids), prefill) > 1e-5
 
 
@@ -392,7 +389,7 @@ def test_mutation_of_join_outputs_breaks_stepwise(
 
     ids = golden["greedy_ids"]
     prefill = model(ids[None])
-    monkeypatch.setattr(qwen3_5, "add_rms_norm", mutated)
+    monkeypatch.setattr(block, "add_rms_norm", mutated)
     assert relative_diff(stepwise(model, ids), prefill) > 1e-5
 
 
@@ -417,8 +414,8 @@ def test_join_predicate_reaches_the_compiled_step(
     def never(hidden: int) -> bool:
         return False
 
-    monkeypatch.setattr(qwen3_5, "add_rms_norm", counted_join)
-    monkeypatch.setattr(qwen3_5, "add_rms_norm_applies", never)
+    monkeypatch.setattr(block, "add_rms_norm", counted_join)
+    monkeypatch.setattr(block, "add_rms_norm_applies", never)
     without_kernel = stepwise(model, ids)
     assert calls["join"] == 0
     assert relative_diff(without_kernel, with_kernel) < 1e-5
@@ -438,8 +435,8 @@ def test_delta_predicate_reaches_the_compiled_step(
     def never(key_dim: int, key_heads: int, value_heads: int, value_dim: int) -> bool:
         return False
 
-    monkeypatch.setattr(qwen3_5, "gated_delta", counted_delta)
-    monkeypatch.setattr(qwen3_5, "gated_delta_applies", never)
+    monkeypatch.setattr(deltanet, "gated_delta", counted_delta)
+    monkeypatch.setattr(deltanet, "gated_delta_applies", never)
     without_kernel = stepwise(model, ids)
     assert calls["delta"] == 0
     assert relative_diff(without_kernel, with_kernel) < 1e-5

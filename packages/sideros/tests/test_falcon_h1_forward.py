@@ -1,9 +1,9 @@
 # pyright: basic
 """Falcon-H1 7B fp32 parity against transformers, plus cache and mutation gates.
 
-The 7B (``n_groups=1``) is the only valid mlx-lm cross-check reference: mlx-lm
-calls bare ``mx.fast.rms_norm`` with no grouping, which matches transformers
-only when ``n_groups=1``. The 34B (``n_groups=2``) diverges and must be checked
+The 7B (``n_groups=1``) is the only valid cross-check against the reference
+implementation: the reference calls bare ``mx.fast.rms_norm`` with no grouping, which
+matches transformers only when ``n_groups=1``. The 34B (``n_groups=2``) diverges and must be checked
 against transformers fp32 directly.
 
 Every tolerance is ``3x`` the fixture's own measured fp32-vs-fp64 floor for that
@@ -26,7 +26,7 @@ from sideros.models.falcon_h1 import CHECKPOINT, FalconH1, FalconH1Activations
 
 FIXTURE = Path(__file__).parent / "fixtures" / "falcon_h1_forward.safetensors"
 
-# The 7B is the fixture model: small enough for fp32, n_groups=1 (valid mlx-lm ref).
+# The 7B is the fixture model: small enough for fp32, n_groups=1 (valid reference).
 MODEL_REPO = "tiiuae/Falcon-H1-7B-Base"
 PATTERNS = ["config.json", "model*.safetensors", "tokenizer.json"]
 

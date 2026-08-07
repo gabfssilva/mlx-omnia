@@ -1,12 +1,12 @@
 """The SSD selective scan's one-token step, in one dispatch.
 
-Ported from mlx-lm's `ssm_kernel` (`mlx_lm/models/ssm.py`): a simdgroup per
+Ported from the reference implementation: a simdgroup per
 `(batch, head)` tiles the state dimension, carrying its `[head_dim, state_size]`
 slice in float32 registers. Per token: `A = -exp(A_log)`, `dA = exp(A·dt)`,
 `state = dA·state + dt·B·x`, `y = state·C + D·x`. The group broadcast from
 `n_groups` to `num_heads` happens in-kernel via the group offset
 (`g_idx = n / G`), so no `repeat` is materialized. `compute_dt` (softplus + clamp)
-runs on the host before the dispatch, the same split mlx-lm takes.
+runs on the host before the dispatch, the same split the reference implementation takes.
 
 Layout: the state is `[B, H, Dh, Ds]` — `Ds` innermost, which is what makes the
 per-lane slice contiguous. The ops path in `models/mamba2.py` carries the same

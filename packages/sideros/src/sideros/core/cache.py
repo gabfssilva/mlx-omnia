@@ -147,3 +147,24 @@ def reserve(buffer: mx.array | None, needed: int, like: mx.array) -> mx.array:
     """Public entry to the block-grown buffer resizer, for caches defined outside
     this module (e.g. a latent KV cache) that grow the same way ``KVCache`` does."""
     return _reserving(buffer, needed, like)
+
+
+class SharedKVReader(LayerCache):
+    """A cache placeholder for KV-shared layers: no projection, no own buffer.
+
+    Reads the full-length K,V from the storing layer's `KVCache` of the same type.
+    `offset` tracks the position so the mask logic works, but the actual K,V come
+    from `keys`/`values` set each step by the trunk.
+    """
+
+    def __init__(self) -> None:
+        super().__init__()
+        self.keys: mx.array | None = None
+        self.values: mx.array | None = None
+
+    @property
+    def is_trimmable(self) -> bool:
+        return False
+
+    def trim(self, length: int) -> None:
+        self.offset = min(self.offset, length)

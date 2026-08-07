@@ -4,7 +4,7 @@ import mlx.core as mx
 import pytest
 
 from sideros.checkpoint import fuse_qkv, interleave_gate_up
-from sideros.models.gpt2 import _transpose_conv1d
+from sideros.models.gpt2.checkpoint import _transpose_conv1d
 from sideros.quant.quantization import Affine, QuantizationPlan, quantize_weights
 
 _FORMAT = Affine(group_size=64, bits=4)

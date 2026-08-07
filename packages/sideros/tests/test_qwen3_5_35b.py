@@ -1,6 +1,7 @@
-"""Qwen3.6-35B-A3B 6-bit against mlx-lm (git main) over the same packed weights.
+"""Qwen3.6-35B-A3B 6-bit against the reference implementation over the same packed weights.
 
-No transformers ground truth exists at this size: the reference is mlx-lm, bounded by
+No transformers ground truth exists at this size: the reference implementation is the
+golden, bounded by
 the floors the fixture measured. The floors are per block (`noise.block_i`) because the
 residual grows down a 40-layer trunk, and the sparse block is what is new here — the
 DeltaNet and the gated attention are already pinned by the 0.8B and 27B fixtures.
@@ -69,9 +70,9 @@ def test_shapes_after_fusion(model: Qwen35) -> None:
     """The shared expert rides in two of the three sparse tensors: row 256 of the
     router and slot 256 of the gate‖up stack, never in the down stack."""
     config = model.config
-    assert config.moe is not None
-    assert (config.moe.num_experts, config.moe.num_experts_per_tok) == (256, 8)
-    assert len(config.layer_types) == 40
+    text = config.text_config
+    assert (text.num_experts, text.num_experts_per_tok) == (256, 8)
+    assert len(text.layer_types) == 40
     mlp = sparse(model)
     assert mlp.gate.weight.shape[0] == 257
     assert mlp.switch_mlp.gate_up_proj.weight.shape[0] == 257
@@ -141,8 +142,8 @@ def test_moe_internals_within_floor(model: Qwen35, golden: dict[str, mx.array]) 
 
 @requires_checkpoint(REPO)
 def test_logits_match_mlxlm(model: Qwen35, golden: dict[str, mx.array]) -> None:
-    """Two mechanisms separate us from mlx-lm and the fixture measured both: evaluation
-    order (`noise.batching` — an N-row matmul does not round like N one-row matmuls, and
+    """Two mechanisms separate us from the reference and the fixture measured both:
+    evaluation order (`noise.batching` — an N-row matmul does not round like N one-row matmuls, and
     three projections fused into one do not round like three) and bfloat16 rounding
     itself (`noise.logits`). The bound is the larger, widened by the metric's own
     quantum: 3.94e-2, where we sit at 3.23e-2 and a packed scale mutated by 1.5 lands at

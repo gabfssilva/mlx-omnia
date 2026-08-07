@@ -102,22 +102,31 @@ class _TokenizerJson(TypedDict):
 
 @dataclass(frozen=True, slots=True)
 class _Split:
-    """One `Split` stage of the pre-tokenizer. `Isolated` keeps every match as a
-    pre-token of its own; `MergedWithNext` cuts before each match and leaves it glued to
-    the text that follows ("a\\nb" on a newline pattern gives ["a", "\\nb"])."""
+    """One `Split` stage of the pre-tokenizer. `Isolated` cuts on both sides of every match
+    and keeps the match as a pre-token of its own; `MergedWithNext` cuts before each match
+    and leaves it glued to the text that follows ("a\\nb" on a newline pattern gives
+    ["a", "\\nb"]).
+
+    What lies *between* the matches is a pre-token too. An exhaustive pattern — every
+    character belonging to some match — leaves no gaps and hides the difference; a sequence
+    of narrow stages does not, and a first stage matching `\\p{N}{1,3}` and nothing else
+    drops every letter of the text if the gaps go with it.
+    """
 
     pattern: regex.Pattern[str]
     merged_with_next: bool
 
     def apply(self, piece: str) -> list[str]:
-        if not self.merged_with_next:
-            return [match.group() for match in self.pattern.finditer(piece)]
         parts: list[str] = []
         previous = 0
         for match in self.pattern.finditer(piece):
             if match.start() > previous:
                 parts.append(piece[previous : match.start()])
-            previous = match.start()
+            if self.merged_with_next:
+                previous = match.start()
+            else:
+                parts.append(match.group())
+                previous = match.end()
         parts.append(piece[previous:])
         return [part for part in parts if part]
 

@@ -94,7 +94,7 @@ The rules that keep it this shape:
 
 # Mini-tutorial: adding a model
 
-`qwen3_moe.py` is the complete template, and MODELS.md records what each ported architecture has that's peculiar.
+`qwen3_moe.py` is the complete template, and `docs/models/<model_type>.md` records what each ported architecture has that's peculiar — `docs/models/index.md` is the index of what is ported, measured and optimized.
 
 **1. Establish the sources of truth, in order.** The checkpoint (config.json + safetensors headers) gives the facts: real names, shapes, dtypes. The transformers modeling file gives the authoritative semantics — read the code, not the docs; it is the tiebreaker for any divergence. mlx-lm (git main, not PyPI) is the closest port and the bf16 numerical reference. The paper gives the why and the vocabulary, but papers systematically omit what changes numbers: exact op order on the residual, intermediate dtypes, tie handling in top-k, whether rope comes before or after q/k-norm. When two implementations disagree, reproduce both in a scratch script and let transformers decide.
 

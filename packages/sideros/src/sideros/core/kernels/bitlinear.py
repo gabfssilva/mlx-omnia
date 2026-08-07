@@ -1,5 +1,5 @@
-"""Ternary matmul over uint8-packed 1.58-bit weights, ported from mlx-lm's
-``make_bitlinear_kernel`` (git main, ``bitlinear_layers.py``).
+"""Ternary matmul over uint8-packed 1.58-bit weights, ported from the
+reference implementation.
 
 The weight is packed 4 ternary values per byte along the output axis:
 ``packed[p, c]`` holds the four outputs ``p, p + out/4, p + 2*out/4, p + 3*out/4``
@@ -11,8 +11,8 @@ with ``simd_sum``; lane 0 writes the four scaled outputs.
 The kernel is a pure float matmul over the unpacked ternary weights followed by a
 single scalar ``weight_scale``. The per-token int8 activation fake-quant that
 transformers' ``AutoBitLinear`` applies is done by the ``BitLinear`` leaf before the
-dispatch, so the kernel itself never sees it (matching mlx-lm, which omits it; the
-leaf adds it back for transformers fidelity). ``invert`` selects multiply (autobitlinear,
+dispatch, so the kernel itself never sees it (matching the reference, which omits it;
+the leaf adds it back for transformers fidelity). ``invert`` selects multiply (autobitlinear,
 the ``microsoft/bitnet-b1.58-2B-4T`` checkpoint) versus divide.
 """
 

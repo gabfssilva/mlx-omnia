@@ -1,7 +1,7 @@
 """Bytes per token and the ceiling they set, pinned to the numbers the house measured:
 1.192 GB on the tied 0.6B (411 tok/s) and 1.711 GB on the 30B MoE (286 tok/s), plus the
-35B-A3B's 2.557 GB — the weights its tree holds, which is not the same as MODELS.md's
-1.80 GB step; the test that pins it reconciles the two.
+35B-A3B's 2.557 GB — the weights its tree holds, which is not the same as the
+qwen3_5_moe doc's 1.80 GB step; the test that pins it reconciles the two.
 
 They come off the checkpoint's own tensors, so a wrong rule moves them at once — counting
 all 128 experts instead of the routed 8, counting an embedding table that a decode step
@@ -16,20 +16,27 @@ from conftest import checkpoint_dir, requires_checkpoint
 from huggingface_hub import snapshot_download
 from mlx.utils import tree_flatten
 
-from sideros.footprint import active_bytes_per_token, ceiling, checkpoint_bytes, resident_bytes
+from sideros.footprint import (
+    active_bytes_per_token,
+    ceiling,
+    checkpoint_bytes,
+    expert_slots,
+    resident_bytes,
+)
+from sideros.models.deepseek_v4.config import LOCAL, DeepseekV4Config
+from sideros.models.deepseek_v4.layers.attention import DeepseekV4Attention
 from sideros.models.gpt2 import CHECKPOINT as GPT2
-from sideros.models.qwen3 import CHECKPOINT as QWEN3
+from sideros.models.qwen3.dense import CHECKPOINT as QWEN3
+from sideros.models.qwen3.moe import CHECKPOINT as QWEN3_MOE
+from sideros.models.qwen3.moe import Qwen3MoE
 from sideros.models.qwen3_5 import CHECKPOINT as QWEN3_5
-from sideros.models.qwen3_5 import Qwen35Config, Qwen35MoE, Qwen35MoEParams
-from sideros.models.qwen3_moe import CHECKPOINT as QWEN3_MOE
-from sideros.models.qwen3_moe import Qwen3MoE
+from sideros.models.qwen3_5 import Qwen35MoE, Qwen35RoPEParameters, Qwen35TextConfig
 
 MOE_REPO = "mlx-community/Qwen3-30B-A3B-4bit"
 SHARED_REPO = "mlx-community/Qwen3.6-35B-A3B-4bit"
 WEIGHTS = ["config.json", "model.safetensors"]
 
-SHARED = Qwen35MoEParams(num_experts=4, num_experts_per_tok=2, moe_intermediate_size=6)
-TINY_QWEN35 = Qwen35Config(
+TINY_QWEN35 = Qwen35TextConfig(
     hidden_size=8,
     num_hidden_layers=1,
     num_attention_heads=2,
@@ -37,20 +44,21 @@ TINY_QWEN35 = Qwen35Config(
     head_dim=4,
     vocab_size=16,
     rms_norm_eps=1e-6,
-    rope_theta=10000.0,
-    partial_rotary_factor=0.5,
-    tie_word_embeddings=True,
-    intermediate_size=16,
     layer_types=("full_attention",),
     linear_num_key_heads=1,
     linear_num_value_heads=1,
     linear_key_head_dim=4,
     linear_value_head_dim=4,
     linear_conv_kernel_dim=4,
-    eos_token_id=(),
-    mrope_section=(1, 1, 1),
-    image_token_id=-1,
-    moe=SHARED,
+    rope_parameters=Qwen35RoPEParameters(
+        rope_theta=10000.0, partial_rotary_factor=0.5, mrope_section=(1, 1, 1)
+    ),
+    tie_word_embeddings=True,
+    intermediate_size=16,
+    num_experts=4,
+    num_experts_per_tok=2,
+    moe_intermediate_size=6,
+    shared_expert_intermediate_size=6,
 )
 """Only `hidden_size` of it reaches the sparse block; the rest is what the dataclass asks
 for. Dense float32, so every leaf below is four bytes an element."""
@@ -62,7 +70,52 @@ class Sparse(nn.Module):
 
     def __init__(self) -> None:
         super().__init__()
-        self.mlp = Qwen35MoE(TINY_QWEN35, SHARED)
+        self.mlp = Qwen35MoE(TINY_QWEN35)
+
+
+TINY_V4 = DeepseekV4Config(
+    hidden_size=8,
+    num_hidden_layers=1,
+    num_attention_heads=2,
+    head_dim=4,
+    vocab_size=16,
+    rms_norm_eps=1e-6,
+    rope_theta=10000.0,
+    compress_rope_theta=10000.0,
+    rope_scaling=None,
+    compress_ratios=(LOCAL,),
+    sliding_window=8,
+    q_lora_rank=4,
+    o_lora_rank=2,
+    o_groups=2,
+    qk_rope_head_dim=2,
+    index_n_heads=1,
+    index_head_dim=2,
+    index_topk=2,
+    hc_mult=1,
+    hc_sinkhorn_iters=1,
+    hc_eps=1e-6,
+    attention_bias=False,
+    tie_word_embeddings=True,
+    moe_intermediate_size=6,
+    n_routed_experts=4,
+    n_shared_experts=1,
+    num_experts_per_tok=2,
+    num_hash_layers=0,
+    norm_topk_prob=True,
+    routed_scaling_factor=1.5,
+    swiglu_limit=7.0,
+    eos_token_id=(),
+)
+"""A `LOCAL` layer: no compressor and no indexer, so the only stack is `wo_a`."""
+
+
+class BlockDiagonal(nn.Module):
+    """Same reason as `Sparse`: the walk climbs from the stack to the module above it."""
+
+    def __init__(self) -> None:
+        super().__init__()
+        self.attn = DeepseekV4Attention(TINY_V4, LOCAL)
 
 
 @pytest.fixture(scope="module")
@@ -81,7 +134,7 @@ def test_a_dense_step_reads_every_weight() -> None:
 
 
 def test_a_tied_table_counts_once_as_the_head() -> None:
-    """Qwen3-0.6B in bf16: 1.192 GB/token, a 411 tok/s ceiling (MODELS.md). The
+    """Qwen3-0.6B in bf16: 1.192 GB/token, a 411 tok/s ceiling (docs/models/qwen3.md). The
     checkpoint serializes `lm_head` even though it is tied and the loader drops it, so
     the table is resident once and read once."""
     model = QWEN3.load(Path(snapshot_download("Qwen/Qwen3-0.6B", allow_patterns=WEIGHTS)), None)
@@ -94,8 +147,8 @@ def test_a_tied_table_counts_once_as_the_head() -> None:
 @requires_checkpoint(MOE_REPO)
 def test_a_routed_step_reads_only_the_active_experts(moe: Qwen3MoE) -> None:
     """8 of 128 experts at 4 bits plus the whole untied lm_head: 1.711 GB/token and a
-    286 tok/s ceiling, the numbers CLAUDE.md and MODELS.md carry. The 0.175 GB embedding
-    table stays out — a decode step gathers one row of it."""
+    286 tok/s ceiling, the numbers CLAUDE.md and docs/models/qwen3_moe.md carry. The
+    0.175 GB embedding table stays out — a decode step gathers one row of it."""
     active = active_bytes_per_token(moe)
     assert round(active / 1e9, 3) == 1.711
     assert round(ceiling(active)) == 286
@@ -106,13 +159,22 @@ def test_a_slot_stacked_past_the_experts_is_read_whole_every_token() -> None:
     `E + 1` rows deep against down's `E`, and the decode kernel gathers that row on every
     token. The four leaves: the router, `k + 1` of the `E + 1` gate‖up rows, `k` of the `E`
     down rows, and the shared expert's own down whole."""
-    experts, k = SHARED.num_experts, SHARED.num_experts_per_tok
-    hidden, inner = TINY_QWEN35.hidden_size, SHARED.moe_intermediate_size
+    experts, k = TINY_QWEN35.num_experts, TINY_QWEN35.num_experts_per_tok
+    hidden, inner = TINY_QWEN35.hidden_size, TINY_QWEN35.moe_intermediate_size
     router = (experts + 1) * hidden
     gate_up = (k + 1) * 2 * inner * hidden
     down = k * inner * hidden
     shared_down = inner * hidden
     assert active_bytes_per_token(Sparse()) == 4 * (router + gate_up + down + shared_down)
+
+
+def test_the_slots_of_a_stack_are_published_by_its_depth() -> None:
+    """What prices a checkpoint nobody loaded: the catalog reads the bytes off the
+    safetensors headers and matches a stacked tensor to its stack by the one thing both
+    sides carry, its leading dimension. qwen3.5's gate‖up is `E + 1` rows deep and `k + 1`
+    of them are read; its down is `E` deep and `k` are."""
+    experts, k = TINY_QWEN35.num_experts, TINY_QWEN35.num_experts_per_tok
+    assert expert_slots(Sparse()) == {experts + 1: k + 1, experts: k}
 
 
 def test_calling_the_shared_slot_a_candidate_undercharges_it_by_a_whole_row() -> None:
@@ -121,9 +183,25 @@ def test_calling_the_shared_slot_a_candidate_undercharges_it_by_a_whole_row() ->
     gate‖up row — 1,179,648 bytes a layer on the 35B-A3B, 47,185,920 over its 40."""
     block = Sparse()
     whole = active_bytes_per_token(block)
-    block.mlp.experts = SHARED.num_experts + 1
-    row = 4 * 2 * SHARED.moe_intermediate_size * TINY_QWEN35.hidden_size
+    block.mlp.experts = TINY_QWEN35.num_experts + 1
+    row = 4 * 2 * TINY_QWEN35.moe_intermediate_size * TINY_QWEN35.hidden_size
     assert whole - active_bytes_per_token(block) == row
+
+
+def test_a_block_diagonal_stack_is_read_whole_every_token() -> None:
+    """deepseek_v4's `wo_a` is a `SwitchLinear` with every slot active — the groups of a
+    block-diagonal matmul, not experts something routes between. The attention block above
+    it says so by declaring as many slots reached as there are groups; without that the walk
+    has no routing module to climb to and the model does not load at all. The mutation is
+    calling it routed: one group of two, and half the output projection stops being read.
+    """
+    block = BlockDiagonal()
+    every_weight = sum(a.nbytes for a in dict(tree_flatten(block.parameters())).values())
+    assert active_bytes_per_token(block) == every_weight
+
+    group = 4 * (TINY_V4.num_attention_heads * TINY_V4.head_dim // TINY_V4.o_groups)
+    block.attn.k = 1
+    assert every_weight - active_bytes_per_token(block) == group * TINY_V4.o_lora_rank
 
 
 @requires_checkpoint(SHARED_REPO)
@@ -134,7 +212,8 @@ def test_the_thirty_five_billion_moe_reads_its_shared_expert_on_every_token() ->
     to be short — and this is to the byte what `catalog._bytes_per_token` reads off the same
     headers, which is what makes the two sides one number.
 
-    It is not MODELS.md's 1.80 GB for this checkpoint, and the gap is not the shared expert
+    It is not the qwen3_5_moe doc's 1.80 GB for this checkpoint, and the gap is not the
+    shared expert
     (that breakdown already charged it whole). This walk sees the tensors the tree holds, so
     the vision tower's blocks (0.888 GB) are in — a text step never runs them — and the
     DeltaNet recurrent state (0.126 GB read and written every step) is out, not being a

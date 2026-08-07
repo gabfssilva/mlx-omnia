@@ -1,8 +1,8 @@
-"""P7 gate: parity vs mlx-lm over the same 4-bit checkpoint, mutation, kernels.
+"""P7 gate: parity vs the reference over the same 4-bit checkpoint, mutation, kernels.
 
-No transformers ground truth exists at this size (fp32 of 30B is ~120GB): mlx-lm
-over the same packed weights is the reference, bounded by measured floors carried
-in the fixture (noise.logits, noise.batching).
+No transformers ground truth exists at this size (fp32 of 30B is ~120GB): the
+reference implementation over the same packed weights is the golden, bounded by
+measured floors carried in the fixture (noise.logits, noise.batching).
 """
 
 from pathlib import Path
@@ -24,7 +24,8 @@ from sideros.core.kernels.moe_gemv import moe_down_combine, moe_gate_up_act
 from sideros.core.kernels.moe_route import softmax_topk, softmax_topk_applies
 from sideros.core.kernels.rope_epilogue import rope_epilogue
 from sideros.core.mxcompat import softmax
-from sideros.models.qwen3_moe import CHECKPOINT, Qwen3MoE
+from sideros.models.qwen3.model import Qwen3MoE
+from sideros.models.qwen3.moe import CHECKPOINT
 
 FIXTURE = Path(__file__).parent / "fixtures" / "qwen3_moe_mlxlm.safetensors"
 REPO = "mlx-community/Qwen3-30B-A3B-4bit"
@@ -49,7 +50,7 @@ def test_logits_match_mlxlm(model: Qwen3MoE, golden: dict[str, mx.array]) -> Non
 @requires_checkpoint(REPO)
 def test_sorted_gather_matches_stepwise(model: Qwen3MoE, golden: dict[str, mx.array]) -> None:
     """Prefill takes the argsort/unsort reorder (168 routed rows); stepwise takes the
-    fused T=1 kernels. The floor is 3x mlx-lm's own measured batching noise."""
+    fused T=1 kernels. The floor is 3x the reference's own measured batching noise."""
     ids = golden["greedy_ids"]
     assert ids.shape[0] * 8 >= 64
     prefill = model(ids[None])
@@ -61,7 +62,7 @@ def test_sorted_gather_matches_stepwise(model: Qwen3MoE, golden: dict[str, mx.ar
 
 @requires_checkpoint(REPO)
 def test_greedy_matches_mlxlm(model: Qwen3MoE, golden: dict[str, mx.array]) -> None:
-    """The reference is 4-bit mlx-lm, so the ids compare modulo ties."""
+    """The reference is 4-bit, so the ids compare modulo ties."""
     prompt = [int(i) for i in np.array(golden["input_ids"])]
     expected = [int(i) for i in np.array(golden["greedy_ids"])]
     generated = list(stream_ids(model, prompt, max_tokens=len(expected) - len(prompt)))
@@ -186,12 +187,14 @@ def test_step_kernels_match_op_path(
     """Kernels on (the default) against both predicates falsified. Same path, same
     inputs, only the rounding of the fused arithmetic differs — bounded by the
     fixture's own measured batching floor, which is the same kind of bf16 reordering."""
-    monkeypatch.setattr("sideros.models.qwen3_moe.ROPE_EPILOGUE_KERNEL", True)
-    monkeypatch.setattr("sideros.models.qwen3_moe.ADD_RMS_NORM_KERNEL", True)
+    monkeypatch.setattr("sideros.models.qwen3.layers.flags.ROPE_EPILOGUE_KERNEL", True)
+    monkeypatch.setattr("sideros.models.qwen3.layers.flags.ADD_RMS_NORM_KERNEL", True)
     ids = golden["greedy_ids"]
     fused = stepwise(model, ids)
-    monkeypatch.setattr("sideros.models.qwen3_moe.rope_epilogue_applies", never_head_dim)
-    monkeypatch.setattr("sideros.models.qwen3_moe.add_rms_norm_applies", never_hidden)
+    monkeypatch.setattr(
+        "sideros.models.qwen3.layers.attention.rope_epilogue_applies", never_head_dim
+    )
+    monkeypatch.setattr("sideros.models.qwen3.layers.block.add_rms_norm_applies", never_hidden)
     assert relative_diff(fused, stepwise(model, ids)) < 3 * golden["noise.batching"].item()
 
 
@@ -221,8 +224,8 @@ def test_rope_epilogue_mutation_breaks_stepwise(
             q_norm=k_norm, k_norm=q_norm, offset=offset, base=base, eps=eps,
         )
 
-    monkeypatch.setattr("sideros.models.qwen3_moe.ROPE_EPILOGUE_KERNEL", True)
-    monkeypatch.setattr("sideros.models.qwen3_moe.rope_epilogue", swapped)
+    monkeypatch.setattr("sideros.models.qwen3.layers.flags.ROPE_EPILOGUE_KERNEL", True)
+    monkeypatch.setattr("sideros.models.qwen3.layers.attention.rope_epilogue", swapped)
     ids = golden["greedy_ids"]
     gap = relative_diff(stepwise(model, ids), model(ids[None]))
     assert gap > 3 * golden["noise.batching"].item()
@@ -240,8 +243,8 @@ def test_add_rms_norm_mutation_breaks_stepwise(
     ) -> tuple[mx.array, mx.array]:
         return add_rms_norm(mx.zeros_like(x), projected, weight, eps)
 
-    monkeypatch.setattr("sideros.models.qwen3_moe.ADD_RMS_NORM_KERNEL", True)
-    monkeypatch.setattr("sideros.models.qwen3_moe.add_rms_norm", without_residual)
+    monkeypatch.setattr("sideros.models.qwen3.layers.flags.ADD_RMS_NORM_KERNEL", True)
+    monkeypatch.setattr("sideros.models.qwen3.layers.block.add_rms_norm", without_residual)
     ids = golden["greedy_ids"]
     gap = relative_diff(stepwise(model, ids), model(ids[None]))
     assert gap > 3 * golden["noise.batching"].item()

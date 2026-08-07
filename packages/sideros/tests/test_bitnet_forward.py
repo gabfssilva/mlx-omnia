@@ -24,7 +24,8 @@ from conftest import floor, load_golden, relative_diff
 from huggingface_hub import snapshot_download
 
 from sideros import KVCache, stream_ids
-from sideros.models.bitnet import CHECKPOINT, BitNet, BitNetActivations, _relu2
+from sideros.models.bitnet import CHECKPOINT, BitNet, BitNetActivations
+from sideros.models.bitnet.layers.mlp import _relu2
 
 FIXTURE = Path(__file__).parent / "fixtures" / "bitnet_forward.safetensors"
 N_LAYER = 30

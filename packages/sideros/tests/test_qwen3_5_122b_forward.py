@@ -1,7 +1,7 @@
-"""Qwen3.5-122B-A10B 4-bit against mlx-lm (git main) over the same packed weights.
+"""Qwen3.5-122B-A10B 4-bit against the reference implementation over the same packed weights.
 
-No fp32 transformers ground truth exists at 122B (~500GB). The reference is mlx-lm,
-bounded by per-block floors: the residual grows down a 48-layer trunk, and a single
+No fp32 transformers ground truth exists at 122B (~500GB). The reference implementation
+is the golden, bounded by per-block floors: the residual grows down a 48-layer trunk, and a single
 floor would be vacuous at one end and impossible at the other. The DeltaNet, gated
 attention, MoE routing, shared expert, and load-time fusions are already pinned by
 the 0.8B / 27B / 35B fixtures; this suite pins the scale (48 layers, 64 value heads,
@@ -68,11 +68,11 @@ def test_shapes_after_fusion(model: Qwen35) -> None:
     """The shared expert rides in two of the three sparse tensors: row 256 of the
     router and slot 256 of the gate‖up stack, never in the down stack."""
     config = model.config
-    assert config.moe is not None
-    assert (config.moe.num_experts, config.moe.num_experts_per_tok) == (256, 8)
-    assert len(config.layer_types) == 48
-    assert config.hidden_size == 3072
-    assert config.moe.moe_intermediate_size == 1024
+    text = config.text_config
+    assert (text.num_experts, text.num_experts_per_tok) == (256, 8)
+    assert len(text.layer_types) == 48
+    assert text.hidden_size == 3072
+    assert text.moe_intermediate_size == 1024
     mlp = sparse(model)
     assert mlp.gate.weight.shape[0] == 257
     assert mlp.switch_mlp.gate_up_proj.weight.shape[0] == 257

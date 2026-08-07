@@ -2,12 +2,13 @@
 prefill scan and the dispatch function.
 
 The per-token Metal kernel lives in ``core/kernels/ssm_step.py`` (ported from
-mlx-lm's ``ssm_kernel``). This module adds the chunked SSD surrogate-attention
+the reference implementation). This module adds the chunked SSD surrogate-attention
 prefill (``ssm_attn``, pure mlx ops) and the ``ssm_update`` dispatch: T=1 +
 state + GPU → kernel; else ``ssm_attn``. Also re-exports ``ssm_step`` and
 ``ssm_applies`` so the model file imports from one place.
 
-No ``.legacy/`` Swift version exists — the kernel comes from mlx-lm verbatim.
+No ``.legacy/`` Swift version exists — the kernel is ported verbatim from the
+reference implementation.
 """
 
 import mlx.core as mx
@@ -53,6 +54,52 @@ def ssm_step(
     return _ssm_step(hidden, A_log, B, C, D, dt, dt_bias, state, time_step_limit)
 
 
+def ssm_step_ref(
+    x: mx.array,
+    A_log: mx.array,
+    B: mx.array,
+    C: mx.array,
+    D: mx.array,
+    dt: mx.array,
+    dt_bias: mx.array,
+    state: mx.array,
+    time_step_limit: tuple[float, float],
+) -> tuple[mx.array, mx.array]:
+    """The SSD recurrence, token by token, entirely in float32 — the parity
+    reference for the decode kernel.
+
+    `x` is `[B, T, H, Dh]`, `B`/`C` are `[B, T, G, Ds]`, `dt` is `[B, T, H]`
+    (pre-softplus), `state` is `[B, H, Dh, Ds]`. Returns the output `[B, T, H, Dh]`
+    in `x`'s dtype and the advanced state.
+    """
+    _batch, length, num_heads, _head_dim = x.shape
+    n_groups = B.shape[2]
+    repeats = num_heads // n_groups
+
+    A = -mx.exp(A_log.astype(mx.float32))
+    dt_processed = _compute_dt(dt, dt_bias, time_step_limit)
+    dA = mx.exp(dt_processed[..., None] * A[None, None, :, None])
+    x32 = x.astype(mx.float32)
+
+    B_expanded = mx.repeat(B, repeats, axis=2)
+    C_expanded = mx.repeat(C, repeats, axis=2)
+
+    out_list: list[mx.array] = []
+    for t in range(length):
+        dA_t = dA[:, t]
+        dB = dt_processed[:, t, :, None, None] * B_expanded[:, t, :, None, :].astype(
+            mx.float32
+        )
+        dBx = dB * x32[:, t, :, :, None]
+        state = state * dA_t[:, :, :, None] + dBx
+        y_t = (state * C_expanded[:, t, :, None, :].astype(mx.float32)).sum(axis=-1)
+        y_t = y_t + x32[:, t] * D[None, :, None].astype(mx.float32)
+        out_list.append(y_t)
+
+    out = mx.stack(out_list, axis=1) if out_list else mx.zeros_like(x32)
+    return out.astype(x.dtype), state
+
+
 def _segsum(x: mx.array) -> mx.array:
     """Stable segment sum: cumsum of the strictly-lower-triangular part, with the
     upper triangle (including diagonal) set to -inf so ``exp`` zeroes it."""
@@ -77,7 +124,7 @@ def ssm_attn(
     time_step_limit: tuple[float, float] = (0.0, float("inf")),
     step: int = 256,
 ) -> tuple[mx.array, mx.array]:
-    """Chunked SSD prefill (pure mlx ops). Ported from mlx-lm's ``ssm_attn``.
+    """Chunked SSD prefill (pure mlx ops). Ported from the reference implementation.
 
     ``x`` ``[B, L, H, Dh]``; ``B``/``C`` ``[B, L, G, Ds]``; ``A_log`` ``[H]``;
     ``D`` ``[H]``; ``dt`` ``[B, L, H]`` (pre softplus+bias); ``state``

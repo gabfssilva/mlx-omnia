@@ -30,9 +30,17 @@ from sideros.chat import Chat, ChatCapability, ChatTemplate
 from sideros.core.cache import KVCache
 from sideros.generate import Sampler, stream_generate
 from sideros.language import GenerationOptions, Text, TextLanguageModel
-from sideros.models.qwen3_5 import Qwen35, Qwen35Config, Qwen35LanguageModel
+from sideros.models.qwen3_5 import (
+    Qwen35,
+    Qwen35Config,
+    Qwen35LanguageModel,
+    Qwen35RoPEParameters,
+    Qwen35TextConfig,
+)
 from sideros.suppress import Segment, Segmenter
-from sideros.tools import HARMONY, QWEN, ToolCall, ToolFamily
+from sideros.tools import ToolCall, ToolFamily
+from sideros.tools.families.harmony import FAMILY as HARMONY
+from sideros.tools.families.qwen import FAMILY as QWEN
 
 CALL = '<tool_call>{"name": "f", "arguments": {"x": 1}}</tool_call>'
 HARMONY_CALL = (
@@ -89,26 +97,26 @@ def streamed(pieces: list[bytes], tools: ToolFamily | None = None) -> list[Segme
 
 
 TINY_QWEN35 = Qwen35Config(
-    hidden_size=8,
-    num_hidden_layers=1,
-    num_attention_heads=2,
-    num_key_value_heads=1,
-    head_dim=4,
-    vocab_size=16,
-    rms_norm_eps=1e-6,
-    rope_theta=10000.0,
-    partial_rotary_factor=0.5,
-    tie_word_embeddings=True,
-    intermediate_size=16,
-    layer_types=("full_attention",),
-    linear_num_key_heads=1,
-    linear_num_value_heads=1,
-    linear_key_head_dim=4,
-    linear_value_head_dim=4,
-    linear_conv_kernel_dim=4,
-    eos_token_id=(),
-    mrope_section=(1, 1, 1),
-    image_token_id=-1,
+    text_config=Qwen35TextConfig(
+        hidden_size=8,
+        num_hidden_layers=1,
+        num_attention_heads=2,
+        num_key_value_heads=1,
+        head_dim=4,
+        vocab_size=16,
+        rms_norm_eps=1e-6,
+        layer_types=("full_attention",),
+        linear_num_key_heads=1,
+        linear_num_value_heads=1,
+        linear_key_head_dim=4,
+        linear_value_head_dim=4,
+        linear_conv_kernel_dim=4,
+        rope_parameters=Qwen35RoPEParameters(
+            rope_theta=10000.0, partial_rotary_factor=0.5, mrope_section=(1, 1, 1)
+        ),
+        tie_word_embeddings=True,
+        intermediate_size=16,
+    ),
 )
 """One attention layer of random weights: the facade under test is the detokenization loop
 around the model, not the model."""
@@ -410,18 +418,22 @@ def prepared(repo: str) -> Text:
 
 def test_the_served_stream_suppresses_with_the_family_its_template_spells() -> None:
     """Nobody hands the family to `TextLanguageModel`, so it arrives with the prompt — which
-    is all the streamer is given. Qwen3.6 writes the same `<tool_call>` marker and fills it
-    with `<function=...>` XML: held, its envelope would be suppressed for a parser that
-    answers `None` to it, and the client would read a turn that called nothing."""
+    is all the streamer is given.
+
+    Qwen3.6 writes the same `<tool_call>` marker and fills it with `<function=...>` XML. The
+    markers are what the stream holds on to and both templates spell those the same way, so
+    both open the same channel; what tells the two apart is the reader on the other side of
+    it, and the difference is written down in one place, the family's own recognizer."""
     pieces = [b"Sure. <tool", b'_call>{"name": "f", "arguments": {"x": 1}}', b"</tool_call>", b"!"]
-    known, _ = text_stream(prepared(QWEN3), pieces)
-    assert list(known) == [
+    channels = [
         Segment("content", "Sure. "),
         Segment("tool", CALL),
         Segment("content", "!"),
     ]
-    unknown, _ = text_stream(prepared(QWEN36), pieces)
-    assert list(unknown) == [Segment("content", piece.decode()) for piece in pieces]
+    json_spelling, _ = text_stream(prepared(QWEN3), pieces)
+    assert list(json_spelling) == channels
+    xml_spelling, _ = text_stream(prepared(QWEN36), pieces)
+    assert list(xml_spelling) == channels
 
 
 # --- the channel a generation starts in, off the real templates ------------------------

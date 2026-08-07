@@ -17,7 +17,7 @@ second half the row (height) rotation. ``layer_norm_eps`` is 1e-5.
 
 import math
 from dataclasses import dataclass
-from typing import TYPE_CHECKING, TypedDict
+from typing import TYPE_CHECKING
 
 import mlx.core as mx
 import mlx.nn as nn
@@ -48,6 +48,12 @@ class Step3p7VisionConfig:
     ls_init_value: float
     use_ln_post: bool
     hidden_act: str
+
+    def __post_init__(self) -> None:
+        if self.hidden_act != "quick_gelu":
+            raise ValueError(f"expected quick_gelu, got {self.hidden_act!r}")
+        if self.use_cls_token:
+            raise ValueError("cls_token is not supported")
 
     @property
     def head_dim(self) -> int:
@@ -281,32 +287,3 @@ class Step3p7Vision(nn.Module):
         return mx.concatenate(outputs, axis=0)
 
 
-class _VisionConfigJson(TypedDict):
-    model_type: str
-    image_size: int
-    patch_size: int
-    width: int
-    layers: int
-    heads: int
-    use_cls_token: bool
-    ls_init_value: float
-    use_ln_post: bool
-    hidden_act: str
-
-
-def vision_config(raw: _VisionConfigJson) -> Step3p7VisionConfig:
-    if raw["hidden_act"] != "quick_gelu":
-        raise ValueError(f"expected quick_gelu, got {raw['hidden_act']!r}")
-    if raw["use_cls_token"]:
-        raise ValueError("cls_token is not supported")
-    return Step3p7VisionConfig(
-        image_size=raw["image_size"],
-        patch_size=raw["patch_size"],
-        width=raw["width"],
-        layers=raw["layers"],
-        heads=raw["heads"],
-        use_cls_token=raw["use_cls_token"],
-        ls_init_value=raw["ls_init_value"],
-        use_ln_post=raw["use_ln_post"],
-        hidden_act=raw["hidden_act"],
-    )

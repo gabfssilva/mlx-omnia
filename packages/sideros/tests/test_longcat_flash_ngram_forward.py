@@ -1,8 +1,8 @@
 # pyright: basic
-"""Longcat Flash Lite (ngram) against mlx-lm (git main) over the same checkpoint.
+"""Longcat Flash Lite (ngram) against the reference implementation over the same checkpoint.
 
-No transformers ground truth exists at this size: the reference is mlx-lm, bounded
-by the floors the fixture measured. The floors are per block (``noise.block_i``)
+No transformers ground truth exists at this size: the reference implementation is the
+golden, bounded by the floors the fixture measured. The floors are per block (``noise.block_i``)
 because the residual grows down a 28-sublayer trunk.
 
 The MLA latent cache, the softmax_bias_topk router, the identity experts and the
@@ -91,7 +91,7 @@ def test_moe_internals_within_floor(
     """A failure here names the culprit: the router, the expert sum, or the
     identity pass-through."""
     from sideros.core.mxcompat import softmax
-    from sideros.models.longcat_flash_ngram import MLACache, NgramCache
+    from sideros.models.longcat_flash_ngram.layers.cache import MLACache, NgramCache
 
     ngram_cache = NgramCache(model.config.emb_neighbor_num)
     embeddings = model.model.ngram_embeddings(golden["input_ids"][None], ngram_cache)

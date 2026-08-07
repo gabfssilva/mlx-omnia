@@ -13,7 +13,10 @@ from pathlib import Path
 
 import pytest
 
-from sideros.tools import HARMONY, QWEN, MalformedToolCall, ToolCall, ToolFamily, tool_family
+from sideros.tools import MalformedToolCall, ToolCall, ToolFamily, tool_family
+from sideros.tools.families.harmony import FAMILY as HARMONY
+from sideros.tools.families.qwen import FAMILY as QWEN
+from sideros.tools.families.qwen_xml import FAMILY as QWEN_XML
 
 FIXTURE = Path(__file__).parent / "fixtures" / "chat_template.json"
 GOLDEN = json.loads(FIXTURE.read_text(encoding="utf-8"))
@@ -62,8 +65,13 @@ def test_a_turn_with_no_envelope_has_no_call() -> None:
 
 def test_broken_json_inside_a_closed_envelope_is_reported() -> None:
     """The envelope is complete, so the model did mean to call something; what it wrote is
-    not a call. Skipping it here would leave the caller reading a refusal."""
-    with pytest.raises(MalformedToolCall, match="did not parse as JSON"):
+    not a call. Skipping it here would leave the caller reading a refusal.
+
+    What never closed is the object, not the marker, and the reader says so with the same
+    word for both: a call cut in half is a call cut in half, whichever of the two ends is
+    missing. Silently defaulting the arguments to `{}` because the marker did arrive would
+    turn a truncated generation into a call the model never finished writing."""
+    with pytest.raises(MalformedToolCall, match="never closes"):
         QWEN.parse_tool_call('<tool_call>\n{"name": "get_weather", </tool_call>')
 
 
@@ -79,7 +87,10 @@ def test_an_envelope_that_carries_no_name_is_reported() -> None:
 
 
 def test_a_payload_that_is_not_an_object_is_reported() -> None:
-    with pytest.raises(MalformedToolCall, match="did not parse as a JSON object"):
+    """A list where the object goes: the reader never finds a member to read, so the call it
+    reports is one that never closed. The wording is not the point — that an envelope nobody
+    could read comes out as an error instead of as silence is."""
+    with pytest.raises(MalformedToolCall, match="never closes"):
         QWEN.parse_tool_call('<tool_call>\n["get_weather"]\n</tool_call>')
 
 
@@ -153,11 +164,13 @@ def test_harmony_reports_broken_json_in_the_arguments() -> None:
 FAMILIES = [
     ("mlx-community/Qwen3-0.6B-4bit", QWEN),
     ("openai/gpt-oss-20b", HARMONY),
-    # Two more spellings, neither of them these two: LFM2.5 writes
-    # `<|tool_call_start|>[fn(arg=1)]<|tool_call_end|>`, and Qwen3.6 keeps Qwen's marker
-    # while filling it with `<function=...><parameter=...>` XML instead of JSON.
+    # Qwen3.6 keeps Qwen's marker and fills it with `<function=...><parameter=...>` XML: the
+    # two are told apart by what follows the marker in the template, which is the only place
+    # the difference is written down.
+    ("mlx-community/Qwen3.6-35B-A3B-6bit", QWEN_XML),
+    # One more spelling, none of these three: LFM2.5 writes
+    # `<|tool_call_start|>[fn(arg=1)]<|tool_call_end|>`.
     ("LiquidAI/LFM2.5-8B-A1B", None),
-    ("mlx-community/Qwen3.6-35B-A3B-6bit", None),
 ]
 
 

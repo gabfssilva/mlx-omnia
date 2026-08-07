@@ -17,8 +17,8 @@ from huggingface_hub import snapshot_download
 from sideros import stream_ids
 from sideros.core.cache import DeltaCache
 from sideros.core.kernels.ssm_step import ssm_step
-from sideros.models import mamba2
 from sideros.models.mamba2 import CHECKPOINT, Mamba2, Mamba2Activations
+from sideros.models.mamba2.layers import flags, ssd
 
 FIXTURE = Path(__file__).parent / "fixtures" / "mamba2_forward.safetensors"
 N_LAYER = 64
@@ -147,7 +147,7 @@ def stepwise(model: Mamba2, ids: mx.array) -> mx.array:
 def test_kernel_is_the_default_path(
     model: Mamba2, golden: dict[str, mx.array], monkeypatch: pytest.MonkeyPatch
 ) -> None:
-    assert mamba2.SSM_KERNEL and mamba2.COMPILED_STEP
+    assert flags.SSM_KERNEL and flags.COMPILED_STEP
 
     calls = {"ssm": 0}
 
@@ -165,7 +165,7 @@ def test_kernel_is_the_default_path(
         calls["ssm"] += 1
         return ssm_step(x, a_log, b, c, d, dt, dt_bias, state, time_step_limit)
 
-    monkeypatch.setattr(mamba2, "ssm_step", counted_ssm)
+    monkeypatch.setattr(ssd, "ssm_step", counted_ssm)
     mx.eval(model(golden["input_ids"][None, :1]))
     assert calls == {"ssm": N_LAYER}
 
@@ -175,7 +175,7 @@ def test_kernel_matches_ops(
 ) -> None:
     ids = golden["input_ids"][None]
     with_kernel = model(ids)
-    monkeypatch.setattr(mamba2, "SSM_KERNEL", False)
+    monkeypatch.setattr(flags, "SSM_KERNEL", False)
     assert relative_diff(with_kernel, model(ids)) < 1e-5
 
 
@@ -184,5 +184,5 @@ def test_compiled_step_matches_eager(
 ) -> None:
     ids = golden["greedy_ids"]
     with_compiled = stepwise(model, ids)
-    monkeypatch.setattr(mamba2, "COMPILED_STEP", False)
+    monkeypatch.setattr(flags, "COMPILED_STEP", False)
     assert relative_diff(with_compiled, stepwise(model, ids)) < 1e-5

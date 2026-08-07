@@ -16,7 +16,8 @@ from conftest import relative_diff
 
 from sideros.core.kernels.rope_epilogue import _KERNEL, _SOURCE, rope_epilogue
 from sideros.core.mxcompat import metal_kernel
-from sideros.models.qwen3_moe import Qwen3Attention, Qwen3MoEConfig
+from sideros.models.qwen3.config import Qwen3MoEConfig
+from sideros.models.qwen3.layers.attention import Qwen3Attention
 
 if TYPE_CHECKING:
     from sideros.core.mxcompat import MetalKernel
@@ -71,7 +72,7 @@ def _ops_path(attention: Qwen3Attention, fused: mx.array, offset: int) -> tuple[
             strict=True,
         )
     )
-    rope = attention._rope
+    rope = attention.rope
     return (
         rope(attention.q_norm(q), offset).reshape(-1),
         rope(attention.k_norm(k), offset).reshape(-1),

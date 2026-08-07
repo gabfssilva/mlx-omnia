@@ -16,15 +16,14 @@ from sideros import KVCache, stream_ids
 from sideros.core.cache import ConvCache
 from sideros.core.kernels.conv_mix import conv_mix
 from sideros.core.kernels.moe_gemv_dense import moe_dense_down
-from sideros.models import lfm2_moe
-from sideros.models.lfm2_moe import (
-    CHECKPOINT,
-    LFM2Attention,
-    LFM2Conv,
-    LFM2MoE,
-    LFM2MoEActivations,
-    LFM2SparseMLP,
-)
+from sideros.models.lfm2.layers import conv as conv_layer
+from sideros.models.lfm2.layers import experts as experts_layer
+from sideros.models.lfm2.layers import flags
+from sideros.models.lfm2.layers.attention import LFM2Attention
+from sideros.models.lfm2.layers.conv import LFM2Conv
+from sideros.models.lfm2.layers.experts import LFM2SparseMLP
+from sideros.models.lfm2.moe import CHECKPOINT, LFM2MoE
+from sideros.models.lfm2.moe.model import LFM2MoEActivations
 
 FIXTURE = Path(__file__).parent / "fixtures" / "lfm2_moe_forward.safetensors"
 REPO = "LiquidAI/LFM2.5-8B-A1B"
@@ -274,7 +273,7 @@ def test_fused_step_matches_ops_path(
     """Each kernel against the op path it replaces, one at a time, on a complete step."""
     fused = step_logits(model, golden["input_ids"])
     with monkeypatch.context() as patch:
-        patch.setattr(lfm2_moe, flag, False)
+        patch.setattr(flags, flag, False)
         ops = step_logits(model, golden["input_ids"])
     assert relative_diff(fused, ops) < 1e-5
 
@@ -294,7 +293,7 @@ def test_mutation_of_conv_window_writeback_breaks_stepwise(
         return gated, slid[::-1]
 
     with monkeypatch.context() as patch:
-        patch.setattr(lfm2_moe, "conv_mix", swapped)
+        patch.setattr(conv_layer, "conv_mix", swapped)
         cache = model.make_cache()
         steps = [model(ids[None, i : i + 1], cache) for i in range(3)]
     assert relative_diff(mx.concatenate(steps, axis=1), model(ids[None, :3])) > 1e-5
@@ -313,5 +312,5 @@ def test_mutation_of_routing_weight_breaks_step(
         return moe_dense_down(gate_up, weight, indices, mx.ones_like(routing))
 
     with monkeypatch.context() as patch:
-        patch.setattr(lfm2_moe, "moe_dense_down", unweighted)
+        patch.setattr(experts_layer, "moe_dense_down", unweighted)
         assert relative_diff(step_logits(model, golden["input_ids"]), reference) > 1e-5

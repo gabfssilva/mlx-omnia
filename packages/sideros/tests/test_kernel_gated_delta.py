@@ -1,10 +1,10 @@
 """Parity and mutation gates for the fused gated delta rule.
 
-The reference is the model's own ops implementation (`models.qwen3_5._delta_rule`) —
+The reference is the model's own ops implementation (`models.qwen3_5.delta_rule`) —
 the same recurrence transformers' `torch_recurrent_gated_delta_rule` runs. Shapes are
 the checkpoints': Qwen3.5-0.8B (Hk = Hv = 16, Dk = Dv = 128, kv-ratio 1) and
 Qwen3.6-27B (Hk = 16, Hv = 48, ratio 3 — the only one that exercises the in-kernel
-key-head broadcast). Magnitudes are checkpoint-like: q/k come out of `_l2norm` (unit
+key-head broadcast). Magnitudes are checkpoint-like: q/k come out of `l2norm` (unit
 rows), v out of conv+silu, beta out of a sigmoid and the decay out of
 `exp(-exp(A_log)·softplus(dt))`, so a lane's dot lands where a bf16 ulp actually
 separates something.
@@ -19,9 +19,15 @@ import numpy as np
 import pytest
 from conftest import relative_diff
 
-from sideros.core.kernels.gated_delta import _KERNEL, _SOURCE, gated_delta, gated_delta_applies
+from sideros.core.kernels.gated_delta import (
+    _KERNEL,
+    _SOURCE,
+    delta_rule,
+    gated_delta,
+    gated_delta_applies,
+)
+from sideros.core.layers import l2norm
 from sideros.core.mxcompat import metal_kernel
-from sideros.models.qwen3_5 import _delta_rule, _l2norm
 
 if TYPE_CHECKING:
     from sideros.core.mxcompat import MetalKernel
@@ -43,8 +49,8 @@ class Inputs:
         def normal(*dims: int) -> mx.array:
             return mx.array(rng.standard_normal(dims), dtype=mx.float32)
 
-        self.q = _l2norm(normal(1, length, hk, dk)).astype(dtype)
-        self.k = _l2norm(normal(1, length, hk, dk)).astype(dtype)
+        self.q = l2norm(normal(1, length, hk, dk)).astype(dtype)
+        self.k = l2norm(normal(1, length, hk, dk)).astype(dtype)
         raw = normal(1, length, hv, dv) * 2.0
         self.v = (raw * mx.sigmoid(raw)).astype(dtype)
         self.beta = mx.sigmoid(normal(1, length, hv)).astype(dtype)
@@ -56,7 +62,7 @@ class Inputs:
     def reference(self) -> tuple[mx.array, mx.array]:
         q = mx.repeat(self.q, self.ratio, axis=2)
         k = mx.repeat(self.k, self.ratio, axis=2)
-        return _delta_rule(q, k, self.v, self.g, self.beta, self.state)
+        return delta_rule(q, k, self.v, self.g, self.beta, self.state)
 
     def kernel_args(self) -> tuple[mx.array, ...]:
         return (

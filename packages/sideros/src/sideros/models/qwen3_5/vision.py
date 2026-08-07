@@ -62,6 +62,11 @@ class Qwen35VisionConfig:
     temporal_patch_size: int
     spatial_merge_size: int
     num_position_embeddings: int
+    deepstack_visual_indexes: tuple[int, ...] = ()
+
+    def __post_init__(self) -> None:
+        if self.deepstack_visual_indexes:
+            raise ValueError("deepstack fan-in is not ported; every shipped config has it empty")
 
     @property
     def head_dim(self) -> int:
@@ -451,37 +456,6 @@ def multimodal_positions(
         raise ValueError("more images than placeholder runs in the prompt")
     positions = np.concatenate(columns, axis=1)
     return positions, int(positions.max()) + 1 - len(ids)
-
-
-class VisionJson(TypedDict):
-    hidden_size: int
-    intermediate_size: int
-    out_hidden_size: int
-    depth: int
-    num_heads: int
-    in_channels: int
-    patch_size: int
-    temporal_patch_size: int
-    spatial_merge_size: int
-    num_position_embeddings: int
-    deepstack_visual_indexes: list[int]
-
-
-def vision_config(raw: VisionJson) -> Qwen35VisionConfig:
-    if raw["deepstack_visual_indexes"]:
-        raise ValueError("deepstack fan-in is not ported; every shipped config has it empty")
-    return Qwen35VisionConfig(
-        hidden_size=raw["hidden_size"],
-        intermediate_size=raw["intermediate_size"],
-        out_hidden_size=raw["out_hidden_size"],
-        depth=raw["depth"],
-        num_heads=raw["num_heads"],
-        in_channels=raw["in_channels"],
-        patch_size=raw["patch_size"],
-        temporal_patch_size=raw["temporal_patch_size"],
-        spatial_merge_size=raw["spatial_merge_size"],
-        num_position_embeddings=raw["num_position_embeddings"],
-    )
 
 
 def normalized_patch_weight(weight: mx.array, config: Qwen35VisionConfig) -> mx.array:
