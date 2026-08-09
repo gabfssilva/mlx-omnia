@@ -39,15 +39,45 @@ export const METHODS: readonly { id: Method; label: string }[] = [
 export const BITS: readonly number[] = [2, 3, 4, 5, 6, 8]
 export const GROUP_SIZES: readonly number[] = [32, 64, 128]
 
+/* The grid the codes are read against. The three exponent-scaled modes carry an exponent per
+   group and no bias, so each fixes its own width and group size — and none of them has the
+   scale-and-bias grid AWQ, GPTQ, oQ and oQe search, which is why they are RTN's alone. */
+export type Mode = 'affine' | 'mxfp4' | 'mxfp8' | 'nvfp4'
+
+export const MODES: readonly { id: Mode; label: string; shape: [number, number] | null }[] = [
+  { id: 'affine', label: 'Affine', shape: null },
+  { id: 'mxfp4', label: 'MXFP4', shape: [32, 4] },
+  { id: 'mxfp8', label: 'MXFP8', shape: [32, 8] },
+  { id: 'nvfp4', label: 'NVFP4', shape: [16, 4] }
+]
+
 export interface PlanRequest {
   source: string
-  bits: number
-  group_size: number
-  /* Width per group of leaves, keyed by the `fullmatch` pattern the engine's selection
+  mode: Mode
+  /* Left out under an exponent-scaled mode: the mode already fixes both, and the daemon
+     refuses a request that sets what it decided. */
+  bits?: number
+  group_size?: number
+  /* Format per group of leaves, keyed by the `fullmatch` pattern the engine's selection
      takes; `null` says dense. A pattern matching no leaf fails the request. */
-  overrides: Record<string, number | null>
+  overrides: Record<string, Override | null>
   method: Method
 }
+
+/* `group_size` absent is the plan's own: departing from it is a decision, and a group that
+   did not make it should not carry a copy of the number. */
+export interface Override {
+  bits: number
+  group_size?: number
+}
+
+/* The width controls as the request carries them. */
+export const selection = (
+  mode: Mode,
+  bits: number,
+  groupSize: number
+): Pick<PlanRequest, 'mode' | 'bits' | 'group_size'> =>
+  mode === 'affine' ? { mode, bits, group_size: groupSize } : { mode }
 
 export interface QuantizeRequest extends PlanRequest {
   repo: string
@@ -59,6 +89,7 @@ export interface PlanLeaf {
   shape: number[]
   /* `null` says the leaf stays dense, which is what the default or an override asked. */
   bits: number | null
+  group_size: number | null
   bytes: number
 }
 

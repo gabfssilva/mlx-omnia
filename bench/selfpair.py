@@ -231,7 +231,7 @@ def main() -> None:
         worker(sys.argv[2])
         return
 
-    from interleaved import MLXLM_REPO, PROMPT, RUNS, TOKENS
+    from interleaved import MLXLM_REPO, PROMPT_TOKENS, RUNS, TOKENS, prompt_ids
 
     from sideros.bpe import ByteLevelBPE
 
@@ -249,9 +249,8 @@ def main() -> None:
     from huggingface_hub import snapshot_download
 
     tokenizer_dir = snapshot_download(MLXLM_REPO[model], allow_patterns=["tokenizer.json"])
-    ids = ByteLevelBPE.from_file(Path(tokenizer_dir) / "tokenizer.json").encode(
-        PROMPT.read_text()
-    )
+    tokenizer = ByteLevelBPE.from_file(Path(tokenizer_dir) / "tokenizer.json")
+    ids = prompt_ids(tokenizer.encode, model, PROMPT_TOKENS)
 
     worktree = Path(tempfile.mkdtemp(prefix=f"selfpair-{commit[:12]}-"))
     subprocess.run(

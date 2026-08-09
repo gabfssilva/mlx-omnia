@@ -1,6 +1,9 @@
 import mlx.core as mx
 import mlx.nn as nn
 
+from sideros.core.kernels.down_combine import DownCombine
+from sideros.core.kernels.gate_up import GateUp
+from sideros.core.kernels.moe_route import softmax_topk_applies, softplus_gather, softplus_topk
 from sideros.core.layers import SORTED_GATHER_MIN, SwitchLinear, sorted_gather
 from sideros.models.deepseek_v4.config import DeepseekV4Config
 
@@ -33,7 +36,23 @@ class MoEGate(nn.Module):
             )
 
     def __call__(self, x: mx.array, ids: mx.array) -> tuple[mx.array, mx.array]:
-        scores = mx.sqrt(nn.softplus((x @ self.weight.T).astype(mx.float32)))
+        logits = x @ self.weight.T
+        if x.shape[-2] == 1 and softmax_topk_applies(logits.size, self.k):
+            if self.hash:
+                chosen = self.tid2eid[ids]
+                weights = softplus_gather(
+                    logits.reshape(-1), chosen.reshape(-1), scale=self.scaling, norm=self.norm_topk
+                )
+                return chosen, weights.reshape(chosen.shape)
+            chosen, weights = softplus_topk(
+                logits.reshape(-1),
+                self.e_score_correction_bias,
+                self.k,
+                scale=self.scaling,
+                norm=self.norm_topk,
+            )
+            return chosen.reshape(1, 1, self.k), weights.reshape(1, 1, self.k)
+        scores = mx.sqrt(nn.softplus(logits.astype(mx.float32)))
         if self.hash:
             chosen = self.tid2eid[ids]
         else:
@@ -95,10 +114,38 @@ class DeepseekV4MoE(nn.Module):
             config.moe_intermediate_size * config.n_shared_experts,
             config.swiglu_limit,
         )
+        self._gate_up: GateUp | None = None
+        self._down: DownCombine | None = None
+
+    def _kernels(self) -> tuple[GateUp, DownCombine]:
+        """Resolved once, at the first T=1 step — after load, when the leaves'
+        formats are final."""
+        gate_up, down = self._gate_up, self._down
+        if gate_up is None or down is None:
+            switch = self.switch_mlp
+            gate_up = GateUp(
+                switch.gate_up_proj, hidden=self.hidden, inner=switch.inner, limit=switch.limit
+            )
+            down = DownCombine(switch.down_proj, hidden=self.hidden, inner=switch.inner)
+            self._gate_up, self._down = gate_up, down
+        return gate_up, down
+
+    def fused_step(self, x: mx.array, chosen: mx.array, weights: mx.array) -> mx.array:
+        gate_up, down = self._kernels()
+        act = gate_up(x.reshape(-1), chosen.reshape(-1))
+        combined = down(
+            act,
+            chosen.reshape(-1),
+            weights.reshape(-1).astype(x.dtype),
+            self.shared_experts(x).reshape(-1),
+        )
+        return combined.reshape(x.shape)
 
     def __call__(self, x: mx.array, ids: mx.array) -> mx.array:
         chosen, weights = self.gate(x, ids)
         length = x.shape[-2]
+        if length == 1:
+            return self.fused_step(x, chosen, weights)
         if length * self.k >= SORTED_GATHER_MIN:
 
             def apply(tokens: mx.array, experts: mx.array) -> mx.array:

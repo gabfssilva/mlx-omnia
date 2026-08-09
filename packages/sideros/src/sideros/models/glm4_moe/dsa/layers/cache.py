@@ -1,5 +1,7 @@
 from collections.abc import Callable
 
+import mlx.core as mx
+
 from sideros.core.cache import KVCache, LayerCache
 
 
@@ -30,6 +32,10 @@ class DSACache(LayerCache):
     @property
     def nbytes(self) -> int:
         return self.attention.nbytes + self.index.nbytes
+
+    @property
+    def tensors(self) -> tuple[mx.array, ...]:
+        return self.attention.tensors + self.index.tensors
 
     def checkpoint(self) -> Callable[[], None]:
         restores = (self.attention.checkpoint(), self.index.checkpoint())

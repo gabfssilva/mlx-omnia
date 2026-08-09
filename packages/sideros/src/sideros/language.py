@@ -12,6 +12,8 @@ from sideros.generate import (
     Constraint,
     Meter,
     Penalty,
+    ReasoningBlock,
+    ReasoningBudget,
     Sampler,
     greedy,
     stream_ids,
@@ -26,7 +28,7 @@ from sideros.model import (
     ModelSignature,
     Wrapping,
 )
-from sideros.suppress import Segment
+from sideros.suppress import REASONING, Segment, opened
 from sideros.tools import ToolFamily
 
 TEXT = ContentType(Modality.TEXT, "text/plain")
@@ -80,6 +82,16 @@ class GenerationOptions:
     because `PromptCache[KVCache]` and `PromptCache[DeltaCache]` are two types, and nothing
     above `stream` can name which one the model builds. Out of the comparison for the same
     reason as the meter: it says what the run may keep, not what it generates."""
+    reasoning_budget: int | None = None
+    """How many ids the reasoning block of this generation may spend, `None` for no cap.
+
+    A number and not a `ReasoningBudget`, for the reason `prefix_budget` is a number: out
+    where a caller stands there is a conversation and not yet a prompt, and what the closer
+    is in ids only exists past the tokenizer. `TextLanguageModel.stream` is where both are,
+    so that is where it is turned into the block the loop watches for.
+
+    Part of the comparison: two requests differing only in how long the model may think are
+    not the same generation."""
     context_limit: int | None = None
     """The checkpoint's own ceiling on prompt and generation together — the config's
     `max_position_embeddings`, when the caller read it. `max_tokens` alone cannot honour
@@ -92,6 +104,36 @@ class Tokenizer(Protocol):
     def encode(self, text: str) -> list[int]: ...
 
     def decode_bytes(self, ids: list[int]) -> bytes: ...
+
+
+def reasoning_budget(
+    tokens: int | None, prompt: str, tokenizer: Tokenizer
+) -> ReasoningBudget | None:
+    """The budget the loop watches for: how many ids the block may spend, and that block in ids.
+
+    Which block depends on the prompt. When the template left one open — Qwen3.6 writes
+    `<think>` into the generation prompt, harmony opens the analysis channel — the budget is
+    already inside it and there is exactly one spelling to close. When it did not, the model
+    is the one that will open a block, and every spelling is watched: which of them this
+    checkpoint writes is a fact of its vocabulary, and one whose tokenizer has no id for
+    `<think>` encodes the marker as pieces the model never emits in that order, so the
+    budget over it simply never arms.
+    """
+    if tokens is None:
+        return None
+    here = opened(prompt)
+    if here is not None:
+        opener, closer = here
+        return ReasoningBudget(
+            tokens,
+            (ReasoningBlock(tuple(tokenizer.encode(opener)), tuple(tokenizer.encode(closer))),),
+            inside=True,
+        )
+    blocks = tuple(
+        ReasoningBlock(tuple(tokenizer.encode(opener)), tuple(tokenizer.encode(closer)))
+        for opener, closer in REASONING
+    )
+    return ReasoningBudget(tokens, blocks)
 
 
 @runtime_checkable
@@ -213,6 +255,9 @@ class TextLanguageModel[C: LayerCache]:
             meter=options.meter,
             prefix=self.prefix,
             constraint=options.constraint,
+            reasoning_budget=reasoning_budget(
+                options.reasoning_budget, input.value, self.tokenizer
+            ),
         )
         # No family — unknown, or a prompt no template rendered — still holds the reasoning
         # block back: that one is the model's own spelling and not the family's.

@@ -580,6 +580,39 @@ def test_include_usage_ends_the_stream_with_a_usage_frame(base_url: str) -> None
     assert all("usage" not in json.loads(frame) for frame in frames[:-2])
 
 
+def test_the_usage_frame_carries_what_the_turn_cost_in_seconds(base_url: str) -> None:
+    """The dialect has no field for a rate, and a chat window that draws one would otherwise
+    have to time the stream from outside — where the load, the queue and the prefill are one
+    number. The extension rides on the frame that is already the request's total.
+
+    `load_seconds` is not asserted: whether this request found the model resident depends on
+    what the suite ran before it, and the key being present with either answer is the
+    contract. What is asserted is that the key is there at all.
+    """
+    body = {
+        "model": MODEL,
+        "messages": [{"role": "user", "content": "Hi"}],
+        "max_tokens": 8,
+        "temperature": 0,
+        "stream": True,
+        "stream_options": {"include_usage": True},
+    }
+    url = f"{base_url}/api/openai/v1/chat/completions"
+    with httpx.Client() as http, http.stream("POST", url, json=body, timeout=60) as response:
+        frames = [
+            line.removeprefix("data: ")
+            for line in response.iter_lines()
+            if line.startswith("data: ")
+        ]
+    timings = json.loads(frames[-2])["x_sideros"]
+    assert "load_seconds" in timings
+    assert timings["ttft_seconds"] > 0
+    assert timings["prefill_tokens_per_second"] > 0
+    assert timings["tokens_per_second"] > 0
+    assert timings["bytes_per_token"] > 0
+    assert 0 < timings["ceiling_fraction"] < 1
+
+
 def test_the_official_sdk_accumulates_the_usage_frame(client: OpenAI) -> None:
     """The SDK's own accumulator over the stream: a frame it cannot fold in is a frame
     that reads as a malformed completion rather than as usage."""

@@ -19,6 +19,7 @@ from typing import TYPE_CHECKING
 import mlx.core as mx
 
 from sideros.core.cache import LayerCache
+from sideros.core.prefill import prefill
 
 if TYPE_CHECKING:
     # `generate` imports this module to reach the speculative path; the names below are
@@ -74,7 +75,9 @@ def stream_speculative_ids[C: LayerCache, D: LayerCache](
     committed = list(prompt)
     # The first token is the target's alone: the prompt's own forward already yields one
     # (that is ttft), and the draft has nothing to propose before it.
-    pending = _ints(mx.argmax(target(mx.array(committed)[None], target_cache)[:, -1, :], axis=-1))
+    ids = mx.array(committed)
+    window = prefill(lambda block: target(ids[block][None], target_cache), ids.size, target_cache)
+    pending = _ints(mx.argmax(target(ids[window][None], target_cache)[:, -1, :], axis=-1))
     committed += pending
 
     emitted = 0
@@ -115,7 +118,13 @@ def _round[C: LayerCache, D: LayerCache](
     A rejected proposal leaves keys in both caches describing a sequence that never
     happened: both are rewound to the accepted prefix before the round returns.
     """
-    ids = mx.array(committed[draft_cache[0].offset :])[None]
+    catchup = mx.array(committed[draft_cache[0].offset :])
+    # Round one is where the draft meets the whole prompt; every round after it is a token
+    # or two behind, and the split collapses to the single block it already was.
+    window = prefill(
+        lambda block: draft(catchup[block][None], draft_cache), catchup.size, draft_cache
+    )
+    ids = catchup[window][None]
     proposals: list[mx.array] = []
     for _ in range(lookahead):
         token = mx.argmax(draft(ids, draft_cache)[:, -1, :], axis=-1)

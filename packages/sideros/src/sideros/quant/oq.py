@@ -17,7 +17,7 @@ originals; a `BlockObservation` carries both outputs.
 import json
 import re
 from collections.abc import Mapping, Sequence
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from pathlib import Path
 from typing import Literal, NotRequired, TypedDict
 
@@ -39,7 +39,6 @@ from sideros.quant.calibration import (
     format_tag,
 )
 from sideros.quant.quantization import (
-    Affine,
     Leaf,
     PlanCost,
     Quantization,
@@ -135,10 +134,12 @@ type Reason = Literal[
 
 @dataclass(frozen=True)
 class Rule:
-    """A path pattern (`fullmatch`, as everywhere else) and the format it asks for."""
+    """A path pattern (`fullmatch`, as everywhere else) and the width it asks for. The
+    width and not the format: the group size of every leaf is the request's, so a recipe
+    that named one would be deciding, behind the caller, half of what was asked."""
 
     pattern: str
-    format: Quantization
+    bits: int
 
 
 @dataclass(frozen=True)
@@ -152,6 +153,9 @@ class Recipe:
     - `exclusions` keep a leaf at the base bits and out of the competition (routed
       experts, whose bank dominates the byte count);
     - `promotions` is the set of widths a free leaf may be promoted to.
+
+    Every width here is read against the request's own base: what a recipe decides is how
+    much precision a leaf deserves, never the group size it is measured in.
     """
 
     identifier: str
@@ -159,7 +163,7 @@ class Recipe:
     protections: tuple[Rule, ...] = ()
     floors: tuple[Rule, ...] = ()
     exclusions: tuple[str, ...] = ()
-    promotions: tuple[Quantization, ...] = ()
+    promotions: tuple[int, ...] = ()
 
     @property
     def name(self) -> str:
@@ -170,17 +174,20 @@ RECIPE_OQ4_V1 = Recipe(
     identifier="oQ4",
     version=1,
     protections=(
-        Rule(r".*\blm_head", Affine(group_size=64, bits=8)),
-        Rule(r".*\bembed_tokens", Affine(group_size=64, bits=8)),
+        Rule(r".*\blm_head", 8),
+        Rule(r".*\bembed_tokens", 8),
     ),
-    floors=(Rule(r".*\b(q_proj|k_proj|v_proj|qkv_proj)", Affine(group_size=64, bits=6)),),
+    floors=(Rule(r".*\b(q_proj|k_proj|v_proj|qkv_proj)", 6),),
     exclusions=(r".*\bswitch_mlp\..*", r".*\bexperts\..*"),
-    promotions=(
-        Affine(group_size=64, bits=5),
-        Affine(group_size=64, bits=6),
-        Affine(group_size=64, bits=8),
-    ),
+    promotions=(5, 6, 8),
 )
+
+
+def widen(base: Quantization, bits: int) -> Quantization:
+    """The base format at another width — the recipe's half of a format meeting the
+    request's. Public because the calibration perturbs by the same set the allocator may
+    promote to, and a candidate measured at another group size is not the candidate."""
+    return replace(base, bits=bits)
 
 
 @dataclass(frozen=True)
@@ -209,10 +216,10 @@ def _matches(patterns: Sequence[str], path: str) -> bool:
     return any(re.fullmatch(pattern, path) for pattern in patterns)
 
 
-def _rule_for(rules: Sequence[Rule], path: str) -> Quantization | None:
+def _rule_for(rules: Sequence[Rule], path: str) -> int | None:
     for rule in rules:
         if re.fullmatch(rule.pattern, path):
-            return rule.format
+            return rule.bits
     return None
 
 
@@ -245,13 +252,17 @@ def _priority(path: str, priorities: Mapping[str, float]) -> float:
 
 
 def _promotion_order(
-    leaf: Leaf, promotions: Sequence[Quantization]
+    leaf: Leaf, promotions: Sequence[int], base: Quantization
 ) -> list[Quantization]:
     """The widths the leaf's own shape admits, most expensive first: the greedy takes the
     largest promotion that fits and falls back to the cheaper ones."""
     admitted = leaf_candidates(leaf)
     return sorted(
-        (format for format in promotions if format in admitted),
+        (
+            format
+            for format in (widen(base, bits) for bits in promotions)
+            if format in admitted
+        ),
         key=lambda format: leaf_cost(leaf, format).total,
         reverse=True,
     )
@@ -291,8 +302,9 @@ class OQAllocator:
                 chosen[leaf.path] = claim[1]
                 reasons[leaf.path] = "override"
                 continue
-            protection = _rule_for(self.recipe.protections, leaf.path)
-            if protection is not None:
+            protected = _rule_for(self.recipe.protections, leaf.path)
+            if protected is not None:
+                protection = widen(self.intent.base, protected)
                 self._admits(leaf, protection)
                 chosen[leaf.path] = protection
                 reasons[leaf.path] = "protection"
@@ -332,7 +344,8 @@ class OQAllocator:
             return True
 
         for leaf in free:
-            floor = _rule_for(self.recipe.floors, leaf.path)
+            floored = _rule_for(self.recipe.floors, leaf.path)
+            floor = None if floored is None else widen(self.intent.base, floored)
             if floor is not None and floor in leaf_candidates(leaf):
                 spend(leaf, floor, "protection")
 
@@ -343,7 +356,7 @@ class OQAllocator:
         for leaf in ordered:
             if target_bytes is not None and total >= target_bytes:
                 break
-            for format in _promotion_order(leaf, self.recipe.promotions):
+            for format in _promotion_order(leaf, self.recipe.promotions, self.intent.base):
                 if spend(leaf, format, "promotion"):
                     break
 

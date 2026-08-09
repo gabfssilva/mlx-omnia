@@ -43,11 +43,11 @@ class Hy3Block(nn.Module):
             normed = mx.fast.rms_norm(x, self.input_layernorm.weight, self.eps)
             return add_rms_norm(
                 x,
-                self.self_attn(normed, mask, cache),
+                self.self_attn(normed, cache, mask),
                 self.post_attention_layernorm.weight,
                 self.eps,
             )
-        attended = x + self.self_attn(self.input_layernorm(x), mask, cache)
+        attended = x + self.self_attn(self.input_layernorm(x), cache, mask)
         return attended, self.post_attention_layernorm(attended)
 
 

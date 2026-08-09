@@ -1,4 +1,4 @@
-from sideros.core.dense import DenseModel
+from sideros.core.attention import DenseModel
 from sideros.models.smollm3.config import SmolLM3Config
 
 

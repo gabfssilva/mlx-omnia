@@ -594,17 +594,24 @@ def budget(model: nn.Module, intent: QuantizationIntent) -> Budget:
 
 
 _RTN = AffineRTN()
+_MXFP_RTN = MXFPRTN()
+_NVFP_RTN = NVFPRTN()
 
 
 def quantize_weights(
     weights: dict[str, mx.array],
     plan: QuantizationPlan,
     *,
-    method: Method[Affine, AffineWeight] = _RTN,
+    method: Method[Affine, AffineWeight] | None = None,
 ) -> dict[str, mx.array]:
     """The transformation runs on the weight dict, tensor by tensor, on the same side as
     the load-time fusions: the dense weight leaves the dict as it is quantized, so the peak
-    is one dense tensor and not the checkpoint. A leaf outside the plan stays dense."""
+    is one dense tensor and not the checkpoint. A leaf outside the plan stays dense.
+
+    `method` is the affine rounding — an imatrix search in place of the extremes. The
+    exponent-scaled modes have no bias to search and no grid to move, so their packing is
+    `mx.quantize`'s and a method handed alongside one is a caller expecting a search that
+    cannot run."""
     missing = sorted(path for path in plan if f"{path}.weight" not in weights)
     if missing:
         raise ValueError(f"the plan names leaves the checkpoint lacks: {missing}")
@@ -615,12 +622,25 @@ def quantize_weights(
     )
     if packed:
         raise ValueError(f"the plan names leaves that are already quantized: {packed}")
+    searched = sorted(
+        path for path, format in plan.items() if not isinstance(format, Affine)
+    )
+    if method is not None and searched:
+        raise ValueError(
+            f"{type(method).__name__} rounds an affine grid, which {searched} have not"
+        )
     for path, format in plan.items():
-        if not isinstance(format, Affine):
-            raise ValueError(
-                f"{path}: {type(method).__name__} produces affine weights, not {format.mode}"
-            )
-        tensors = method.quantize(weights.pop(f"{path}.weight"), format).tensors(path)
+        weight = weights.pop(f"{path}.weight")
+        match format:
+            case Affine():
+                result: AffineWeight | MXFPWeight | NVFPWeight = (method or _RTN).quantize(
+                    weight, format
+                )
+            case MXFP():
+                result = _MXFP_RTN.quantize(weight, format)
+            case NVFP():
+                result = _NVFP_RTN.quantize(weight, format)
+        tensors = result.tensors(path)
         mx.eval(list(tensors.values()))
         weights.update(tensors)
     return weights

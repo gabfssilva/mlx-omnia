@@ -13,27 +13,26 @@ from sideros.checkpoint import (
     reject_dtype_cast,
     stop_tokens,
 )
+from sideros.core.mxcompat import quantize
 from sideros.language import LanguageModel, TextLanguageModel
 from sideros.model import CompositeModel, ModelInput
 from sideros.models.laguna.config import LagunaConfig
 from sideros.models.laguna.model import Laguna
 
 
-def weights(
-    directory: Path, config: LagunaConfig, dtype: mx.Dtype | None
-) -> dict[str, mx.array]:
-    """e_score_correction_bias ships float32 in a bfloat16 checkpoint and stays
-    float32: the router adds it in float32 whatever the model's precision."""
+def weights(directory: Path, config: LagunaConfig, dtype: mx.Dtype | None) -> dict[str, mx.array]:
+    """e_score_correction_bias is float32 whatever the checkpoint's precision: the router
+    adds it in float32, and a conversion that wrote it in the model's dtype (the oQ
+    quantizations do) is upcast back rather than followed."""
     loaded = _rename_vlm(load_shards(directory))
     reject_dtype_cast(dtype, loaded)
 
-    if dtype is not None:
-        loaded = {
-            key: value
-            if key.endswith("e_score_correction_bias")
-            else value.astype(dtype)
-            for key, value in loaded.items()
-        }
+    loaded = {
+        key: value.astype(mx.float32)
+        if key.endswith("e_score_correction_bias")
+        else (value if dtype is None else value.astype(dtype))
+        for key, value in loaded.items()
+    }
 
     if config.tie_word_embeddings:
         drop_tied_head(loaded)
@@ -42,7 +41,8 @@ def weights(
     loaded = concat_gate_up(loaded, config.num_hidden_layers)
     loaded = _stack_experts(loaded, config)
     loaded = _interleave_stacked_experts(loaded, config)
-    return _fuse_shared(loaded, config)
+    loaded = _fuse_shared(loaded, config)
+    return _requantize_dense(loaded, config)
 
 
 def _rename_vlm(weights: dict[str, mx.array]) -> dict[str, mx.array]:
@@ -72,13 +72,9 @@ def _stack_experts(weights: dict[str, mx.array], config: LagunaConfig) -> dict[s
 
         for suffix in ("weight", "scales", "biases"):
             gate_keys = [
-                f"{prefix}experts.{e}.gate_proj.{suffix}"
-                for e in range(config.num_experts)
+                f"{prefix}experts.{e}.gate_proj.{suffix}" for e in range(config.num_experts)
             ]
-            up_keys = [
-                f"{prefix}experts.{e}.up_proj.{suffix}"
-                for e in range(config.num_experts)
-            ]
+            up_keys = [f"{prefix}experts.{e}.up_proj.{suffix}" for e in range(config.num_experts)]
             if not all(key in weights for key in gate_keys + up_keys):
                 continue
             gates = mx.stack([weights.pop(key) for key in gate_keys])
@@ -91,8 +87,7 @@ def _stack_experts(weights: dict[str, mx.array], config: LagunaConfig) -> dict[s
 
         for suffix in ("weight", "scales", "biases"):
             down_keys = [
-                f"{prefix}experts.{e}.down_proj.{suffix}"
-                for e in range(config.num_experts)
+                f"{prefix}experts.{e}.down_proj.{suffix}" for e in range(config.num_experts)
             ]
             if not all(key in weights for key in down_keys):
                 continue
@@ -140,6 +135,65 @@ def _fuse_shared(weights: dict[str, mx.array], config: LagunaConfig) -> dict[str
             mx.eval(fused)
             weights[f"{prefix}gate_up_proj.{suffix}"] = fused
     return weights
+
+
+DENSE_GROUP_SIZE = 32
+DENSE_BITS = 8
+ATTENTION_GROUP_SIZE = 16
+ATTENTION_BITS = 4
+
+
+def _requantize_dense(weights: dict[str, mx.array], config: LagunaConfig) -> dict[str, mx.array]:
+    """A checkpoint that ships its expert stacks quantized and everything else dense spends
+    most of its per-token bandwidth on the dense side: on Laguna-XS-2.1-NVFP4 the attention
+    is 2.862 and the `lm_head` 0.411 of the 4.036 GB read per token, against 0.552 GB for
+    the eight routed experts. NVFP4 reduces the two main attention projections; the head
+    stays dense because greedy decode prunes its exact reads with a certified bound.
+
+    Emitting packed tensors here rather than quantizing the built tree is what keeps the
+    spine untouched — `infer_quantization` reads the format off the shapes and builds the
+    quantized leaf itself. A leaf that already arrived packed (every oQ conversion of
+    Laguna-S) carries its own scales and is left alone. `embed_tokens` stays dense: it is a
+    one-row lookup per token, so its width costs nothing per step.
+
+    The cost is reordering, not accuracy. For attention, measured: the perturbation moves
+    the logits 3.200e-01 where the model's own prefill-vs-stepwise batching noise already
+    moves them 2.633e-01, with the same tie-gap distribution (median 0.250) — 1.22x a floor
+    the architecture carries on its own, well inside the 3x the suite requires. The routing
+    near-ties cascading through 40 sparse layers dominate; the weights round-trip at 5e-03.
+    `docs/models/laguna.md` carries the numbers.
+    """
+    for layer in range(config.num_hidden_layers):
+        prefix = f"model.layers.{layer}.self_attn."
+        for name in ("qkv_proj", "o_proj"):
+            _pack(
+                weights,
+                f"{prefix}{name}",
+                group_size=ATTENTION_GROUP_SIZE,
+                bits=ATTENTION_BITS,
+                mode="nvfp4",
+            )
+        _pack(weights, f"{prefix}g_proj")
+    return weights
+
+
+def _pack(
+    weights: dict[str, mx.array],
+    path: str,
+    *,
+    group_size: int = DENSE_GROUP_SIZE,
+    bits: int = DENSE_BITS,
+    mode: str = "affine",
+) -> None:
+    weight = weights.get(f"{path}.weight")
+    if weight is None or f"{path}.scales" in weights:
+        return
+    packed, scales, *rest = quantize(weight, group_size=group_size, bits=bits, mode=mode)
+    mx.eval(packed, scales, *rest)
+    weights[f"{path}.weight"] = packed
+    weights[f"{path}.scales"] = scales
+    if rest:
+        weights[f"{path}.biases"] = rest[0]
 
 
 def _composite(directory: Path, model: Laguna) -> LanguageModel[ModelInput]:

@@ -114,6 +114,89 @@ _SIGMOID_KERNEL = metal_kernel(
     source=_SIGMOID_SOURCE,
 )
 
+_SOFTPLUS_HEADER = """
+inline float mlx_log1p(float x) {
+    float xp1 = 1.0f + x;
+    if (xp1 == 1.0f) return x;
+    return x * (metal::log(xp1) / (xp1 - 1.0f));
+}
+inline float mlx_softplus(float v) {
+    float maxval = metal::max(v, 0.0f);
+    float minval = metal::min(v, 0.0f);
+    return maxval + mlx_log1p(metal::exp(minval - maxval));
+}
+"""
+
+_SOFTPLUS_SOURCE = """
+    uint lane = thread_position_in_threadgroup.x;
+    constexpr uint per_lane = EXPERTS / 32;
+
+    float s[per_lane];
+    float b[per_lane];
+    for (uint i = 0; i < per_lane; i++) {
+        float v = (float)L[lane + i * 32];
+        s[i] = metal::precise::sqrt(mlx_softplus(v));
+        b[i] = s[i] + B[lane + i * 32];
+    }
+
+    float pick[TOPK];
+    for (uint j = 0; j < TOPK; j++) {
+        float local = -INFINITY;
+        for (uint i = 0; i < per_lane; i++) {
+            local = metal::max(local, b[i]);
+        }
+        float best = simd_max(local);
+        int slot = -1;
+        for (int i = (int)per_lane - 1; i >= 0; i--) {
+            if (slot < 0 && b[i] == best) slot = i;
+        }
+        int cand = slot >= 0 ? (int)(lane + (uint)slot * 32) : -1;
+        int winner = simd_max(cand);
+        uint wslot = (uint)winner / 32;
+        pick[j] = simd_broadcast(s[wslot], (ushort)((uint)winner % 32));
+        if (winner == cand && slot >= 0) b[(uint)slot] = -INFINITY;
+        if (lane == 0) OI[j] = (uint)winner;
+    }
+    float total = 0.0f;
+    for (int j = TOPK - 1; j >= 0; j--) {
+        total = total + pick[j];
+    }
+    if (lane < TOPK) {
+        float w = NORM ? pick[lane] / (total + 1e-20f) : pick[lane];
+        OW[lane] = w * SC;
+    }
+"""
+
+_SOFTPLUS_KERNEL = metal_kernel(
+    name="moe_softplus_topk",
+    input_names=["L", "B", "SC"],
+    output_names=["OI", "OW"],
+    source=_SOFTPLUS_SOURCE,
+    header=_SOFTPLUS_HEADER,
+)
+
+_SOFTPLUS_GATHER_SOURCE = """
+    uint lane = thread_position_in_threadgroup.x;
+    float s = 0.0f;
+    if (lane < TOPK) {
+        float v = (float)L[C[lane]];
+        s = metal::precise::sqrt(mlx_softplus(v));
+    }
+    float total = simd_sum(s);
+    if (lane < TOPK) {
+        float w = NORM ? s / (total + 1e-20f) : s;
+        OW[lane] = w * SC;
+    }
+"""
+
+_SOFTPLUS_GATHER_KERNEL = metal_kernel(
+    name="moe_softplus_gather",
+    input_names=["L", "C", "SC"],
+    output_names=["OW"],
+    source=_SOFTPLUS_GATHER_SOURCE,
+    header=_SOFTPLUS_HEADER,
+)
+
 
 def softmax_topk_applies(experts: int, k: int) -> bool:
     """One simdgroup owns the whole row: `experts / 32` entries per lane, and the k
@@ -137,6 +220,45 @@ def softmax_topk(
         output_dtypes=[mx.uint32, logits.dtype],
     )
     return out[0], out[1]
+
+
+def softplus_topk(
+    logits: mx.array, bias: mx.array, k: int, *, scale: float, norm: bool
+) -> tuple[mx.array, mx.array]:
+    """One token's `sqrt(softplus)` routing pick (DeepSeek-V4 style): selection by
+    `score + bias`, weights from the unbiased scores, renormalized when `norm` and
+    scaled. The score replicates mlx's lowering exactly — LogAddExp as
+    `max + log1p(exp(min - max))` with the Goldberg `log1p`, `metal::precise::sqrt` —
+    so a selection flip against the op chain needs a tie at fp32 resolution."""
+    experts = logits.size
+    assert softmax_topk_applies(experts, k)
+    out = _SOFTPLUS_KERNEL(
+        inputs=[logits, bias.astype(mx.float32), mx.array(scale, dtype=mx.float32)],
+        template=[("T", logits.dtype), ("TOPK", k), ("EXPERTS", experts), ("NORM", int(norm))],
+        grid=(32, 1, 1),
+        threadgroup=(32, 1, 1),
+        output_shapes=[(k,), (k,)],
+        output_dtypes=[mx.uint32, mx.float32],
+    )
+    return out[0], out[1]
+
+
+def softplus_gather(
+    logits: mx.array, chosen: mx.array, *, scale: float, norm: bool
+) -> mx.array:
+    """The hash-routed variant: the experts are given, only their `sqrt(softplus)`
+    weights are computed, renormalized when `norm` and scaled."""
+    k = chosen.size
+    assert 0 < k <= 32
+    (out,) = _SOFTPLUS_GATHER_KERNEL(
+        inputs=[logits, chosen, mx.array(scale, dtype=mx.float32)],
+        template=[("T", logits.dtype), ("TOPK", k), ("NORM", int(norm))],
+        grid=(32, 1, 1),
+        threadgroup=(32, 1, 1),
+        output_shapes=[(k,)],
+        output_dtypes=[mx.float32],
+    )
+    return out
 
 
 def sigmoid_topk(

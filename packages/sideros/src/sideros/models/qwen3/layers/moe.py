@@ -1,20 +1,16 @@
 """The routed MLP, on every layer of the sparse trunk.
 
-The T=1 step routes through the fused kernels when the shapes tile (`moe_gemv_applies`);
-prefill gathers sorted by expert — a pure reorder.
+The T=1 step routes through the fused kernels when the leaves' formats and shapes
+serve them; prefill gathers sorted by expert — a pure reorder.
 """
 
 import mlx.core as mx
 import mlx.nn as nn
 
-from sideros.core.kernels.moe_gemv import moe_down_combine, moe_gate_up_act, moe_gemv_applies
+from sideros.core.kernels.down_combine import DownCombine
+from sideros.core.kernels.gate_up import GateUp
 from sideros.core.kernels.moe_route import softmax_topk, softmax_topk_applies
-from sideros.core.layers import (
-    SORTED_GATHER_MIN,
-    QuantizedSwitchLinear,
-    SwitchGLU,
-    sorted_gather,
-)
+from sideros.core.layers import SORTED_GATHER_MIN, SwitchGLU, sorted_gather
 from sideros.core.mxcompat import softmax
 from sideros.models.qwen3.config import Qwen3MoEConfig
 
@@ -30,6 +26,8 @@ class Qwen3MoEMLP(nn.Module):
         self.k = config.num_experts_per_tok
         self.split = config.num_experts - self.k
         self.norm_topk = config.norm_topk_prob
+        self._gate_up: GateUp | None = None
+        self._down: DownCombine | None = None
 
     def route(self, x: mx.array) -> tuple[mx.array, mx.array]:
         """The softmax spans all experts, so the kept weights depend on the dropped
@@ -41,50 +39,27 @@ class Qwen3MoEMLP(nn.Module):
             weights = weights / weights.sum(axis=-1, keepdims=True)
         return chosen, weights
 
+    def _kernels(self) -> tuple[GateUp, DownCombine]:
+        """Resolved once, at the first T=1 step — after load, when the leaves'
+        formats are final."""
+        gate_up, down = self._gate_up, self._down
+        if gate_up is None or down is None:
+            switch = self.switch_mlp
+            gate_up = GateUp(switch.gate_up_proj, hidden=self.hidden, inner=switch.inner)
+            down = DownCombine(switch.down_proj, hidden=self.hidden, inner=switch.inner)
+            self._gate_up, self._down = gate_up, down
+        return gate_up, down
+
     def step_applies(self) -> bool:
-        gate_up = self.switch_mlp.gate_up_proj
-        down = self.switch_mlp.down_proj
-        return (
-            self.norm_topk
-            and isinstance(gate_up, QuantizedSwitchLinear)
-            and isinstance(down, QuantizedSwitchLinear)
-            # The gemv kernels read an affine bias per group; MXFP carries none.
-            and (gate_up.mode, down.mode) == ("affine", "affine")
-            and moe_gemv_applies(
-                self.hidden, self.switch_mlp.inner, gate_up.group_size, down.group_size
-            )
-            and softmax_topk_applies(self.split + self.k, self.k)
-        )
+        return self.norm_topk and softmax_topk_applies(self.split + self.k, self.k)
 
     def step(self, h: mx.array, residual: mx.array) -> mx.array:
         """T=1: routing, both expert gemvs, the routed sum and the residual join in
         three dispatches."""
-        gate_up = self.switch_mlp.gate_up_proj
-        down = self.switch_mlp.down_proj
-        assert isinstance(gate_up, QuantizedSwitchLinear)
-        assert isinstance(down, QuantizedSwitchLinear)
-        assert gate_up.biases is not None and down.biases is not None
+        gate_up, down = self._kernels()
         chosen, weights = softmax_topk(self.gate(h).reshape(-1), self.k)
-        act = moe_gate_up_act(
-            h.reshape(-1),
-            gate_up.weight,
-            gate_up.scales,
-            gate_up.biases,
-            chosen,
-            group_size=gate_up.group_size,
-            bits=gate_up.bits,
-        )
-        return moe_down_combine(
-            act.reshape(-1),
-            down.weight,
-            down.scales,
-            down.biases,
-            chosen,
-            weights,
-            residual.reshape(-1),
-            group_size=down.group_size,
-            bits=down.bits,
-        ).reshape(1, 1, self.hidden)
+        act = gate_up(h.reshape(-1), chosen)
+        return down(act, chosen, weights, residual.reshape(-1)).reshape(1, 1, self.hidden)
 
     def __call__(self, x: mx.array) -> mx.array:
         chosen, weights = self.route(x)

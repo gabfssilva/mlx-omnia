@@ -3,23 +3,12 @@ from typing import NamedTuple
 import mlx.core as mx
 import mlx.nn as nn
 
-from sideros.core.kernels.moe_gemv import moe_down_combine, moe_gate_up_act, moe_gemv_applies
+from sideros.core.kernels.down_combine import DownCombine
+from sideros.core.kernels.gate_up import GateUp
 from sideros.core.kernels.moe_route import softmax_topk, softmax_topk_applies
-from sideros.core.layers import (
-    SORTED_GATHER_MIN,
-    QuantizedSwitchLinear,
-    SwitchLinear,
-    sorted_gather,
-)
+from sideros.core.layers import SORTED_GATHER_MIN, SwitchLinear, sorted_gather
 from sideros.core.mxcompat import softmax
 from sideros.models.qwen3_5.config import Qwen35TextConfig
-
-
-def _packed(linear: nn.QuantizedLinear) -> tuple[mx.array, mx.array, mx.array]:
-    """A quantized leaf's three tensors, narrowed: `biases` is optional on the type but
-    never absent under affine quantization."""
-    assert isinstance(linear.biases, mx.array)
-    return linear.weight, linear.scales, linear.biases
 
 
 class Qwen35SharedExpert(nn.Module):
@@ -71,6 +60,8 @@ class Qwen35MoE(nn.Module):
             config.num_experts, config.hidden_size, config.moe_intermediate_size
         )
         self.shared_expert = Qwen35SharedExpert(config)
+        self._gate_up: GateUp | None = None
+        self._down: DownCombine | None = None
 
     def route(self, logits: mx.array) -> tuple[mx.array, mx.array, mx.array]:
         """The softmax spans all 256 experts, so the kept weights depend on the dropped
@@ -110,44 +101,33 @@ class Qwen35MoE(nn.Module):
         shared = mx.sigmoid(logits[..., self.experts :]) * self._shared(x)
         return Qwen35MoEInternals(probs, chosen, weights, routed, shared, routed + shared)
 
-    def fused_step_applies(self) -> bool:
-        gate_up = self.switch_mlp.gate_up_proj
-        down = self.switch_mlp.down_proj
-        shared = self.shared_expert.down_proj
-        return (
-            isinstance(gate_up, QuantizedSwitchLinear)
-            and isinstance(down, QuantizedSwitchLinear)
-            and isinstance(shared, nn.QuantizedLinear)
-            # The gemv kernels read an affine bias per group; MXFP carries none.
-            and (gate_up.mode, down.mode) == ("affine", "affine")
-            and (shared.bits, shared.group_size) == (down.bits, down.group_size)
-            and moe_gemv_applies(
-                self.hidden, self.switch_mlp.inner, gate_up.group_size, down.group_size
+    def _kernels(self) -> tuple[GateUp, DownCombine]:
+        """Resolved once, at the first T=1 step — after load, when the leaves'
+        formats are final."""
+        gate_up, down = self._gate_up, self._down
+        if gate_up is None or down is None:
+            switch = self.switch_mlp
+            gate_up = GateUp(switch.gate_up_proj, hidden=self.hidden, inner=switch.inner)
+            down = DownCombine(
+                switch.down_proj,
+                hidden=self.hidden,
+                inner=switch.inner,
+                shared=self.shared_expert.down_proj,
             )
-            and softmax_topk_applies(self.experts, self.k)
-        )
+            self._gate_up, self._down = gate_up, down
+        return gate_up, down
+
+    def fused_step_applies(self) -> bool:
+        return softmax_topk_applies(self.experts, self.k)
 
     def fused_step(self, x: mx.array, residual: mx.array) -> mx.array:
         """Four dispatches for the whole sparse block at T=1: the shared expert rides
         along as the ninth slot, so routing, silu, weighting, the expert sum and the
         residual all stay inside the two gemv kernels."""
-        gate_up = self.switch_mlp.gate_up_proj
-        down = self.switch_mlp.down_proj
-        shared = self.shared_expert.down_proj
-        assert isinstance(gate_up, QuantizedSwitchLinear)
-        assert isinstance(down, QuantizedSwitchLinear)
-        assert isinstance(shared, nn.QuantizedLinear)
-        assert gate_up.biases is not None and down.biases is not None
+        gate_up, down = self._kernels()
         chosen, weights = softmax_topk(self.gate(x).reshape(-1), self.k, shared=True)
-        act = moe_gate_up_act(
-            x.reshape(-1), gate_up.weight, gate_up.scales, gate_up.biases, chosen,
-            group_size=gate_up.group_size, bits=gate_up.bits,
-        )
-        return moe_down_combine(
-            act.reshape(-1), down.weight, down.scales, down.biases, chosen, weights,
-            residual.reshape(-1), group_size=down.group_size, bits=down.bits,
-            shared=_packed(shared),
-        ).reshape(1, 1, self.hidden)
+        act = gate_up(x.reshape(-1), chosen)
+        return down(act, chosen, weights, residual.reshape(-1)).reshape(1, 1, self.hidden)
 
     def __call__(self, x: mx.array) -> mx.array:
         return self.internals(x).out

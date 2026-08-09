@@ -9,7 +9,7 @@ sigmoid, argpartition, take_along_axis, renormalize) is ~10 tiny dependent kerne
 
 The stacks are the checkpoint layout `[experts, out, in]`, rows contiguous, gate‖up
 **block**-concatenated (`[w1 ‖ w3]` on the output axis, LFM2.5's load-time fusion) —
-not the row interleave `moe_gemv.py` wants.
+not the row interleave the quantized gate-up/down-combine kernels want.
 
 Two rounding differences against the op chain, both documented by the tests: the router
 score is sigmoid of an f32 dot (the op chain rounds the gemv and the sigmoid to T), and

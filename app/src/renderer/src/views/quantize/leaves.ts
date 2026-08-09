@@ -19,6 +19,7 @@ export interface LeafGroup {
   /* What the plan gave them, `null` when they stay dense; `mixed` when they disagree,
      which only a hand-written override could produce. */
   bits: number | null
+  groupSize: number | null
   mixed: boolean
 }
 
@@ -39,13 +40,14 @@ export function group(leaves: readonly PlanLeaf[]): LeafGroup[] {
         leaves: 1,
         bytes: leaf.bytes,
         bits: leaf.bits,
+        groupSize: leaf.group_size,
         mixed: false
       })
       continue
     }
     found.leaves += 1
     found.bytes += leaf.bytes
-    if (found.bits !== leaf.bits) found.mixed = true
+    if (found.bits !== leaf.bits || found.groupSize !== leaf.group_size) found.mixed = true
   }
   return [...groups.values()]
 }

@@ -151,7 +151,7 @@ def test_cache_trim_rejected_only_when_untrimmable(model: Llama4) -> None:
 def test_fused_step_matches_op_path(
     model: Llama4, golden: dict[str, mx.array], monkeypatch: pytest.MonkeyPatch
 ) -> None:
-    """The T=1 fused step (moe_gemv with pre-multiplication) vs the ops path.
+    """The T=1 fused step (the affine gemv kernels with pre-multiplication) vs the ops path.
     Both compute the same arithmetic; the bound is the fixture's batching floor."""
     ids = golden["greedy_ids"]
     fused = stepwise(model, ids)

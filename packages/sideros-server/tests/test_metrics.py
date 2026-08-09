@@ -70,6 +70,10 @@ _PACE = 0.02
 _PACED_TOKENS = 100
 """Two seconds of generation at `_PACE`: room to connect in the middle and to leave again."""
 
+_COLD_LOAD = 0.2
+"""Seconds the `cold` model takes to load. Long enough that a load reported as the wait it
+was cannot be confused with the scheduling around it."""
+
 _TICK = 0.001
 """The step of the model with no tree. Small, but not zero: a decode that took no measurable
 time would have no rate to report, and this suite would be asserting on `None`."""
@@ -136,6 +140,9 @@ def load(model_id: str) -> CompositeModel[Text, Segment, GenerationOptions]:
             return CompositeModel(TextLanguageModel(PacedLM(), CountingTokenizer()), [])
         case "opaque":
             return CompositeModel(OpaqueLanguageModel(), [])
+        case "cold":
+            time.sleep(_COLD_LOAD)
+            return CompositeModel(TextLanguageModel(TinyLM(), CountingTokenizer()), [])
         case other:
             raise ValueError(f"no model {other!r} in this stand")
 
@@ -281,6 +288,29 @@ def test_two_sequential_requests_are_two_records_with_their_own_numbers(stand: S
 
     after = totals(stand, "quick")
     assert (after[0] - before[0], after[1] - before[1], after[2] - before[2]) == (2, 10, 13)
+
+
+def test_the_load_is_the_first_request_s_and_no_other_s(stand: Stand) -> None:
+    """A cold checkpoint is seconds and every request after it is none, so the load belongs to
+    the request that paid it: reported on the first and absent on the second. It sits outside
+    `ttft`, which starts at the prefill with the weights already in memory — a load folded
+    into it would read as a prefill twenty times the size of the prompt.
+
+    The prefill rate is asserted as the ratio it is defined as, not as a floor: `prefill_rate`
+    reporting the decode's denominator by mistake would pass any `> 0`.
+    """
+    run(stand, "cold", "abcdefgh", 4)
+    first = entries(snapshot(stand), "requests")[0]
+    run(stand, "cold", "abcdefgh", 4)
+    second = entries(snapshot(stand), "requests")[0]
+
+    assert number(first, "load_seconds") >= _COLD_LOAD
+    assert number(first, "ttft") < _COLD_LOAD, "the load leaked into the meter"
+    assert second["load_seconds"] is None
+    for record in (first, second):
+        assert number(record, "prefill_tokens_per_second") == pytest.approx(
+            number(record, "prompt_tokens") / number(record, "ttft")
+        )
 
 
 def test_a_model_with_no_tree_reports_no_bytes_and_no_ceiling(stand: Stand) -> None:

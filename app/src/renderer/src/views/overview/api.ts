@@ -121,8 +121,12 @@ export interface Sample {
   prompt_tokens: number
   completion_tokens: number
   started_at: number
+  /* What this request paid to put its model in memory, absent when it found it there. It
+     sits outside `ttft`, which starts at the prefill. */
+  load_seconds: number | null
   ttft: number | null
   tokens_per_second: number | null
+  prefill_tokens_per_second: number | null
   bytes_per_token: number | null
   ceiling_fraction: number | null
 }
@@ -160,7 +164,7 @@ export const patchConfig = (patch: ConfigPatch): Promise<ConfigView> =>
 /* ── desktop shell (serve.ts /desktop/daemon) ──────────────────────────── */
 
 /* These talk to the shell, not the daemon: only the shell holds the handle of the
-   process it spawned. Absent shell (bare `deno task dev:web`) — the GET fails and
+   process it spawned. Absent shell (bare `npm run dev:web`) — the GET fails and
    the buttons stay locked. */
 export const getOwnership = (): Promise<{ owned: boolean }> =>
   json<{ owned: boolean }>('/desktop/daemon')

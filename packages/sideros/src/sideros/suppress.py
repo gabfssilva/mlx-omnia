@@ -24,7 +24,7 @@ from typing import Literal
 
 from sideros.tools import ToolFamily
 
-__all__ = ["Channel", "Segment", "Segmenter", "unmarked"]
+__all__ = ["REASONING", "Channel", "Segment", "Segmenter", "opened", "unmarked"]
 
 type Channel = Literal["content", "reasoning", "tool"]
 
@@ -34,6 +34,12 @@ _REASONING: tuple[tuple[str, Channel, str], ...] = (
 )
 """The two spellings of the same block in circulation: Qwen's tag and harmony's channel,
 which gpt-oss opens every turn on."""
+
+REASONING: tuple[tuple[str, str], ...] = tuple((opener, closer) for opener, _, closer in _REASONING)
+"""The same two spellings as opener/closer pairs, for the side of the engine that works in
+ids and not in text. A reasoning budget has to recognise the block before there is any
+decoded text to segment, so it tokenizes these; naming them twice is how the two machines
+would come to disagree about what a reasoning block is."""
 
 _BODY = "<|message|>"
 """What harmony puts between the header of a block and its text. Named next to the spelling
@@ -63,6 +69,19 @@ def unmarked(text: str) -> str:
 class Segment:
     channel: Channel
     text: str
+
+
+def opened(prompt: str) -> tuple[str, str] | None:
+    """The reasoning block this prompt leaves open — its opener and closer — or `None`.
+
+    The marker has to be what the prompt *ends* on, for the reason spelled out in `_resume`,
+    which reads the same answer for the streamer's sake.
+    """
+    tail = prompt.rstrip()
+    for opener, closer in REASONING:
+        if tail.endswith(opener):
+            return opener, closer
+    return None
 
 
 def _resume(prompt: str) -> tuple[Channel, str]:

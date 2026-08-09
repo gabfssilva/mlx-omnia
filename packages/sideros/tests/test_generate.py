@@ -1,3 +1,4 @@
+from collections.abc import Callable
 from itertools import islice
 from pathlib import Path
 
@@ -136,6 +137,52 @@ class ScriptedLM:
         self.step += 1
         row = -mx.abs(mx.arange(self.vocab) - token).astype(mx.float32)
         return mx.broadcast_to(row, (1, ids.shape[1], self.vocab))
+
+
+class CompiledScriptedLM(ScriptedLM):
+    def __init__(self, ids: list[int], vocab: int) -> None:
+        super().__init__(ids, vocab)
+        self.compiled_calls = 0
+
+    def compile_decode(self, cache: list[KVCache]) -> Callable[[mx.array], mx.array]:
+        def decode(ids: mx.array) -> mx.array:
+            self.compiled_calls += 1
+            return self(ids[None], cache)[:, -1, :]
+
+        return decode
+
+
+class GreedyCompiledScriptedLM(CompiledScriptedLM):
+    def __init__(self, ids: list[int], vocab: int) -> None:
+        super().__init__(ids, vocab)
+        self.greedy_compiled_calls = 0
+
+    def compile_greedy_decode(self, cache: list[KVCache]) -> Callable[[mx.array], mx.array]:
+        def decode(ids: mx.array) -> mx.array:
+            self.greedy_compiled_calls += 1
+            return self(ids[None], cache)[:, -1, :]
+
+        return decode
+
+
+def test_stream_ids_uses_model_compiled_decode_after_prefill() -> None:
+    model = CompiledScriptedLM([1, 2, 3, 4], vocab=5)
+
+    assert list(stream_ids(model, [0], max_tokens=4)) == [1, 2, 3, 4]
+    assert model.compiled_calls == 4
+
+
+def test_stream_ids_uses_greedy_compiled_decode_only_for_plain_greedy() -> None:
+    model = GreedyCompiledScriptedLM([1, 2, 3, 4], vocab=5)
+
+    assert list(stream_ids(model, [0], max_tokens=4)) == [1, 2, 3, 4]
+    assert model.greedy_compiled_calls == 4
+    assert model.compiled_calls == 0
+
+    model = GreedyCompiledScriptedLM([1, 2, 3, 4], vocab=5)
+    assert list(stream_ids(model, [0], max_tokens=4, sampler=sampler(top_k(1)))) == [1, 2, 3, 4]
+    assert model.greedy_compiled_calls == 0
+    assert model.compiled_calls == 4
 
 
 def test_stream_generate_flushes_partial_utf8(tokenizer: GPT2Tokenizer) -> None:

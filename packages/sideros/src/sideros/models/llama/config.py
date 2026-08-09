@@ -1,7 +1,7 @@
 from dataclasses import dataclass
 from typing import assert_never
 
-from sideros.core.dense import DenseConfig
+from sideros.core.attention import DenseConfig
 from sideros.core.rope import LlamaRoPEScaling
 
 

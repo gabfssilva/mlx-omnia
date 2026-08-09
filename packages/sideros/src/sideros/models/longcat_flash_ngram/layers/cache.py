@@ -32,6 +32,10 @@ class NgramCache(LayerCache):
     def nbytes(self) -> int:
         return 0 if self._context is None else self._context.nbytes
 
+    @property
+    def tensors(self) -> tuple[mx.array, ...]:
+        return () if self._context is None else (self._context,)
+
     def checkpoint(self) -> Callable[[], None]:
         parent = super().checkpoint()
         context = self._context
@@ -78,6 +82,10 @@ class MLACache(LayerCache):
     @property
     def nbytes(self) -> int:
         return sum(buf.nbytes for buf in (self._latent, self._k_pe) if buf is not None)
+
+    @property
+    def tensors(self) -> tuple[mx.array, ...]:
+        return tuple(buf for buf in (self._latent, self._k_pe) if buf is not None)
 
     def checkpoint(self) -> Callable[[], None]:
         parent = super().checkpoint()

@@ -2,30 +2,32 @@ import { type JSX, useEffect, useRef, useState } from 'react'
 import './chat.css'
 import {
   type CatalogEntry,
-  DEFAULT_PARAMS,
   type Params,
   type Session,
   type SessionSummary,
   type StoredMessage,
+  type Timings,
   type Turn,
+  type TurnMetrics,
   completion,
   createSession,
   deleteSession,
-  getCatalogEntry,
   getSession,
   listCatalog,
   listModels,
   listSessions,
+  metricsOf,
+  metricsOfSample,
+  paramsOf,
   patchSession,
   putMessages
 } from './api'
+import { type Sample, metricEvents } from '../overview/api'
 import { Composer } from './Composer'
 import { Sessions } from './Sessions'
 import { Thread, type Live } from './Thread'
 import { shortModel } from './format'
 
-/* The sustained bandwidth every "% of the ceiling" in the house is measured against. */
-const SUSTAINED = 490e9
 const TITLE_MAX = 48
 
 const reason = (error: unknown): string =>
@@ -77,7 +79,16 @@ export function Chat(): JSX.Element {
   const [live, setLive] = useState<Live | null>(null)
   const [notice, setNotice] = useState<string | null>(null)
   const [spent, setSpent] = useState<number | null>(null)
+  /* The daemon's register, as it stands for the turn being written. */
+  const [pulse, setPulse] = useState<Sample | null>(null)
+  /* How long this turn has been waiting for the register to know about it: the model being
+     read off disk, and the queue in front of it. Both are before the meter exists. */
+  const [waiting, setWaiting] = useState<number | null>(null)
   const abort = useRef<AbortController | null>(null)
+  /* The same live entry, readable from inside a generation: what the turn is written with
+     when the stream ends without the frame that carries its totals. */
+  const pulsed = useRef<Sample | null>(null)
+  const startedAt = useRef(0)
   /* Which session `messages` holds, so the fetch below does not undo a turn this window
      has already appended. */
   const loaded = useRef<string | null>(null)
@@ -124,8 +135,11 @@ export function Chat(): JSX.Element {
     if (model === '' && models.length > 0) setModel(models[0])
   }, [model, models])
 
-  const params = knobs[current ?? ''] ?? DEFAULT_PARAMS
   const entry = catalog.find((candidate) => candidate.id === model) ?? null
+  /* Untouched, a chat is sampled the way the checkpoint says it wants to be — the same
+     values the daemon would fill in for a request that named none. `pick` drops the entry
+     when the model changes, so the sliders follow the model rather than the chat. */
+  const params = knobs[current ?? ''] ?? paramsOf(entry)
   const streaming = live !== null
   const title = summaries.find((summary) => summary.id === current)?.title ?? 'New chat'
   /* What the last turn spent against what the checkpoint can hold — either half alone
@@ -137,6 +151,44 @@ export function Chat(): JSX.Element {
     .filter((part) => part !== null)
     .join(' / ')
 
+  /* Where the numbers under a turn come from while it is still being written. The register
+     is the daemon's and not this window's, so only a request on this chat's model is drawn:
+     another client's generation is not this one. It publishes at both ends of a request and
+     resamples twice a second in between, which is what makes the rate move as it is read. */
+  useEffect(() => {
+    if (!streaming) return
+    const controller = new AbortController()
+    const follow = async (): Promise<void> => {
+      for await (const snapshot of metricEvents(controller.signal)) {
+        const running = snapshot.live
+        const mine = running !== null && running.model === model ? running : null
+        pulsed.current = mine
+        setPulse(mine)
+      }
+    }
+    /* A daemon that cannot be watched costs the live numbers and nothing else — the turn
+       itself rides the completion stream, which has its own failure. */
+    follow().catch(() => undefined)
+    return () => {
+      controller.abort()
+      setPulse(null)
+    }
+  }, [streaming, model])
+
+  /* The clock the reader is left with before the register knows anything: a cold 30B is tens
+     of seconds with nothing to draw, and the load only becomes a number once the request has
+     the model and reaches the gate. */
+  useEffect(() => {
+    if (!streaming || pulse !== null) {
+      setWaiting(null)
+      return
+    }
+    const tick = (): void => setWaiting(performance.now() - startedAt.current)
+    tick()
+    const timer = setInterval(tick, 250)
+    return () => clearInterval(timer)
+  }, [streaming, pulse])
+
   const setParams = (next: Params): void => {
     if (current !== null) setKnobs((all) => ({ ...all, [current]: next }))
   }
@@ -146,19 +198,14 @@ export function Chat(): JSX.Element {
   async function run(id: string, history: StoredMessage[]): Promise<void> {
     const controller = new AbortController()
     abort.current = controller
-    const started = performance.now()
-    let first: number | null = null
+    startedAt.current = performance.now()
+    pulsed.current = null
     let content = ''
     let reasoning = ''
     let failure: string | null = null
-    let completed: number | null = null
     let finish: string | null = null
+    let timings: Timings | null = null
     let flushed = 0
-    /* The entry read again, asked for on the first token and awaited after the last: by
-       then the model is resident, and a resident entry is priced by the tree that is
-       generating instead of by an estimate off the headers — a checkpoint carries blocks
-       the loader drops. Asking here is what keeps the round trip off the end of the turn. */
-    let priced: Promise<CatalogEntry | null> | null = null
     const paint = (force: boolean): void => {
       const at = performance.now()
       /* A token a frame is a render a frame; 30 a second is what the eye reads. */
@@ -171,18 +218,16 @@ export function Chat(): JSX.Element {
       for await (const frame of completion(model, turns(history, params), params, controller.signal)) {
         switch (frame.kind) {
           case 'reasoning':
-            first ??= performance.now()
-            priced ??= getCatalogEntry(model).catch(() => null)
             reasoning += frame.text
             break
           case 'content':
-            first ??= performance.now()
-            priced ??= getCatalogEntry(model).catch(() => null)
             content += frame.text
             break
           case 'usage':
-            completed = frame.completion_tokens
             if (selected.current === id) setSpent(frame.total_tokens)
+            break
+          case 'timings':
+            timings = frame.timings
             break
           case 'error':
             failure = frame.message
@@ -199,23 +244,17 @@ export function Chat(): JSX.Element {
       abort.current = null
     }
 
-    const ended = performance.now()
-    const rate =
-      completed !== null && first !== null && ended > first
-        ? completed / ((ended - first) / 1000)
-        : null
-    const perToken = (await priced)?.bytes_per_token ?? entry?.bytes_per_token ?? null
-    const fraction = rate !== null && perToken ? rate / (SUSTAINED / perToken) : null
-    const answer: StoredMessage = {
-      role: 'assistant',
-      content,
-      metrics: {
-        ttft_ms: (first ?? ended) - started,
-        tokens_per_second: rate,
-        ceiling_fraction: fraction,
-        finish
-      }
-    }
+    /* The turn's numbers are the daemon's, and the two ways it says them: the frame that
+       closes a stream that reached its end, and the last live entry the register published
+       when it did not — a turn the reader stopped is answered by no frame at all. */
+    const metrics: TurnMetrics | null =
+      timings !== null
+        ? metricsOf(timings, finish)
+        : pulsed.current === null
+          ? null
+          : metricsOfSample(pulsed.current)
+    const answer: StoredMessage = { role: 'assistant', content }
+    if (metrics !== null) answer.metrics = metrics
     if (reasoning !== '') answer.reasoning_content = reasoning
     if (failure !== null) answer.error = failure
     /* A turn that was stopped before it said anything leaves nothing behind; everything
@@ -312,6 +351,12 @@ export function Chat(): JSX.Element {
   async function pick(next: string): Promise<void> {
     setModel(next)
     if (current === null) return
+    /* The sampling knobs follow the model: another checkpoint is another set of defaults,
+       and 0.6 carried over from the one before is a value nobody chose for this one. What
+       does not follow are the three the checkpoint has no opinion on — the budget, the
+       effort and the system prompt — which are the reader's and stay. */
+    const chosen = catalog.find((candidate) => candidate.id === next) ?? null
+    setKnobs((all) => ({ ...all, [current]: paramsOf(chosen, params) }))
     try {
       const moved = await patchSession(current, { model: next })
       setSummaries((all) => merge(all, moved))
@@ -347,7 +392,13 @@ export function Chat(): JSX.Element {
           </div>
         </div>
 
-        <Thread key={current ?? 'none'} messages={messages} live={live} />
+        <Thread
+          key={current ?? 'none'}
+          messages={messages}
+          live={live}
+          liveMetrics={pulse === null ? null : metricsOfSample(pulse)}
+          waiting={waiting}
+        />
 
         <Composer
           draft={draft}

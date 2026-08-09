@@ -33,7 +33,8 @@ position clock — no MRoPE.
 
 Load-time fusions (5): qkv concat, dense gate‖up concat, MoE expert gate‖up
 row-interleave, shared expert gate‖up concat, +1 on every RMSNorm weight. No new Metal
-kernel: ``sigmoid_topk`` + ``moe_gemv`` cover the decode path; layers 43-44 fall back
+kernel: ``sigmoid_topk`` + the affine gate-up/down-combine kernels cover the decode
+path; layers 43-44 fall back
 to eager (the clamp is not in the kernel).
 """
 

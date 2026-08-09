@@ -152,7 +152,7 @@ export function App(): JSX.Element {
     <div className="window">
       <aside className="side">
         <div className="railpanel">
-          {/* The real traffic lights land here; see theme.css and desktop/macos.ts. */}
+          {/* The real traffic lights land here; see theme.css and desktop/main.ts. */}
           <div className="lights" />
           <div className="mark">S</div>
           <div className="nav">

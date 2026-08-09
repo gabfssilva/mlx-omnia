@@ -98,6 +98,21 @@ export interface Setting {
   note: string | null
 }
 
+/* sideros.chat.Effort — `auto` is the checkpoint's template deciding, `on` is thinking with
+   no rung named, and the five rungs are what a template that reads `reasoning_effort` gets. */
+export type Effort = 'auto' | 'off' | 'on' | 'low' | 'medium' | 'high' | 'xhigh' | 'max'
+
+export const EFFORTS: readonly Effort[] = [
+  'auto',
+  'off',
+  'on',
+  'low',
+  'medium',
+  'high',
+  'xhigh',
+  'max'
+]
+
 /* profiles.Sampling — every knob optional, and null is "the profile does not set it". */
 export interface Sampling {
   temperature: number | null
@@ -106,6 +121,11 @@ export interface Sampling {
   min_p: number | null
   repetition_penalty: number | null
   seed: number | null
+  reasoning_effort: Effort | null
+  /* The ids the reasoning block may spend. A profile is the only surface it has on the two
+     OpenAI dialects: neither request body can spell one, and inventing a field there would
+     be a field only this server answers. */
+  reasoning_budget: number | null
 }
 
 /* profiles.ProfileView */

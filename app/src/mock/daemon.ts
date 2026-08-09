@@ -4,9 +4,12 @@
    packages/sideros-server/src/sideros_server/*.py — where those disagree with this
    file, they are right.
 
-   `deno task mock`, or `deno task dev:mock` to have the desktop shell start it. */
+   `npm run mock`, or `npm run dev:mock` to have the desktop shell start it. */
 
-const PORT = Number(Deno.env.get('SIDEROS_MOCK_PORT') ?? 8642)
+import { createServer } from 'node:http'
+import { Readable } from 'node:stream'
+
+const PORT = Number(process.env.SIDEROS_MOCK_PORT ?? 8642)
 const STARTED = performance.now()
 const VERSION = '0.1.0'
 
@@ -45,17 +48,43 @@ interface Entry {
   dtype: string | null
   context: number | null
   bytes_on_disk: number
+  defaults: Defaults
   bytes_per_token: number | null
   resident: boolean
 }
 
+/* What the checkpoint's `generation_config.json` declares, null for a knob it does not.
+   The values below are the real ones the four checkpoints ship — gpt-oss ships none. */
+interface Defaults {
+  temperature: number | null
+  top_p: number | null
+  top_k: number | null
+  min_p: number | null
+  repetition_penalty: number | null
+}
+
+const NO_DEFAULTS: Defaults = {
+  temperature: null,
+  top_p: null,
+  top_k: null,
+  min_p: null,
+  repetition_penalty: null
+}
+
+const declares = (temperature: number, topP: number, topK: number): Defaults => ({
+  ...NO_DEFAULTS,
+  temperature,
+  top_p: topP,
+  top_k: topK
+})
+
 /* Ceilings the mockup prints come out of these: 490e9 / bytes_per_token. */
 const CATALOG: Entry[] = [
-  entry('mlx-community/Qwen3-30B-A3B-4bit', 'qwen3_moe', '4-bit', 'bfloat16', 262144, 17.2, 1_711_000_000),
-  entry('openai/gpt-oss-20b', 'gpt_oss', 'mxfp4', 'bfloat16', 131072, 12.9, 940_500_000),
-  entry('mlx-community/gemma-3-12b-it-8bit', 'gemma3', '8-bit', 'bfloat16', 131072, 12.8, 12_250_000_000),
-  entry('mlx-community/LFM2-8B-A1B-4bit', 'lfm2_moe', '4-bit', 'bfloat16', 32768, 4.5, 830_500_000),
-  entry('local/Qwen3.5-VL-27B-4bit', 'qwen3_5_vision', '4-bit', 'bfloat16', 131072, 15.6, 14_410_000_000)
+  entry('mlx-community/Qwen3-30B-A3B-4bit', 'qwen3_moe', '4-bit', 'bfloat16', 262144, 17.2, 1_711_000_000, declares(0.6, 0.95, 20)),
+  entry('openai/gpt-oss-20b', 'gpt_oss', 'mxfp4', 'bfloat16', 131072, 12.9, 940_500_000, NO_DEFAULTS),
+  entry('mlx-community/gemma-3-12b-it-8bit', 'gemma3', '8-bit', 'bfloat16', 131072, 12.8, 12_250_000_000, declares(1.0, 0.95, 64)),
+  entry('mlx-community/LFM2-8B-A1B-4bit', 'lfm2_moe', '4-bit', 'bfloat16', 32768, 4.5, 830_500_000, declares(0.3, 0.95, 50)),
+  entry('local/Qwen3.5-VL-27B-4bit', 'qwen3_5_vision', '4-bit', 'bfloat16', 131072, 15.6, 14_410_000_000, declares(0.7, 0.8, 20))
 ]
 
 function entry(
@@ -65,7 +94,8 @@ function entry(
   dtype: string,
   context: number,
   gigabytes: number,
-  bytesPerToken: number
+  bytesPerToken: number,
+  defaults: Defaults
 ): Entry {
   const directory = `${SYSTEM.catalog}/models--${id.replace(/\//g, '--')}/snapshots/a1b2c3d`
   return {
@@ -77,6 +107,7 @@ function entry(
     dtype,
     context,
     bytes_on_disk: gib(gigabytes),
+    defaults,
     bytes_per_token: bytesPerToken,
     resident: false
   }
@@ -245,7 +276,7 @@ async function handle(request: Request): Promise<Response> {
     return ok({
       status: 'ok',
       models: [...RESIDENT.keys()],
-      pid: Deno.pid,
+      pid: process.pid,
       uptime: (performance.now() - STARTED) / 1000,
       version: VERSION
     })
@@ -397,8 +428,9 @@ async function handle(request: Request): Promise<Response> {
   if (path === '/admin/hub/staging') return ok([])
 
   if (path === '/admin/quantizations/plan' && method === 'POST') {
-    const body = (await request.json()) as { bits?: number; group_size?: number }
-    return ok(PLAN(body.bits ?? 4, body.group_size ?? 64))
+    const body = (await request.json()) as { mode?: string; bits?: number; group_size?: number }
+    const shape = SHAPES[body.mode ?? 'affine']
+    return ok(PLAN(shape?.[1] ?? body.bits ?? 4, shape?.[0] ?? body.group_size ?? 64))
   }
 
   if (path === '/admin/quantizations' && method === 'POST') {
@@ -510,17 +542,51 @@ function CONFIG() {
   }
 }
 
+/* The register's live entry while a mock completion is streaming. The chat view draws the
+   turn's numbers from this stream as they move, so a fixture that only ever answered the
+   frozen sample below would draw a rate nobody is generating. */
+let LIVE: {
+  model: string
+  started_at: number
+  load_seconds: number | null
+  ttft: number | null
+  tokens: number
+} | null = null
+
+function sampled() {
+  const live = LIVE
+  if (live === null) return null
+  const perToken = CATALOG.find((e) => e.id === live.model)?.bytes_per_token ?? null
+  const decoding = live.ttft === null ? 0 : now() - live.started_at - live.ttft
+  const rate = live.tokens > 1 && decoding > 0 ? (live.tokens - 1) / decoding : null
+  return {
+    model: live.model,
+    state: 'running',
+    prompt_tokens: PROMPT_TOKENS,
+    completion_tokens: live.tokens,
+    started_at: live.started_at,
+    load_seconds: live.load_seconds,
+    ttft: live.ttft,
+    tokens_per_second: rate,
+    prefill_tokens_per_second: live.ttft === null ? null : PROMPT_TOKENS / live.ttft,
+    bytes_per_token: perToken,
+    ceiling_fraction: rate === null || perToken === null ? null : rate / (490e9 / perToken)
+  }
+}
+
 function METRICS() {
   const perToken = CATALOG[1].bytes_per_token
   return {
-    live: {
+    live: sampled() ?? {
       model: CATALOG[1].id,
       state: 'running',
       prompt_tokens: 1284,
       completion_tokens: 210,
       started_at: now() - 4,
+      load_seconds: null,
       ttft: 0.096,
       tokens_per_second: 248.7,
+      prefill_tokens_per_second: 1284 / 0.096,
       bytes_per_token: perToken,
       ceiling_fraction: 248.7 / (490e9 / (perToken ?? 1))
     },
@@ -540,12 +606,19 @@ function METRICS() {
 
 /* The mockup's quantize screen: Qwen3-32B dense bf16 65.5 GB → 19.0 GB at 4.75
    bits/weight, with lm_head overridden to dense. */
+/* Group size and width the exponent-scaled modes fix; affine has none and reads the body. */
+const SHAPES: Record<string, [number, number] | undefined> = {
+  mxfp4: [32, 4],
+  mxfp8: [32, 8],
+  nvfp4: [16, 4]
+}
+
 function PLAN(bits: number, groupSize: number) {
   const leaves = [
-    { path: 'model.embed_tokens', kind: 'Embedding', shape: [151936, 5120] as number[], bits, bytes: gib(1.1) },
-    { path: 'model.layers.*.self_attn.{q,k,v,o}_proj', kind: 'Linear', shape: [5120, 5120] as number[], bits, bytes: gib(10.5) },
-    { path: 'model.layers.*.mlp.{gate,up,down}_proj', kind: 'Linear', shape: [25600, 5120] as number[], bits, bytes: gib(52.8) },
-    { path: 'lm_head', kind: 'Linear', shape: [151936, 5120] as number[], bits: null, bytes: gib(1.1) }
+    { path: 'model.embed_tokens', kind: 'Embedding', shape: [151936, 5120] as number[], bits, group_size: groupSize, bytes: gib(1.1) },
+    { path: 'model.layers.*.self_attn.{q,k,v,o}_proj', kind: 'Linear', shape: [5120, 5120] as number[], bits, group_size: groupSize, bytes: gib(10.5) },
+    { path: 'model.layers.*.mlp.{gate,up,down}_proj', kind: 'Linear', shape: [25600, 5120] as number[], bits, group_size: groupSize, bytes: gib(52.8) },
+    { path: 'lm_head', kind: 'Linear', shape: [151936, 5120] as number[], bits: null, group_size: null, bytes: gib(1.1) }
   ]
   const weights = 32_500_000_000
   const total = gib(19.0)
@@ -576,6 +649,15 @@ function completion(model: string) {
   }
 }
 
+const PROMPT_TOKENS = 128
+
+/* Seconds the first turn on a model waits for its weights. */
+const MOCK_LOAD = 2.4
+
+/* Models this fixture has already answered on. A checkpoint is read off disk once and every
+   turn after it finds it there, which is the difference `load_seconds` reports. */
+const WARM = new Set<string>()
+
 /* Token by token, reasoning first, in the frames the dialect defines: the chat view's
    accumulator is exercised for real. */
 function completionStream(model: string): Response {
@@ -591,16 +673,31 @@ function completionStream(model: string): Response {
     })}\n\n`
 
   return stream(async function* () {
+    /* Before the register knows anything: the weights being read, which is what the chat
+       window counts as `waiting` and reports as `load` once the request reaches the gate. */
+    const load = WARM.has(model) ? null : MOCK_LOAD
+    WARM.add(model)
+    if (load !== null) await sleep(load * 1000)
+    const live = { model, started_at: now(), load_seconds: load, ttft: null as number | null, tokens: 0 }
+    LIVE = live
+    const emitted = (): void => {
+      live.ttft ??= now() - live.started_at
+      live.tokens += 1
+    }
     yield chunk({ role: 'assistant', content: '' }, null)
     await sleep(140)
     for (const token of tokens(REASONING)) {
+      emitted()
       yield chunk({ reasoning_content: token }, null)
       await sleep(12)
     }
     for (const token of tokens(ANSWER)) {
+      emitted()
       yield chunk({ content: token }, null)
       await sleep(22)
     }
+    const final = sampled()
+    LIVE = null
     yield chunk({}, 'stop')
     yield `data: ${JSON.stringify({
       id,
@@ -608,7 +705,20 @@ function completionStream(model: string): Response {
       created,
       model,
       choices: [],
-      usage: { prompt_tokens: 128, completion_tokens: 96, total_tokens: 224 }
+      usage: {
+        prompt_tokens: PROMPT_TOKENS,
+        completion_tokens: live.tokens,
+        total_tokens: PROMPT_TOKENS + live.tokens
+      },
+      /* app.py `_timings`, on the frame that closes the turn. */
+      x_sideros: {
+        load_seconds: load,
+        ttft_seconds: final?.ttft ?? null,
+        prefill_tokens_per_second: final?.prefill_tokens_per_second ?? null,
+        tokens_per_second: final?.tokens_per_second ?? null,
+        bytes_per_token: final?.bytes_per_token ?? null,
+        ceiling_fraction: final?.ceiling_fraction ?? null
+      }
     })}\n\n`
     yield 'data: [DONE]\n\n'
   })
@@ -616,4 +726,21 @@ function completionStream(model: string): Response {
 
 const tokens = (text: string): string[] => text.match(/\s*\S+/g) ?? []
 
-Deno.serve({ port: PORT, hostname: '127.0.0.1' }, handle)
+/* The routes above are written against the Web Request/Response pair; node's server
+   speaks streams, so the two are bridged here. The response body is piped rather than
+   buffered — half the fixtures are SSE. */
+createServer((incoming, outgoing) => {
+  void (async () => {
+    const chunks: Buffer[] = []
+    for await (const chunk of incoming) chunks.push(chunk as Buffer)
+    const request = new Request(new URL(incoming.url ?? '/', `http://127.0.0.1:${PORT}`), {
+      method: incoming.method,
+      headers: incoming.headers as Record<string, string>,
+      ...(chunks.length === 0 ? {} : { body: Buffer.concat(chunks) })
+    })
+    const answer = await handle(request)
+    outgoing.writeHead(answer.status, Object.fromEntries(answer.headers))
+    if (answer.body === null) outgoing.end()
+    else Readable.fromWeb(answer.body).pipe(outgoing)
+  })()
+}).listen(PORT, '127.0.0.1', () => console.log(`mock daemon on http://127.0.0.1:${PORT}`))

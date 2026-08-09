@@ -1,5 +1,5 @@
 import type { JSX } from 'react'
-import type { Params } from './api'
+import { EFFORTS, type Effort, type Params } from './api'
 
 /* One decimal place when one is what the number has: 0.6 and not 0.60, which is what
    the mockup reads. */
@@ -38,6 +38,38 @@ function Slider({
         aria-label={label}
         onChange={(event) => onChange(Number(event.target.value))}
       />
+    </div>
+  )
+}
+
+function Choice({
+  label,
+  value,
+  options,
+  onChange
+}: {
+  label: string
+  value: string
+  options: readonly string[]
+  onChange: (value: string) => void
+}): JSX.Element {
+  return (
+    <div className="param">
+      <div className="prow">
+        <label htmlFor="chat-effort">{label}</label>
+      </div>
+      <select
+        id="chat-effort"
+        className="mini"
+        value={value}
+        onChange={(event) => onChange(event.target.value)}
+      >
+        {options.map((option) => (
+          <option key={option} value={option}>
+            {option}
+          </option>
+        ))}
+      </select>
     </div>
   )
 }
@@ -121,6 +153,14 @@ export function ParamsPane({
         max={budgetCap}
         step={256}
         onChange={(value) => set('max_tokens', value)}
+      />
+      {/* How long the model may think has no field in this dialect and is not here: it is a
+          profile knob, under Models. What this sets is how hard it is asked to. */}
+      <Choice
+        label="Reasoning effort"
+        value={params.reasoning_effort}
+        options={EFFORTS}
+        onChange={(value) => set('reasoning_effort', value as Effort)}
       />
 
       <div className="param">

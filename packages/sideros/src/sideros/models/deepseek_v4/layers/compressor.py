@@ -24,8 +24,7 @@ class Compressor(nn.Module):
         self.head_dim = head_dim
         self.overlap = ratio == OVERLAP
         self.out_dim = head_dim * (2 if self.overlap else 1)
-        self.wkv = nn.Linear(config.hidden_size, self.out_dim, bias=False)
-        self.wgate = nn.Linear(config.hidden_size, self.out_dim, bias=False)
+        self.wkvg = nn.Linear(config.hidden_size, 2 * self.out_dim, bias=False)
         self.ape = mx.zeros((ratio, self.out_dim), dtype=mx.float32)
         self.norm = nn.RMSNorm(head_dim, eps=config.rms_norm_eps)
         self.rope = rotary(
@@ -37,7 +36,8 @@ class Compressor(nn.Module):
         )
 
     def __call__(self, x: mx.array, cache: PoolCache, offset: int) -> mx.array:
-        ready_kv, ready_gate, base = cache.accumulate(self.wkv(x), self.wgate(x), offset)
+        kv, gate = mx.split(self.wkvg(x), 2, axis=-1)
+        ready_kv, ready_gate, base = cache.accumulate(kv, gate, offset)
         if ready_kv.shape[1]:
             kv = mx.unflatten(ready_kv, 1, (-1, self.ratio))
             gate = mx.unflatten(ready_gate, 1, (-1, self.ratio))

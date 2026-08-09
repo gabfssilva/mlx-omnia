@@ -61,11 +61,11 @@ class LagunaConfig:
     num_experts: int
     num_experts_per_tok: int
     moe_routed_scaling_factor: float
-    moe_router_logit_softcapping: float
     layer_types: tuple[str, ...]
     mlp_layer_types: tuple[str, ...]
     num_attention_heads_per_layer: tuple[int, ...]
     rope_parameters: LagunaRoPEConfigs
+    moe_router_logit_softcapping: float = 0.0
     eos_token_id: int | tuple[int, ...] = ()
 
     def __post_init__(self) -> None:

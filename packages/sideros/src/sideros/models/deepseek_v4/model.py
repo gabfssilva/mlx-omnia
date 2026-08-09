@@ -39,8 +39,16 @@ class DeepseekV4(nn.Module):
             )
         )
         blocks: list[mx.array] = []
-        for block, layer_cache in zip(self.model.layers, cache, strict=True):
-            h = block(h, mask, layer_cache, ids)
+        layers = self.model.layers
+        partials: mx.array | None = None
+        for index, (block, layer_cache) in enumerate(zip(layers, cache, strict=True)):
+            following = layers[index + 1] if index + 1 < len(layers) else None
+            next_fn = (
+                following.attn_hc.fn
+                if following is not None and following.attn_hc.fused
+                else None
+            )
+            h, partials = block(h, mask, layer_cache, ids, partials, next_fn)
             blocks.append(h)
         normed = self.model.norm(self.model.hc_head(h))
         return DeepseekV4Activations(blocks, self.lm_head(normed))

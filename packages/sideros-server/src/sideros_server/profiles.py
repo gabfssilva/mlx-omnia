@@ -28,6 +28,8 @@ from typing import Annotated
 from fastapi import APIRouter, Depends, HTTPException, Request
 from pydantic import BaseModel, ConfigDict, Field
 
+from sideros.chat import Effort
+from sideros.checkpoint import SamplingDefaults
 from sideros_server import catalog
 from sideros_server.store import Profile, Store
 
@@ -35,7 +37,14 @@ from sideros_server.store import Profile, Store
 class Sampling(BaseModel):
     """The dialect's own knobs, under the dialect's own bounds, each one optional: a knob
     the profile leaves unset is not part of it, and what the request says — or what the
-    dialect defaults to — stands."""
+    dialect defaults to — stands.
+
+    The two reasoning knobs are the profile's whole vocabulary and not any one dialect's:
+    every dialect can spell part of it and none spells all of it — `chat/completions` and
+    `/responses` have an effort and no budget, `/messages` and `generateContent` have a
+    budget and only a switch. A profile is where a client of the half that cannot ask
+    reaches the other half, which is the same job `min_p`, `repetition_penalty` and `seed`
+    already do for the dialects that have no field for them."""
 
     model_config = ConfigDict(extra="forbid")
 
@@ -45,6 +54,14 @@ class Sampling(BaseModel):
     min_p: float | None = Field(default=None, ge=0.0, lt=1.0)
     repetition_penalty: float | None = Field(default=None, gt=0.0)
     seed: int | None = None
+    reasoning_effort: Effort | None = None
+    """How hard the checkpoint is asked to think, in the engine's own vocabulary rather than
+    a dialect's: `auto` is the template's default, `off` and `on` are the switch a dialect
+    that has no rungs can throw, and the five rungs are `reasoning_effort`'s own."""
+    reasoning_budget: int | None = Field(default=None, ge=0)
+    """How many ids the reasoning block may spend, `None` for no cap. Zero is not the same
+    as `reasoning_effort="off"`: off never opens the block, zero opens it and ends it as
+    early as the loop can."""
 
 
 class ProfileBody(BaseModel):
@@ -88,6 +105,30 @@ def resolve(store: Store, model: str) -> tuple[str, ProfileView | None]:
     if colon and (found := store.profile(head, tail)) is not None:
         return head, _view(found)
     return model, None
+
+
+def preset(model_id: str, profile: ProfileView | None) -> Sampling:
+    """What stands between the request and the dialect's own defaults: the profile where it
+    opines, the checkpoint's `generation_config.json` under it.
+
+    Three levels, and each one only fills what the level above left unset — request, then
+    profile, then checkpoint. The checkpoint is the lowest because it is the least specific:
+    it says how the people who trained it meant it to be sampled, which a profile written
+    for a job and a client that named a knob both outrank.
+
+    The dialect's defaults stay where they are, as the floor under all three: a checkpoint
+    that declares nothing changes nothing."""
+    declared = catalog.defaults_of(model_id)
+    asked = Sampling() if profile is None else profile.sampling
+    filled = {
+        knob: value
+        for knob, value in vars(declared).items()
+        if value is not None and getattr(asked, knob) is None
+    }
+    return asked.model_copy(update=filled)
+
+
+assert set(vars(SamplingDefaults())) <= set(Sampling.model_fields)
 
 
 def served_ids(store: Store) -> list[str]:
@@ -138,9 +179,7 @@ def save(model_id: str, name: str, body: ProfileBody, store: StoreDep) -> Profil
     profile no request could ever select.
     """
     if ":" in name:
-        raise HTTPException(
-            status_code=400, detail=f"profile name {name!r} may not contain ':'"
-        )
+        raise HTTPException(status_code=400, detail=f"profile name {name!r} may not contain ':'")
     store.save_profile(
         Profile(
             model=model_id,

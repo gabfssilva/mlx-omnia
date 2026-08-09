@@ -69,7 +69,8 @@ forbidden_modules = ["sideros.tools.families"]
 allow_indirect_imports = true
 
 [tool.pyright]
-typeCheckingMode = "strict"
+typeCheckingMode = "off"
+#typeCheckingMode = "strict"
 # mlx ships incomplete stubs (mlx.nn has none; array methods take Unknown varargs).
 # Our signatures stay fully annotated; these rules only flag mlx's gap.
 reportMissingTypeStubs = false

@@ -255,6 +255,11 @@ class Job:
     meter: Meter = field(default_factory=Meter)
     """The numbers of this generation, filled by the model as it runs — which is the only
     place they exist. Complete by the time the sentinel reaches the consumer."""
+    load_seconds: float | None = None
+    """What this request paid to put its model in memory, and `None` when it found it there.
+    It is the request's number and not the model's: the same checkpoint is cold once and warm
+    for every request after it, and a reader told `load 12 s` on the second turn would be
+    reading somebody else's wait."""
     state: JobState = "queued"
     """What became of the request. Only the worker moves it to a terminal state, so the
     `cancel()` every response ends in — the `finally` of the SSE generator — cannot rewrite
@@ -573,7 +578,14 @@ class Engine:
         worker failing mid-generation. `NotResident` comes before even that, when the config
         says so — see `_reachable`.
         """
+        # Cold decided before the await, because after it the model is resident either way.
+        # What is timed is the whole wait — admission and the eviction it may order included:
+        # they are the request's seconds too, and a load timed from the loader alone reports
+        # less than the reader sat through.
+        cold = model_id not in self._models
+        started = time.perf_counter()
         model = await self._reachable(model_id)
+        loaded = time.perf_counter() - started if cold else None
         if not model.accepts(input):
             raise UnsupportedInput(input)
         entry = self._residency[model_id]
@@ -589,7 +601,15 @@ class Engine:
         # cold path every suite that is not about reuse runs on.
         budget = 0 if self._store is None else _config(self._store).prefix_budget
         options = replace(options, prefix_budget=budget)
-        job = Job(model_id, model, input, options, asyncio.get_running_loop(), lease=entry)
+        job = Job(
+            model_id,
+            model,
+            input,
+            options,
+            asyncio.get_running_loop(),
+            lease=entry,
+            load_seconds=loaded,
+        )
         await self._queue.put(job)
         return job
 
@@ -610,7 +630,10 @@ class Engine:
             # Both ends of the record are taken here rather than in `_decode`: the meter is
             # written from the decode thread, but nothing about publishing it belongs there.
             self._metrics.begin(
-                job.model_id, job.meter, None if entry is None else entry.active_bytes
+                job.model_id,
+                job.meter,
+                None if entry is None else entry.active_bytes,
+                job.load_seconds,
             )
             try:
                 if job.cancelled.is_set():

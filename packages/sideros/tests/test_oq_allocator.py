@@ -13,6 +13,7 @@ from sideros.quant.oq import (
     Recipe,
     Rule,
     allocate,
+    widen,
 )
 from sideros.quant.quantization import (
     Affine,
@@ -85,7 +86,7 @@ def _scores(sensitivities: list[float]) -> list[BlockScore]:
 def _protection(recipe: Recipe, path: str) -> Quantization | None:
     for rule in recipe.protections:
         if re.fullmatch(rule.pattern, path):
-            return rule.format
+            return widen(_BASE, rule.bits)
     return None
 
 
@@ -162,6 +163,30 @@ def test_protections_are_reserved_before_the_allocation() -> None:
         assert decision.format == Affine(group_size=64, bits=8)
 
 
+def test_every_width_the_recipe_names_is_read_at_the_group_size_that_was_asked_for() -> None:
+    """The recipe names widths; the group size of the whole plan is the request's. A leaf
+    protected or promoted at 64 under a base of 128 would be the allocator deciding, behind
+    the caller, half of what the caller asked — and it would ship a checkpoint whose leaves
+    disagree on a number nobody chose."""
+    leaves = _leaves()
+    intent = QuantizationIntent(
+        base=Affine(group_size=128, bits=4),
+        target_bpw=8.0,
+        hard_cap_bpw=8.0,
+        overrides={},
+    )
+    allocation = OQAllocator(intent, RECIPE_OQ4_V1).allocate(leaves, _scores([1.0] * _LAYERS))
+
+    assert allocation.decisions["lm_head"].format == Affine(group_size=128, bits=8)
+    promoted = [
+        decision.format
+        for decision in allocation.decisions.values()
+        if decision.reason == "promotion"
+    ]
+    assert promoted, "nothing was promoted, so the group size proves nothing"
+    assert {format.group_size for format in promoted if format is not None} == {128}
+
+
 def test_unreachable_target_raises_with_the_numbers() -> None:
     leaves = _leaves()
     cap = _baseline_bpw(leaves, RECIPE_OQ4_V1) - 0.5
@@ -196,9 +221,9 @@ def test_a_tie_resolves_by_path_and_repeats() -> None:
     recipe = Recipe(
         identifier="test",
         version=1,
-        protections=(Rule(r".*\blm_head", Affine(group_size=64, bits=8)),),
+        protections=(Rule(r".*\blm_head", 8),),
         exclusions=(r".*\bswitch_mlp\..*", r"embed_tokens"),
-        promotions=(Affine(group_size=64, bits=6),),
+        promotions=(6,),
     )
     leaves = _leaves()
     cap = _baseline_bpw(leaves, recipe) + 0.15
@@ -228,9 +253,9 @@ def test_a_budget_for_one_block_goes_to_the_most_sensitive_one() -> None:
     recipe = Recipe(
         identifier="test",
         version=1,
-        protections=(Rule(r".*\blm_head", Affine(group_size=64, bits=8)),),
+        protections=(Rule(r".*\blm_head", 8),),
         exclusions=(r".*\bswitch_mlp\..*", r"embed_tokens"),
-        promotions=(six,),
+        promotions=(6,),
     )
     leaves = _leaves()
     free = [
@@ -357,7 +382,7 @@ def test_the_oq_plan_beats_uniform_rtn_at_the_same_effective_size() -> None:
     recipe = Recipe(
         identifier="test",
         version=1,
-        promotions=(Affine(group_size=64, bits=5), six, Affine(group_size=64, bits=8)),
+        promotions=(5, 6, 8),
     )
     allocation = OQAllocator(intent, recipe).allocate(leaves, scores)
     assert allocation.cost.total_bytes <= uniform_cost.total_bytes

@@ -46,7 +46,7 @@ uv workspace with three packages, plus the desktop app:
 | `packages/sideros` | the engine: model packages, checkpoint loading, generation pipeline, Metal kernels, quantization |
 | `packages/sideros-server` | FastAPI server speaking the OpenAI API (streaming included), global FCFS queue |
 | `packages/sideros-cli` | HTTP client for the server; depends only on httpx |
-| `app/` | desktop app (React renderer in a Deno Desktop shell), talks to the server over HTTP only |
+| `app/` | desktop app (React renderer in an Electron shell), talks to the server over HTTP only |
 
 Inside the engine:
 

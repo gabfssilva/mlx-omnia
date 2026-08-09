@@ -42,8 +42,9 @@ Two deliberate divergences from the reference, both the house's existing convent
 Nothing here is measured. The mHC junction runs in ops (~4 dispatches x 20 iterations x
 2 junctions x 43 layers) and, by the arithmetic in the recon, dominates the step: the
 fused Sinkhorn kernel other engines have written is the first optimization, not an
-afterthought. The routed experts are mxfp4 without biases, so neither `moe_gemv`
-(affine) nor `mxfp4_moe_gemv` (gpt-oss's activation and a per-row bias) applies as it
+afterthought. The routed experts are mxfp4 without biases, so neither the affine
+gate-up/down-combine kernels nor the mxfp4 ones (which bake swiglu_oai and a per-row
+bias) serve them — `GateUp`/`DownCombine` resolve to the default ops strategy as it
 stands.
 
 MTP: `compress_ratios` has one entry per layer **plus one** for the `mtp` block. The extra

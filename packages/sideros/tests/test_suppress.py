@@ -412,7 +412,7 @@ def prepared(repo: str) -> Text:
     """
     meta = GOLDEN["repos"][repo]
     template = ChatTemplate.from_source(meta["template"], meta["special_tokens"])
-    chat = Chat(({"role": "user", "content": "Weather in Rio?"},), enable_thinking=False)
+    chat = Chat(({"role": "user", "content": "Weather in Rio?"},), reasoning_effort="off")
     return ChatCapability(template).prepare(chat)
 
 

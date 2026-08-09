@@ -43,6 +43,8 @@ from sideros import (
 )
 from sideros.checkpoint import Checkpoint, Pending, attach_weights, save_quantized
 from sideros.quant.quantization import (
+    MXFP,
+    NVFP,
     Affine,
     QuantizationPlan,
     infer_quantization,
@@ -536,7 +538,7 @@ def test_the_entry_carries_the_width_the_plan_asked_for_leaf_by_leaf(
             repo=REPO,
             bits=4,
             group_size=64,
-            overrides={"head": 8, "embed": None},
+            overrides={"head": {"bits": 8, "group_size": 32}, "embed": None},
         ),
         "ok",
     )
@@ -548,17 +550,104 @@ def test_the_entry_carries_the_width_the_plan_asked_for_leaf_by_leaf(
     assert {leaf: infer_quantization(tensors, leaf, input_dims=64) for leaf in _LEAVES} == {
         "attn": Affine(group_size=64, bits=4),
         "embed": None,
-        "head": Affine(group_size=64, bits=8),
+        "head": Affine(group_size=32, bits=8),
         "mlp": Affine(group_size=64, bits=4),
     }
     declared = json.loads((entry.directory / "config.json").read_text())["quantization"]
     assert declared["leaves"] == {
         "attn": {"group_size": 64, "bits": 4},
-        "head": {"group_size": 64, "bits": 8},
+        "head": {"group_size": 32, "bits": 8},
         "mlp": {"group_size": 64, "bits": 4},
     }
     assert entry.quantization == "mixed"
     assert _logits(sideros.load(REPO, local_files_only=True)).shape == (1, 5, 32)
+
+
+def test_a_group_size_the_plan_does_not_share_travels_with_the_leaf_that_asked_for_it(
+    client: TestClient, source: Path
+) -> None:
+    """The priced plan answers per leaf, and a group size is half of what a leaf is: an
+    override that names one has to reach the price the same way the width does, or the
+    screen shows a plan that is not the one the job would write."""
+    priced = price(
+        client,
+        source=str(source),
+        bits=4,
+        group_size=64,
+        overrides={"head": {"bits": 8, "group_size": 32}, "embed": None},
+    )
+
+    assert {leaf["path"]: (leaf["bits"], leaf["group_size"]) for leaf in priced["leaves"]} == {
+        "attn": (4, 64),
+        "embed": (None, None),
+        "head": (8, 32),
+        "mlp": (4, 64),
+    }
+
+
+@pytest.mark.parametrize(
+    ("mode", "format"),
+    [
+        ("mxfp4", MXFP(mode="mxfp4", group_size=32, bits=4)),
+        ("mxfp8", MXFP(mode="mxfp8", group_size=32, bits=8)),
+        ("nvfp4", NVFP(group_size=16, bits=4)),
+    ],
+)
+def test_an_exponent_scaled_mode_packs_its_own_shape_and_the_entry_loads_by_its_id(
+    client: TestClient, source: Path, mode: str, format: object
+) -> None:
+    """The mode is the whole selection: neither width nor group size is a control under it,
+    and what comes out is read off the tensors — uint8 scales at the mode's own group. A
+    leaf left dense is still the caller's, so the `null` half of the selection stays."""
+    wait_for(
+        client,
+        start(client, source=str(source), repo=REPO, mode=mode, overrides={"embed": None}),
+        "ok",
+    )
+
+    (entry,) = catalog.scan()
+    tensors = mx.load(str(entry.directory / "model.safetensors"))
+    assert isinstance(tensors, dict)
+
+    assert {leaf: infer_quantization(tensors, leaf, input_dims=64) for leaf in _LEAVES} == {
+        "attn": format,
+        "embed": None,
+        "head": format,
+        "mlp": format,
+    }
+    assert entry.quantization == mode
+    assert _logits(sideros.load(REPO, local_files_only=True)).shape == (1, 5, 32)
+
+
+def test_an_exponent_scaled_mode_refuses_what_it_does_not_decide(
+    client: TestClient, blocked: Path
+) -> None:
+    """Three requests the mode already answered: a width and a group size it fixes, a method
+    that searches a scale and a bias per group it does not have, and an override naming a
+    width where the width is the mode. Refused from the request alone, before a job exists —
+    and `null` is still an override, because dense is not a width."""
+    refusals: list[dict[str, object]] = [
+        {"source": str(blocked), "repo": REPO, "mode": "nvfp4", "bits": 4},
+        {"source": str(blocked), "repo": REPO, "mode": "nvfp4", "group_size": 16},
+        {"source": str(blocked), "repo": REPO, "mode": "nvfp4", "method": "awq"},
+        {
+            "source": str(blocked),
+            "repo": REPO,
+            "mode": "nvfp4",
+            "overrides": {"lm_head": {"bits": 8}},
+        },
+    ]
+    for body in refusals:
+        response = client.post("/admin/quantizations", json=body)
+        assert response.status_code == 400, response.text
+
+    accepted = client.post(
+        "/admin/quantizations/plan",
+        json={"source": str(blocked), "mode": "nvfp4", "overrides": {"lm_head": None}},
+    )
+
+    assert accepted.status_code == 200, accepted.text
+    assert client.get("/admin/jobs").json() == [], "a refused request started a job"
 
 
 def test_the_provenance_records_the_source_and_the_digest_the_path_stopped_carrying(
@@ -961,7 +1050,7 @@ def test_an_override_that_matches_no_leaf_fails_the_job_and_writes_nothing(
     exactly as empty as it was."""
     failed = wait_for(
         client,
-        start(client, source=str(source), repo=REPO, overrides={"lm_head": 8}),
+        start(client, source=str(source), repo=REPO, overrides={"lm_head": {"bits": 8}}),
         "error",
     )
 
@@ -1031,7 +1120,10 @@ def test_pricing_refuses_what_the_job_refuses_and_starts_nothing(
     three ways a request can be wrong answer here instead of minutes later inside a worker —
     and none of them leaves a job behind."""
     refusals: dict[int, list[dict[str, object]]] = {
-        400: [{"source": str(source), "bits": 7}, {"source": str(source), "overrides": {"x": 8}}],
+        400: [
+            {"source": str(source), "bits": 7},
+            {"source": str(source), "overrides": {"x": {"bits": 8}}},
+        ],
         404: [{"source": "nobody/nothing"}],
     }
     for status, bodies in refusals.items():

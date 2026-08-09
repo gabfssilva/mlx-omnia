@@ -3,18 +3,49 @@
   "version": "0.0.0",
   "private": true,
   "type": "module",
-  "dependencies": {
-    "react": "^19.2.0",
-    "react-dom": "^19.2.0",
-    "react-markdown": "^10.1.0",
-    "rehype-raw": "^7.0.0",
-    "rehype-sanitize": "^6.0.0",
-    "remark-gfm": "^4.0.1"
+  "main": "dist/desktop/main.mjs",
+  "scripts": {
+    "dev": "npm run build:main && SIDEROS_DEV=1 electron .",
+    "dev:mock": "npm run build:main && SIDEROS_DEV=1 SIDEROS_MOCK=1 electron .",
+    "dev:web": "vite",
+    "mock": "node src/mock/daemon.ts",
+    "build:main": "esbuild src/desktop/main.ts --bundle --platform=node --format=esm --target=node22 --external:electron --outfile=dist/desktop/main.mjs",
+    "build:renderer": "vite build",
+    "build": "npm run build:renderer && npm run build:main",
+    "app": "npm run build && electron .",
+    "package": "npm run build && electron-builder --mac",
+    "typecheck": "tsc --noEmit -p tsconfig.json && tsc --noEmit -p tsconfig.desktop.json"
+  },
+  "build": {
+    "appId": "dev.sideros.desktop",
+    "productName": "Sideros",
+    "directories": {
+      "output": "release"
+    },
+    "files": [
+      "dist/**",
+      "package.json"
+    ],
+    "mac": {
+      "category": "public.app-category.developer-tools",
+      "target": "dmg"
+    }
   },
   "devDependencies": {
+    "@types/node": "^26.1.2",
     "@types/react": "^19.2.0",
     "@types/react-dom": "^19.2.0",
     "@vitejs/plugin-react": "^5.2.0",
+    "electron": "^43.2.0",
+    "electron-builder": "^26.15.3",
+    "esbuild": "^0.28.1",
+    "react": "^19.2.0",
+    "react-dom": "^19.2.0",
+    "react-markdown": "^10.1.0",
+    "rehype-highlight": "^7.0.2",
+    "rehype-raw": "^7.0.0",
+    "rehype-sanitize": "^6.0.0",
+    "remark-gfm": "^4.0.1",
     "typescript": "^5.9.3",
     "vite": "^7.3.0"
   }

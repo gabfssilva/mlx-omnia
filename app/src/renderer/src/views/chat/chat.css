@@ -72,6 +72,15 @@
 .msg.model code { font-family: var(--mono); font-size: 12px; background: var(--sunken); border-radius: 5px; padding: 1.5px 6px; }
 .msg.model pre { background: var(--sunken); border-radius: 8px; padding: 10px 12px; overflow-x: auto; }
 .msg.model pre code { background: none; border-radius: 0; padding: 0; line-height: 1.6; }
+.msg.model .hljs-comment, .msg.model .hljs-quote { color: var(--syn-com); font-style: italic; }
+.msg.model :is(.hljs-keyword, .hljs-selector-tag, .hljs-built_in, .hljs-literal, .hljs-meta) { color: var(--syn-key); }
+.msg.model :is(.hljs-string, .hljs-regexp, .hljs-symbol, .hljs-addition) { color: var(--syn-str); }
+.msg.model :is(.hljs-number, .hljs-deletion) { color: var(--syn-num); }
+.msg.model :is(.hljs-title, .hljs-title.class_, .hljs-title.function_, .hljs-section) { color: var(--syn-fn); }
+.msg.model :is(.hljs-attr, .hljs-attribute, .hljs-variable, .hljs-type, .hljs-params, .hljs-selector-attr) { color: var(--syn-attr); }
+.msg.model :is(.hljs-emphasis) { font-style: italic; }
+.msg.model :is(.hljs-strong) { font-weight: 600; }
+
 .msg.model :is(h1, h2, h3, h4, h5, h6) { margin: 16px 0 8px; font-size: 14px; font-weight: 600; letter-spacing: -.01em; }
 .msg.model .mdbody > :is(h1, h2, h3, h4, h5, h6):first-child { margin-top: 0; }
 .msg.model :is(ul, ol) { padding-left: 22px; }
@@ -94,7 +103,8 @@
 .msg.open .reasonbody { display: block; }
 .msg.open .reason svg { transform: rotate(90deg); }
 .metrics { margin-top: 14px; font-size: 11px; color: var(--fg3); font-variant-numeric: tabular-nums;
-  display: flex; align-items: center; gap: 8px; }
+  display: flex; align-items: center; flex-wrap: wrap; gap: 8px; }
+.metrics span + span::before { content: '·'; margin-right: 8px; color: var(--hair2); }
 .metrics .pct { color: var(--ember-ink); font-weight: 600; }
 .caret { display: inline-block; width: 7px; height: 15px; border-radius: 2px; vertical-align: text-bottom; margin-left: 3px;
   background: linear-gradient(180deg, var(--ember1), var(--ember2)); box-shadow: var(--glow); animation: pulse 1s step-end infinite; }

@@ -93,7 +93,12 @@ def sorted_gather(
     order = mx.argsort(flat)
     tokens = x.reshape(length, 1, hidden)[order // k]
     out = apply(tokens, flat[order])
-    return out[mx.argsort(order)].reshape(1, length, k, hidden)
+    # The unsort needs argsort(order), and order is a permutation: its inverse is the
+    # scatter inverse[order] = arange — one indexed write instead of a second sort.
+    inverse = mx.put_along_axis(
+        mx.zeros_like(order), order, mx.arange(order.size, dtype=order.dtype), axis=0
+    )
+    return out[inverse].reshape(1, length, k, hidden)
 
 
 class SwitchLinear(nn.Module):

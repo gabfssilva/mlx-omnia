@@ -29,12 +29,12 @@ from conftest import (
 from sideros import KVCache, stream_ids
 from sideros.checkpoint import stop_tokens
 from sideros.core.config import load_config
-from sideros.core.kernels.mxfp4_moe_gemv import mxfp4_down_combine
+from sideros.core.kernels.down_combine import DownCombine
 from sideros.core.kernels.sink_attention import sink_attention
 from sideros.core.layers import QuantizedSwitchLinear
 from sideros.models.gpt_oss import CHECKPOINT, GPTOSS, GPTOSSConfig
 from sideros.models.gpt_oss.layers import attention as attention_module
-from sideros.models.gpt_oss.layers import flags, moe
+from sideros.models.gpt_oss.layers import flags
 
 FIXTURE = Path(__file__).parent / "fixtures" / "gpt_oss_120b_mlxlm.safetensors"
 REPO = "openai/gpt-oss-120b"
@@ -236,15 +236,15 @@ def test_fused_mlp_dropping_residual_breaks_parity(
     forgets to hand it over (or adds it twice outside) must be caught."""
     ids = golden["greedy_ids"]
 
-    def without_residual(
-        act: mx.array, weight: mx.array, scales: mx.array, bias: mx.array,
-        indices: mx.array, routing: mx.array, residual: mx.array,
-    ) -> mx.array:
-        return mxfp4_down_combine(
-            act, weight, scales, bias, indices, routing, mx.zeros_like(residual)
-        )
+    original = DownCombine.__call__
 
-    monkeypatch.setattr(moe, "mxfp4_down_combine", without_residual)
+    def without_residual(
+        self: DownCombine, act: mx.array, chosen: mx.array, weights: mx.array,
+        residual: mx.array,
+    ) -> mx.array:
+        return original(self, act, chosen, weights, mx.zeros_like(residual))
+
+    monkeypatch.setattr(DownCombine, "__call__", without_residual)
     broken = _stepwise(model, ids)
     monkeypatch.undo()
     assert relative_diff(broken, model(ids[None])) > 3 * golden["noise.batching"].item()

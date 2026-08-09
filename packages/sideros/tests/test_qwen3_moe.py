@@ -20,7 +20,8 @@ from conftest import (
 
 from sideros import KVCache, stream_ids
 from sideros.core.kernels.add_rms_norm import add_rms_norm
-from sideros.core.kernels.moe_gemv import moe_down_combine, moe_gate_up_act
+from sideros.core.kernels.down_combine.affine import AffineDownCombine
+from sideros.core.kernels.gate_up.affine import AffineGateUp
 from sideros.core.kernels.moe_route import softmax_topk, softmax_topk_applies
 from sideros.core.kernels.rope_epilogue import rope_epilogue
 from sideros.core.mxcompat import softmax
@@ -142,10 +143,8 @@ def test_moe_gemv_matches_op_chain_fp32() -> None:
     gw, gs, gb = mx.quantize(gate_up, group_size=group, bits=bits)
     dw, ds, db = mx.quantize(down, group_size=group, bits=bits)
 
-    act = moe_gate_up_act(x, gw, gs, gb, indices, group_size=group, bits=bits)
-    out = moe_down_combine(
-        act.reshape(-1), dw, ds, db, indices, routing, residual, group_size=group, bits=bits
-    )
+    act = AffineGateUp(gw, gs, gb, group, bits, None)(x, indices)
+    out = AffineDownCombine(dw, ds, db, group, bits, None)(act, indices, routing, residual)
 
     fused = mx.gather_qmm(
         x[None, None, None], gw, gs, gb, rhs_indices=indices[None],

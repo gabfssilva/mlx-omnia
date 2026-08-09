@@ -30,7 +30,7 @@ import json
 import re
 import shutil
 from collections.abc import Iterator, Mapping
-from dataclasses import dataclass, replace
+from dataclasses import dataclass, field, replace
 from functools import lru_cache
 from pathlib import Path, PurePosixPath
 from typing import Annotated, NotRequired, TypedDict
@@ -39,7 +39,7 @@ import huggingface_hub.constants
 from fastapi import APIRouter, Depends, HTTPException, Request
 from fastapi.responses import FileResponse, PlainTextResponse
 
-from sideros.checkpoint import QuantizationJson
+from sideros.checkpoint import QuantizationJson, SamplingDefaults, sampling_defaults
 from sideros.footprint import expert_slots
 from sideros.task import source as checkpoint_source
 from sideros_server.engine import Engine
@@ -112,6 +112,11 @@ class CatalogEntry:
     dtype: str | None
     context: int | None
     bytes_on_disk: int
+    defaults: SamplingDefaults = field(default_factory=SamplingDefaults)
+    """How the checkpoint's own `generation_config.json` says it wants to be sampled. It is
+    what a request that names no knob gets, and what the app fills its sliders with when a
+    model is picked — an empty one is a checkpoint that says nothing, and there the dialect's
+    defaults are all there is."""
     bytes_per_token: int | None = None
     """Bytes a decode step reads, and the denominator of every "% of the ceiling" the house
     reports. `None` when the shards' headers cannot be read."""
@@ -294,6 +299,7 @@ def _entry(model_id: str, directory: Path, store: Path) -> CatalogEntry | None:
         quantization=_quantization(config),
         dtype=config.get("dtype") or config.get("torch_dtype"),
         context=context,
+        defaults=sampling_defaults(directory),
         bytes_on_disk=sum(path.stat().st_size for path in directory.iterdir() if path.is_file()),
         bytes_per_token=_bytes_per_token(directory, config),
     )
@@ -357,6 +363,18 @@ def context_of(model_id: str) -> int | None:
         if entry.id == model_id:
             return entry.context
     return None
+
+
+@lru_cache(maxsize=256)
+def defaults_of(model_id: str) -> SamplingDefaults:
+    """The checkpoint's sampling defaults, by id, for the dialects to fill the knobs a
+    request left out. Empty for an id the disk does not answer for — every test double, and
+    a model deleted mid-request — which is the same thing as a checkpoint that declares
+    nothing. Cached for the reason `context_of` is."""
+    for entry in scan():
+        if entry.id == model_id:
+            return entry.defaults
+    return SamplingDefaults()
 
 
 async def resident_models(request: Request) -> Mapping[str, int | None]:

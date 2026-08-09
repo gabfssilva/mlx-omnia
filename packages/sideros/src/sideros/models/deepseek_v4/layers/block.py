@@ -19,14 +19,23 @@ class DeepseekV4Block(nn.Module):
         self.ffn_hc = HyperConnection(config)
 
     def __call__(
-        self, h: mx.array, mask: mx.array | str | None, cache: DeepseekV4Cache, ids: mx.array
-    ) -> mx.array:
+        self,
+        h: mx.array,
+        mask: mx.array | str | None,
+        cache: DeepseekV4Cache,
+        ids: mx.array,
+        partials: mx.array | None = None,
+        next_fn: mx.array | None = None,
+    ) -> tuple[mx.array, mx.array | None]:
         residual = h
-        x, post, comb = self.attn_hc(h)
-        h = hc_expand(self.attn(self.attn_norm(x), mask, cache), residual, post, comb)
+        x, post, comb = self.attn_hc(h, self.attn_norm, partials)
+        h, partials = hc_expand(
+            self.attn(x, mask, cache), residual, post, comb,
+            self.ffn_hc.fn if self.ffn_hc.fused else None,
+        )
         residual = h
-        x, post, comb = self.ffn_hc(h)
-        return hc_expand(self.ffn(self.ffn_norm(x), ids), residual, post, comb)
+        x, post, comb = self.ffn_hc(h, self.ffn_norm, partials)
+        return hc_expand(self.ffn(x, ids), residual, post, comb, next_fn)
 
 
 class DeepseekV4Trunk(nn.Module):

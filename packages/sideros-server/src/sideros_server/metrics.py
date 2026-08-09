@@ -57,6 +57,10 @@ class Sample:
     holds no tensors — and `ceiling_fraction` with it: a percentage of a ceiling nobody
     computed is a number nobody can read. `tokens_per_second` is the meter's, decode only,
     and absent before the second token exists to measure a rate between.
+
+    `load_seconds` is `Job.load_seconds`: the seconds this request spent putting its model in
+    memory, absent when it found it resident. It is outside `ttft` — the meter starts at the
+    prefill, with the weights already there.
     """
 
     model: str
@@ -64,8 +68,10 @@ class Sample:
     prompt_tokens: int
     completion_tokens: int
     started_at: float
+    load_seconds: float | None
     ttft: float | None
     tokens_per_second: float | None
+    prefill_tokens_per_second: float | None
     bytes_per_token: int | None
     ceiling_fraction: float | None
 
@@ -123,12 +129,24 @@ class _Live:
     meter: Meter
     bytes_per_token: int | None
     started_at: float
+    load_seconds: float | None
 
 
 def _fraction(rate: float | None, bytes_per_token: int | None) -> float | None:
     if rate is None or bytes_per_token is None:
         return None
     return rate / ceiling(bytes_per_token)
+
+
+def prefill_rate(prompt_tokens: int, ttft: float | None) -> float | None:
+    """The prompt against the time it took to get a token out of it — the same denominator
+    mlx-lm's "prompt tok/s" uses, and the only one this process can measure: separating the
+    prefill from the step that draws the first token would cost a sync the decode loop does
+    not pay. So it is a floor on the prefill rate, by one decode step.
+    """
+    if ttft is None or ttft <= 0 or prompt_tokens == 0:
+        return None
+    return prompt_tokens / ttft
 
 
 def _measure(live: _Live, state: RequestState) -> Sample:
@@ -140,8 +158,10 @@ def _measure(live: _Live, state: RequestState) -> Sample:
         prompt_tokens=meter.prompt_tokens,
         completion_tokens=meter.completion_tokens,
         started_at=live.started_at,
+        load_seconds=live.load_seconds,
         ttft=meter.ttft,
         tokens_per_second=rate,
+        prefill_tokens_per_second=prefill_rate(meter.prompt_tokens, meter.ttft),
         bytes_per_token=live.bytes_per_token,
         ceiling_fraction=_fraction(rate, live.bytes_per_token),
     )
@@ -172,10 +192,16 @@ class Metrics:
         self._live: _Live | None = None
         self.watchers: set[asyncio.Queue[Snapshot]] = set()
 
-    def begin(self, model: str, meter: Meter, bytes_per_token: int | None) -> None:
+    def begin(
+        self,
+        model: str,
+        meter: Meter,
+        bytes_per_token: int | None,
+        load_seconds: float | None = None,
+    ) -> None:
         """The request reached the gate. `bytes_per_token` is the model's, taken once at
         load: walking a 30B's tree per request would cost more than the request."""
-        self._live = _Live(model, meter, bytes_per_token, time.time())
+        self._live = _Live(model, meter, bytes_per_token, time.time(), load_seconds)
         self._publish()
 
     def end(self, state: RequestState) -> None:

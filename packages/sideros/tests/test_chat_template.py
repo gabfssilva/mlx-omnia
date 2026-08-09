@@ -23,6 +23,7 @@ from sideros.chat import (
     ChatCapability,
     ChatMessage,
     ChatTemplate,
+    Effort,
     ImageMarkerMismatch,
     MultimodalChatCapability,
     chat_capabilities,
@@ -70,11 +71,16 @@ def template_of(case: dict[str, Any]) -> ChatTemplate:
 
 
 def chat_of(case: dict[str, Any]) -> Chat:
+    """The fixture is written in the kwargs transformers was called with, which is the
+    ground truth this compares against. `enable_thinking` is the bool the effort resolves
+    to, so the case is read back through the same mapping the render applies."""
     kwargs = case["kwargs"]
+    thinking = kwargs.get("enable_thinking")
+    effort: Effort = "auto" if thinking is None else "on" if thinking else "off"
     return Chat(
         tuple(cast(list[ChatMessage], case["messages"])),
         tuple(kwargs.get("tools", ())),
-        kwargs.get("enable_thinking"),
+        effort,
     )
 
 
@@ -293,3 +299,36 @@ def test_generation_prompt_is_optional() -> None:
     template = template_of(case)
     assert template.render(chat_of(case), add_generation_prompt=False) != case["rendered"]
     assert case["rendered"].startswith(template.render(chat_of(case), add_generation_prompt=False))
+
+
+ECHO = ChatTemplate.from_source(
+    "{% if enable_thinking is defined %}on={{ enable_thinking }};{% endif %}"
+    "{% if reasoning_effort is defined %}effort={{ reasoning_effort }};{% endif %}"
+)
+"""A template that reports which thinking kwargs reached it. `is defined` is the branch the
+templates in circulation take, which is why an unset kwarg has to be absent and not false."""
+
+
+def rendered(effort: Effort) -> str:
+    return ECHO.render(Chat(({"role": "user", "content": "hi"},), reasoning_effort=effort))
+
+
+def test_auto_sends_no_thinking_kwarg_at_all() -> None:
+    """`auto` is the template's own default, and the only way to ask for it is to say
+    nothing: `enable_thinking=false` is off, not unset."""
+    assert rendered("auto") == ""
+
+
+def test_the_switch_travels_without_a_level() -> None:
+    """What a dialect with only a switch can say. A level here would be one this server
+    invented for a client that named none."""
+    assert rendered("off") == "on=False;"
+    assert rendered("on") == "on=True;"
+
+
+def test_a_level_travels_with_the_switch() -> None:
+    """Both kwargs, because a template that reads only `enable_thinking` would otherwise
+    have thinking turned off by omission — and the rung is passed through as written."""
+    assert rendered("high") == "on=True;effort=high;"
+    assert rendered("xhigh") == "on=True;effort=xhigh;"
+    assert rendered("max") == "on=True;effort=max;"

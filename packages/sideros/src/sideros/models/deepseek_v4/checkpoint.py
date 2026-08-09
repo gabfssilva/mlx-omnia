@@ -31,6 +31,7 @@ def weights(
                 tensors, layers, config.o_groups, config.o_lora_rank
             ),
             lambda tensors: _narrow_hash_tables(tensors, layers),
+            lambda tensors: _concat_compressor_gates(tensors, layers),
             lambda tensors: interleave_gate_up(tensors, layers, prefix="ffn"),
             lambda tensors: concat_gate_up(tensors, layers, prefix="ffn.shared_experts"),
         ],
@@ -50,6 +51,20 @@ def _group_output_lora(
             tensor = weights.get(key)
             if tensor is not None and tensor.ndim == 2:
                 weights[key] = tensor.reshape(groups, rank, -1)
+    return weights
+
+
+def _concat_compressor_gates(weights: dict[str, mx.array], layers: int) -> dict[str, mx.array]:
+    """`wkv` and `wgate` rows stacked into one `wkvg` per compressor: a decode step pays
+    one gemv instead of two, and a row concat leaves every quantization group intact."""
+    for layer in range(layers):
+        for prefix in ("attn.compressor", "attn.indexer.compressor"):
+            base = f"model.layers.{layer}.{prefix}"
+            for suffix in ("weight", "scales", "biases"):
+                kv = weights.pop(f"{base}.wkv.{suffix}", None)
+                gate = weights.pop(f"{base}.wgate.{suffix}", None)
+                if kv is not None and gate is not None:
+                    weights[f"{base}.wkvg.{suffix}"] = mx.concatenate([kv, gate], axis=0)
     return weights
 
 

@@ -32,6 +32,7 @@ from sideros import (
 )
 from sideros import ChatMessage as Turn
 from sideros.chat import tool_family_of
+from sideros.footprint import ceiling
 from sideros.generate import Constraint, Meter
 from sideros.grammar import GrammarRefused
 from sideros.schema import MalformedJSON, SchemaViolation
@@ -60,13 +61,16 @@ from sideros_server.engine import Engine, Job, NotConstrainable
 from sideros_server.jobs import Jobs
 from sideros_server.profiles import Sampling, StoreDep
 from sideros_server.responses import (
+    PROFILE_ONLY,
     Calls,
     Checked,
+    OpenAIEffort,
     ToolTurn,
     UnreadableImage,
     content_of,
     declared,
     document,
+    effort_of,
     failed,
     inline_image,
     instruction,
@@ -217,6 +221,10 @@ class ChatRequest(BaseModel):
     on decoding, and accepting the field without one answers with a call the model may
     never have made."""
     max_tokens: int = Field(default=128, gt=0)
+    reasoning_effort: OpenAIEffort | None = None
+    """How hard the checkpoint is asked to think. There is no budget beside it because
+    upstream has none: a client that wants one names a profile, which is where the knobs
+    this dialect cannot spell already live."""
     stream: bool = False
     # Ignored when `stream` is false, and honestly so: the non-streaming answer carries
     # `usage` either way, so nothing the client asked for goes unanswered.
@@ -245,16 +253,22 @@ class ChatRequest(BaseModel):
     queue — four generations is the longest one request may hold it."""
 
 
-def _options(request: ChatRequest, constraint: Constraint | None) -> GenerationOptions:
+def _options(
+    request: ChatRequest, sampling: Sampling, constraint: Constraint | None
+) -> GenerationOptions:
     """The dialect's defaults are OpenAI's, so an unset `temperature` is 1.0 and the answer
     is drawn, not argmaxed. Filters run in the order below — the cuts read the distribution
     temperature already shaped, which is what makes `top_p` mean the same here as upstream.
 
     The constraint composes with all of them and is nobody's filter: the mask is applied
-    before the sampler runs, so what is drawn is drawn from what the grammar left."""
+    before the sampler runs, so what is drawn is drawn from what the grammar left.
+
+    `sampling` is here for the knobs this dialect has no field for — `reasoning_budget` is
+    the only one so far — which `_preset` cannot fill because there is nothing to fill."""
     repeats = request.repetition_penalty
     penalty: Penalty | None = None if repeats == 1.0 else repetition_penalty(repeats)
     limit = catalog.context_of(request.model)
+    thinking = sampling.reasoning_budget
     if request.temperature == 0.0:
         # The deterministic end of the dial: no distribution is left to draw from, and
         # dividing by it would hand the sampler a row of infinities.
@@ -263,6 +277,7 @@ def _options(request: ChatRequest, constraint: Constraint | None) -> GenerationO
             sampler=greedy,
             penalty=penalty,
             constraint=constraint,
+            reasoning_budget=thinking,
             context_limit=limit,
         )
 
@@ -279,19 +294,21 @@ def _options(request: ChatRequest, constraint: Constraint | None) -> GenerationO
         sampler=drawn,
         penalty=penalty,
         constraint=constraint,
+        reasoning_budget=thinking,
         context_limit=limit,
     )
 
 
 def _preset(request: ChatRequest, sampling: Sampling) -> ChatRequest:
-    """The profile fills the knobs the client left out, and only those: a request that
-    names a temperature means it, whatever the profile it also named says. Which knobs were
+    """The preset — the profile, over the sampling defaults the checkpoint declares — fills
+    the knobs the client left out, and only those: a request that names a temperature
+    means it, whatever the profile it also named says. Which knobs were
     left out is the request's own `model_fields_set` — the dialect's defaults are values
     like any other, so an unset field cannot be told from an explicit one by its value."""
     filled = {
         knob: value
         for knob, value in sampling.model_dump(exclude_none=True).items()
-        if knob not in request.model_fields_set
+        if knob not in request.model_fields_set and knob not in PROFILE_ONLY
     }
     return request.model_copy(update=filled)
 
@@ -299,8 +316,9 @@ def _preset(request: ChatRequest, sampling: Sampling) -> ChatRequest:
 # `model_copy(update=...)` writes the keys straight into the instance: no validation, and the
 # `extra="forbid"` above never sees them. A knob the profile grows and the dialect does not have
 # would be set on the request and read by nobody — silently, and only for requests that name a
-# profile, which is the one path with no dialect-level schema to catch it.
-assert set(Sampling.model_fields) <= set(ChatRequest.model_fields)
+# profile, which is the one path with no dialect-level schema to catch it. `PROFILE_ONLY` is
+# the exception with a reader: those are excluded above and read in `_options`.
+assert set(Sampling.model_fields) - PROFILE_ONLY <= set(ChatRequest.model_fields)
 
 
 def _messages(request: ChatRequest, system_prompt: str | None) -> list[ChatMessage]:
@@ -494,7 +512,28 @@ def _usage(meter: Meter) -> dict[str, int]:
     }
 
 
-def _usage_chunk(request_id: str, created: int, model: str, meter: Meter) -> str:
+def _timings(job: Job) -> dict[str, object]:
+    """What the turn cost in seconds, beside what it cost in tokens. The dialect has no field
+    for any of it, so it rides under a prefixed key an SDK that does not know it drops — the
+    same numbers `/admin/metrics` publishes, so a client reading the stream and a dashboard
+    watching the register never disagree.
+    """
+    meter = job.meter
+    rate = meter.tokens_per_second
+    per_token = None if job.lease is None else job.lease.active_bytes
+    return {
+        "load_seconds": job.load_seconds,
+        "ttft_seconds": meter.ttft,
+        "prefill_tokens_per_second": metrics.prefill_rate(meter.prompt_tokens, meter.ttft),
+        "tokens_per_second": rate,
+        "bytes_per_token": per_token,
+        "ceiling_fraction": (
+            None if rate is None or per_token is None else rate / ceiling(per_token)
+        ),
+    }
+
+
+def _usage_chunk(request_id: str, created: int, model: str, job: Job) -> str:
     """The extra frame `stream_options.include_usage` asks for: the whole request's usage
     and no choices, which is the shape the SDK folds into the completion it accumulates."""
     payload = {
@@ -503,7 +542,8 @@ def _usage_chunk(request_id: str, created: int, model: str, meter: Meter) -> str
         "created": created,
         "model": model,
         "choices": [],
-        "usage": _usage(meter),
+        "usage": _usage(job.meter),
+        "x_sideros": _timings(job),
     }
     return f"data: {json.dumps(payload)}\n\n"
 
@@ -560,8 +600,7 @@ async def _events(
                 # answer: a client draws `<think>` and everything under it as what the model
                 # said, and the first token of the answer arrives hundreds of tokens late.
                 if thought := unmarked(piece.text):
-                    yield _chunk(request_id, created, model, {"reasoning_content": thought},
-                                 None)
+                    yield _chunk(request_id, created, model, {"reasoning_content": thought}, None)
                 continue
             # No family, nothing that could read a channel back: every segment is text the
             # client asked for, whichever one the model wrote it on.
@@ -606,7 +645,7 @@ async def _events(
         if usage:
             # After the finish frame and before [DONE], where the dialect puts it: the
             # job is over by now, so the meter is the whole request's.
-            yield _usage_chunk(request_id, created, model, job.meter)
+            yield _usage_chunk(request_id, created, model, job)
         yield "data: [DONE]\n\n"
     finally:
         job.cancel()
@@ -659,7 +698,8 @@ async def chat(
         return refused
 
     model_id, profile = profiles.resolve(store, request.model)
-    asked = request if profile is None else _preset(request, profile.sampling)
+    preset = profiles.preset(model_id, profile)
+    asked = _preset(request, preset)
     messages = request.messages if profile is None else _messages(request, profile.system_prompt)
     tools = _tools(request)
     checked = _checked(request)
@@ -672,7 +712,8 @@ async def chat(
         return openai_error(400, str(unreadable), "invalid_image")
     if checked is not None:
         turns = (*turns, instruction(checked.schema))
-    conversation = Chat(turns, tools=tools)
+    effort = effort_of(request.reasoning_effort, preset.reasoning_effort)
+    conversation = Chat(turns, tools=tools, reasoning_effort=effort)
     request_id = f"chatcmpl-{uuid.uuid4().hex}"
     created = int(time.time())
     spent: dict[str, int] = {"prompt_tokens": 0, "completion_tokens": 0, "total_tokens": 0}
@@ -687,7 +728,7 @@ async def chat(
             # same answer to the client: this model is not available here. The reason travels
             # in the message rather than in a second status code. A `model:typo` lands here
             # too, whole: no profile matched, so the name was never split.
-            job = await engine.submit(model_id, conversation, _options(asked, constrained))
+            job = await engine.submit(model_id, conversation, _options(asked, preset, constrained))
         except GrammarRefused as refusal:
             # The compiler's own words — `Unimplemented keys: ["uniqueItems"]` is a reason
             # where "grammar error" is not, and what the client does with it is send the same
@@ -700,8 +741,9 @@ async def chat(
                 400, unsupported_reason(request.model, conversation), "unsupported_input"
             )
         except Exception as error:
-            return openai_error(404, f"model {request.model!r} is not available: {error}",
-                                "model_not_found")
+            return openai_error(
+                404, f"model {request.model!r} is not available: {error}", "model_not_found"
+            )
 
         # No tools offered, nothing to read back; no family, nothing that could read it. Both
         # reach the client the way the generation always did, piece for piece: suppressing an
@@ -716,8 +758,9 @@ async def chat(
             streaming = request.stream_options
             usage = streaming is not None and streaming.include_usage
             return StreamingResponse(
-                _events(job, request_id, created, request.model, usage, calls,
-                        asked.max_tokens, checked),
+                _events(
+                    job, request_id, created, request.model, usage, calls, asked.max_tokens, checked
+                ),
                 media_type="text/event-stream",
             )
 

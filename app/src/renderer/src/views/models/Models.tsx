@@ -319,6 +319,10 @@ export function Models(): JSX.Element {
             .toLowerCase()
             .includes(needle)
         )
+  /* Held models float to the top; unloading drops the row back into catalog order. */
+  const held = (entry: api.CatalogEntry): number =>
+    fleet.residents.has(entry.id) || fleet.jobs[entry.id] !== undefined ? 0 : 1
+  const ordered = [...listed].sort((a, b) => held(a) - held(b))
   const bytes = fleet.entries.reduce((sum, entry) => sum + entry.bytes_on_disk, 0)
 
   return (
@@ -356,14 +360,14 @@ export function Models(): JSX.Element {
         )}
 
         <div className="list">
-          {listed.length === 0 ? (
+          {ordered.length === 0 ? (
             <div className="empty">
               {fleet.entries.length === 0
                 ? 'Nothing in the catalog yet.'
                 : `Nothing matches “${filter.trim()}”.`}
             </div>
           ) : (
-            listed.map((entry) => (
+            ordered.map((entry) => (
               <Row key={entry.id} entry={entry} fleet={fleet} onOpen={() => setSelected(entry.id)} />
             ))
           )}

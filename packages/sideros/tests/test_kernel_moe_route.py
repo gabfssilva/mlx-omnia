@@ -27,16 +27,22 @@ harmless because the picked set is compared sorted.
 """
 
 import mlx.core as mx
+import mlx.nn as nn
 import numpy as np
 import pytest
 from conftest import relative_diff
 
 from sideros.core.kernels.moe_route import (
     _SIGMOID_SOURCE,
+    _SOFTPLUS_GATHER_SOURCE,
+    _SOFTPLUS_HEADER,
+    _SOFTPLUS_SOURCE,
     _SOURCE,
     sigmoid_topk,
     softmax_topk,
     softmax_topk_applies,
+    softplus_gather,
+    softplus_topk,
 )
 from sideros.core.mxcompat import metal_kernel, softmax
 
@@ -356,5 +362,200 @@ def test_sigmoid_unmutated_replica_agrees_with_the_module() -> None:
     bias = sigmoid_bias(logits.size, 0)
     indices, weights = sigmoid_topk(logits, bias, k, scale=SIGMOID_SCALE)
     intact = _sigmoid_route(_SIGMOID_SOURCE, "moe_sigmoid_intact", logits, bias, k)
+    assert mx.array_equal(intact[0], indices)
+    assert mx.array_equal(intact[1], weights)
+
+
+# --- sqrt(softplus) routing (deepseek_v4): selection by score+bias, weights unbiased ---
+
+SOFTPLUS_SCALE = 1.5
+
+
+def softplus_op_chain(
+    logits: mx.array, bias: mx.array, k: int, *, norm: bool
+) -> tuple[mx.array, mx.array]:
+    """The stock `MoEGate` chain: fp32 `sqrt(softplus)` scores, selection on the biased
+    scores (ties to the higher index, stable argsort reversed), weights unbiased,
+    renormalized when `norm`, scaled in fp32."""
+    scores = np.array(mx.sqrt(nn.softplus(logits.astype(mx.float32))))
+    biased = scores + np.array(bias)
+    chosen = np.argsort(biased, kind="stable")[::-1][:k]
+    weights = scores[chosen]
+    if norm:
+        weights = weights / (weights.sum() + 1e-20)
+    scaled = (weights * SOFTPLUS_SCALE).astype(np.float32)
+    return mx.array(chosen.astype(np.uint32)), mx.array(scaled)
+
+
+@pytest.mark.parametrize("dtype", [mx.float32, mx.bfloat16])
+@pytest.mark.parametrize("shape", [(256, 6), (128, 8)])
+def test_softplus_matches_op_chain(shape: tuple[int, int], dtype: mx.Dtype) -> None:
+    experts, k = shape
+    for seed in range(4):
+        logits = replica(experts, k, seed, dtype, shared=False)
+        bias = sigmoid_bias(experts, seed)
+        indices, weights = softplus_topk(logits, bias, k, scale=SOFTPLUS_SCALE, norm=True)
+        ref_indices, ref_weights = softplus_op_chain(logits, bias, k, norm=True)
+        assert mx.array_equal(mx.sort(indices), mx.sort(ref_indices))
+        ours, theirs = _by_index(indices, weights), _by_index(ref_indices, ref_weights)
+        order = sorted(theirs)
+        assert relative_diff(
+            mx.array([ours[i] for i in order]), mx.array([theirs[i] for i in order])
+        ) < _weight_bound(mx.float32)
+
+
+@pytest.mark.parametrize("dtype", [mx.float32, mx.bfloat16])
+def test_softplus_exact_ties_go_to_the_higher_index(dtype: mx.Dtype) -> None:
+    """Zero bias keeps `sqrt(softplus)` monotonic in the logits, so the tie group and
+    the promised order are the softmax case's."""
+    logits, k = tied_logits(dtype, shared=False)
+    indices, _ = softplus_topk(logits, mx.zeros((logits.size,)), k, scale=SOFTPLUS_SCALE, norm=True)
+    assert np.array(indices).tolist() == [0, 1, 2, 120, 99, 67, 35, 11]
+
+
+def test_softplus_bias_selects_but_never_weighs() -> None:
+    logits = replica(256, 6, 2, mx.bfloat16, shared=False)
+    zero = mx.zeros((256,))
+    base_idx, _ = softplus_topk(logits, zero, 6, scale=SOFTPLUS_SCALE, norm=True)
+    outsider = next(e for e in range(256) if e not in set(np.array(base_idx).tolist()))
+    boosted = mx.where(mx.arange(256) == outsider, 10.0, 0.0)
+    indices, weights = softplus_topk(logits, boosted, 6, scale=SOFTPLUS_SCALE, norm=True)
+    assert outsider in set(np.array(indices).tolist())
+    ref_indices, ref_weights = softplus_op_chain(logits, boosted, 6, norm=True)
+    ours, theirs = _by_index(indices, weights), _by_index(ref_indices, ref_weights)
+    order = sorted(theirs)
+    assert relative_diff(
+        mx.array([ours[i] for i in order]), mx.array([theirs[i] for i in order])
+    ) < _weight_bound(mx.float32)
+
+
+def test_softplus_without_norm_keeps_raw_scores() -> None:
+    logits = replica(256, 6, 3, mx.bfloat16, shared=False)
+    bias = sigmoid_bias(256, 3)
+    indices, weights = softplus_topk(logits, bias, 6, scale=SOFTPLUS_SCALE, norm=False)
+    ref_indices, ref_weights = softplus_op_chain(logits, bias, 6, norm=False)
+    assert mx.array_equal(mx.sort(indices), mx.sort(ref_indices))
+    ours, theirs = _by_index(indices, weights), _by_index(ref_indices, ref_weights)
+    order = sorted(theirs)
+    assert relative_diff(
+        mx.array([ours[i] for i in order]), mx.array([theirs[i] for i in order])
+    ) < _weight_bound(mx.float32)
+
+
+def test_softplus_gather_matches_op_chain() -> None:
+    """The hash variant: experts given (duplicates included — a hash table may repeat),
+    only the weights computed."""
+    for seed in range(4):
+        logits = replica(256, 6, seed, mx.bfloat16, shared=False)
+        rng = np.random.default_rng(seed)
+        picks = rng.integers(0, 256, size=6)
+        if seed == 0:
+            picks[1] = picks[0]
+        chosen = mx.array(picks.astype(np.uint32))
+        weights = softplus_gather(logits, chosen, scale=SOFTPLUS_SCALE, norm=True)
+        scores = np.array(mx.sqrt(nn.softplus(logits.astype(mx.float32))))
+        ref = scores[picks]
+        ref = ref / (ref.sum() + 1e-20) * SOFTPLUS_SCALE
+        assert relative_diff(weights, mx.array(ref.astype(np.float32))) < _weight_bound(
+            mx.float32
+        )
+
+
+_SOFTPLUS_MUTATIONS = {
+    "resolve a lane's tie downwards": (
+        "for (int i = (int)per_lane - 1; i >= 0; i--) {",
+        "for (int i = 0; i < (int)per_lane; i++) {",
+    ),
+    "keep picking the same expert": (
+        "if (winner == cand && slot >= 0) b[(uint)slot] = -INFINITY;",
+        "if (false) b[(uint)slot] = -INFINITY;",
+    ),
+    "drop the renormalization": (
+        "float w = NORM ? pick[lane] / (total + 1e-20f) : pick[lane];",
+        "float w = pick[lane];",
+    ),
+    "ignore the bias in selection": (
+        "b[i] = s[i] + B[lane + i * 32];",
+        "b[i] = s[i];",
+    ),
+    "score without the sqrt": (
+        "s[i] = metal::precise::sqrt(mlx_softplus(v));",
+        "s[i] = mlx_softplus(v);",
+    ),
+}
+
+
+def _softplus_route(
+    source: str, name: str, logits: mx.array, bias: mx.array, k: int
+) -> list[mx.array]:
+    return metal_kernel(
+        name=name,
+        input_names=["L", "B", "SC"],
+        output_names=["OI", "OW"],
+        source=source,
+        header=_SOFTPLUS_HEADER,
+    )(
+        inputs=[logits, bias, mx.array(SOFTPLUS_SCALE, dtype=mx.float32)],
+        template=[("T", logits.dtype), ("TOPK", k), ("EXPERTS", logits.size), ("NORM", 1)],
+        grid=(32, 1, 1),
+        threadgroup=(32, 1, 1),
+        output_shapes=[(k,), (k,)],
+        output_dtypes=[mx.uint32, mx.float32],
+    )
+
+
+@pytest.mark.parametrize("mutation", sorted(_SOFTPLUS_MUTATIONS))
+def test_softplus_mutations_break_the_routing(mutation: str) -> None:
+    old, new = _SOFTPLUS_MUTATIONS[mutation]
+    source = _SOFTPLUS_SOURCE.replace(old, new)
+    assert source != _SOFTPLUS_SOURCE
+    logits, k = tied_logits(mx.float32, shared=False)
+    bias = mx.where(mx.arange(logits.size) == logits.size - 1, 10.0, 0.0)
+    ref_indices, ref_weights = softplus_op_chain(logits, bias, k, norm=True)
+    broken = _softplus_route(
+        source,
+        f"moe_softplus_broken_{sorted(_SOFTPLUS_MUTATIONS).index(mutation)}",
+        logits,
+        bias,
+        k,
+    )
+    picked_changed = not mx.array_equal(mx.sort(broken[0]), mx.sort(ref_indices))
+    ours, theirs = _by_index(broken[0], broken[1]), _by_index(ref_indices, ref_weights)
+    weights_changed = any(
+        e not in theirs or abs(w - theirs[e]) > 1e-2 * abs(theirs[e]) for e, w in ours.items()
+    )
+    assert picked_changed or weights_changed
+
+
+def test_softplus_gather_mutation_breaks_the_weights() -> None:
+    source = _SOFTPLUS_GATHER_SOURCE.replace(
+        "float w = NORM ? s / (total + 1e-20f) : s;", "float w = s;"
+    )
+    assert source != _SOFTPLUS_GATHER_SOURCE
+    logits = replica(256, 6, 1, mx.float32, shared=False)
+    chosen = mx.array(np.arange(6).astype(np.uint32))
+    ref = softplus_gather(logits, chosen, scale=SOFTPLUS_SCALE, norm=True)
+    (broken,) = metal_kernel(
+        name="moe_softplus_gather_broken",
+        input_names=["L", "C", "SC"],
+        output_names=["OW"],
+        source=source,
+        header=_SOFTPLUS_HEADER,
+    )(
+        inputs=[logits, chosen, mx.array(SOFTPLUS_SCALE, dtype=mx.float32)],
+        template=[("T", logits.dtype), ("TOPK", 6), ("NORM", 1)],
+        grid=(32, 1, 1),
+        threadgroup=(32, 1, 1),
+        output_shapes=[(6,)],
+        output_dtypes=[mx.float32],
+    )
+    assert relative_diff(broken, ref) > 1e-2
+
+
+def test_softplus_unmutated_replica_agrees_with_the_module() -> None:
+    logits, k = tied_logits(mx.float32, shared=False)
+    bias = sigmoid_bias(logits.size, 0)
+    indices, weights = softplus_topk(logits, bias, k, scale=SOFTPLUS_SCALE, norm=True)
+    intact = _softplus_route(_SOFTPLUS_SOURCE, "moe_softplus_intact", logits, bias, k)
     assert mx.array_equal(intact[0], indices)
     assert mx.array_equal(intact[1], weights)

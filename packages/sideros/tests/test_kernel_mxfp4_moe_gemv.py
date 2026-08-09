@@ -13,11 +13,9 @@ import numpy as np
 import pytest
 from conftest import relative_diff
 
-from sideros.core.kernels.mxfp4_moe_gemv import (
-    mxfp4_down_combine,
-    mxfp4_gate_up_act,
-    mxfp4_moe_applies,
-)
+from sideros.core.kernels.down_combine.mxfp4 import Mxfp4DownCombine
+from sideros.core.kernels.gate_up.mxfp4 import Mxfp4GateUp
+from sideros.core.kernels.gate_up.mxfp4 import applies as mxfp4_moe_applies
 
 EXPERTS, HIDDEN, INNER, TOPK, LIMIT = 32, 2880, 2880, 4, 7.0
 GROUP = 32
@@ -80,13 +78,11 @@ def kernel_step(
     gate_up: Stack, down: Stack, x: mx.array, residual: mx.array,
     indices: mx.array, routing: mx.array, dtype: mx.Dtype,
 ) -> tuple[mx.array, mx.array]:
-    act = mxfp4_gate_up_act(
-        x.astype(dtype), gate_up.weight, gate_up.scales, gate_up.bias.astype(dtype),
-        indices, limit=LIMIT,
+    act = Mxfp4GateUp(gate_up.weight, gate_up.scales, gate_up.bias.astype(dtype), LIMIT)(
+        x.astype(dtype), indices
     )
-    out = mxfp4_down_combine(
-        act, down.weight, down.scales, down.bias.astype(dtype), indices,
-        routing.astype(dtype), residual.astype(dtype),
+    out = Mxfp4DownCombine(down.weight, down.scales, down.bias.astype(dtype))(
+        act, indices, routing.astype(dtype), residual.astype(dtype)
     )
     return act, out
 
@@ -147,8 +143,6 @@ def test_mutations_break_parity(
     else:
         broken = Stack(gate_up.weight, gate_up.scales, gate_up.bias + 1.0)
 
-    act = mxfp4_gate_up_act(x, broken.weight, broken.scales, broken.bias, idx, limit=LIMIT)
-    out = mxfp4_down_combine(
-        act, down.weight, down.scales, down.bias, idx, routing, residual
-    )
+    act = Mxfp4GateUp(broken.weight, broken.scales, broken.bias, LIMIT)(x, idx)
+    out = Mxfp4DownCombine(down.weight, down.scales, down.bias)(act, idx, routing, residual)
     assert relative_diff(out, reference) > 1e-5

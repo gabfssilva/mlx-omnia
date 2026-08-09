@@ -174,14 +174,20 @@ def hub(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> Path:
     root = tmp_path / "hub"
     monkeypatch.setattr(catalog, "HUB_CACHE", root)
     monkeypatch.setattr(catalog, "QUANTIZED_CACHE", tmp_path / "quantized")
+    # Both caches are keyed by id and the ids here repeat across tests, each over its own
+    # `tmp_path`: without this, the second test to ask reads the first one's disk.
+    catalog.context_of.cache_clear()
+    catalog.defaults_of.cache_clear()
     return root
 
 
-def installed(hub: Path, model_id: str) -> None:
+def installed(hub: Path, model_id: str, generation: Mapping[str, object] | None = None) -> None:
     repository = hub / f"models--{model_id.replace('/', '--')}"
     snapshot = repository / "snapshots" / "head"
     snapshot.mkdir(parents=True)
     (snapshot / "config.json").write_text(json.dumps(CONFIG))
+    if generation is not None:
+        (snapshot / "generation_config.json").write_text(json.dumps(generation))
     (snapshot / "model.safetensors").write_bytes(b"\0" * 64)
     (repository / "refs").mkdir(parents=True)
     (repository / "refs" / "main").write_text("head")
@@ -247,6 +253,8 @@ def test_a_profile_is_written_read_replaced_and_deleted_under_its_model(
             "min_p": None,
             "repetition_penalty": None,
             "seed": None,
+            "reasoning_effort": None,
+            "reasoning_budget": None,
         },
         "system_prompt": "be terse",
     }
@@ -335,6 +343,54 @@ def test_a_knob_the_request_sends_wins_over_the_profiles(client: TestClient) -> 
     greedy = ask(client, f"{TINY}:cold")
     assert ask(client, f"{TINY}:hot", temperature=0) == greedy
     assert ask(client, f"{TINY}:hot") != greedy
+
+
+def test_a_request_naming_no_knob_is_sampled_by_what_the_checkpoint_declares(
+    client: TestClient, hub: Path
+) -> None:
+    """`generation_config.json` is how the people who trained a checkpoint say it wants to
+    be sampled, and a request that names nothing gets it. `do_sample: false` is the argmax,
+    so the answer repeats — and the same request against the same model with the file
+    removed does not, which is what says the repetition is the file's doing and not the
+    dialect's."""
+    installed(hub, TINY, generation={"do_sample": False, "temperature": 0.6})
+
+    greedy = ask(client, TINY)
+    assert len(greedy) == 32, "one letter per token, so a short answer is a stop nobody asked for"
+    assert greedy == ask(client, TINY)
+
+
+def test_a_checkpoint_that_declares_nothing_leaves_the_dialects_defaults(
+    client: TestClient, hub: Path
+) -> None:
+    """The mutation of the test above: same model, same request, no `generation_config.json`
+    — and the dialect's own 1.0 unseeded is what samples it, which does not repeat."""
+    installed(hub, TINY)
+
+    assert ask(client, TINY) != ask(client, TINY)
+
+
+def test_a_profile_wins_over_what_the_checkpoint_declares(client: TestClient, hub: Path) -> None:
+    """The checkpoint says how it was meant to be sampled in general; a profile is written
+    for a job, and the more specific of the two is the one that stands."""
+    installed(hub, TINY, generation={"do_sample": False, "temperature": 0.6})
+    put(client, TINY, "hot", sampling={"temperature": 2, "seed": 7})
+
+    greedy = ask(client, TINY)
+    hot = ask(client, f"{TINY}:hot")
+    assert hot != greedy
+    assert hot == ask(client, f"{TINY}:hot")
+
+
+def test_a_knob_the_request_sends_wins_over_what_the_checkpoint_declares(
+    client: TestClient, hub: Path
+) -> None:
+    """The lowest of the three levels is the checkpoint's, so a client that names a
+    temperature means it there too."""
+    installed(hub, TINY, generation={"do_sample": False, "temperature": 0.6})
+
+    greedy = ask(client, TINY)
+    assert ask(client, TINY, temperature=2) != greedy
 
 
 def test_the_profiles_system_prompt_reaches_the_template(client: TestClient) -> None:

@@ -48,7 +48,7 @@ from sideros import (
     top_k,
     top_p,
 )
-from sideros.chat import tool_family_of
+from sideros.chat import Effort, tool_family_of
 from sideros.generate import Constraint, Meter
 from sideros.grammar import GrammarRefused
 from sideros.schema import MalformedJSON, SchemaViolation
@@ -201,6 +201,28 @@ class ToolConfig(BaseModel):
     functionCallingConfig: FunctionCallingConfig
 
 
+class ThinkingConfig(BaseModel):
+    """How long the checkpoint may think, in the one field this dialect has for it.
+
+    `thinkingBudget` carries the switch and the length in a single number, and the three
+    ranges are upstream's own: `-1` leaves the decision to the model, which is the template's
+    default here and so reaches it as no kwarg at all; `0` turns thinking off; anything above
+    it is thinking on with that many ids to spend, ended by feeding the block's closer once
+    they are gone. There is no rung beside it because upstream has none on this route — a
+    client that wants one names a profile, which is where the effort lives whole.
+
+    `includeThoughts` is declared so that refusing it is a named error. It asks for the
+    reasoning to come back as parts marked `thought`, and this route returns what the model
+    wrote on one channel: honouring the `false` it defaults to would mean dropping text the
+    client has been receiving, and honouring `true` would mean a part shape nothing here
+    writes. Either answer would be a client told something untrue about what it got."""
+
+    model_config = ConfigDict(extra="forbid")
+
+    thinkingBudget: int | None = Field(default=None, ge=-1)
+    includeThoughts: None = None
+
+
 class GenerationConfig(BaseModel):
     """The knobs the sampler has, plus the three fields this dialect spells structured output
     in. Everything else — `stopSequences`, `candidateCount` — is refused by name: accepting
@@ -210,6 +232,7 @@ class GenerationConfig(BaseModel):
     model_config = ConfigDict(extra="forbid")
 
     temperature: float | None = Field(default=None, ge=0.0)
+    thinkingConfig: ThinkingConfig | None = None
     topP: float | None = Field(default=None, gt=0.0, le=1.0)
     topK: int | None = Field(default=None, ge=1)
     maxOutputTokens: int = Field(default=128, gt=0)
@@ -345,6 +368,31 @@ def _knob(asked: float | None, preset: float | None, default: float) -> float:
     return default if preset is None else preset
 
 
+def _thinks(asked: GenerationConfig, preset: Sampling) -> Effort:
+    """What the template is told about thinking, off the one number this dialect has for it.
+
+    `-1` and an absent `thinkingConfig` are the same thing — the decision is the model's — so
+    both fall to the profile and then to `auto`. `0` is off. Anything above it is on, and the
+    number itself is the budget rather than a rung: this dialect names a length, and turning
+    one into `medium` would write a level into the prompt that no client asked for."""
+    config = asked.thinkingConfig
+    budget = None if config is None else config.thinkingBudget
+    if budget is None or budget < 0:
+        return "auto" if preset.reasoning_effort is None else preset.reasoning_effort
+    return "off" if budget == 0 else "on"
+
+
+def _budget(asked: GenerationConfig, preset: Sampling) -> int | None:
+    """The ids the block may spend. `-1` is no cap and `0` is a block that never opens, so
+    neither is a number the loop counts down — what reaches it is a positive budget, or the
+    profile's when the request named none."""
+    config = asked.thinkingConfig
+    budget = None if config is None else config.thinkingBudget
+    if budget is None:
+        return preset.reasoning_budget
+    return budget if budget > 0 else None
+
+
 def _options(
     asked: GenerationConfig, preset: Sampling, constraint: Constraint | None
 ) -> GenerationOptions:
@@ -356,6 +404,7 @@ def _options(
     repeats = _knob(None, preset.repetition_penalty, 1.0)
     penalty: Penalty | None = None if repeats == 1.0 else repetition_penalty(repeats)
     heat = _knob(asked.temperature, preset.temperature, 1.0)
+    budget = _budget(asked, preset)
     if heat == 0.0:
         # The deterministic end of the dial: nothing is left to draw from, and dividing by it
         # would hand the sampler a row of infinities.
@@ -364,6 +413,7 @@ def _options(
             sampler=greedy,
             penalty=penalty,
             constraint=constraint,
+            reasoning_budget=budget,
         )
 
     filters: list[LogitFilter] = [temperature(heat)]
@@ -383,6 +433,7 @@ def _options(
         sampler=drawn,
         penalty=penalty,
         constraint=constraint,
+        reasoning_budget=budget,
     )
 
 
@@ -567,12 +618,12 @@ async def generate(
         return error("INVALID_ARGUMENT", str(unreadable))
     if checked is not None:
         turns = (*turns, instruction(checked.schema))
-    conversation = Chat(turns, tools=tools)
+    preset = profiles.preset(model_id, profile)
+    conversation = Chat(turns, tools=tools, reasoning_effort=_thinks(asked, preset))
     try:
         # One walk per generation and never one shared between two: the grammar behind it is
         # the engine's to keep, the walk is this request's.
         constrained = None if strict is None else await engine.constrain(model_id, strict)
-        preset = Sampling() if profile is None else profile.sampling
         # A name no checkpoint answers to and one whose load fails are the same answer to the
         # client: this model is not available here, with the reason in the message rather than
         # in a second status. A `model:typo` arrives here whole — no profile matched, so the

@@ -34,7 +34,7 @@ from sideros.quant.quantization import (
 class QuantizationJson(TypedDict):
     group_size: int
     bits: int
-    mode: NotRequired[Literal["affine", "mxfp4", "mxfp8"]]
+    mode: NotRequired[Literal["affine", "mxfp4", "mxfp8", "nvfp4"]]
 
 
 class _PlanJson(TypedDict):
@@ -47,11 +47,66 @@ class _PlanJson(TypedDict):
 
 
 class _GenerationJson(TypedDict):
-    """Only the field read here. The file carries the sampling defaults too, and those are
-    the client's to send — a daemon that took a checkpoint's `temperature` would answer a
-    request that named none with a draw nobody asked for."""
+    """What transformers keeps beside the weights: the ids that end a turn, and how the
+    people who trained the checkpoint meant it to be sampled. Both are read — the second
+    only as a *default*, which is a value a request still overrides."""
 
     eos_token_id: NotRequired[int | list[int] | None]
+    do_sample: NotRequired[bool]
+    temperature: NotRequired[float | None]
+    top_p: NotRequired[float | None]
+    top_k: NotRequired[int | None]
+    min_p: NotRequired[float | None]
+    repetition_penalty: NotRequired[float | None]
+
+
+@dataclass(frozen=True)
+class SamplingDefaults:
+    """The knobs a checkpoint declares, each `None` for one it does not — which is not the
+    same as a knob it declares neutral. Qwen3 ships 0.6/0.95/20 and is visibly worse
+    argmaxed; gpt-oss ships nothing and means whatever asks for it.
+
+    `min_p` and `repetition_penalty` are here because some conversions do carry them, not
+    because transformers samples with them by default."""
+
+    temperature: float | None = None
+    top_p: float | None = None
+    top_k: int | None = None
+    min_p: float | None = None
+    repetition_penalty: float | None = None
+
+
+def _positive(raw: object) -> float | None:
+    """A knob is read only when it is a number that means something. `top_k: 0` and
+    `top_p: 0` are how transformers spells *disabled*, and copied across as values they
+    would be a cut that keeps nothing."""
+    if isinstance(raw, bool) or not isinstance(raw, (int, float)):
+        return None
+    return float(raw) if raw > 0 else None
+
+
+def sampling_defaults(directory: Path) -> SamplingDefaults:
+    """How the checkpoint says it wants to be sampled, or nothing when it does not say.
+
+    `do_sample: false` is the whole answer when it appears: transformers ignores the
+    temperature and the cuts under it and takes the argmax, so a file that carries 0.6 and
+    `do_sample: false` means greedy — and `temperature: 0.0` is how every dialect here
+    spells that. Reading the 0.6 instead would draw where the checkpoint says not to.
+    """
+    path = directory / "generation_config.json"
+    if not path.is_file():
+        return SamplingDefaults()
+    raw: _GenerationJson = json.loads(path.read_text(encoding="utf-8"))
+    if raw.get("do_sample") is False:
+        return SamplingDefaults(temperature=0.0)
+    top_k = _positive(raw.get("top_k"))
+    return SamplingDefaults(
+        temperature=_positive(raw.get("temperature")),
+        top_p=_positive(raw.get("top_p")),
+        top_k=None if top_k is None else int(top_k),
+        min_p=_positive(raw.get("min_p")),
+        repetition_penalty=_positive(raw.get("repetition_penalty")),
+    )
 
 
 class _DeclarationJson(TypedDict):
@@ -65,16 +120,18 @@ def leaf_json(format: Quantization) -> QuantizationJson:
     match format:
         case Affine(group_size=group_size, bits=bits):
             return {"group_size": group_size, "bits": bits}
-        case MXFP(mode=mode, group_size=group_size, bits=bits):
+        case MXFP(mode=mode, group_size=group_size, bits=bits) | NVFP(
+            mode=mode, group_size=group_size, bits=bits
+        ):
             return {"group_size": group_size, "bits": bits, "mode": mode}
-        case NVFP():
-            raise ValueError("nvfp4 has no config block shape yet")
 
 
 def leaf_format(raw: QuantizationJson) -> Quantization:
     mode = raw.get("mode", "affine")
     if mode == "affine":
         return Affine(group_size=raw["group_size"], bits=raw["bits"])
+    if mode == "nvfp4":
+        return NVFP(group_size=raw["group_size"], bits=raw["bits"])
     return MXFP(mode=mode, group_size=raw["group_size"], bits=raw["bits"])
 
 
@@ -417,7 +474,35 @@ def attach_weights[M: nn.Module](
     )
     model.load_weights(list(weights.items()), strict=True)
     mx.eval(model.parameters())
+    wire_resident()
     return model
+
+
+def wire_resident() -> int:
+    """Pin everything currently live into Metal's residency set, and return the limit set.
+
+    mlx attaches an `MTLResidencySet` to its command queue but leaves it at capacity zero,
+    so nothing is ever added and the driver re-establishes residency for the whole live
+    footprint on *every* command buffer. Raising the limit migrates every tracked
+    allocation in a single commit.
+
+    The limit is deliberately the live size plus page slack and nothing more. mlx only
+    pays a per-allocation commit for a buffer that still *fits* under the capacity, so
+    headroom is the expensive part, not wiring: with the limit sitting exactly at the live
+    bytes, every later transient fails the fit test and takes the commit-free path. Called
+    on each load, so a second resident model widens the set through the one-commit resize
+    rather than through per-allocation inserts.
+
+    `clear_cache` first, so the target is measured over live buffers instead of mlx's free
+    pool. The clamp is what keeps the call from raising: it throws above the device's
+    recommended working set.
+    """
+    mx.clear_cache()
+    recommended = mx.device_info()["max_recommended_working_set_size"]
+    assert isinstance(recommended, int)
+    return mx.set_wired_limit(
+        min(mx.get_active_memory() + (64 << 20), recommended - (256 << 20))
+    )
 
 
 def prepare_weights(

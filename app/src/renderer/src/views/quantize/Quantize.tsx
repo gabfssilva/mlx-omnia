@@ -5,15 +5,25 @@ import {
   BITS,
   GROUP_SIZES,
   METHODS,
+  MODES,
   REPO,
   create,
   detail,
   listModels,
   machine,
   price,
-  residency
+  residency,
+  selection
 } from './api'
-import type { CatalogEntry, Machine, Method, PricedPlan, Residency } from './api'
+import type {
+  CatalogEntry,
+  Machine,
+  Method,
+  Mode,
+  Override,
+  PricedPlan,
+  Residency
+} from './api'
 import { group } from './leaves'
 import type { LeafGroup } from './leaves'
 import './quantize.css'
@@ -44,8 +54,10 @@ const describe = (entry: CatalogEntry): string =>
 
 /* The id the screen suggests: `local/` because a load by id asks the Hub first, and a
    name that also exists up there resolves to somebody else's weights. */
-const suggest = (source: string, bits: number): string =>
-  source === '' ? '' : `local/${source.split('/').pop() ?? source}-${bits}bit`
+const suggest = (source: string, mode: Mode, bits: number): string =>
+  source === ''
+    ? ''
+    : `local/${source.split('/').pop() ?? source}-${mode === 'affine' ? `${bits}bit` : mode}`
 
 export function Quantize(): JSX.Element {
   const [entries, setEntries] = useState<CatalogEntry[] | null>(null)
@@ -54,9 +66,10 @@ export function Quantize(): JSX.Element {
 
   const [source, setSource] = useState('')
   const [method, setMethod] = useState<Method>('rtn')
+  const [mode, setMode] = useState<Mode>('affine')
   const [bits, setBits] = useState(4)
   const [groupSize, setGroupSize] = useState(64)
-  const [overrides, setOverrides] = useState<Record<string, number | null>>({})
+  const [overrides, setOverrides] = useState<Record<string, Override | null>>({})
   const [repo, setRepo] = useState('')
   const [named, setNamed] = useState(false)
 
@@ -88,8 +101,8 @@ export function Quantize(): JSX.Element {
   }, [load])
 
   useEffect(() => {
-    if (!named) setRepo(suggest(source, bits))
-  }, [source, bits, named])
+    if (!named) setRepo(suggest(source, mode, bits))
+  }, [source, mode, bits, named])
 
   useEffect(() => () => stream.current?.abort(), [])
 
@@ -100,7 +113,10 @@ export function Quantize(): JSX.Element {
     const controller = new AbortController()
     const timer = setTimeout(() => {
       setPricing(true)
-      price({ source, bits, group_size: groupSize, overrides, method }, controller.signal)
+      price(
+        { source, ...selection(mode, bits, groupSize), overrides, method },
+        controller.signal
+      )
         .then((priced) => {
           setPlan(priced)
           setRefusal(null)
@@ -118,7 +134,7 @@ export function Quantize(): JSX.Element {
       clearTimeout(timer)
       controller.abort()
     }
-  }, [source, bits, groupSize, overrides, method])
+  }, [source, mode, bits, groupSize, overrides, method])
 
   const follow = useCallback(
     async (id: string) => {
@@ -140,8 +156,7 @@ export function Quantize(): JSX.Element {
     try {
       const started = await create({
         source,
-        bits,
-        group_size: groupSize,
+        ...selection(mode, bits, groupSize),
         overrides,
         method,
         repo
@@ -166,10 +181,35 @@ export function Quantize(): JSX.Element {
     setOverrides((current) => {
       const next = { ...current }
       if (choice === '') delete next[pattern]
-      else next[pattern] = choice === 'dense' ? null : Number(choice)
+      else if (choice === 'dense') next[pattern] = null
+      /* The group size the row already carried survives a change of width: the two are
+         picked apart, and re-picking one is not a way of forgetting the other. */
+      else next[pattern] = { ...current[pattern], bits: Number(choice) }
       return next
     })
 
+  /* Only where a width was already picked: the wire has no override that names a group
+     size alone, and the plan's own is what a row without one means. */
+  const regroup = (pattern: string, choice: string): void =>
+    setOverrides((current) => {
+      const found = current[pattern]
+      if (found == null) return current
+      const { group_size: _dropped, ...rest } = found
+      return {
+        ...current,
+        [pattern]: choice === '' ? rest : { ...rest, group_size: Number(choice) }
+      }
+    })
+
+  /* The mode's own shape when it has one — which is also what says it is not affine. */
+  const exponent = MODES.find((entry) => entry.id === mode && entry.shape !== null) ?? null
+  /* The two methods whose widths are the allocator's: what a group the caller left alone
+     ends up at is decided by the calibration, so the screen has no number to name yet. */
+  const allocated = method === 'oq' || method === 'oqe'
+  /* Under the allocator the base width is a width like any other: it is not what a group
+     left alone gets, so naming it is a choice and it stays on the list. */
+  const widths =
+    exponent !== null ? [] : allocated ? BITS : BITS.filter((value) => value !== bits)
   const chosen = entries?.find((entry) => entry.id === source) ?? null
   const groups = plan === null ? [] : group(plan.leaves)
   const running = job !== null && !isFinished(job)
@@ -235,52 +275,87 @@ export function Quantize(): JSX.Element {
             </div>
 
             <div className="fieldcol">
-              <span className="eyebrow">Method</span>
+              <span className="eyebrow">Format</span>
               <div className="seg">
-                {METHODS.map((entry) => (
+                {MODES.map((entry) => (
                   <button
                     key={entry.id}
-                    className={entry.id === method ? 'on' : undefined}
-                    onClick={() => setMethod(entry.id)}
+                    className={entry.id === mode ? 'on' : undefined}
+                    onClick={() => {
+                      setMode(entry.id)
+                      if (entry.shape === null) return
+                      /* The exponent grid has no bias to search and no width to pick, so
+                         the two controls it decides go with it. */
+                      setMethod('rtn')
+                      setOverrides((current) =>
+                        Object.fromEntries(
+                          Object.entries(current).filter(([, value]) => value === null)
+                        )
+                      )
+                    }}
                   >
                     {entry.label}
                   </button>
                 ))}
               </div>
               <span className="eyebrow" style={{ fontWeight: 400 }}>
-                AWQ, GPTQ, oQ and oQe run a calibration pass before writing.
+                {exponent === null
+                  ? 'A scale and a bias per group, at the width and group size below.'
+                  : `An exponent per group and no bias: ${exponent.shape?.[1]} bits at group ${exponent.shape?.[0]}, packed by mx.quantize. Method, width and group size are the mode's.`}
               </span>
             </div>
 
-            <div className="fieldcol">
-              <span className="eyebrow">Width</span>
-              <div className="seg">
-                {BITS.map((value) => (
-                  <button
-                    key={value}
-                    className={value === bits ? 'on' : undefined}
-                    onClick={() => setBits(value)}
-                  >
-                    {value}
-                  </button>
-                ))}
-              </div>
-            </div>
+            {exponent === null && (
+              <>
+                <div className="fieldcol">
+                  <span className="eyebrow">Method</span>
+                  <div className="seg">
+                    {METHODS.map((entry) => (
+                      <button
+                        key={entry.id}
+                        className={entry.id === method ? 'on' : undefined}
+                        onClick={() => setMethod(entry.id)}
+                      >
+                        {entry.label}
+                      </button>
+                    ))}
+                  </div>
+                  <span className="eyebrow" style={{ fontWeight: 400 }}>
+                    AWQ, GPTQ, oQ and oQe run a calibration pass before writing.
+                  </span>
+                </div>
 
-            <div className="fieldcol">
-              <span className="eyebrow">Group size</span>
-              <div className="seg">
-                {GROUP_SIZES.map((value) => (
-                  <button
-                    key={value}
-                    className={value === groupSize ? 'on' : undefined}
-                    onClick={() => setGroupSize(value)}
-                  >
-                    {value}
-                  </button>
-                ))}
-              </div>
-            </div>
+                <div className="fieldcol">
+                  <span className="eyebrow">Width</span>
+                  <div className="seg">
+                    {BITS.map((value) => (
+                      <button
+                        key={value}
+                        className={value === bits ? 'on' : undefined}
+                        onClick={() => setBits(value)}
+                      >
+                        {value}
+                      </button>
+                    ))}
+                  </div>
+                </div>
+
+                <div className="fieldcol">
+                  <span className="eyebrow">Group size</span>
+                  <div className="seg">
+                    {GROUP_SIZES.map((value) => (
+                      <button
+                        key={value}
+                        className={value === groupSize ? 'on' : undefined}
+                        onClick={() => setGroupSize(value)}
+                      >
+                        {value}
+                      </button>
+                    ))}
+                  </div>
+                </div>
+              </>
+            )}
 
             <div className="fieldcol">
               <span className="eyebrow">Output id</span>
@@ -371,10 +446,17 @@ export function Quantize(): JSX.Element {
               <Row
                 key={entry.pattern}
                 group={entry}
-                bits={bits}
+                widths={widths}
+                placeholder={
+                  exponent?.label ??
+                  (allocated ? 'auto' : entry.mixed ? 'mixed' : `${bits}-bit`)
+                }
+                groups={exponent === null ? GROUP_SIZES : []}
+                planGroup={exponent === null ? groupSize : null}
                 override={overrides[entry.pattern]}
                 overridden={entry.pattern in overrides}
                 onPick={pick}
+                onRegroup={regroup}
               />
             ))
           )}
@@ -386,18 +468,31 @@ export function Quantize(): JSX.Element {
 
 function Row({
   group: entry,
-  bits,
+  widths,
+  groups,
+  planGroup,
+  placeholder,
   override,
   overridden,
-  onPick
+  onPick,
+  onRegroup
 }: {
   group: LeafGroup
-  bits: number
-  override: number | null | undefined
+  /* The widths worth naming here — empty under an exponent-scaled mode, where the width is
+     the mode and dense is the only override left. */
+  widths: readonly number[]
+  /* The group sizes, on the same rule. */
+  groups: readonly number[]
+  /* The group size this row falls back to, `null` where the mode decides it. */
+  planGroup: number | null
+  /* What the group is without an override of its own. */
+  placeholder: string
+  override: Override | null | undefined
   overridden: boolean
   onPick: (pattern: string, choice: string) => void
+  onRegroup: (pattern: string, choice: string) => void
 }): JSX.Element {
-  const selected = !overridden ? '' : override === null ? 'dense' : String(override)
+  const selected = !overridden ? '' : override == null ? 'dense' : String(override.bits)
   return (
     <div className={entry.bits === null ? 'leaf frozen' : 'leaf'}>
       <code title={entry.pattern}>{entry.label}</code>
@@ -410,14 +505,30 @@ function Row({
         value={selected}
         onChange={(event) => onPick(entry.pattern, event.target.value)}
       >
-        <option value="">{entry.mixed ? 'mixed' : `${bits}-bit`}</option>
-        {BITS.filter((value) => value !== bits).map((value) => (
+        <option value="">{placeholder}</option>
+        {widths.map((value) => (
           <option key={value} value={value}>
             {value}-bit
           </option>
         ))}
         <option value="dense">dense</option>
       </select>
+      {override != null && groups.length > 0 && (
+        <select
+          className="pick"
+          value={override.group_size === undefined ? '' : String(override.group_size)}
+          onChange={(event) => onRegroup(entry.pattern, event.target.value)}
+        >
+          <option value="">group {planGroup}</option>
+          {groups
+            .filter((value) => value !== planGroup)
+            .map((value) => (
+              <option key={value} value={value}>
+                group {value}
+              </option>
+            ))}
+        </select>
+      )}
     </div>
   )
 }

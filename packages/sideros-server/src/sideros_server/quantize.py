@@ -94,9 +94,12 @@ from sideros.quant.oq import (
     OqSensitivity,
     plan_provenance,
     provenance_json,
+    widen,
 )
 from sideros.quant.oqe import ImportanceMatrixAffine
 from sideros.quant.quantization import (
+    MXFP,
+    NVFP,
     Affine,
     ByPath,
     Leaf,
@@ -144,6 +147,17 @@ def _install(staged: Path, digest: str, final: Path) -> None:
     staged.rename(final)
 
 
+class Override(BaseModel):
+    """One group of leaves against the rest of the plan. `group_size` absent is the plan's
+    own — the group size is a decision about the whole checkpoint, and a leaf that departs
+    from it says so."""
+
+    model_config = ConfigDict(extra="forbid")
+
+    bits: int
+    group_size: int | None = None
+
+
 class PlanRequest(BaseModel):
     """The selection alone — everything but where the result lands, which pricing does not
     need because nothing is written."""
@@ -152,10 +166,14 @@ class PlanRequest(BaseModel):
 
     source: str
     """A catalog id: a repository already on disk, or the directory of a quantized entry."""
+    mode: Literal["affine", "mxfp4", "mxfp8", "nvfp4"] = "affine"
+    """The grid the codes are read against. Affine is a scale and a bias per group; the other
+    three carry a power-of-two — or, in nvfp4, an E4M3 — exponent per group and no bias, so
+    the mode alone fixes `group_size` and `bits`."""
     bits: int = 4
     group_size: int = 64
-    overrides: dict[str, int | None] = Field(default_factory=dict)
-    """Width per group of leaves, keyed by the same `fullmatch` pattern the engine's
+    overrides: dict[str, Override | None] = Field(default_factory=dict)
+    """Format per group of leaves, keyed by the same `fullmatch` pattern the engine's
     selection takes; `null` says dense. A pattern matching no leaf fails the job, which is
     the engine's own rule about a selection that does not resolve."""
     method: Literal["rtn", "awq", "gptq", "oq", "oqe"] = "rtn"
@@ -197,6 +215,10 @@ _HEADROOM = 1.0
 promotions are 5, 6 and 8 bits over a 4-bit base: under a bit of headroom the greedy buys
 nothing and oQ is an expensive RTN."""
 
+_SHAPE: dict[str, tuple[int, int]] = {"mxfp4": (32, 4), "mxfp8": (32, 8), "nvfp4": (16, 4)}
+"""Group size and width of each exponent-scaled mode — the one pair `mx.quantize` packs and
+the engine's own `__post_init__` admits."""
+
 _SEED = 0
 """The corpus draws its windows from a generator seeded with this, so the pass — and every
 accumulator's summation order — is a function of the request alone."""
@@ -226,6 +248,34 @@ def _admissible(request: PlanRequest) -> None:
                     f"allocates no budget: {named} is the allocator's alone"
                 ),
             )
+    if request.mode != "affine":
+        named = sorted(set_fields.intersection(("bits", "group_size")))
+        if named:
+            raise HTTPException(
+                status_code=400,
+                detail=f"{request.mode!r} fixes {_SHAPE[request.mode]}, so it takes no {named}",
+            )
+        if request.method != "rtn":
+            raise HTTPException(
+                status_code=400,
+                detail=(
+                    f"{request.method!r} searches a scale and a bias per group, which "
+                    f"{request.mode!r} does not have: the exponent modes are rtn's"
+                ),
+            )
+        named = sorted(
+            pattern
+            for pattern, override in request.overrides.items()
+            if override is not None
+        )
+        if named:
+            raise HTTPException(
+                status_code=400,
+                detail=(
+                    f"under {request.mode!r} the format is the mode, so an override can only "
+                    f"be null (dense): {named}"
+                ),
+            )
     if request.method == "gptq" and request.bits not in _GPTQ_BITS:
         raise HTTPException(
             status_code=400,
@@ -236,15 +286,29 @@ def _admissible(request: PlanRequest) -> None:
         )
 
 
+def _format(request: PlanRequest, bits: int, group_size: int | None = None) -> Quantization:
+    match request.mode:
+        case "affine":
+            return Affine(group_size=group_size or request.group_size, bits=bits)
+        case "mxfp4" | "mxfp8":
+            group_size, width = _SHAPE[request.mode]
+            return MXFP(mode=request.mode, group_size=group_size, bits=width)
+        case "nvfp4":
+            group_size, width = _SHAPE[request.mode]
+            return NVFP(group_size=group_size, bits=width)
+
+
 def _selection(request: PlanRequest) -> ByPath:
     """The screen's controls as the engine's selection. The widths a format admits are the
     engine's table, not a second one here: an unsupported pair raises out of `Affine` and
     this route answers with what it said."""
     overrides: dict[str | re.Pattern[str], Quantization | None] = {
-        pattern: None if bits is None else Affine(group_size=request.group_size, bits=bits)
-        for pattern, bits in request.overrides.items()
+        pattern: None
+        if override is None
+        else _format(request, override.bits, override.group_size)
+        for pattern, override in request.overrides.items()
     }
-    return ByPath(Affine(group_size=request.group_size, bits=request.bits), overrides)
+    return ByPath(_format(request, request.bits), overrides)
 
 
 def _leaves(directory: Path, model: nn.Module) -> list[Leaf]:
@@ -310,9 +374,11 @@ def _observe(
 
 def _candidates(base: Affine) -> tuple[Quantization, ...]:
     """The widths every block is perturbed by: the one the request asked for, plus the ones
-    the recipe may promote a leaf to. A width nobody measured is a width the allocator would
-    be ordering blocks by without having seen it."""
-    return (base, *(format for format in RECIPE_OQ4_V1.promotions if format != base))
+    the recipe may promote a leaf to — all at the request's own group size, which is where
+    the allocator will spend them. A width nobody measured is a width the allocator would be
+    ordering blocks by without having seen it."""
+    promotions = (widen(base, bits) for bits in RECIPE_OQ4_V1.promotions)
+    return (base, *(format for format in promotions if format != base))
 
 
 def _intent(request: PlanRequest, selection: ByPath, floor: float) -> QuantizationIntent:
@@ -565,6 +631,9 @@ class PlanLeaf(BaseModel):
     shape: tuple[int, ...]
     bits: int | None
     """`null` says the leaf stays dense, which is what the default or an override asked."""
+    group_size: int | None
+    """`null` for the same reason, and never the request's own field read back: under an
+    exponent-scaled mode or an override of its own a leaf carries a group nobody typed."""
     bytes: int
 
 
@@ -643,6 +712,7 @@ def price(request: PlanRequest) -> PricedPlan:
                 kind=leaf.kind,
                 shape=leaf.shape,
                 bits=None if (format := plan.get(leaf.path)) is None else format.bits,
+                group_size=None if format is None else format.group_size,
                 bytes=costs[leaf.path].total,
             )
             for leaf in leaves

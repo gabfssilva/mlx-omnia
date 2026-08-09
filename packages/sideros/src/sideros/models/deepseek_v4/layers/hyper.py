@@ -1,14 +1,27 @@
 import mlx.core as mx
 import mlx.nn as nn
 
+from sideros.core.kernels import hyper_connection as kernels
+from sideros.core.kernels.hyper_connection import hc_junction, hc_junction_applies
 from sideros.core.mxcompat import softmax
 from sideros.models.deepseek_v4.config import DeepseekV4Config
 
 
-def hc_expand(x: mx.array, residual: mx.array, post: mx.array, comb: mx.array) -> mx.array:
-    """The sublayer output broadcast back over the copies, plus the copies mixed."""
+def hc_expand(
+    x: mx.array,
+    residual: mx.array,
+    post: mx.array,
+    comb: mx.array,
+    fn: mx.array | None = None,
+) -> tuple[mx.array, mx.array | None]:
+    """The sublayer output broadcast back over the copies, plus the copies mixed — and,
+    given the next junction's `fn`, that junction's gemv partials on the way out."""
+    hc, hidden = residual.shape[-2:]
+    if hc_junction_applies(hc, hidden):
+        return kernels.hc_expand(x, residual, post, comb, fn)
     y = post[..., None] * x[:, :, None, :].astype(mx.float32)
-    return (y + mx.matmul(comb.swapaxes(-1, -2), residual.astype(mx.float32))).astype(x.dtype)
+    out = (y + mx.matmul(comb.swapaxes(-1, -2), residual.astype(mx.float32))).astype(x.dtype)
+    return out, None
 
 
 class HyperConnection(nn.Module):
@@ -31,9 +44,28 @@ class HyperConnection(nn.Module):
         self.fn = mx.zeros((mix, self.hc_mult * config.hidden_size), dtype=mx.float32)
         self.base = mx.zeros((mix,), dtype=mx.float32)
         self.scale = mx.ones((3,), dtype=mx.float32)
+        self.fused = hc_junction_applies(self.hc_mult, config.hidden_size)
 
-    def __call__(self, x: mx.array) -> tuple[mx.array, mx.array, mx.array]:
+    def __call__(
+        self, x: mx.array, norm: nn.RMSNorm, partials: mx.array | None = None
+    ) -> tuple[mx.array, mx.array, mx.array]:
+        """The sublayer's rms-normed input — the collapse only ever feeds `norm` — plus
+        the two re-expansion tensors. `partials` are the mixes gemv's partial sums when
+        the preceding expansion already computed them."""
         hc, eps = self.hc_mult, self.hc_eps
+        if self.fused:
+            if partials is None:
+                partials = (x.flatten(-2) @ self.fn.T)[..., None, :]
+            return hc_junction(
+                x,
+                partials,
+                self.scale,
+                self.base,
+                norm.weight,
+                iters=self.iters,
+                eps=eps,
+                norm_eps=self.norm_eps,
+            )
         y = x.astype(mx.float32)
         mixes = mx.fast.rms_norm(y.flatten(-2), None, self.norm_eps) @ self.fn.T
         pre = mx.sigmoid(mixes[..., :hc] * self.scale[0] + self.base[:hc]) + eps
@@ -44,7 +76,7 @@ class HyperConnection(nn.Module):
         for _ in range(max(self.iters - 1, 0)):
             comb = comb / (comb.sum(axis=-1, keepdims=True) + eps)
             comb = comb / (comb.sum(axis=-2, keepdims=True) + eps)
-        return (pre[..., None] * y).sum(axis=2).astype(x.dtype), post, comb
+        return norm((pre[..., None] * y).sum(axis=2).astype(x.dtype)), post, comb
 
 
 class HyperHead(nn.Module):

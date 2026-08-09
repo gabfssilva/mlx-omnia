@@ -6,6 +6,7 @@ import mlx.nn as nn
 import numpy as np
 
 from sideros.core.cache import DeltaCache, KVCache
+from sideros.core.prefill import prefill
 from sideros.core.prompt_cache import PromptCache
 from sideros.generate import Meter, Penalty, Sampler, greedy, stream_ids, stream_text
 from sideros.language import (
@@ -177,7 +178,18 @@ def stream_multimodal_ids(
         row += 1
         return out
 
-    y = step(mx.array(prompt.ids)[None], prompt.positions, prompt.embeddings)
+    ids = mx.array(prompt.ids)
+
+    def feed(part: slice) -> mx.array:
+        return model(
+            ids[part][None],
+            cache,
+            positions=prompt.positions[:, part],
+            embeddings=prompt.embeddings[:, part],
+        )
+
+    window = prefill(feed, ids.size, cache)
+    y = step(ids[window][None], prompt.positions[:, window], prompt.embeddings[:, window])
     mx.async_eval(y)
     for _ in range(max_tokens):
         if penalty is not None:

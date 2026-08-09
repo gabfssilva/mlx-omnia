@@ -1,5 +1,7 @@
 from collections.abc import Callable
 
+import mlx.core as mx
+
 from sideros.core.cache import DeltaCache, KVCache, LayerCache
 
 
@@ -22,6 +24,10 @@ class FalconH1LayerCache(LayerCache):
     @property
     def nbytes(self) -> int:
         return self.mamba.nbytes + self.kv.nbytes
+
+    @property
+    def tensors(self) -> tuple[mx.array, ...]:
+        return self.mamba.tensors + self.kv.tensors
 
     def checkpoint(self) -> Callable[[], None]:
         mamba_restore = self.mamba.checkpoint()

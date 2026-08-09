@@ -42,7 +42,7 @@ import zlib
 from collections.abc import AsyncIterator, Iterator, Mapping, Sequence
 from dataclasses import dataclass
 from itertools import count
-from typing import Annotated, Literal
+from typing import Annotated, Final, Literal
 
 import numpy as np
 import numpy.typing as npt
@@ -69,7 +69,7 @@ from sideros import (
     top_p,
 )
 from sideros import ChatMessage as Turn
-from sideros.chat import tool_family_of
+from sideros.chat import Effort, tool_family_of
 from sideros.generate import Constraint, Meter
 from sideros.grammar import GrammarRefused
 from sideros.schema import (
@@ -499,6 +499,57 @@ class TextConfig(BaseModel):
     member pydantic tried first."""
 
 
+type OpenAIEffort = Literal["none", "minimal", "low", "medium", "high", "xhigh", "max"]
+"""How the two OpenAI dialects spell an effort, which is upstream's vocabulary widened by
+two rungs. `xhigh` and `max` are not in the OpenAI spec — they are what Anthropic and
+DeepSeek V4 call the rungs above `high`, and the templates that read `reasoning_effort`
+spell whatever they are handed — so accepting them here is a superset and never a lie: a
+level named is a level rendered.
+
+The one collapse is `minimal`, which upstream added for GPT-5 and no template in
+circulation reads: it lands on `low`, the nearest rung that means something, rather than
+being refused to a client whose SDK sends it by default."""
+
+_EFFORT: Final[Mapping[OpenAIEffort, Effort]] = {
+    "none": "off",
+    "minimal": "low",
+    "low": "low",
+    "medium": "medium",
+    "high": "high",
+    "xhigh": "xhigh",
+    "max": "max",
+}
+
+
+def effort_of(asked: OpenAIEffort | None, preset: Effort | None) -> Effort:
+    """The effort this generation runs at: the request's, then the profile's, then `auto`.
+
+    Same precedence as every other knob — a request that names one means it — and `auto` is
+    what a request and a profile that both said nothing add up to, which leaves the decision
+    with the checkpoint's own template.
+    """
+    if asked is not None:
+        return _EFFORT[asked]
+    return "auto" if preset is None else preset
+
+
+class Reasoning(BaseModel):
+    """`reasoning.effort` is this dialect's spelling of the same knob `chat/completions` puts
+    at the top level.
+
+    `summary` is declared so that refusing it is a named error: it asks for the reasoning
+    back as a summary, there is no summarizer here, and answering with the raw block under
+    that name would be a client told it received something shorter than it did. There is no
+    budget beside it because upstream has none — how long the model may think is reachable
+    on this route through a profile, which is where the knobs this dialect cannot spell
+    already live."""
+
+    model_config = ConfigDict(extra="forbid")
+
+    effort: OpenAIEffort | None = None
+    summary: None = None
+
+
 class ResponsesRequest(BaseModel):
     model_config = ConfigDict(extra="forbid")
 
@@ -523,6 +574,7 @@ class ResponsesRequest(BaseModel):
     docstring. The field is declared so that saying so is a named error and not the generic
     refusal an undeclared one would get."""
     max_output_tokens: int = Field(default=128, gt=0)
+    reasoning: Reasoning | None = None
     stream: bool = False
     temperature: float = Field(default=1.0, ge=0.0)
     top_p: float = Field(default=1.0, gt=0.0, le=1.0)
@@ -532,15 +584,21 @@ class ResponsesRequest(BaseModel):
     seed: int | None = None
 
 
-def _options(request: ResponsesRequest, constraint: Constraint | None) -> GenerationOptions:
+def _options(
+    request: ResponsesRequest, sampling: Sampling, constraint: Constraint | None
+) -> GenerationOptions:
     """The dialect's defaults are OpenAI's, so an unset `temperature` is 1.0 and the answer
     is drawn, not argmaxed. Filters run in the order below — the cuts read the distribution
     temperature already shaped.
 
     The constraint composes with all of them and is nobody's filter: the mask is applied
-    before the sampler runs, so what is drawn is drawn from what the grammar left."""
+    before the sampler runs, so what is drawn is drawn from what the grammar left.
+
+    `sampling` is here for the knobs this dialect has no field for — `reasoning_budget` is
+    the only one so far — which `_preset` cannot fill because there is nothing to fill."""
     repeats = request.repetition_penalty
     penalty: Penalty | None = None if repeats == 1.0 else repetition_penalty(repeats)
+    thinking = sampling.reasoning_budget
     if request.temperature == 0.0:
         # The deterministic end of the dial: no distribution is left to draw from, and
         # dividing by it would hand the sampler a row of infinities.
@@ -549,6 +607,7 @@ def _options(request: ResponsesRequest, constraint: Constraint | None) -> Genera
             sampler=greedy,
             penalty=penalty,
             constraint=constraint,
+            reasoning_budget=thinking,
         )
 
     filters: list[LogitFilter] = [temperature(request.temperature)]
@@ -564,6 +623,7 @@ def _options(request: ResponsesRequest, constraint: Constraint | None) -> Genera
         sampler=drawn,
         penalty=penalty,
         constraint=constraint,
+        reasoning_budget=thinking,
     )
 
 
@@ -584,16 +644,36 @@ def _guaranteed(request: ResponsesRequest) -> Mapping[str, object] | None:
     return wanted.definition if isinstance(wanted, SchemaOutput) and wanted.strict else None
 
 
+PROFILE_ONLY: Final = frozenset({"reasoning_budget", "reasoning_effort"})
+"""Knobs the profile spells in the engine's vocabulary rather than an OpenAI dialect's, so
+they are read off the profile where they are used instead of copied onto the request.
+
+`reasoning_budget` is here because neither OpenAI route has a field for it at all and
+inventing one would be a field only this server answers. `reasoning_effort` is here because
+the two vocabularies differ where it counts: the profile can say `on`, which is thinking
+with no rung named, and neither route has a spelling for that — copied across, it would land
+in a field typed for OpenAI's words and be read by `effort_of` as none of them.
+
+Both routes share the set, because both refuse for the same reasons."""
+
+
 def _preset(request: ResponsesRequest, sampling: Sampling) -> ResponsesRequest:
-    """The profile fills the knobs the client left out, and only those. Which ones were left
+    """The preset — the profile, over the sampling defaults the checkpoint declares — fills
+    the knobs the client left out, and only those. Which ones were left
     out is `model_fields_set` — the dialect's defaults are values like any other, so an unset
     field cannot be told from an explicit one by its value."""
     filled = {
         knob: value
         for knob, value in sampling.model_dump(exclude_none=True).items()
-        if knob not in request.model_fields_set
+        if knob not in request.model_fields_set and knob not in PROFILE_ONLY
     }
     return request.model_copy(update=filled)
+
+
+# The same invariant `chat/completions` asserts, for the same reason: `model_copy(update=...)`
+# writes the keys straight into the instance, so a knob the profile grows and this route does
+# not have would be set on the request and read by nobody.
+assert set(Sampling.model_fields) - PROFILE_ONLY <= set(ResponsesRequest.model_fields)
 
 
 def _given_part(part: ContentPart | InputImage) -> TextPart | ImagePart:
@@ -646,9 +726,7 @@ def _given(input: str | list[InputItem]) -> tuple[ToolTurn, ...]:
                 else:
                     turns.append({"role": "assistant", "content": "", "tool_calls": [call]})
             case FunctionOutputItem():
-                turns.append(
-                    {"role": "tool", "content": item.output, "tool_call_id": item.call_id}
-                )
+                turns.append({"role": "tool", "content": item.output, "tool_call_id": item.call_id})
     return tuple(turns)
 
 
@@ -1033,7 +1111,8 @@ async def respond(
         return openai_error(400, "input must contain non-empty text", "empty_input")
 
     model_id, profile = profiles.resolve(store, request.model)
-    asked = request if profile is None else _preset(request, profile.sampling)
+    preset = profiles.preset(model_id, profile)
+    asked = _preset(request, preset)
     turns = _prefixed(
         given, request.instructions, None if profile is None else profile.system_prompt
     )
@@ -1051,7 +1130,9 @@ async def respond(
         turns = (*turns, instruction(checked.schema))
     # The conversation goes to the model as a conversation: what turns it into a prompt is
     # the checkpoint's own chat template, and a model that ships none says so below.
-    conversation = Chat(turns, tools=tools)
+    reasoning = request.reasoning
+    effort = effort_of(None if reasoning is None else reasoning.effort, preset.reasoning_effort)
+    conversation = Chat(turns, tools=tools, reasoning_effort=effort)
     request_id = f"resp_{uuid.uuid4().hex}"
     message_id = f"msg_{uuid.uuid4().hex}"
     created = int(time.time())
@@ -1061,7 +1142,7 @@ async def respond(
         constrained = None if strict is None else await engine.constrain(model_id, strict)
         # A name that does not resolve to a checkpoint and one whose load fails are the same
         # answer to the client: this model is not available here.
-        job = await engine.submit(model_id, conversation, _options(asked, constrained))
+        job = await engine.submit(model_id, conversation, _options(asked, preset, constrained))
     except GrammarRefused as refusal:
         # The compiler's own words — `Unimplemented keys: ["uniqueItems"]` is a reason where
         # "grammar error" is not, and what the client does with it is send the same schema
@@ -1074,8 +1155,9 @@ async def respond(
             400, unsupported_reason(request.model, conversation), "unsupported_input"
         )
     except Exception as error:
-        return openai_error(404, f"model {request.model!r} is not available: {error}",
-                            "model_not_found")
+        return openai_error(
+            404, f"model {request.model!r} is not available: {error}", "model_not_found"
+        )
 
     # No tools offered, nothing to read back; no family, nothing that could read it. Both
     # reach the client the way the generation always did, piece for piece: suppressing an

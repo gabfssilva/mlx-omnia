@@ -16,6 +16,8 @@ interface Draft {
   min_p: string
   repetition_penalty: string
   seed: string
+  reasoning_effort: api.Effort
+  reasoning_budget: string
   system_prompt: string
 }
 
@@ -36,6 +38,10 @@ const EMPTY: Draft = {
   min_p: '',
   repetition_penalty: '',
   seed: '',
+  /* `auto` is the profile not setting it, which is the same `null` every other knob's
+     blank means: the checkpoint's own template decides. */
+  reasoning_effort: 'auto',
+  reasoning_budget: '',
   system_prompt: ''
 }
 
@@ -47,6 +53,8 @@ const draftOf = (view: api.ProfileView): Draft => ({
   min_p: text(view.sampling.min_p),
   repetition_penalty: text(view.sampling.repetition_penalty),
   seed: text(view.sampling.seed),
+  reasoning_effort: view.sampling.reasoning_effort ?? 'auto',
+  reasoning_budget: text(view.sampling.reasoning_budget),
   system_prompt: view.system_prompt ?? ''
 })
 
@@ -66,6 +74,37 @@ interface KnobProps {
   min: string
   onChange: (next: string) => void
 }
+
+function Choice({
+  label,
+  value,
+  options,
+  onChange
+}: {
+  label: string
+  value: string
+  options: readonly string[]
+  onChange: (next: string) => void
+}): JSX.Element {
+  return (
+    <div className="fieldcol">
+      <span className="eyebrow">{label}</span>
+      <select
+        className="input tn"
+        value={value}
+        aria-label={label}
+        onChange={(event) => onChange(event.target.value)}
+      >
+        {options.map((option) => (
+          <option key={option} value={option}>
+            {option}
+          </option>
+        ))}
+      </select>
+    </div>
+  )
+}
+
 
 function Knob({ label, value, step, min, onChange }: KnobProps): JSX.Element {
   return (
@@ -142,7 +181,9 @@ export function Profiles({ model }: { model: string }): JSX.Element {
             top_k: num(draft.top_k),
             min_p: num(draft.min_p),
             repetition_penalty: num(draft.repetition_penalty),
-            seed: num(draft.seed)
+            seed: num(draft.seed),
+            reasoning_effort: draft.reasoning_effort === 'auto' ? null : draft.reasoning_effort,
+            reasoning_budget: num(draft.reasoning_budget)
           },
           system_prompt: draft.system_prompt.trim() === '' ? null : draft.system_prompt
         })
@@ -213,6 +254,8 @@ export function Profiles({ model }: { model: string }): JSX.Element {
             <Knob label="Min-p" value={draft.min_p} step="0.01" min="0" onChange={(next) => edit({ min_p: next })} />
             <Knob label="Repetition penalty" value={draft.repetition_penalty} step="0.01" min="0" onChange={(next) => edit({ repetition_penalty: next })} />
             <Knob label="Seed" value={draft.seed} step="1" min="0" onChange={(next) => edit({ seed: next })} />
+            <Choice label="Reasoning effort" value={draft.reasoning_effort} options={api.EFFORTS} onChange={(next) => edit({ reasoning_effort: next as api.Effort })} />
+            <Knob label="Reasoning budget" value={draft.reasoning_budget} step="64" min="0" onChange={(next) => edit({ reasoning_budget: next })} />
           </div>
           <div className="fieldcol">
             <span className="eyebrow">System prompt</span>
@@ -254,6 +297,15 @@ export function Profiles({ model }: { model: string }): JSX.Element {
             <Line label="Repetition penalty" value={profile.sampling.repetition_penalty} />
           )}
           {profile.sampling.seed !== null && <Line label="Seed" value={profile.sampling.seed} />}
+          {profile.sampling.reasoning_effort !== null && (
+            <div className="kvline">
+              <span className="eyebrow">Reasoning effort</span>
+              <b>{profile.sampling.reasoning_effort}</b>
+            </div>
+          )}
+          {profile.sampling.reasoning_budget !== null && (
+            <Line label="Reasoning budget" value={profile.sampling.reasoning_budget} />
+          )}
           <div className="kvline">
             <span className="eyebrow">System prompt</span>
             <b className={profile.system_prompt === null ? 'unset' : 'prompt'}>

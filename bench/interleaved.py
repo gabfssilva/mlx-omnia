@@ -46,6 +46,7 @@ Usage:
   uv run --with "mlx-lm @ git+https://github.com/ml-explore/mlx-lm" bench/interleaved.py qwen3
   uv run --with "mlx-lm @ git+https://github.com/ml-explore/mlx-lm" bench/interleaved.py qwen2
   … bench/interleaved.py <model> [draft] [lookahead]   e.g. qwen3-14b qwen3-4b-4bit 4
+  … bench/interleaved.py <model> --prompt-tokens 8192   (default 1024)
 """
 
 import json
@@ -68,6 +69,7 @@ from sideros.speculative import Acceptance
 
 TOKENS = 128
 RUNS = 5
+PROMPT_TOKENS = 1024
 PROMPT = Path(__file__).parent.parent / "reference" / "bench_prompt.txt"
 HUB = Path.home() / ".cache/huggingface/hub"
 
@@ -175,8 +177,10 @@ def forced(script: list[int]) -> Callable[[mx.array], mx.array]:
 
 def cached(repository: str) -> Path:
     """The snapshot already on disk: a bench whose first act is to download tens of GB is
-    not a bench."""
-    return next((HUB / f"models--{repository.replace('/', '--')}" / "snapshots").iterdir())
+    not a bench. A tokenizer-only fetch can leave a second, near-empty snapshot behind,
+    so only one carrying a config counts."""
+    snapshots = HUB / f"models--{repository.replace('/', '--')}" / "snapshots"
+    return next(path for path in snapshots.iterdir() if (path / "config.json").exists())
 
 
 def _snapshot(repository: str, *patterns: str) -> Path:
@@ -193,6 +197,8 @@ OURS = {
     "qwen3-14b": lambda: tree(cached("mlx-community/Qwen3-14b-bf16")),
     "qwen3-moe": lambda: tree(cached("mlx-community/Qwen3-30B-A3B-4bit")),
     "gpt-oss-120b": lambda: tree(cached("openai/gpt-oss-120b")),
+    "deepseek-v4": lambda: tree(cached("mlx-community/DeepSeek-V4-Flash-0731-2.4bit-mixed")),
+    "laguna-xs": lambda: tree(cached("poolside/Laguna-XS-2.1-NVFP4-mlx")),
 }
 
 
@@ -207,6 +213,8 @@ MLXLM_REPO = {
     "qwen3-14b": "mlx-community/Qwen3-14b-bf16",
     "qwen3-moe": "mlx-community/Qwen3-30B-A3B-4bit",
     "gpt-oss-120b": "openai/gpt-oss-120b",
+    "deepseek-v4": "mlx-community/DeepSeek-V4-Flash-0731-2.4bit-mixed",
+    "laguna-xs": "poolside/Laguna-XS-2.1-NVFP4-mlx",
 }
 
 DRAFTS = {
@@ -218,7 +226,23 @@ DRAFTS = {
 # Every draft above is a Qwen3, and the ids of two tokenizers are two alphabets.
 DRAFTABLE = ("qwen3", "qwen3-14b", "qwen3-moe")
 
-WITH_CEILING = ("qwen2", "qwen3", "qwen3-14b", "qwen3-moe", "gpt-oss-120b")
+WITH_CEILING = ("qwen2", "qwen3", "qwen3-14b", "qwen3-moe", "gpt-oss-120b", "deepseek-v4")
+
+CONTEXT = {"gpt2": 1024}
+
+
+def prompt_ids(encode: Callable[[str], list[int]], name: str, target: int) -> list[int]:
+    """The bench prompt tiled out to `target` ids — the text repeats until the slice
+    holds, so every length is the same distribution of tokens."""
+    limit = CONTEXT.get(name)
+    if limit is not None and target > limit - TOKENS:
+        target = limit - TOKENS
+        print(f"prompt capped at {target} ids ({name} context is {limit})", file=sys.stderr)
+    text = PROMPT.read_text()
+    ids = [int(i) for i in encode(text)]
+    if len(ids) < target:
+        ids = [int(i) for i in encode(text * (-(-target // len(ids)) + 1))]
+    return ids[:target]
 
 
 def load_draft(name: str):
@@ -301,12 +325,15 @@ def battery(
 
 
 def report(name: str, samples: list[tuple[float, float]], prompt: int) -> tuple[float, float]:
+    """Three items per arm. The prefill rate is `prompt / ttft`, which carries one decode
+    step — at bench prompt sizes that step is noise (selfpair's convention)."""
     decodes = [d for _, d in samples]
     ttfts = [t for t, _ in samples]
     median = statistics.median(decodes)
     ttft = statistics.median(ttfts)
     print(
-        f"{name:<14} ttft {ttft * 1000:7.1f} ms ({ttft * 1000 / prompt:5.2f} ms/prompt tok)   "
+        f"{name:<14} ttft {ttft * 1000:7.1f} ms   "
+        f"prefill {prompt / ttft:7.1f} tok/s   "
         f"decode {median:7.1f} tok/s   "
         f"(min {min(decodes):.1f}, max {max(decodes):.1f}, n={len(samples)})"
     )
@@ -347,18 +374,24 @@ def report_speculation(
 def main() -> None:
     from mlx_lm import load as mlxlm_load
 
-    name = sys.argv[1] if len(sys.argv) > 1 else "gpt2"
-    draft_name = sys.argv[2] if len(sys.argv) > 2 else None
-    lookahead = int(sys.argv[3]) if len(sys.argv) > 3 else 4
+    args = sys.argv[1:]
+    tokens = PROMPT_TOKENS
+    if "--prompt-tokens" in args:
+        at = args.index("--prompt-tokens")
+        tokens = int(args[at + 1])
+        del args[at : at + 2]
+    name = args[0] if len(args) > 0 else "gpt2"
+    draft_name = args[1] if len(args) > 1 else None
+    lookahead = int(args[2]) if len(args) > 2 else 4
     if draft_name is not None and name not in DRAFTABLE:
         raise SystemExit(f"{name} and {draft_name} do not share a tokenizer")
-    text = PROMPT.read_text()
 
     ref_model, ref_tok = mlxlm_load(MLXLM_REPO[name])
     if name == "gpt2":
         ref_model.set_dtype(mx.float16)
         mx.eval(ref_model.parameters())
-    ids = [int(i) for i in ref_tok.encode(text)]
+    ids = prompt_ids(lambda text: [int(i) for i in ref_tok.encode(text)], name, tokens)
+    print(f"prompt: {len(ids)} ids", file=sys.stderr)
 
     ours_model = load_ours(name)
     draft_model = None if draft_name is None else load_draft(draft_name)

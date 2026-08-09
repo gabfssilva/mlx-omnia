@@ -42,7 +42,9 @@ export function Composer({
     const element = field.current
     if (element === null) return
     element.style.height = 'auto'
-    element.style.height = `${element.scrollHeight}px`
+    /* Views stay mounted while hidden, and a hidden element measures 0 — writing that back
+       would leave the field collapsed until the first keystroke. */
+    if (element.scrollHeight > 0) element.style.height = `${element.scrollHeight}px`
   }, [draft])
 
   /* A model the catalog does not list — the one this chat was started on, gone since —

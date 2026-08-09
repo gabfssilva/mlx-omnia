@@ -9,6 +9,8 @@
   --fg: #17181C; --fg2: #5C5F66; --fg3: #9B9EA6;
   --ember1: #E8541F; --ember2: #E89B12;
   --ember-ink: #C64715;
+  --syn-key: #9A3AB0; --syn-str: #1F8A4C; --syn-num: #B8621B;
+  --syn-fn: #2A6FD6; --syn-com: #8A8D94; --syn-attr: #C64715;
   --glow: none;
   --ok: #1FA46B; --bad: #D6453A;
   --shadow: 0 24px 80px rgba(20,20,40,.18), 0 2px 8px rgba(20,20,40,.08);
@@ -24,6 +26,8 @@
     --fg: #F2F3F5; --fg2: #A0A3AB; --fg3: #5F626B;
     --ember1: #FF6A3D; --ember2: #FFC53D;
     --ember-ink: #FF8A5C;
+    --syn-key: #C792EA; --syn-str: #7EE787; --syn-num: #FFC53D;
+    --syn-fn: #79B8FF; --syn-com: #6B6E76; --syn-attr: #FF8A5C;
     --glow: 0 0 14px rgba(255,116,61,.35);
     --ok: #3DD68C; --bad: #F0564A;
     --shadow: 0 32px 100px rgba(0,0,0,.6), 0 2px 10px rgba(0,0,0,.5);
@@ -37,6 +41,8 @@
   --fg: #17181C; --fg2: #5C5F66; --fg3: #9B9EA6;
   --ember1: #E8541F; --ember2: #E89B12;
   --ember-ink: #C64715;
+  --syn-key: #9A3AB0; --syn-str: #1F8A4C; --syn-num: #B8621B;
+  --syn-fn: #2A6FD6; --syn-com: #8A8D94; --syn-attr: #C64715;
   --glow: none;
   --ok: #1FA46B; --bad: #D6453A;
   --shadow: 0 24px 80px rgba(20,20,40,.18), 0 2px 8px rgba(20,20,40,.08);
@@ -49,6 +55,8 @@
   --fg: #F2F3F5; --fg2: #A0A3AB; --fg3: #5F626B;
   --ember1: #FF6A3D; --ember2: #FFC53D;
   --ember-ink: #FF8A5C;
+  --syn-key: #C792EA; --syn-str: #7EE787; --syn-num: #FFC53D;
+  --syn-fn: #79B8FF; --syn-com: #6B6E76; --syn-attr: #FF8A5C;
   --glow: 0 0 14px rgba(255,116,61,.35);
   --ok: #3DD68C; --bad: #F0564A;
   --shadow: 0 32px 100px rgba(0,0,0,.6), 0 2px 10px rgba(0,0,0,.5);
@@ -57,8 +65,9 @@
 * { box-sizing: border-box; }
 html, body, #root { margin: 0; height: 100%; }
 /* The design's px values are the mockup's, which read right at ~1000px of width; a real
-   1300pt window at 1:1 makes them minuscule. One knob, mirrored by UI_SCALE in
-   src/desktop/macos.ts (traffic lights and drag areas are placed in native points). */
+   1300pt window at 1:1 makes them minuscule. The zoom does not reach the traffic
+   lights, which AppKit places in native points: `trafficLightPosition` in
+   src/desktop/main.ts carries the same factor applied by hand. */
 html { zoom: 1.25; }
 body {
   font-family: var(--sans); font-size: 13px; color: var(--fg);
@@ -75,10 +84,14 @@ body {
 
 /* ── sidebar (floating, macOS-like) ───────────────── */
 .side { width: 76px; flex: none; display: flex; flex-direction: column; padding: 1px 0 1px 1px; }
-/* Empty on purpose: the traffic lights are the real ones, moved into this space by
-   src/desktop/macos.ts. Nothing may be drawn here — it would sit under them. The height
-   is the mockup's own row: 11px dots under 11px of padding, 13px below. */
-.lights { height: 35px; flex: none; }
+/* Empty on purpose: the traffic lights are the real ones, placed into this space by
+   `trafficLightPosition`. Nothing may be drawn here — it would sit under them. The
+   height is the mockup's own row: 11px dots under 11px of padding, 13px below. It is
+   also a drag handle, which is safe exactly because no control claims these pixels;
+   AppKit takes the clicks that land on the lights themselves first. `align-self`
+   because the panel centers its children, which collapses an empty div to zero width
+   and takes the drag region with it. */
+.lights { height: 35px; flex: none; align-self: stretch; -webkit-app-region: drag; }
 .railpanel {
   flex: 1; background: var(--rail); border: 1px solid var(--hair); border-radius: 14px;
   display: flex; flex-direction: column; align-items: center; padding: 0 0 14px; gap: 6px;
@@ -113,7 +126,11 @@ body {
 @keyframes enter { from { opacity: 0; transform: translateY(6px); } }
 @media (prefers-reduced-motion: reduce) { .view.on { animation: none; } .pulse, .chip.hot .dot, .caret { animation: none !important; } }
 
-.vhead { display: flex; align-items: center; gap: 12px; padding: 20px 32px 14px; flex: none; }
+/* The window's drag handle outside the rail. Only the header's own empty space moves
+   the window — every child opts back out, since a drag region swallows the click. */
+.vhead { display: flex; align-items: center; gap: 12px; padding: 20px 32px 14px; flex: none;
+  -webkit-app-region: drag; }
+.vhead > * { -webkit-app-region: no-drag; }
 .vhead h1 { margin: 0; font-size: 17px; font-weight: 650; letter-spacing: -.02em; }
 .vhead .trail { margin-left: auto; display: flex; align-items: center; gap: 10px; }
 .vbody { flex: 1; overflow-y: auto; padding: 8px 32px 32px; }

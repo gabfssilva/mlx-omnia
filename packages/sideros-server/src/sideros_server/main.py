@@ -1,4 +1,9 @@
 import argparse
+import os
+import signal
+import threading
+import time
+from collections.abc import Callable
 
 import uvicorn
 
@@ -21,9 +26,38 @@ def _resident(model_id: str) -> LanguageModel[ModelInput]:
     return load(model_id, local_files_only=True)
 
 
+def watch_parent(pid: int, gone: Callable[[], None], every: float = 1.0) -> None:
+    """Call `gone` once the process that asked to be the owner is no longer there.
+
+    Whoever spawns the daemon kills it on the way out, but only when it gets to run its own
+    exit path: a force quit, a crash or a SIGKILL leaves the daemon behind holding the port
+    and a resident model, and the next start adopts it as a stranger it may not stop. The
+    watch is the daemon's own half of that contract, so it does not depend on the owner
+    getting a last word in.
+
+    Signal 0 asks the kernel whether the pid exists without sending anything. Only
+    `ProcessLookupError` means gone — a pid that exists but belongs to someone else raises
+    `PermissionError`, and killing on that would be killing on a permission answer.
+    """
+
+    def watch() -> None:
+        while True:
+            time.sleep(every)
+            try:
+                os.kill(pid, 0)
+            except ProcessLookupError:
+                gone()
+                return
+
+    threading.Thread(target=watch, daemon=True).start()
+
+
 def main() -> None:
     parser = argparse.ArgumentParser(prog="sideros-server")
     parser.add_argument("--host", default="127.0.0.1")
+    # The process this daemon belongs to: when it dies, so does the daemon. Off by default —
+    # a daemon spawned by the CLI is meant to outlive the command that started it.
+    parser.add_argument("--parent-pid", type=int, default=None)
     # No default, so that the saved port is what a bare `sideros-server` binds and an explicit
     # `--port` still wins: `/admin/config` answers `restart` for this field, and a process that
     # went on binding 8642 whatever the file said would make that word a lie.
@@ -36,6 +70,10 @@ def main() -> None:
     # the loopback without a key has to happen before anything is served.
     store = Store()
     auth.check_bind(args.host, store)
+    if args.parent_pid is not None:
+        # SIGTERM to self rather than a direct exit: it is the same shutdown the owner's own
+        # kill takes, so uvicorn drains what is open instead of dropping it mid-stream.
+        watch_parent(args.parent_pid, lambda: os.kill(os.getpid(), signal.SIGTERM))
     port = config.current(store).port if args.port is None else args.port
     app = create_app(Engine(_resident, store), store, host=args.host)
     uvicorn.run(app, host=args.host, port=port)

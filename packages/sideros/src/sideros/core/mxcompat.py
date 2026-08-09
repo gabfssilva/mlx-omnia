@@ -53,9 +53,19 @@ if TYPE_CHECKING:
         sorted_indices: bool = False,
     ) -> mx.array: ...
 
+    def quantize(
+        w: mx.array,
+        /,
+        group_size: int = 64,
+        bits: int = 4,
+        *,
+        mode: str = "affine",
+    ) -> tuple[mx.array, ...]: ...
+
 else:
     module_item = dict.__getitem__
     set_module_item = dict.__setitem__
     metal_kernel = mx.fast.metal_kernel
     softmax = mx.softmax
     gather_mm = mx.gather_mm
+    quantize = mx.quantize

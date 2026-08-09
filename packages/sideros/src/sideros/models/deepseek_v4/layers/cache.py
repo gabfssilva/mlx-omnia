@@ -32,6 +32,11 @@ class PoolCache(LayerCache):
         buffers = (self.tail_kv, self.tail_gate, self.pooled)
         return sum(buffer.nbytes for buffer in buffers if buffer is not None)
 
+    @property
+    def tensors(self) -> tuple[mx.array, ...]:
+        buffers = (self.tail_kv, self.tail_gate, self.pooled, *(self.previous or ()))
+        return tuple(buffer for buffer in buffers if buffer is not None)
+
     def checkpoint(self) -> Callable[[], None]:
         parent = super().checkpoint()
         state = (self.remainder, self.rows, self.previous, self.pooled)
@@ -122,6 +127,15 @@ class DeepseekV4Cache(LayerCache):
     def nbytes(self) -> int:
         pools = (self.compressor, self.indexer)
         return self.attention.nbytes + sum(pool.nbytes for pool in pools if pool is not None)
+
+    @property
+    def tensors(self) -> tuple[mx.array, ...]:
+        pools = (self.compressor, self.indexer)
+        held = self.attention.tensors
+        for pool in pools:
+            if pool is not None:
+                held += pool.tensors
+        return held
 
     def checkpoint(self) -> Callable[[], None]:
         pools = (self.compressor, self.indexer)

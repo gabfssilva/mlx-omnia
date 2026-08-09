@@ -9,12 +9,13 @@ import codecs
 import time
 from collections.abc import Callable, Collection, Generator, Iterable, Iterator
 from dataclasses import dataclass
-from typing import Protocol
+from typing import Protocol, runtime_checkable
 
 import mlx.core as mx
 
 from sideros.core.cache import LayerCache
 from sideros.core.mxcompat import softmax
+from sideros.core.prefill import prefill
 from sideros.core.prompt_cache import PromptCache
 from sideros.speculative import Acceptance, SpeculationRefused, stream_speculative_ids
 from sideros.suppress import Segment, Segmenter
@@ -29,6 +30,16 @@ class CausalLM[C: LayerCache](Protocol):
     def make_cache(self) -> list[C]: ...
 
     def __call__(self, ids: mx.array, cache: list[C] | None = None) -> mx.array: ...
+
+
+@runtime_checkable
+class CompiledDecode[C: LayerCache](Protocol):
+    def compile_decode(self, cache: list[C]) -> Callable[[mx.array], mx.array]: ...
+
+
+@runtime_checkable
+class CompiledGreedyDecode[C: LayerCache](Protocol):
+    def compile_greedy_decode(self, cache: list[C]) -> Callable[[mx.array], mx.array]: ...
 
 
 class Constraint(Protocol):
@@ -47,6 +58,92 @@ class Constraint(Protocol):
     def mask(self, logits: mx.array, remaining: int) -> mx.array: ...
 
     def accept(self, token: int) -> bool: ...
+
+
+class ConstraintConflict(ValueError):
+    """Two things asking for the same step. The one pair that exists is a grammar and a
+    reasoning budget, and it is named where it is raised."""
+
+
+@dataclass(frozen=True)
+class ReasoningBlock:
+    """One spelling of the reasoning block, in ids: what opens it and what closes it.
+
+    Tokenized rather than matched over text because the budget has to act on the step after
+    the one it read, and the decoded text of a step exists only past the incremental UTF-8
+    decoder in `stream_text`, which is downstream of the loop. A checkpoint whose tokenizer
+    has no single id for `<think>` encodes the marker as ordinary pieces the model never
+    emits as that sequence, and the budget over it never arms — which is the same thing as
+    a checkpoint that does not reason.
+    """
+
+    open: tuple[int, ...]
+    close: tuple[int, ...]
+
+
+@dataclass(frozen=True)
+class ReasoningBudget:
+    """How many ids a generation may spend inside the reasoning block, and how to end it.
+
+    The budget is enforced by *feeding* the closing ids, not by masking the logits into
+    them: the closer is a fixed sequence, so once the budget is spent there is nothing left
+    to draw and the loop can hand the ids over itself. That is why a budget costs no sync —
+    unlike a `Constraint`, whose mask for step n+1 is a function of the id step n drew — and
+    all it spends is the one queued step discarded on the turn it arms.
+
+    `inside` says the prompt already left a block open, which is what Qwen3.6's template
+    does when it writes `<think>` into the generation prompt. Then `blocks` holds the one
+    block it opened; otherwise it holds every spelling the model might open by itself.
+
+    One block per generation: once the reasoning has ended — because the model closed it or
+    because this forced it — the budget is spent, and a model that opens a second block
+    writes it out in full. Re-entry is rare enough that counting it would be state kept for
+    a case nobody has measured.
+    """
+
+    tokens: int
+    blocks: tuple[ReasoningBlock, ...]
+    inside: bool = False
+
+
+class _Budget:
+    """One generation's walk through `ReasoningBudget`: the ids seen, and what is owed."""
+
+    def __init__(self, spec: ReasoningBudget) -> None:
+        self._blocks = spec.blocks
+        self._left = spec.tokens
+        self._block: ReasoningBlock | None = spec.blocks[0] if spec.inside else None
+        self._window = max(
+            (len(marker) for block in spec.blocks for marker in (block.open, block.close)),
+            default=1,
+        )
+        self._recent: list[int] = []
+        self._spent = False
+
+    def emitted(self, token: int) -> tuple[int, ...]:
+        """The ids the loop owes after this one: the closer, on the single step the budget
+        runs out with the block still open, and nothing on every other step."""
+        if self._spent:
+            return ()
+        self._recent.append(token)
+        del self._recent[: -self._window]
+        if self._block is None:
+            for block in self._blocks:
+                if self._tail(block.open):
+                    self._block = block
+                    break
+            return ()
+        if self._tail(self._block.close):
+            self._spent = True
+            return ()
+        self._left -= 1
+        if self._left > 0:
+            return ()
+        self._spent = True
+        return self._block.close
+
+    def _tail(self, marker: tuple[int, ...]) -> bool:
+        return len(self._recent) >= len(marker) and tuple(self._recent[-len(marker) :]) == marker
 
 
 class Detokenizer(Protocol):
@@ -231,6 +328,7 @@ def stream_ids[C: LayerCache, D: LayerCache](
     acceptance: Acceptance | None = None,
     prefix: PromptCache[C] | None = None,
     constraint: Constraint | None = None,
+    reasoning_budget: ReasoningBudget | None = None,
 ) -> Generator[int]:
     """`penalty` reads the ids as an mx.array — prompt first, newest last — so the token
     just drawn joins the history without a round trip to the host: reading it back here
@@ -247,10 +345,15 @@ def stream_ids[C: LayerCache, D: LayerCache](
     wall the `meter` met. Nothing is taken until the first `next`: the generator's body runs
     then, so building the iterator and dropping it leaves the trie untouched.
 
-    Keying on the ids is what makes the template, `enable_thinking` and the declared tools
+    Keying on the ids is what makes the template, the effort asked for and the declared tools
     part of the key without this ever naming them: they change the render, the render changes
     the ids, and the match ends where the ids do. One trie belongs to one model — the ids of
     two checkpoints are two alphabets, and nothing in a cache says which one wrote it.
+
+    A `reasoning_budget` takes the ids over instead of shaping them: when the block runs out
+    of budget the closer is fed the way a drawn id is, so the cache gets its rows and the
+    consumer reads the marker the segmenter is waiting for. It costs the step queued behind
+    the id it arms on, once, and no sync — the value of every id was already read back.
 
     A `constraint` is the one option that changes the shape of the loop rather than the
     numbers inside it: its mask for step n+1 is a function of the id step n drew, so the
@@ -284,6 +387,12 @@ def stream_ids[C: LayerCache, D: LayerCache](
                 "need its own mask, and a rejected round would have to rewind the matcher "
                 "by exactly what it rewinds the caches"
             )
+        if reasoning_budget is not None:
+            raise SpeculationRefused(
+                "speculation and a reasoning budget are not wired together: the closer would "
+                "have to be fed into the target and the draft in step, and a rejected round "
+                "would have to give back ids the budget has already counted"
+            )
         yield from stream_speculative_ids(
             model,
             draft,
@@ -312,8 +421,10 @@ def stream_ids[C: LayerCache, D: LayerCache](
     if meter is not None:
         meter.prefill(len(prompt))
 
+    decode: Callable[[mx.array], mx.array] | None = None
+
     def step(ids: mx.array, seen: mx.array) -> mx.array:
-        logits = model(ids[None], cache)[:, -1, :]
+        logits = model(ids[None], cache)[:, -1, :] if decode is None else decode(ids)
         if penalty is not None:
             logits = penalty(logits, seen)
         if constraint is not None:
@@ -330,10 +441,37 @@ def stream_ids[C: LayerCache, D: LayerCache](
         mx.async_eval(queued)
         return queued
 
+    if reasoning_budget is not None and constraint is not None:
+        # Refused rather than made inert: the closer is fed past the mask, and the matcher —
+        # which is advanced over every id this yields — would then be asked to accept an id
+        # it had forbidden. A grammar leaves no reasoning block to budget anyway: it forces
+        # the document from the first step, so the block a template opened never closes.
+        raise ConstraintConflict(
+            "a reasoning budget and a grammar do not compose: the forced closer bypasses the "
+            "mask the matcher is advanced under"
+        )
+    budget = None if reasoning_budget is None else _Budget(reasoning_budget)
+    owed: list[int] = []
+    """The closer, between the step the budget armed on and the steps that feed it out."""
+
     try:
-        y = step(history if reuse is None else mx.array(prompt[reuse.length :]), history)
+        # What the reuse did not already cover, fed in blocks: only the last block's logits
+        # are read, and the blocks before it never compute the head at all.
+        fresh = history if reuse is None else mx.array(prompt[reuse.length :])
+        window = prefill(lambda block: model(fresh[block][None], cache), fresh.size, cache)
+        y = step(fresh[window], history)
         mx.async_eval(y)
-        for _ in range(max_tokens):
+        if prefix is None:
+            if (
+                sampler is greedy
+                and penalty is None
+                and constraint is None
+                and isinstance(model, CompiledGreedyDecode)
+            ):
+                decode = model.compile_greedy_decode(cache)
+            elif isinstance(model, CompiledDecode):
+                decode = model.compile_decode(cache)
+        for emitted in range(max_tokens):
             # Free, step n+1 is queued before n is read back and the GPU never idles;
             # constrained, n+1's mask needs the value of n, so the queue waits behind the
             # sync it was there to hide.
@@ -355,6 +493,21 @@ def stream_ids[C: LayerCache, D: LayerCache](
                 # and what is left after it is the grammar's stop. Drawing that would be a
                 # step spent on an id the loop does not emit.
                 return
+            if budget is not None:
+                owed.extend(budget.emitted(token))
+            if emitted % 256 == 0:
+                # The first pass hands back the last prefill block's transients, which no
+                # decode step will need again; the ones after it keep the pool from drifting
+                # up over a long generation.
+                mx.clear_cache()
+            if owed:
+                # The next id is not drawn but owed. `token` still has to be fed — the cache
+                # owes it a row either way — so the free path's queued step is spent and its
+                # result dropped, which is the whole cost of arming.
+                if following is None:
+                    advance(y)
+                y = mx.array(owed.pop(0))
+                continue
             y = advance(y) if following is None else following
     except Exception:
         # A forward that raised leaves the trunk at disagreeing offsets — some layers wrote

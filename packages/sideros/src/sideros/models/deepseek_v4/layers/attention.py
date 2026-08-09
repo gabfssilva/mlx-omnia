@@ -40,6 +40,7 @@ class DeepseekV4Attention(nn.Module):
             config.o_groups * config.o_lora_rank, hidden, bias=config.attention_bias
         )
         self.attn_sink = mx.zeros((self.heads,), dtype=mx.float32)
+        self._groups = mx.arange(config.o_groups)[None]
         self.rope = rotary(
             config.qk_rope_head_dim,
             self.head_dim,
@@ -76,7 +77,7 @@ class DeepseekV4Attention(nn.Module):
         )
         out = self.rope(attended, offset, inverse=True)
         out = out.reshape(1, self.o_groups, -1, length, self.head_dim)
-        out = self.wo_a(out.transpose(0, 1, 3, 2, 4).flatten(-2), mx.arange(self.o_groups)[None])
+        out = self.wo_a(out.transpose(0, 1, 3, 2, 4).flatten(-2), self._groups)
         return self.wo_b(out.transpose(0, 2, 1, 3).flatten(-2))
 
     def _columns(
@@ -111,6 +112,10 @@ class DeepseekV4Attention(nn.Module):
                 axis=-1,
             )
             pool_mask = sparse if pool_mask is None else sparse & pool_mask
+        if pool_mask is None and mask is None:
+            # Every pooled row and every local key is behind the single query: an
+            # all-true mask, which the no-mask sdpa path handles without building it.
+            return mx.concatenate([keys, pooled], axis=2), None
         if pool_mask is None:
             pool_mask = mx.ones((length, pooled.shape[2]), dtype=mx.bool_)
         dense = mx.concatenate([_dense(mask, length, keys.shape[2]), pool_mask], axis=-1)

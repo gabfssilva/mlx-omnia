@@ -592,9 +592,7 @@ def test_grey_and_palette_pngs_come_out_as_rgb() -> None:
     table = bytes([255, 0, 0, 0, 255, 0, 0, 0, 255])
     indices = np.array([[0, 1], [2, 0]], dtype=np.uint8)
     coloured = image_part(
-        base64.b64encode(
-            png(filtered(indices[:, :, None], 1), 2, 2, 3, palette=table)
-        ).decode(),
+        base64.b64encode(png(filtered(indices[:, :, None], 1), 2, 2, 3, palette=table)).decode(),
         "image/png",
     )
     assert np.array_equal(
@@ -677,3 +675,43 @@ def test_the_stand_touches_no_hub_cache(stand: Stand) -> None:
 
     assert listed.status_code == 200, listed.text
     assert listed.json() == []
+
+
+def test_counting_the_tokens_of_a_conversation_with_an_image_is_refused(
+    claude: anthropic.Anthropic,
+) -> None:
+    """How many tokens a picture becomes is decided by the checkpoint's own processor, and
+    `count_tokens` renders text: a count that skipped the image would be a number the request
+    it is about never pays. Refused by name so the client knows which turn to drop, and not
+    silently short.
+
+    The generation first, because only a resident model answers this route at all: the
+    refusal under test is the one about the image, not the one about the load."""
+    through_anthropic(claude)
+
+    with pytest.raises(anthropic.BadRequestError) as raised:
+        claude.messages.count_tokens(
+            model=MODEL,
+            messages=[
+                {
+                    "role": "user",
+                    "content": [
+                        {"type": "text", "text": ASKED},
+                        {
+                            "type": "image",
+                            "source": {
+                                "type": "base64",
+                                "media_type": "image/png",
+                                "data": BASE64,
+                            },
+                        },
+                    ],
+                }
+            ],
+        )
+
+    body = raised.value.body
+    assert isinstance(body, dict)
+    error = body["error"]
+    assert isinstance(error, dict)
+    assert "image" in str(error["message"])

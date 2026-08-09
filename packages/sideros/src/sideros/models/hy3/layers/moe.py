@@ -1,15 +1,10 @@
 import mlx.core as mx
 import mlx.nn as nn
 
-from sideros.core.kernels.moe_gemv import moe_down_combine, moe_gate_up_act, moe_gemv_applies
+from sideros.core.kernels.down_combine import DownCombine
+from sideros.core.kernels.gate_up import GateUp
 from sideros.core.kernels.moe_route import sigmoid_topk, softmax_topk_applies
-from sideros.core.layers import (
-    SORTED_GATHER_MIN,
-    QuantizedSwitchLinear,
-    SwiGLU,
-    SwitchLinear,
-    sorted_gather,
-)
+from sideros.core.layers import SORTED_GATHER_MIN, SwiGLU, SwitchLinear, sorted_gather
 from sideros.models.hy3.config import Hy3Config
 
 
@@ -49,6 +44,8 @@ class Hy3SparseMoe(nn.Module):
         self.hidden = config.hidden_size
         self.scaling = config.router_scaling_factor
         self.fp32_combine = config.enable_moe_fp32_combine
+        self._gate_up: GateUp | None = None
+        self._down: DownCombine | None = None
 
     def route(self, x: mx.array) -> tuple[mx.array, mx.array]:
         """Sigmoid routing (not softmax): scores are independent, selection adds the
@@ -62,53 +59,31 @@ class Hy3SparseMoe(nn.Module):
         weights = weights / weights.sum(axis=-1, keepdims=True)
         return chosen, weights.astype(x.dtype)
 
+    def _kernels(self) -> tuple[GateUp, DownCombine]:
+        """Resolved once, at the first T=1 step — after load, when the leaves'
+        formats are final."""
+        gate_up, down = self._gate_up, self._down
+        if gate_up is None or down is None:
+            switch = self.switch_mlp
+            gate_up = GateUp(switch.gate_up_proj, hidden=self.hidden, inner=switch.inner)
+            down = DownCombine(switch.down_proj, hidden=self.hidden, inner=switch.inner)
+            self._gate_up, self._down = gate_up, down
+        return gate_up, down
+
     def fused_step_applies(self) -> bool:
-        gate_up = self.switch_mlp.gate_up_proj
-        down = self.switch_mlp.down_proj
-        return (
-            isinstance(gate_up, QuantizedSwitchLinear)
-            and isinstance(down, QuantizedSwitchLinear)
-            and (gate_up.mode, down.mode) == ("affine", "affine")
-            and moe_gemv_applies(
-                self.hidden, self.switch_mlp.inner, gate_up.group_size, down.group_size
-            )
-            and softmax_topk_applies(self.split + self.k, self.k)
-            and not self.fp32_combine
-        )
+        return not self.fp32_combine and softmax_topk_applies(self.split + self.k, self.k)
 
     def fused_step(self, x: mx.array, residual: mx.array) -> mx.array:
-        gate_up = self.switch_mlp.gate_up_proj
-        down = self.switch_mlp.down_proj
-        assert isinstance(gate_up, QuantizedSwitchLinear)
-        assert isinstance(down, QuantizedSwitchLinear)
-        assert gate_up.biases is not None and down.biases is not None
+        gate_up, down = self._kernels()
         chosen, weights = sigmoid_topk(
             self.gate(x.astype(mx.float32)).astype(x.dtype).reshape(-1),
             self.e_score_correction_bias,
             self.k,
             scale=self.scaling,
         )
-        act = moe_gate_up_act(
-            x.reshape(-1),
-            gate_up.weight,
-            gate_up.scales,
-            gate_up.biases,
-            chosen,
-            group_size=gate_up.group_size,
-            bits=gate_up.bits,
-        )
+        act = gate_up(x.reshape(-1), chosen)
         joined = residual + self.shared_expert(x)
-        return moe_down_combine(
-            act.reshape(-1),
-            down.weight,
-            down.scales,
-            down.biases,
-            chosen,
-            weights,
-            joined.reshape(-1),
-            group_size=down.group_size,
-            bits=down.bits,
-        ).reshape(1, 1, self.hidden)
+        return down(act, chosen, weights, joined.reshape(-1)).reshape(1, 1, self.hidden)
 
     def __call__(self, x: mx.array) -> mx.array:
         chosen, weights = self.route(x)

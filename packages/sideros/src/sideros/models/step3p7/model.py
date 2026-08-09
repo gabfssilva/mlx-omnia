@@ -6,6 +6,7 @@ import mlx.nn as nn
 import numpy as np
 
 from sideros.core.cache import KVCache
+from sideros.core.prefill import prefill
 from sideros.generate import Meter, Penalty, Sampler, greedy, stream_ids, stream_text
 from sideros.language import (
     TEXT,
@@ -132,7 +133,18 @@ def stream_step3p7_ids(
         logits = model(ids, cache, embeddings=emb)[:, -1, :]
         return sampler(logits if penalty is None else penalty(logits, history))[0]
 
-    y = step(mx.array(prompt.ids)[None], prompt.embeddings)
+    ids = mx.array(prompt.ids)
+    embeddings = prompt.embeddings
+
+    def feed(block: slice) -> mx.array:
+        return model(
+            ids[block][None],
+            cache,
+            embeddings=None if embeddings is None else embeddings[:, block],
+        )
+
+    window = prefill(feed, ids.size, cache)
+    y = step(ids[window][None], None if embeddings is None else embeddings[:, window])
     mx.async_eval(y)
     for _ in range(max_tokens):
         if penalty is not None:

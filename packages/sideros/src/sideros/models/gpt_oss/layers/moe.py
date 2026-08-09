@@ -1,11 +1,8 @@
 import mlx.core as mx
 import mlx.nn as nn
 
-from sideros.core.kernels.mxfp4_moe_gemv import (
-    mxfp4_down_combine,
-    mxfp4_gate_up_act,
-    mxfp4_moe_applies,
-)
+from sideros.core.kernels.down_combine import DownCombine
+from sideros.core.kernels.gate_up import GateUp
 from sideros.core.layers import (
     SORTED_GATHER_MIN,
     QuantizedSwitchLinear,
@@ -88,7 +85,8 @@ class GPTOSSMLP(nn.Module):
         self.k = config.num_experts_per_tok
         self.split = config.num_local_experts - self.k
         self.hidden = config.hidden_size
-        self.fusable = mxfp4_moe_applies(config.hidden_size, config.intermediate_size)
+        self._gate_up: GateUp | None = None
+        self._down: DownCombine | None = None
 
     def route(self, x: mx.array) -> tuple[mx.array, mx.array]:
         """Top-k over the raw (biased) logits, then a softmax over only those k."""
@@ -110,32 +108,39 @@ class GPTOSSMLP(nn.Module):
             routed = self.experts(mx.expand_dims(x, (-2, -3)), chosen).squeeze(-2)
         return (routed * mx.expand_dims(weights, -1)).sum(axis=-2)
 
+    def _kernels(self) -> tuple[GateUp, DownCombine]:
+        """Resolved once, at the first T=1 step — after load, when the leaves' formats
+        and the projection biases are final."""
+        gate_up, down = self._gate_up, self._down
+        if gate_up is None or down is None:
+            experts = self.experts
+            gate_up = GateUp(
+                experts.gate_up_proj,
+                hidden=self.hidden,
+                inner=experts.inner,
+                activation="swiglu_oai",
+                limit=experts.limit,
+                bias=experts.gate_up_proj_bias,
+            )
+            down = DownCombine(
+                experts.down_proj,
+                hidden=self.hidden,
+                inner=experts.inner,
+                bias=experts.down_proj_bias,
+            )
+            self._gate_up, self._down = gate_up, down
+        return gate_up, down
+
     def fused_step(self, x: mx.array, residual: mx.array) -> mx.array | None:
-        """The whole routed MLP plus the residual in two dispatches, or `None` when the
-        step is not what the kernel is written for: T=1 and MXFP4 leaves. Routing stays
-        outside — the pick is a top-k over the raw logits and moving it in-kernel flips
-        near-ties."""
-        experts = self.experts
-        leaves = experts.mxfp4()
-        if leaves is None or not (flags.USE_MXFP4_MOE_GEMV and self.fusable and x.shape[1] == 1):
+        """The whole routed MLP plus the residual in two dispatches, or `None` off the
+        T=1 step. Routing stays outside — the pick is a top-k over the raw logits and
+        moving it in-kernel flips near-ties."""
+        if not (flags.USE_MXFP4_MOE_GEMV and x.shape[1] == 1):
             return None
-        gate_up, down = leaves
+        gate_up, down = self._kernels()
         chosen, weights = self.route(x)
         indices = chosen.reshape(-1).astype(mx.uint32)
-        act = mxfp4_gate_up_act(
-            x.reshape(-1),
-            gate_up.weight,
-            gate_up.scales,
-            experts.gate_up_proj_bias,
-            indices,
-            limit=experts.limit,
+        act = gate_up(x.reshape(-1), indices)
+        return down(act, indices, weights.reshape(-1), residual.reshape(-1)).reshape(
+            1, 1, self.hidden
         )
-        return mxfp4_down_combine(
-            act,
-            down.weight,
-            down.scales,
-            experts.down_proj_bias,
-            indices,
-            weights.reshape(-1),
-            residual.reshape(-1),
-        ).reshape(1, 1, self.hidden)

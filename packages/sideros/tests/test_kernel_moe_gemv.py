@@ -1,4 +1,5 @@
-"""The routed quantized MLP of a one-token step against its op chain (`moe_gemv`).
+"""The routed quantized MLP of a one-token step against its op chain (the affine
+gate-up and down-combine kernels).
 
 The replica is the whole step the two kernels replace — gather the routed gate‖up
 stacks, silu(gate)·up, gather the down stacks, weight by the router, sum the experts,
@@ -10,8 +11,13 @@ above the projections would let a dropped routing weight pass a relative bound).
 Both paths read the *same* quantized tensors, so what is compared is arithmetic
 order, not the quantizer: the fp32 bound holds identically at 2 bits and at 8. The
 bit width is what the templated `qmoeDot` switches on — 4 has its own word-at-a-time
-path, 3/5/6 stream a bit field across byte boundaries, 2/8 fall in the generic branch
-byte-aligned.
+path, 2 a word (or short, on the down side's 8-value tiles) of sixteen (eight)
+weights at a time, 3/5/6 stream a bit field across byte boundaries, 8 falls in the
+generic branch byte-aligned.
+
+The gate‖up epilogue optionally clamps before the activation (GPT-OSS order: gate
+capped above, up clipped both ways); without a limit the guard keeps the path
+bit-identical to the unclamped one, which the `limit=None` runs assert implicitly.
 
 Shapes are the smallest the tiling accepts twice over (hidden 1024, inner 512: two
 iterations of each kernel's k loop), and `moe_gemv_applies` is asserted so a shape
@@ -25,15 +31,18 @@ import numpy as np
 import pytest
 from conftest import relative_diff
 
-from sideros.core.kernels.moe_gemv import (
-    _DOWN_SOURCE,
-    _GATE_UP_SOURCE,
-    _HEADER,
-    moe_down_combine,
-    moe_gate_up_act,
-    moe_gemv_applies,
-)
+from sideros.core.kernels.down_combine.affine import _SOURCE as _DOWN_SOURCE
+from sideros.core.kernels.down_combine.affine import AffineDownCombine
+from sideros.core.kernels.down_combine.affine import applies as down_applies
+from sideros.core.kernels.gate_up.affine import _SOURCE as _GATE_UP_SOURCE
+from sideros.core.kernels.gate_up.affine import HEADER as _HEADER
+from sideros.core.kernels.gate_up.affine import AffineGateUp
+from sideros.core.kernels.gate_up.affine import applies as gate_up_applies
 from sideros.core.mxcompat import metal_kernel
+
+
+def moe_gemv_applies(hidden: int, inner: int, gate_group: int, down_group: int) -> bool:
+    return gate_up_applies(hidden, inner, gate_group) and down_applies(hidden, inner, down_group)
 
 HIDDEN, INNER, EXPERTS, TOPK = 1024, 512, 8, 4
 BITS = [2, 3, 4, 5, 6, 8]
@@ -83,14 +92,12 @@ class Replica:
         return self.indices.shape[0]
 
     def kernels(self) -> tuple[mx.array, mx.array]:
-        act = moe_gate_up_act(
-            self.x, self.gw, self.gs, self.gb, self.indices,
-            group_size=self.gate_group, bits=self.bits,
+        act = AffineGateUp(self.gw, self.gs, self.gb, self.gate_group, self.bits, None)(
+            self.x, self.indices
         )
-        out = moe_down_combine(
-            act.reshape(-1), self.dw, self.ds, self.db, self.indices, self.routing, self.residual,
-            group_size=self.down_group, bits=self.bits, shared=self.shared_packed,
-        )
+        out = AffineDownCombine(
+            self.dw, self.ds, self.db, self.down_group, self.bits, self.shared_packed
+        )(act, self.indices, self.routing, self.residual)
         return act, out
 
     def op_chain(self) -> tuple[mx.array, mx.array]:
@@ -141,6 +148,28 @@ def test_matches_op_chain_fp32(bits: int, shared: bool) -> None:
     assert relative_diff(out, ref_out) < 1e-5
 
 
+@pytest.mark.parametrize("bits", BITS)
+def test_clamped_gate_up_matches_op_chain(bits: int) -> None:
+    """With a limit low enough to bite, the kernel's clamp must match the stock order:
+    gate capped above, up clipped both ways, before the activation."""
+    replica = Replica(bits, shared=False)
+    limit = 0.5
+    act = AffineGateUp(
+        replica.gw, replica.gs, replica.gb, replica.gate_group, replica.bits, limit
+    )(replica.x, replica.indices)
+    fused = mx.gather_qmm(
+        replica.x[None, None, None], replica.gw, replica.gs, replica.gb,
+        rhs_indices=replica.indices[None], transpose=True,
+        group_size=replica.gate_group, bits=replica.bits,
+    )
+    pairs = fused.reshape(replica.slots, INNER, 2)
+    gate = mx.minimum(pairs[..., 0], limit)
+    up = mx.clip(pairs[..., 1], -limit, limit)
+    ref = gate * mx.sigmoid(gate) * up
+    assert relative_diff(mx.minimum(pairs[..., 0], limit), pairs[..., 0]) > 0  # the limit bites
+    assert relative_diff(act, ref) < 1e-5
+
+
 @pytest.mark.parametrize("groups", [(32, 32), (128, 128), (128, 32), (32, 128)])
 def test_group_size_reaches_both_kernels(groups: tuple[int, int]) -> None:
     """Gate‖up and down carry independent group sizes; a frozen one shows here."""
@@ -176,13 +205,14 @@ _DOWN_MUTATIONS = {
 def _gate_up(source: str, name: str, replica: Replica) -> mx.array:
     return metal_kernel(
         name=name,
-        input_names=["X", "W", "S", "Bs", "IDX", "N", "KD", "GSIZE"],
+        input_names=["X", "W", "S", "Bs", "IDX", "LIM", "N", "KD", "GSIZE"],
         output_names=["Y"],
         source=source,
         header=_HEADER,
     )(
         inputs=[
             replica.x, replica.gw, replica.gs, replica.gb, replica.indices,
+            mx.array(float("inf"), dtype=mx.float32),
             mx.array(INNER, dtype=mx.int32),
             mx.array(HIDDEN, dtype=mx.int32),
             mx.array(replica.gate_group, dtype=mx.int32),
@@ -215,13 +245,45 @@ def _down(source: str, name: str, replica: Replica, act: mx.array) -> mx.array:
             mx.array(replica.down_group, dtype=mx.int32),
         ],
         template=[
-            ("T", mx.float32), ("BITS", replica.bits), ("TOPK", replica.slots), ("SHARED", 1)
+            ("T", mx.float32), ("BITS", replica.bits), ("TOPK", replica.slots), ("SHARED", 1),
+            ("VPT", 16 if replica.bits == 2 and INNER % 512 == 0 else 8),
         ],
         grid=(64, HIDDEN // 8, 1),
         threadgroup=(64, 1, 1),
         output_shapes=[(HIDDEN,)],
         output_dtypes=[mx.float32],
     )[0]
+
+
+def test_dropping_the_clamp_breaks_the_clamped_parity() -> None:
+    source = _GATE_UP_SOURCE.replace("g = metal::min(g, limit);", "")
+    assert source != _GATE_UP_SOURCE
+    replica = Replica(4, shared=False)
+    limit = 0.5
+    ref = AffineGateUp(
+        replica.gw, replica.gs, replica.gb, replica.gate_group, replica.bits, limit
+    )(replica.x, replica.indices)
+    broken = metal_kernel(
+        name="moe_gemv_gate_up_no_clamp",
+        input_names=["X", "W", "S", "Bs", "IDX", "LIM", "N", "KD", "GSIZE"],
+        output_names=["Y"],
+        source=source,
+        header=_HEADER,
+    )(
+        inputs=[
+            replica.x, replica.gw, replica.gs, replica.gb, replica.indices,
+            mx.array(limit, dtype=mx.float32),
+            mx.array(INNER, dtype=mx.int32),
+            mx.array(HIDDEN, dtype=mx.int32),
+            mx.array(replica.gate_group, dtype=mx.int32),
+        ],
+        template=[("T", mx.float32), ("BITS", replica.bits)],
+        grid=(64, 2 * INNER // 8, replica.slots),
+        threadgroup=(64, 1, 1),
+        output_shapes=[(replica.slots, INNER)],
+        output_dtypes=[mx.float32],
+    )[0]
+    assert relative_diff(broken, ref) > 1e-3
 
 
 @pytest.mark.parametrize("mutation", sorted(_GATE_UP_MUTATIONS))

@@ -2,6 +2,7 @@
    the OpenAI dialect under /api/openai/v1. The transport itself is api/http.ts. */
 
 import { json, send, sse } from '../../api/http'
+import type { Sample } from '../overview/api'
 
 /* ── sessions ─────────────────────────────────────────────────────────── */
 
@@ -9,9 +10,18 @@ export type Role = 'system' | 'user' | 'assistant'
 
 /* What a turn cost, kept next to the turn it belongs to. The server stores the array
    opaquely and its own ChatMessage drops fields it does not declare, so these ride along
-   and are dropped on the way back into a completion. */
+   and are dropped on the way back into a completion.
+
+   Every number is the daemon's own, off `x_sideros` on the usage frame or off the live
+   register — never timed from out here, where the load, the queue and the prefill are one
+   wait with no way to tell them apart. */
 export interface TurnMetrics {
-  ttft_ms: number
+  /* The seconds this turn spent putting its model in memory, absent when it found it
+     resident — which is every turn after the first on a model. */
+  load_ms: number | null
+  /* Prefill plus the step that draws the first token, with the weights already there. */
+  ttft_ms: number | null
+  prefill_tokens_per_second: number | null
   tokens_per_second: number | null
   ceiling_fraction: number | null
   /* Which of the three ended the turn, as the dialect spells it. `length` is the one a
@@ -62,13 +72,17 @@ const record = (value: unknown): Record<string, unknown> | null =>
 
 const ROLES: readonly string[] = ['system', 'user', 'assistant']
 
+const numeric = (value: unknown): number | null => (typeof value === 'number' ? value : null)
+
 function readMetrics(value: unknown): TurnMetrics | undefined {
   const row = record(value)
-  if (row === null || typeof row.ttft_ms !== 'number') return undefined
+  if (row === null) return undefined
   return {
-    ttft_ms: row.ttft_ms,
-    tokens_per_second: typeof row.tokens_per_second === 'number' ? row.tokens_per_second : null,
-    ceiling_fraction: typeof row.ceiling_fraction === 'number' ? row.ceiling_fraction : null,
+    load_ms: numeric(row.load_ms),
+    ttft_ms: numeric(row.ttft_ms),
+    prefill_tokens_per_second: numeric(row.prefill_tokens_per_second),
+    tokens_per_second: numeric(row.tokens_per_second),
+    ceiling_fraction: numeric(row.ceiling_fraction),
     finish: typeof row.finish === 'string' ? row.finish : null
   }
 }
@@ -123,10 +137,21 @@ export const deleteSession = (id: string): Promise<void> => send<void>('DELETE',
 
 /* ── the catalog, for what the header and the metrics line report ─────── */
 
+/* What the checkpoint's own `generation_config.json` declares. A knob it does not declare
+   is null, which is not the same as one it declares neutral. */
+export interface SamplingDefaults {
+  temperature: number | null
+  top_p: number | null
+  top_k: number | null
+  min_p: number | null
+  repetition_penalty: number | null
+}
+
 export interface CatalogEntry {
   id: string
   quantization: string | null
   context: number | null
+  defaults: SamplingDefaults
   bytes_per_token: number | null
 }
 
@@ -137,12 +162,23 @@ export const listModels = (): Promise<string[]> =>
 
 export const listCatalog = (): Promise<CatalogEntry[]> => json<CatalogEntry[]>('/admin/models')
 
-/* One entry, read again when a turn ends: by then the model is resident, and a resident
-   entry is priced by the tree that answered instead of by an estimate off the headers. */
-export const getCatalogEntry = (id: string): Promise<CatalogEntry> =>
-  json<CatalogEntry>(`/admin/models/${encodeURIComponent(id)}`)
-
 /* ── completions ──────────────────────────────────────────────────────── */
+
+/* `chat/completions`' own vocabulary, which is upstream's. There is no `reasoning_budget`
+   beside it because the dialect has no field for one — how long the model may think is set
+   on a profile, under Models. */
+export type Effort = 'default' | 'none' | 'minimal' | 'low' | 'medium' | 'high' | 'xhigh' | 'max'
+
+export const EFFORTS: readonly Effort[] = [
+  'default',
+  'none',
+  'minimal',
+  'low',
+  'medium',
+  'high',
+  'xhigh',
+  'max'
+]
 
 export interface Params {
   temperature: number
@@ -152,17 +188,42 @@ export interface Params {
   min_p: number
   repetition_penalty: number
   max_tokens: number
+  /* `default` leaves the field out, which is the checkpoint's own template deciding. */
+  reasoning_effort: Effort
   system_prompt: string
 }
 
+/* The dialect's own defaults, which is what the daemon samples with when nothing else
+   says otherwise — not any one checkpoint's. What a checkpoint does declare comes off its
+   catalog entry and lands on top, in `paramsOf`. */
 export const DEFAULT_PARAMS: Params = {
-  temperature: 0.6,
-  top_p: 0.95,
-  top_k: 20,
+  temperature: 1,
+  top_p: 1,
+  top_k: null,
   min_p: 0,
   repetition_penalty: 1,
   max_tokens: 4096,
+  reasoning_effort: 'default',
   system_prompt: ''
+}
+
+/* The knobs a chat opens on: the checkpoint's declared defaults over the dialect's, which
+   is the same order the daemon resolves them in — so the sliders read what the request
+   would have been sampled with had nobody touched them.
+
+   `max_tokens`, the effort and the system prompt are not in that file and stay as they
+   were: they are the reader's, not the checkpoint's. */
+export const paramsOf = (entry: CatalogEntry | null, from = DEFAULT_PARAMS): Params => {
+  const declared = entry?.defaults
+  if (declared === undefined) return from
+  return {
+    ...from,
+    temperature: declared.temperature ?? DEFAULT_PARAMS.temperature,
+    top_p: declared.top_p ?? DEFAULT_PARAMS.top_p,
+    top_k: declared.top_k,
+    min_p: declared.min_p ?? DEFAULT_PARAMS.min_p,
+    repetition_penalty: declared.repetition_penalty ?? DEFAULT_PARAMS.repetition_penalty
+  }
 }
 
 export interface Turn {
@@ -174,8 +235,21 @@ export type Frame =
   | { kind: 'content'; text: string }
   | { kind: 'reasoning'; text: string }
   | { kind: 'usage'; prompt_tokens: number; completion_tokens: number; total_tokens: number }
+  | { kind: 'timings'; timings: Timings }
   | { kind: 'finish'; reason: string }
   | { kind: 'error'; message: string }
+
+/* app.py `_timings`: what the turn cost in seconds, on the usage frame under a key the
+   dialect does not define. Absent from any other server that speaks this route, which is
+   what the `| undefined` on the chunk is for. */
+export interface Timings {
+  load_seconds: number | null
+  ttft_seconds: number | null
+  prefill_tokens_per_second: number | null
+  tokens_per_second: number | null
+  bytes_per_token: number | null
+  ceiling_fraction: number | null
+}
 
 interface Delta {
   content?: string | null
@@ -197,6 +271,7 @@ interface Usage {
 interface Chunk {
   choices?: Choice[]
   usage?: Usage | null
+  x_sideros?: Timings
   /* The one frame that fails a request already answered 200. */
   error?: { message: string; type: string; code: string | null }
 }
@@ -214,8 +289,32 @@ function body(model: string, messages: Turn[], params: Params): Record<string, u
   if (params.top_k !== null) asked.top_k = params.top_k
   if (params.min_p > 0) asked.min_p = params.min_p
   if (params.repetition_penalty > 1) asked.repetition_penalty = params.repetition_penalty
+  if (params.reasoning_effort !== 'default') asked.reasoning_effort = params.reasoning_effort
   return asked
 }
+
+const ms = (seconds: number | null): number | null => (seconds === null ? null : seconds * 1000)
+
+/* The turn's numbers as they are kept, from the frame that closes it. */
+export const metricsOf = (timings: Timings, finish: string | null): TurnMetrics => ({
+  load_ms: ms(timings.load_seconds),
+  ttft_ms: ms(timings.ttft_seconds),
+  prefill_tokens_per_second: timings.prefill_tokens_per_second,
+  tokens_per_second: timings.tokens_per_second,
+  ceiling_fraction: timings.ceiling_fraction,
+  finish
+})
+
+/* The same numbers while the turn is still being written, off the register's live entry.
+   `finish` is nobody's yet: the turn has not ended. */
+export const metricsOfSample = (sample: Sample): TurnMetrics => ({
+  load_ms: ms(sample.load_seconds),
+  ttft_ms: ms(sample.ttft),
+  prefill_tokens_per_second: sample.prefill_tokens_per_second,
+  tokens_per_second: sample.tokens_per_second,
+  ceiling_fraction: sample.ceiling_fraction,
+  finish: null
+})
 
 /* The frames of one turn, in order. `[DONE]` ends it; an `error` frame is yielded and
    then ends it, because that is the whole failure — the stream will not say more. */
@@ -245,5 +344,6 @@ export async function* completion(
       if (choice.finish_reason) yield { kind: 'finish', reason: choice.finish_reason }
     }
     if (frame.usage) yield { kind: 'usage', ...frame.usage }
+    if (frame.x_sideros) yield { kind: 'timings', timings: frame.x_sideros }
   }
 }

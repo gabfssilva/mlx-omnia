@@ -1,11 +1,25 @@
+from collections.abc import Callable
 from typing import NamedTuple
 
 import mlx.core as mx
 import mlx.nn as nn
 
-from sideros.core.cache import KVCache
+from sideros.checkpoint import wire_resident
+from sideros.core.cache import FixedKVCache, KVCache, RingKVCache
+from sideros.core.kernels.lm_head_argmax import (
+    Int5Planes,
+    int5_planes,
+    lm_head_argmax_applies,
+    lm_head_argmax_row,
+)
+from sideros.core.kernels.sdpa_decode import SCALED_DOT_PRODUCT_ATTENTION
+from sideros.core.patch import uses
 from sideros.models.laguna.config import FULL, SLIDING, LagunaConfig
+from sideros.models.laguna.layers.attention import _ATLASES, _ATTENTION_BANKS
 from sideros.models.laguna.layers.block import LagunaTrunk
+from sideros.models.laguna.layers.moe import _BANKS, LagunaSparseMoe
+
+_LM_HEAD_PLANES: dict[int, tuple[mx.array, mx.array, mx.array]] = {}
 
 
 class LagunaActivations(NamedTuple):
@@ -13,6 +27,7 @@ class LagunaActivations(NamedTuple):
     logits: mx.array
 
 
+@uses(SCALED_DOT_PRODUCT_ATTENTION)
 class Laguna(nn.Module):
     def __init__(self, config: LagunaConfig) -> None:
         super().__init__()
@@ -21,11 +36,88 @@ class Laguna(nn.Module):
         if not config.tie_word_embeddings:
             self.lm_head = nn.Linear(config.hidden_size, config.vocab_size, bias=False)
 
-    def make_cache(self) -> list[KVCache]:
-        return [KVCache() for _ in self.model.layers]
+    def make_cache(self) -> list[KVCache | RingKVCache]:
+        """Sliding layers get a fixed ring: constant shape per step is what lets the fused
+        sliding reader own the append, and what keeps the decode graph from being rebuilt
+        around a growing slice."""
+        window = self.config.sliding_window
+        # Held back with the fused sliding reader: correct only once the reader owns the
+        # append, and the per-step slice writes here cost more than the growing cache.
+        del window
+        return [KVCache() for _ in self.config.layer_types]
+
+    def compile_decode(
+        self, cache: list[KVCache | FixedKVCache | RingKVCache], capacity: int = 4096
+    ) -> Callable[[mx.array], mx.array]:
+        """Promote a completed prefill cache and compile one-token forwards."""
+        return self._compile_decode(cache, capacity, argmax_only=False)
+
+    def compile_greedy_decode(
+        self, cache: list[KVCache | FixedKVCache | RingKVCache], capacity: int = 4096
+    ) -> Callable[[mx.array], mx.array]:
+        return self._compile_decode(cache, capacity, argmax_only=True)
+
+    def _compile_decode(
+        self,
+        cache: list[KVCache | FixedKVCache | RingKVCache],
+        capacity: int,
+        *,
+        argmax_only: bool,
+    ) -> Callable[[mx.array], mx.array]:
+        if not cache or not all(isinstance(layer, KVCache) for layer in cache):
+            raise ValueError("decode compilation requires a completed growing KV cache")
+        offset = cache[0].offset
+        if offset >= capacity:
+            raise ValueError(f"prompt length {offset} does not fit compiled capacity {capacity}")
+        promoted = [
+            RingKVCache.promote(layer, self.config.sliding_window)
+            if kind == SLIDING
+            else FixedKVCache.promote(layer, capacity)
+            for layer, kind in zip(cache, self.config.layer_types, strict=True)
+        ]
+        cache[:] = promoted
+        state = [layer.state for layer in promoted]
+
+        head_planes = self._head_planes() if argmax_only else None
+
+        def forward(ids: mx.array) -> mx.array:
+            return self._activations(ids[None], promoted, project_head=head_planes is None).logits[
+                :, -1, :
+            ]
+
+        for layer in self.model.layers:
+            layer.self_attn._angles(offset)
+            layer.self_attn._prepare_decode()
+            if isinstance(layer.mlp, LagunaSparseMoe):
+                layer.mlp.packed_step_applies()
+        wire_resident()
+        inputs = [self.state, _ATLASES, _ATTENTION_BANKS, _BANKS, state]
+        compiled = mx.compile(
+            forward,
+            inputs=inputs,
+            outputs=state,
+        )
+        if head_planes is None:
+            return compiled
+
+        def greedy_forward(ids: mx.array) -> mx.array:
+            return self._greedy_logits(compiled(ids), head_planes)
+
+        return greedy_forward
 
     def activations(
-        self, ids: mx.array, cache: list[KVCache] | None = None
+        self,
+        ids: mx.array,
+        cache: list[KVCache | FixedKVCache | RingKVCache] | None = None,
+    ) -> LagunaActivations:
+        return self._activations(ids, cache, project_head=True)
+
+    def _activations(
+        self,
+        ids: mx.array,
+        cache: list[KVCache | FixedKVCache | RingKVCache] | None,
+        *,
+        project_head: bool,
     ) -> LagunaActivations:
         cache = cache if cache is not None else self.make_cache()
         x = self.model.embed_tokens(ids)
@@ -34,7 +126,17 @@ class Laguna(nn.Module):
         full: mx.array | str | None = None if length == 1 else "causal"
         sliding: mx.array | str | None = None
         if SLIDING in self.config.layer_types:
-            sliding = self._sliding_mask(length, offset)
+            ring = next(
+                (
+                    layer
+                    for layer, kind in zip(cache, self.config.layer_types, strict=True)
+                    if kind == SLIDING and isinstance(layer, RingKVCache)
+                ),
+                None,
+            )
+            sliding = (
+                self._ring_mask(ring) if ring is not None else self._sliding_mask(length, offset)
+            )
 
         blocks: list[mx.array] = []
         for block, kind, layer_cache in zip(
@@ -43,14 +145,54 @@ class Laguna(nn.Module):
             x = block(x, full if kind == FULL else sliding, layer_cache)
             blocks.append(x)
         normed = self.model.norm(x)
-        if self.config.tie_word_embeddings:
+        if not project_head:
+            logits = normed
+        elif self.config.tie_word_embeddings:
             logits = self.model.embed_tokens.as_linear(normed)
         else:
             logits = self.lm_head(normed)
         return LagunaActivations(blocks, logits)
 
-    def __call__(self, ids: mx.array, cache: list[KVCache] | None = None) -> mx.array:
+    def _head_planes(self) -> Int5Planes | None:
+        if self.config.tie_word_embeddings:
+            return None
+        weight = self.lm_head.weight
+        vocab, hidden = weight.shape
+        if not lm_head_argmax_applies(vocab, hidden, rows=1, dtype=weight.dtype, argmax_only=True):
+            return None
+        key = id(weight)
+        if cached := _LM_HEAD_PLANES.get(key):
+            return Int5Planes(*cached)
+        planes = int5_planes(weight)
+        if planes is not None:
+            mx.eval(*planes)
+            _LM_HEAD_PLANES[key] = tuple(planes)
+        return planes
+
+    def _greedy_logits(self, x: mx.array, planes: Int5Planes | None = None) -> mx.array:
+        if self.config.tie_word_embeddings:
+            return self.model.embed_tokens.as_linear(x)
+        planes = planes if planes is not None else self._head_planes()
+        if planes is None:
+            return self.lm_head(x)
+        return lm_head_argmax_row(x, self.lm_head.weight, planes).reshape(
+            *x.shape[:-1], self.config.vocab_size
+        )
+
+    def __call__(
+        self, ids: mx.array, cache: list[KVCache | FixedKVCache | RingKVCache] | None = None
+    ) -> mx.array:
         return self.activations(ids, cache).logits
+
+    def _ring_mask(self, ring: RingKVCache) -> mx.array | None:
+        """The ring's own rows, for a reader that attends the whole buffer instead of a
+        growing slice. Slot `j` holds the absolute position `a` with `a % window == j`, so
+        the filled slots are `0..position` while the ring is still short of a full window —
+        and the order of the rest does not matter, the keys were rotated on the way in.
+        A ring the prefill already filled stays full, and needs no mask at all."""
+        if ring.offset >= ring.window:
+            return None
+        return (mx.arange(ring.window) <= ring.position).reshape(1, 1, 1, ring.window)
 
     def _sliding_mask(self, length: int, offset: int) -> mx.array | str | None:
         """The band `rows >= columns and rows < columns + window`, built only where

@@ -44,16 +44,52 @@ __all__ = [
     "ChatCapability",
     "ChatMessage",
     "ChatTemplate",
+    "Effort",
     "ImageMarkerMismatch",
     "ImagePart",
     "MultimodalChatCapability",
     "TextPart",
     "chat_capabilities",
     "chat_template",
+    "template_of",
     "tool_family_of",
 ]
 
 CHAT = ContentType(Modality.TEXT, "application/vnd.sideros.chat")
+
+type Effort = Literal["auto", "off", "on", "low", "medium", "high", "xhigh", "max"]
+"""How hard the checkpoint is asked to think, as the templates in circulation can be told it.
+
+Three of the values say something no level does. `auto` says nothing at all — no kwarg
+reaches the template, so what happens is the template's own default, which is thinking on
+for Qwen3 and off for Gemma 4. `off` and `on` are the yes/no a dialect that has only a
+switch can express: Anthropic's `thinking.type` and Gemini's `thinkingBudget` name a state
+and never a rung, and collapsing either onto `medium` would write a level into the prompt
+that no client asked for.
+
+The five rungs are `reasoning_effort`'s own vocabulary, and they are passed through as
+written: `xhigh` is Anthropic's, `max` is DeepSeek V4's, and a template that reads the
+kwarg spells whatever it is handed. A template that does not read it ignores it, which is
+what makes sending both kwargs safe.
+"""
+
+
+def _thinking(effort: Effort) -> dict[str, object]:
+    """The chat-template kwargs one effort asks for.
+
+    `enable_thinking` travels with every level because it is the kwarg the templates in
+    circulation actually branch on — `reasoning_effort` alone reaches a Qwen template that
+    never reads it and turns thinking off by omission.
+    """
+    match effort:
+        case "auto":
+            return {}
+        case "off":
+            return {"enable_thinking": False}
+        case "on":
+            return {"enable_thinking": True}
+        case _:
+            return {"enable_thinking": True, "reasoning_effort": effort}
 
 
 class TextPart(TypedDict):
@@ -77,12 +113,16 @@ class ChatMessage(TypedDict):
 @dataclass(frozen=True)
 class Chat:
     """A conversation as model input. `tools` are JSON schemas in the shape the template
-    expects; `enable_thinking` only reaches the template when someone sets it, which is how
-    transformers treats its kwargs."""
+    expects; `reasoning_effort` only reaches the template when it is not `auto`, which is how
+    transformers treats its kwargs.
+
+    How *long* the checkpoint may think is not here: it is spent in ids and enforced against
+    the ones the loop draws, so it travels with the generation
+    (`GenerationOptions.reasoning_budget`) and not with the prompt."""
 
     messages: tuple[ChatMessage, ...]
     tools: tuple[Mapping[str, object], ...] = ()
-    enable_thinking: bool | None = None
+    reasoning_effort: Effort = "auto"
 
     @property
     def content_type(self) -> ContentType:
@@ -234,14 +274,13 @@ class ChatTemplate:
         return tool_family(self.source)
 
     def render(self, chat: Chat, *, add_generation_prompt: bool = True) -> str:
-        thinking = {} if chat.enable_thinking is None else {"enable_thinking": chat.enable_thinking}
         return self.template.render(
             messages=list(chat.messages),
             tools=list(chat.tools) or None,
             documents=None,
             add_generation_prompt=add_generation_prompt,
             **self.special_tokens,
-            **thinking,
+            **_thinking(chat.reasoning_effort),
         )
 
 
@@ -347,20 +386,27 @@ class _Composed(Protocol):
     def input_sources(self) -> Mapping[ContentType, object]: ...
 
 
-def tool_family_of(model: object) -> ToolFamily | None:
-    """Which envelope the checkpoint behind a loaded model spells a call in, or `None` when
-    nothing here can say.
+def template_of(model: object) -> ChatTemplate | None:
+    """The chat template behind a loaded model, or `None` when nothing here holds one.
 
-    The answer is a fact of the chat template, and a caller holding only the model — the
-    server hands over a `Chat` and reads back text — reaches it through the capability that
-    renders the conversation. Walking down the facades is what `tokenizer_of` does for the
-    tokenizer, and for the same reason: what `load` returns is a stack of them.
+    A caller that hands the engine a `Chat` and reads back text never sees the prompt: what
+    renders one is the capability inside the composite, and the only way to it from outside
+    is down the facades. Walking them is what `tokenizer_of` does for the tokenizer, and for
+    the same reason — what `load` returns is a stack of them.
     """
     while True:
         if isinstance(model, _Composed):
             capability = model.input_sources.get(CHAT)
             if isinstance(capability, ChatCapability | MultimodalChatCapability):
-                return capability.template.tool_family
+                return capability.template
         if not isinstance(model, Wrapping):
             return None
         model = model.model
+
+
+def tool_family_of(model: object) -> ToolFamily | None:
+    """Which envelope the checkpoint behind a loaded model spells a call in, or `None` when
+    nothing here can say. It is a fact of the chat template, so it is read off the one
+    `template_of` walks down to rather than looked for a second time."""
+    template = template_of(model)
+    return None if template is None else template.tool_family
