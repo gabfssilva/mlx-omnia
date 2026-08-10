@@ -39,3 +39,6 @@ plans/
 
 # Regenerable test fixtures (see tests/fixtures/generate_*.py)
 packages/sideros/tests/fixtures/*.safetensors
+
+# Deno Desktop probe bundle: build artifact, 65 MB of signed binaries.
+/app/probe.app/
