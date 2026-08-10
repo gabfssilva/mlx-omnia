@@ -2,9 +2,9 @@
 strategy), the default's bit-exact agreement with the primitive written as explicit
 ops (which pins the epilogue order — bias before the routing weight, residual last),
 and each specialized kernel's fp32 parity against that same default. The delegator is
-total: every declaration resolves, the default serving whatever no kernel does —
-including a shared expert quantized unlike the routed stack, which the affine spare
-slot refuses.
+total: every declaration resolves, the default serving whatever no kernel does. A shared
+expert quantized unlike the routed stack stays inside the affine kernel — the spare slot
+carries its own width and group — and only a mode with no decoder there falls back.
 """
 
 import mlx.core as mx
@@ -57,7 +57,7 @@ def default(
     shared: nn.Linear | nn.QuantizedLinear | None = None,
 ) -> DefaultDownCombine:
     return DefaultDownCombine.build(
-        quantized, hidden=HIDDEN, inner=INNER, bias=bias, shared=shared
+        quantized, hidden=HIDDEN, inner=INNER, bias=bias, shared=shared, layout="interleaved"
     )
 
 
@@ -103,10 +103,25 @@ def test_mxfp4_resolves_and_matches_default() -> None:
     assert relative_diff(down(act, chosen, weights, residual), reference) < 1e-5
 
 
-def test_shared_with_mismatched_format_falls_to_default() -> None:
+def test_shared_keeps_its_own_width_inside_the_affine_kernel() -> None:
+    """A per-leaf plan quantizes the shared expert unlike the routed stack; the spare
+    slot decodes it on its own width and group rather than handing the step back."""
     quantized = leaf("affine", group_size=64, bits=4)
-    mismatched = shared_down(group_size=64, bits=8)
+    mismatched = shared_down(group_size=32, bits=8)
     down = DownCombine(quantized, hidden=HIDDEN, inner=INNER, shared=mismatched)
+    assert isinstance(down.strategy, AffineDownCombine)
+    act, chosen, weights, residual = step_inputs(ACTIVE + 1)
+    reference = default(quantized, shared=mismatched)(act, chosen, weights, residual)
+    assert relative_diff(down(act, chosen, weights, residual), reference) < 1e-5
+
+
+def test_shared_in_another_mode_falls_to_default() -> None:
+    """Width and group the spare slot carries; a mode it has no decoder for it does not."""
+    quantized = leaf("affine", group_size=64, bits=4)
+    mx.random.seed(17)
+    other = nn.QuantizedLinear(INNER, HIDDEN, bias=False, group_size=32, bits=4, mode="mxfp4")
+    mx.eval(other.parameters())
+    down = DownCombine(quantized, hidden=HIDDEN, inner=INNER, shared=other)
     assert isinstance(down.strategy, DefaultDownCombine)
 
 

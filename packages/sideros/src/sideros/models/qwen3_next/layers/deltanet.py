@@ -1,10 +1,8 @@
-import math
-
 import mlx.core as mx
 import mlx.nn as nn
 
 from sideros.core.cache import DeltaCache
-from sideros.core.kernels.gated_delta import delta_rule, gated_delta, gated_delta_applies
+from sideros.core.kernels.gated_delta import GatedDelta
 from sideros.core.layers import l2norm
 from sideros.models.qwen3_next.config import Qwen3NextConfig
 from sideros.models.qwen3_next.layers import flags
@@ -32,6 +30,22 @@ class Qwen3NextDeltaNet(nn.Module):
         self.dt_bias = mx.zeros((heads,))
         self.out_proj = nn.Linear(config.value_dim, config.hidden_size, bias=False)
         self.per_key = heads // key_heads
+        self._rule: GatedDelta | None = None
+
+    def rule(self) -> GatedDelta:
+        """Resolved once, at the first step — after load, when the A/B switch is final."""
+        rule = self._rule
+        if rule is None:
+            config = self.config
+            rule = GatedDelta(
+                key_dim=config.linear_key_head_dim,
+                key_heads=config.linear_num_key_heads,
+                value_heads=config.linear_num_value_heads,
+                value_dim=config.linear_value_head_dim,
+                enabled=flags.GATED_DELTA_KERNEL,
+            )
+            self._rule = rule
+        return rule
 
     def reorder(self, qkvz: mx.array, ba: mx.array) -> tuple[mx.array, ...]:
         """`in_proj_qkvz` is grouped by key head: within each group come one q, one k,
@@ -95,31 +109,18 @@ class Qwen3NextDeltaNet(nn.Module):
         beta = mx.sigmoid(b)
 
         state = cache.state
-        if flags.GATED_DELTA_KERNEL and gated_delta_applies(
-            config.linear_key_head_dim, key_heads, heads, config.linear_value_head_dim
-        ):
-            scale = 1 / math.sqrt(config.linear_key_head_dim)
-            if state is None:
-                shape = (1, heads, config.linear_value_head_dim, config.linear_key_head_dim)
-                state = mx.zeros(shape, dtype=mx.float32)
-            out, state = gated_delta(
-                l2norm(q, scale, dtype=mx.float32),
-                l2norm(k, dtype=mx.float32),
-                v.astype(mx.float32),
-                mx.exp(g),
-                beta.astype(mx.float32),
-                state,
-            )
-            out = out.astype(v.dtype)
-        else:
-            q, k = l2norm(q), l2norm(k)
-            if heads != key_heads:
-                q = mx.repeat(q, self.per_key, axis=2)
-                k = mx.repeat(k, self.per_key, axis=2)
-            if state is None:
-                shape = (1, heads, config.linear_key_head_dim, config.linear_value_head_dim)
-                state = mx.zeros(shape, dtype=mx.float32)
-            out, state = delta_rule(q, k, v, g, beta, state)
+        if state is None:
+            shape = (1, heads, config.linear_value_head_dim, config.linear_key_head_dim)
+            state = mx.zeros(shape, dtype=mx.float32)
+        out, state = self.rule()(
+            l2norm(q, config.linear_key_head_dim**-0.5, dtype=mx.float32),
+            l2norm(k, dtype=mx.float32),
+            v.astype(mx.float32),
+            mx.exp(g),
+            beta.astype(mx.float32),
+            state,
+        )
+        out = out.astype(v.dtype)
         cache.state = state
         cache.offset += length
 

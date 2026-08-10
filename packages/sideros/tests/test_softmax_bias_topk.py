@@ -20,7 +20,7 @@ import numpy as np
 import pytest
 from conftest import relative_diff
 
-from sideros.core.kernels.softmax_bias_topk import (
+from sideros.core.kernels.route.bias_topk import (
     _SOURCE,
     softmax_bias_topk,
     softmax_bias_topk_applies,

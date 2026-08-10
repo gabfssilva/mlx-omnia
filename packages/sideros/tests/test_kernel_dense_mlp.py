@@ -15,12 +15,15 @@ only when they straddle a tie.
 import mlx.core as mx
 from conftest import relative_diff
 
-from sideros.core.kernels.dense_mlp import (
+from sideros.core.kernels.mlp import DefaultMlp, Mlp
+from sideros.core.kernels.mlp.dense import (
+    DenseMlp,
     dense_down_residual,
     dense_down_residual_applies,
     dense_gate_up_swiglu,
     dense_gate_up_swiglu_applies,
 )
+from sideros.core.layers import SwiGLU
 
 HIDDEN = 256
 INNER = 512
@@ -96,3 +99,28 @@ def test_gate_up_layout_is_gate_rows_first() -> None:
     u = mx.matmul(up.astype(mx.float32), x.astype(mx.float32))
     assert relative_diff(activated, swiglu_reference(g, u)) < FLOOR
     assert relative_diff(activated, swiglu_reference(u, g)) > FLOOR
+
+
+def test_facade_resolves_the_dense_kernels_and_matches_the_leaf() -> None:
+    """The delegator is total: a bf16 leaf whose shapes tile gets the kernels, anything
+    else falls through to the leaf's own call, and both compute the same MLP step."""
+    mx.random.seed(3)
+    leaf = SwiGLU(HIDDEN, INNER)
+    leaf.set_dtype(mx.bfloat16)
+    row = mx.random.normal((HIDDEN,)).astype(mx.bfloat16)
+    residual = mx.random.normal((HIDDEN,)).astype(mx.bfloat16)
+
+    fused = Mlp(leaf, hidden=HIDDEN, inner=INNER)
+    assert isinstance(fused.strategy, DenseMlp)
+
+    plain = Mlp(leaf, hidden=HIDDEN, inner=INNER, activation="gelu_tanh")
+    assert isinstance(plain.strategy, DefaultMlp)
+
+    # Against the leaf, not against a rounding-matched reference: the two chains round
+    # at different points, so what is claimed here is the same MLP, not the same bits.
+    assert relative_diff(fused(row, residual), plain(row, residual)) < 2.0**-5
+
+
+def test_facade_falls_back_when_the_leaf_is_not_bf16() -> None:
+    leaf = SwiGLU(HIDDEN, INNER)
+    assert isinstance(Mlp(leaf, hidden=HIDDEN, inner=INNER).strategy, DefaultMlp)

@@ -9,7 +9,7 @@ import mlx.nn as nn
 
 from sideros.core.kernels.down_combine import DownCombine
 from sideros.core.kernels.gate_up import GateUp
-from sideros.core.kernels.moe_route import softmax_topk, softmax_topk_applies
+from sideros.core.kernels.route import Route
 from sideros.core.layers import SORTED_GATHER_MIN, SwitchGLU, sorted_gather
 from sideros.core.mxcompat import softmax
 from sideros.models.qwen3.config import Qwen3MoEConfig
@@ -23,9 +23,11 @@ class Qwen3MoEMLP(nn.Module):
             config.num_experts, config.hidden_size, config.moe_intermediate_size
         )
         self.hidden = config.hidden_size
+        self.experts = config.num_experts
         self.k = config.num_experts_per_tok
         self.split = config.num_experts - self.k
         self.norm_topk = config.norm_topk_prob
+        self._route: Route | None = None
         self._gate_up: GateUp | None = None
         self._down: DownCombine | None = None
 
@@ -39,25 +41,25 @@ class Qwen3MoEMLP(nn.Module):
             weights = weights / weights.sum(axis=-1, keepdims=True)
         return chosen, weights
 
-    def _kernels(self) -> tuple[GateUp, DownCombine]:
+    def _kernels(self) -> tuple[Route, GateUp, DownCombine]:
         """Resolved once, at the first T=1 step — after load, when the leaves'
         formats are final."""
-        gate_up, down = self._gate_up, self._down
-        if gate_up is None or down is None:
+        route, gate_up, down = self._route, self._gate_up, self._down
+        if route is None or gate_up is None or down is None:
             switch = self.switch_mlp
+            route = Route(
+                self.gate.weight, experts=self.experts, k=self.k, normalize=self.norm_topk
+            )
             gate_up = GateUp(switch.gate_up_proj, hidden=self.hidden, inner=switch.inner)
             down = DownCombine(switch.down_proj, hidden=self.hidden, inner=switch.inner)
-            self._gate_up, self._down = gate_up, down
-        return gate_up, down
-
-    def step_applies(self) -> bool:
-        return self.norm_topk and softmax_topk_applies(self.split + self.k, self.k)
+            self._route, self._gate_up, self._down = route, gate_up, down
+        return route, gate_up, down
 
     def step(self, h: mx.array, residual: mx.array) -> mx.array:
         """T=1: routing, both expert gemvs, the routed sum and the residual join in
         three dispatches."""
-        gate_up, down = self._kernels()
-        chosen, weights = softmax_topk(self.gate(h).reshape(-1), self.k)
+        route, gate_up, down = self._kernels()
+        chosen, weights = route(h.reshape(-1), logits=self.gate(h).reshape(-1))
         act = gate_up(h.reshape(-1), chosen)
         return down(act, chosen, weights, residual.reshape(-1)).reshape(1, 1, self.hidden)
 

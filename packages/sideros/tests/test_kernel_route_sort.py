@@ -15,7 +15,7 @@ import mlx.core as mx
 import numpy as np
 import pytest
 
-from sideros.core.kernels.route_sort import (
+from sideros.core.kernels.route.sort import (
     _SOURCE,
     _TILE,
     route_counting_sort,

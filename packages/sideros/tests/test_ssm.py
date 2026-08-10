@@ -18,7 +18,14 @@ import mlx.core as mx
 import mlx.nn as nn
 import pytest
 
-from sideros.core.kernels.ssm import ssm_applies, ssm_attn, ssm_step
+from sideros.core.kernels.ssm import (
+    DefaultSsm,
+    FusedSsm,
+    Ssm,
+    ssm_applies,
+    ssm_attn,
+    ssm_step,
+)
 
 
 def _ops_path_step(
@@ -266,3 +273,39 @@ def test_mutation_A_log_breaks_parity() -> None:
         ).max().item()
     )
     assert diff > 1e-4, f"perturbed A_log did not change output (diff={diff:.3e})"
+
+
+def test_ssm_delegator_resolution_and_parity() -> None:
+    """`Ssm` binds the fused strategy when the tiling divides the geometry and the
+    ops scan when it does not, and the fused decode matches the free function."""
+    if mx.default_device() != mx.gpu or not mx.metal.is_available():
+        pytest.skip("Metal not available")
+
+    (
+        in_proj_w, x, conv_w, conv_b, A_log, dt_bias, D, state,
+        intermediate, conv_dim, heads, head_dim, d_state, groups,
+    ) = _make_replica(mx.float32)
+
+    hidden, B, C, D_arr, dt, dt_bias, state, A_log = _run_mamba_step(
+        in_proj_w, x, conv_w, conv_b, A_log, dt_bias, D, state,
+        intermediate, conv_dim, heads, head_dim, d_state, groups,
+    )
+
+    fused = Ssm(
+        A_log=A_log, D=D_arr, dt_bias=dt_bias,
+        d_state=d_state, heads=heads, groups=groups,
+    )
+    assert isinstance(fused.strategy, FusedSsm)
+
+    ops = Ssm(
+        A_log=A_log, D=D_arr, dt_bias=dt_bias,
+        d_state=d_state + 1, heads=heads, groups=groups,
+    )
+    assert isinstance(ops.strategy, DefaultSsm)
+
+    out, out_state = fused(hidden, B, C, dt, state)
+    ref_out, ref_state = ssm_step(hidden, A_log, B, C, D_arr, dt, dt_bias, state)
+    mx.eval(out, out_state, ref_out, ref_state)
+
+    assert float(mx.abs(out - ref_out).max().item()) == 0.0
+    assert float(mx.abs(out_state - ref_state).max().item()) == 0.0

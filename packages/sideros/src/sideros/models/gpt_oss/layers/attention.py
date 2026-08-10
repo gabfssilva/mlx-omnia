@@ -4,8 +4,11 @@ import mlx.core as mx
 import mlx.nn as nn
 
 from sideros.core.cache import KVCache
-from sideros.core.kernels.sink_attention import sink_attention, sink_attention_applies
-from sideros.core.layers import split_qkv
+from sideros.core.kernels.attention import (
+    AttentionStep,
+    AttentionStepStrategy,
+    DefaultAttentionStep,
+)
 from sideros.models.gpt_oss.config import GPTOSSConfig
 from sideros.models.gpt_oss.layers import flags
 
@@ -28,36 +31,55 @@ class GPTOSSAttention(nn.Module):
         # Leading underscore: not a parameter, so the strict load does not demand it.
         self._freqs = freqs
         self._mscale = mscale
+        self._step: AttentionStepStrategy | None = None
+        self._step_cache: KVCache | None = None
+        self._step_sink = flags.USE_SINK_ATTENTION
 
     def __call__(self, x: mx.array, mask: mx.array | str | None, cache: KVCache) -> mx.array:
         length = x.shape[1]
-        offset = cache.offset
         query_width = self.heads * self.head_dim
-        q, k, v = split_qkv(
-            self.qkv_proj(x),
-            heads=self.heads,
-            kv_heads=self.kv_heads,
-            head_dim=self.head_dim,
+        key_value_width = self.kv_heads * self.head_dim
+        q, k, v = mx.split(
+            self.qkv_proj(x), [query_width, query_width + key_value_width], axis=-1
         )
-        queries = self._rope(q, offset)
-        keys, values = cache.update_and_fetch(self._rope(k, offset), v)
-        sinks = self.sinks
-        if (
-            flags.USE_SINK_ATTENTION
-            and not isinstance(mask, str)
-            and sinks.dtype == queries.dtype
-            and sink_attention_applies(queries, keys)
-        ):
-            attended = sink_attention(queries, keys, values, sinks, mask, self.scale)
-        else:
-            attended = mx.fast.scaled_dot_product_attention(
-                queries, keys, values, scale=self.scale, mask=mask, sinks=sinks
-            )
+        attended = self._attention(cache, x.dtype)(q, k, v, mask)
         return self.o_proj(attended.transpose(0, 2, 1, 3).reshape(1, length, query_width))
 
-    def _rope(self, x: mx.array, offset: int) -> mx.array:
-        scaled = x * self._mscale if self._mscale != 1.0 else x
-        return mx.fast.rope(
-            scaled, self.head_dim, traditional=False, base=None, scale=1.0, offset=offset,
-            freqs=self._freqs,
-        )
+    def _attention(self, cache: KVCache, dtype: mx.Dtype) -> AttentionStepStrategy:
+        """Resolved once, at the first step after load — and again whenever the cache is
+        replaced or the bench switch moves, since the step is bound to one cache."""
+        step = self._step
+        fused = flags.USE_SINK_ATTENTION
+        if step is None or self._step_cache is not cache or self._step_sink != fused:
+            step = (
+                AttentionStep(
+                    cache,
+                    heads=self.heads,
+                    kv_heads=self.kv_heads,
+                    head_dim=self.head_dim,
+                    scale=self.scale,
+                    dtype=dtype,
+                    rotary_pairs=self.head_dim // 2,
+                    mscale=self._mscale,
+                    freqs=self._freqs,
+                    sinks=self.sinks,
+                )
+                if fused
+                else DefaultAttentionStep(
+                    cache=cache,
+                    heads=self.heads,
+                    kv_heads=self.kv_heads,
+                    head_dim=self.head_dim,
+                    scale=self.scale,
+                    query_weight=None,
+                    key_weight=None,
+                    eps=1e-6,
+                    rotary_pairs=self.head_dim // 2,
+                    mscale=self._mscale,
+                    freqs=self._freqs,
+                    base=0.0,
+                    sinks=self.sinks,
+                )
+            )
+            self._step, self._step_cache, self._step_sink = step, cache, fused
+        return step

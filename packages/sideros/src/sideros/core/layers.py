@@ -7,13 +7,13 @@ order of the copies it replaced — the parity fixtures are the contract.
 """
 
 import math
-from collections.abc import Callable
+from collections.abc import Callable, Sequence
 from typing import Literal
 
 import mlx.core as mx
 import mlx.nn as nn
 
-from sideros.core.kernels.segmented_qkv import qkv_step
+from sideros.core.kernels.qkv_rope.segmented import qkv_step
 from sideros.core.mxcompat import gather_mm
 
 # What `mx.quantize` accepts. Kept as primitives here so `core` stays below
@@ -47,6 +47,17 @@ def split_qkv(
     return q, k, v
 
 
+def segmented(x: mx.array, parts: Sequence[nn.Linear | nn.QuantizedLinear]) -> mx.array:
+    """Projections sharing the input, concatenated on the output axis. Three of them on a
+    single-token step go through `qkv_step` in one dispatch; the concatenation stays as
+    fallback and parity reference."""
+    if len(parts) == 3 and x.shape[1] == 1:
+        fused = qkv_step(x, parts[0], parts[1], parts[2])
+        if fused is not None:
+            return fused
+    return mx.concatenate([part(x) for part in parts], axis=-1)
+
+
 class SegmentedQKV(nn.Module):
     """q/k/v sharing the input and concatenated on the output axis, kept as three
     physical leaves instead of one matrix.
@@ -55,9 +66,7 @@ class SegmentedQKV(nn.Module):
     segment carries its own `weight`, `scales`/`biases` and (once quantized) its own
     bits/group_size/mode, so a checkpoint with q in 4 bits, k in 8 and v dense loads
     without either widening or requantizing anything. The interface is `nn.Linear`'s —
-    the model splits the concatenated output exactly as it does on the fused path. On a
-    single-token step `qkv_step` runs the three segments in one dispatch; the
-    concatenation stays as fallback and parity reference.
+    the model splits the concatenated output exactly as it does on the fused path.
     """
 
     def __init__(
@@ -69,11 +78,26 @@ class SegmentedQKV(nn.Module):
         self.v_proj: nn.Linear | nn.QuantizedLinear = nn.Linear(input_dims, values, bias=bias)
 
     def __call__(self, x: mx.array) -> mx.array:
-        if x.shape[1] == 1:
-            fused = qkv_step(x, self.q_proj, self.k_proj, self.v_proj)
-            if fused is not None:
-                return fused
-        return mx.concatenate([self.q_proj(x), self.k_proj(x), self.v_proj(x)], axis=-1)
+        return segmented(x, (self.q_proj, self.k_proj, self.v_proj))
+
+
+class SegmentedLinear(nn.Module):
+    """The same split for a projection whose parts the checkpoint does not name q/k/v —
+    a mixer that fuses four (qkv‖z‖b‖a), a gate‖up pair — kept as separate leaves when a
+    mixed plan gives them no common matrix.
+
+    The parts are numbered, not named: their order is the order the model splits the
+    concatenated output in, and the loader that declined to fuse is what writes it down.
+    """
+
+    def __init__(self, input_dims: int, outputs: Sequence[int], *, bias: bool) -> None:
+        super().__init__()
+        self.parts: list[nn.Linear | nn.QuantizedLinear] = [
+            nn.Linear(input_dims, output, bias=bias) for output in outputs
+        ]
+
+    def __call__(self, x: mx.array) -> mx.array:
+        return segmented(x, self.parts)
 
 
 def sorted_gather(

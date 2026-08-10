@@ -72,9 +72,9 @@ def _stack_convs(
         if attends or not all(key in weights for key in keys):
             continue
         taps = [weights.pop(key) for key in keys]
-        fused = mx.concatenate([tap.reshape(tap.shape[0], -1) for tap in taps], axis=0)
-        mx.eval(fused)
-        weights[f"{prefix}conv1d.weight"] = fused
+        weights[f"{prefix}conv1d.weight"] = mx.concatenate(
+            [tap.reshape(tap.shape[0], -1) for tap in taps], axis=0
+        )
     return weights
 
 
@@ -111,9 +111,9 @@ def _fuse_kda_proj(
                     f" format across {', '.join(_KDA_PROJECTIONS)}_proj, which the fused"
                     " projection cannot hold"
                 )
-            fused = mx.concatenate([weights.pop(key) for key in present], axis=0)
-            mx.eval(fused)
-            weights[f"{prefix}fused_proj.{suffix}"] = fused
+            weights[f"{prefix}fused_proj.{suffix}"] = mx.concatenate(
+                [weights.pop(key) for key in present], axis=0
+            )
     return weights
 
 
@@ -135,7 +135,6 @@ def _split_kv_b(
             mx.swapaxes(stacked[:, :nope], -1, -2)
         )
         weights[f"{leaf}unembed_out.weight"] = mx.contiguous(stacked[:, nope:])
-        mx.eval(weights[f"{leaf}embed_q.weight"], weights[f"{leaf}unembed_out.weight"])
     return weights
 
 

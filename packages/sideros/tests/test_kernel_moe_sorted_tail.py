@@ -2,14 +2,15 @@
 
 There is no quantization here and no reassociation: the kernel reads the same rows the
 un-sort would have produced, in the same slot order, and rounds at the same places. The
-reference is the explicit gather followed by the same bf16 chain, so the two agree to
-within one bf16 ulp — a wrong `inverse_order` read, by contrast, is a different row.
+reference is the default strategy — the explicit gather followed by the same bf16 chain —
+so the two agree to within one bf16 ulp; a wrong `inverse_order` read, by contrast, is a
+different row.
 """
 
 import mlx.core as mx
 from conftest import relative_diff
 
-from sideros.core.kernels.moe_sorted_tail import moe_sorted_tail, moe_sorted_tail_applies
+from sideros.core.kernels.moe_tail import DefaultMoeTail, MoeTail, SortedMoeTail
 
 TOKENS = 3
 TOPK = 4
@@ -27,27 +28,9 @@ def assert_matches(ours: mx.array, expected: mx.array) -> None:
     assert relative_diff(ours, expected) < SLACK
 
 
-def tail_reference(
-    sorted_outputs: mx.array,
-    inverse_order: mx.array,
-    routing: mx.array,
-    shared: mx.array,
-    residual: mx.array,
-) -> mx.array:
-    gathered = mx.take(sorted_outputs, inverse_order.reshape(-1), axis=0).reshape(
-        TOKENS, TOPK, HIDDEN
-    )
-    weights = routing.astype(mx.bfloat16)
-    total = mx.zeros((TOKENS, HIDDEN), dtype=mx.bfloat16)
-    for slot in range(TOPK):
-        total = gathered[:, slot] * weights[:, slot : slot + 1] + total
-    scaled = total * mx.array(SCALING, dtype=mx.bfloat16)
-    return residual + (scaled + shared)
-
-
-def test_applies_requires_four_column_tiles() -> None:
-    assert moe_sorted_tail_applies(HIDDEN)
-    assert not moe_sorted_tail_applies(HIDDEN + 2)
+def test_delegator_prefers_the_kernel_and_stays_total() -> None:
+    assert isinstance(MoeTail(hidden=HIDDEN).strategy, SortedMoeTail)
+    assert isinstance(MoeTail(hidden=HIDDEN + 2).strategy, DefaultMoeTail)
 
 
 def test_matches_gather_then_combine() -> None:
@@ -61,10 +44,7 @@ def test_matches_gather_then_combine() -> None:
     shared = mx.random.normal((TOKENS, HIDDEN)).astype(mx.bfloat16)
     residual = mx.random.normal((TOKENS, HIDDEN)).astype(mx.bfloat16)
 
-    fused = moe_sorted_tail(
-        sorted_outputs, inverse_order, routing, shared, residual, SCALING
-    )
+    args = (sorted_outputs, inverse_order, routing, shared, residual, SCALING)
+    fused = MoeTail(hidden=HIDDEN)(*args)
 
-    assert_matches(
-        fused, tail_reference(sorted_outputs, inverse_order, routing, shared, residual)
-    )
+    assert_matches(fused, DefaultMoeTail.build(hidden=HIDDEN)(*args))

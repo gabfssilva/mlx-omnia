@@ -21,6 +21,7 @@ from sideros import (
     Text,
 )
 from sideros.checkpoint import Checkpoint, checkpoint, load_checkpoint, save_quantized
+from sideros.parsers import Segment
 from sideros.quant.quantization import (
     Affine,
     ByPath,
@@ -29,7 +30,6 @@ from sideros.quant.quantization import (
     inventory,
     quantize_weights,
 )
-from sideros.suppress import Segment
 
 _COARSE = Affine(group_size=64, bits=4)
 _FINE = Affine(group_size=64, bits=8)

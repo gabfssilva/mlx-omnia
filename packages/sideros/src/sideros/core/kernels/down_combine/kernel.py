@@ -8,9 +8,15 @@ is the caller's routing, not this package's. The down side rounds `(T)((T)dot·w
 per expert and accumulates in fp32, adding the residual at T.
 """
 
-from typing import Protocol
+from typing import Literal, Protocol
 
 import mlx.core as mx
+
+Layout = Literal["interleaved", "blocked"]
+"""How the gate/up half handed its result over. `interleaved` means `act` is already
+silu(gate)·up, `[n, inner]`. `blocked` means it is the un-activated `[gate ‖ up]` block,
+`[n, 2*inner]`, and the activation is this half's — the two halves declare the same
+layout."""
 
 
 class DownCombineStrategy(Protocol):

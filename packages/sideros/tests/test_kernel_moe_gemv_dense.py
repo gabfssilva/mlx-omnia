@@ -12,7 +12,6 @@ import mlx.core as mx
 import numpy as np
 import pytest
 from conftest import relative_diff
-
 from sideros.core.kernels.moe_gemv_dense import (
     _DOWN_SOURCE,
     _GATE_UP_SOURCE,
@@ -21,6 +20,7 @@ from sideros.core.kernels.moe_gemv_dense import (
     moe_gemv_dense_applies,
     moe_route_sigmoid,
 )
+
 from sideros.core.mxcompat import gather_mm, metal_kernel
 
 HIDDEN, INNER, EXPERTS, TOPK = 2048, 1792, 32, 4

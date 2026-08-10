@@ -8,14 +8,18 @@ bytes, with the SwiGLU chain reproduced expression for expression in bf16.
 """
 
 import mlx.core as mx
+import mlx.nn as nn
 import pytest
 from conftest import relative_diff
 
-from sideros.core.kernels.nvfp4_halved_gate_up import (
+from sideros.core.kernels.mlp import DefaultMlp, Mlp
+from sideros.core.kernels.mlp.nvfp4 import (
+    Nvfp4Mlp,
     halve_gate_up_scales,
     nvfp4_halved_gate_up,
     nvfp4_halved_gate_up_applies,
 )
+from sideros.core.layers import SwiGLU
 
 HIDDEN = 512
 INNER = 32
@@ -117,3 +121,43 @@ def test_scale_codes_match_dequantize(code: int) -> None:
     fused = nvfp4_halved_gate_up(x, weight, halved)
 
     assert_matches(fused, swiglu_reference(x, weight, scales))
+
+
+def test_facade_resolves_the_kernel_and_leaves_the_down_half_to_the_leaf() -> None:
+    """The delegator binds the gate/up kernel when the leaf is nvfp4 and its scale plane
+    carries the certificate; the down projection stays the leaf's own call, so the step
+    is the kernel's activation through `down_proj` plus the residual."""
+    weight, scales = quantized_paired((2 * INNER, HIDDEN), seed=4)
+    gate_up = nn.QuantizedLinear(
+        HIDDEN, 2 * INNER, bias=False, group_size=GROUP, bits=BITS, mode="nvfp4"
+    )
+    gate_up.update({"weight": weight, "scales": scales})
+    leaf = SwiGLU(HIDDEN, INNER)
+    leaf.set_dtype(mx.bfloat16)
+    leaf.update_modules({"gate_up_proj": gate_up})
+
+    mlp = Mlp(leaf, hidden=HIDDEN, inner=INNER)
+    assert isinstance(mlp.strategy, Nvfp4Mlp)
+
+    x = mx.random.normal((HIDDEN,)).astype(mx.bfloat16)
+    residual = mx.random.normal((HIDDEN,)).astype(mx.bfloat16)
+    halved = halve_gate_up_scales(scales)
+    assert halved is not None
+    activated = nvfp4_halved_gate_up(x, weight, halved)
+    expected = leaf.down_proj(activated[None]).reshape(-1) + residual
+
+    assert relative_diff(mlp(x, residual), expected) == 0.0
+
+
+def test_facade_falls_back_when_the_scale_plane_is_unpaired() -> None:
+    weight, scales = quantized_paired((2 * INNER, HIDDEN), seed=5)
+    scales[7, 3] = mx.array(0x42, dtype=mx.uint8)
+    gate_up = nn.QuantizedLinear(
+        HIDDEN, 2 * INNER, bias=False, group_size=GROUP, bits=BITS, mode="nvfp4"
+    )
+    gate_up.update({"weight": weight, "scales": scales})
+    leaf = SwiGLU(HIDDEN, INNER)
+    leaf.set_dtype(mx.bfloat16)
+    leaf.update_modules({"gate_up_proj": gate_up})
+
+    assert isinstance(Mlp(leaf, hidden=HIDDEN, inner=INNER).strategy, DefaultMlp)

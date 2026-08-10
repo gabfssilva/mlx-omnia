@@ -22,7 +22,7 @@ import mlx.core as mx
 import numpy as np
 from conftest import relative_diff
 
-from sideros.core.kernels.qk_norm_rope import (
+from sideros.core.kernels.qkv_rope.qk_norm_rope import (
     _OUTPUTS,
     _PREFILL_SCALED_INPUTS,
     _PREFILL_SCALED_SOURCE,

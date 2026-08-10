@@ -15,7 +15,7 @@ import pytest
 from conftest import relative_diff
 
 from sideros.core.kernels.ssm import ssm_step_ref
-from sideros.core.kernels.ssm_step import _KERNEL, _SOURCE, ssm_step, ssm_step_applies
+from sideros.core.kernels.ssm.step import _KERNEL, _SOURCE, ssm_step, ssm_step_applies
 from sideros.core.mxcompat import metal_kernel
 
 if TYPE_CHECKING:
@@ -73,7 +73,7 @@ def dispatch(
     head_dim = x.shape[3]
     n_groups = B.shape[2]
     state_size = B.shape[3]
-    from sideros.core.kernels.ssm_step import _compute_dt
+    from sideros.core.kernels.ssm.step import _compute_dt
     dt_processed = _compute_dt(dt, dt_bias, limit)
     heads_per_group = num_heads // n_groups
     out, state_out = kernel(

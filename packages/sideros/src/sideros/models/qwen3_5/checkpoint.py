@@ -11,6 +11,7 @@ from sideros.chat import (
 from sideros.checkpoint import (
     checkpoint,
     drop_tied_head,
+    fusible,
     reject_dtype_cast,
     stop_tokens,
 )
@@ -98,73 +99,89 @@ def _renamed(name: str) -> str | None:
     return name
 
 
+_SUFFIXES = ("weight", "scales", "biases")
+
+
+def _fuse(
+    weights: dict[str, mx.array], prefix: str, name: str, parts: tuple[str, ...]
+) -> None:
+    """The parts concatenated on the output axis — row-aligned in every representation,
+    so dense and packed fuse alike. The originals leave the dict, otherwise both copies
+    stay resident.
+
+    A per-leaf plan is what breaks that: a mixed-precision quantizer picks a width per
+    projection, and qkv in 3 bits next to z in 5 has no common matrix. The parts then move
+    under the fused name instead of into it, numbered in the order the model splits the
+    output, and `attach_weights` builds a `SegmentedLinear` over them. The checkpoint is
+    untouched either way — the decision is the loader's, taken by comparing the tensors.
+    """
+    if not all(f"{prefix}{part}.weight" in weights for part in parts):
+        return
+    if not all(fusible(weights, [f"{prefix}{part}.{s}" for part in parts]) for s in _SUFFIXES):
+        for index, part in enumerate(parts):
+            for suffix in _SUFFIXES:
+                key = f"{prefix}{part}.{suffix}"
+                if key in weights:
+                    weights[f"{prefix}{name}.parts.{index}.{suffix}"] = weights.pop(key)
+        return
+    for suffix in _SUFFIXES:
+        keys = [f"{prefix}{part}.{suffix}" for part in parts]
+        if not all(key in weights for key in keys):
+            continue
+        fused = mx.concatenate([weights.pop(key) for key in keys], axis=0)
+        mx.eval(fused)
+        weights[f"{prefix}{name}.{suffix}"] = fused
+
+
 def _fuse_projections(
     weights: dict[str, mx.array], config: Qwen35TextConfig
 ) -> dict[str, mx.array]:
-    """One fused projection per mixer instead of three or four, concatenated on the
-    output axis — row-aligned in every representation, so dense and packed fuse alike.
-    The originals leave the dict, otherwise both copies stay resident."""
+    """One fused projection per mixer instead of three or four, and one per dense MLP."""
     for layer, kind in enumerate(config.layer_types):
         if kind == "full_attention":
             prefix, parts = f"model.layers.{layer}.self_attn.", ("q_proj", "k_proj", "v_proj")
         else:
             prefix = f"model.layers.{layer}.linear_attn."
             parts = ("in_proj_qkv", "in_proj_z", "in_proj_b", "in_proj_a")
-        for suffix in ("weight", "scales", "biases"):
-            keys = [f"{prefix}{part}.{suffix}" for part in parts]
-            if not all(key in weights for key in keys):
-                continue
-            fused = mx.concatenate([weights.pop(key) for key in keys], axis=0)
-            mx.eval(fused)
-            weights[f"{prefix}fused_proj.{suffix}"] = fused
+        _fuse(weights, prefix, "fused_proj", parts)
 
     for layer in range(config.num_hidden_layers):
-        prefix = f"model.layers.{layer}.mlp."
-        for suffix in ("weight", "scales", "biases"):
-            keys = [f"{prefix}{part}_proj.{suffix}" for part in ("gate", "up")]
-            if not all(key in weights for key in keys):
-                continue
-            fused = mx.concatenate([weights.pop(key) for key in keys], axis=0)
-            mx.eval(fused)
-            weights[f"{prefix}gate_up_proj.{suffix}"] = fused
+        _fuse(weights, f"model.layers.{layer}.mlp.", "gate_up_proj", ("gate_proj", "up_proj"))
     return weights
 
 
-def _fuse_moe(weights: dict[str, mx.array], config: Qwen35TextConfig) -> dict[str, mx.array]:
-    """Two load-time fusions on the sparse block, both row-aligned so packed weights,
-    scales and biases take the same path:
+def _interleave(weights: dict[str, mx.array], prefix: str) -> None:
+    """gate and up row by row ([g0,u0,g1,…]) into one leaf — the layout the T=1 kernels
+    read a pair from. Rows again, so packed weights, scales and biases take the same
+    path; the stack's leading expert axis rides along untouched."""
+    for suffix in _SUFFIXES:
+        keys = [f"{prefix}{part}_proj.{suffix}" for part in ("gate", "up")]
+        if not all(key in weights for key in keys):
+            continue
+        stacked = [weights.pop(key) for key in keys]
+        *lead, rows, cols = stacked[0].shape
+        fused = mx.stack(stacked, axis=-2).reshape(*lead, 2 * rows, cols)
+        mx.eval(fused)
+        weights[f"{prefix}gate_up_proj.{suffix}"] = fused
 
-    - the shared expert's logit becomes row 256 of the router's matrix, so one gemv
-      produces the routing logits and the shared gate together;
-    - gate and up interleave row by row ([g0,u0,g1,…]) into the expert stack, and the
-      shared expert's pair is stacked as slot 256. That stack was already a copy the
-      load paid for; the *down* stack is the one that goes mmap'd from the file into
-      the model, and appending a row to it materializes 5.4 GB.
+
+def _fuse_moe(weights: dict[str, mx.array], config: Qwen35TextConfig) -> dict[str, mx.array]:
+    """The sparse block's load-time fusions: the shared expert's logit becomes row 256 of
+    the router's matrix, so one gemv produces the routing logits and the shared gate
+    together, and gate/up interleave into one leaf per stack.
+
+    The shared expert's pair stays a leaf of its own rather than slot 256 of the routed
+    stack: a stack holds one quantization format, and a per-leaf plan gives that expert
+    its own. The T=1 kernels read it through their spare slot, so the fused step is the
+    same four dispatches either way.
     """
     if config.num_experts == 0:
         return weights
     for layer in range(config.num_hidden_layers):
         prefix = f"model.layers.{layer}.mlp."
-        for suffix in ("weight", "scales", "biases"):
-            router = f"{prefix}gate.{suffix}"
-            shared_gate = f"{prefix}shared_expert_gate.{suffix}"
-            if router in weights and shared_gate in weights:
-                fused = mx.concatenate([weights.pop(router), weights.pop(shared_gate)], axis=0)
-                mx.eval(fused)
-                weights[router] = fused
-
-            keys = [f"{prefix}switch_mlp.{part}_proj.{suffix}" for part in ("gate", "up")]
-            shared = [f"{prefix}shared_expert.{part}_proj.{suffix}" for part in ("gate", "up")]
-            if not all(key in weights for key in keys + shared):
-                continue
-            stacked = [weights.pop(key) for key in keys]
-            experts, rows, cols = stacked[0].shape
-            routed = mx.stack(stacked, axis=2).reshape(experts, 2 * rows, cols)
-            pair = [weights.pop(key) for key in shared]
-            slot = mx.stack(pair, axis=1).reshape(1, 2 * rows, cols)
-            fused = mx.concatenate([routed, slot], axis=0)
-            mx.eval(fused)
-            weights[f"{prefix}switch_mlp.gate_up_proj.{suffix}"] = fused
+        _fuse(weights, prefix, "gate", ("gate", "shared_expert_gate"))
+        _interleave(weights, f"{prefix}switch_mlp.")
+        _interleave(weights, f"{prefix}shared_expert.")
     return weights
 
 

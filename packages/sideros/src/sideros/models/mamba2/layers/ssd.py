@@ -2,10 +2,14 @@ import mlx.core as mx
 import mlx.nn as nn
 
 from sideros.core.cache import DeltaCache
-from sideros.core.kernels.ssm import ssm_attn, ssm_step_ref
-from sideros.core.kernels.ssm_step import ssm_step, ssm_step_applies
+from sideros.core.kernels.ssm import DefaultSsm, Ssm
+from sideros.core.kernels.ssm.step import ssm_step
 from sideros.models.mamba2.config import Mamba2Config
 from sideros.models.mamba2.layers import flags
+
+# `ssm_step` is re-exported because the compiled one-token step in `block.py` calls
+# it through this module and keys its trace on the binding found here.
+__all__ = ["Conv1dWeight", "Mamba2Mixer", "ssm_step"]
 
 
 class Conv1dWeight(nn.Module):
@@ -39,6 +43,38 @@ class Mamba2Mixer(nn.Module):
         self.out_proj = nn.Linear(
             config.intermediate_size, config.hidden_size, bias=config.use_bias
         )
+        self._scan: Ssm | None = None
+        self._reference: DefaultSsm | None = None
+
+    def _kernels(self) -> tuple[Ssm, DefaultSsm]:
+        """Resolved once, at the first step — after load, when the weights are
+        final. The ops scan is kept beside the delegator because `flags.SSM_KERNEL`
+        selects between them at run time."""
+        scan, reference = self._scan, self._reference
+        if scan is None or reference is None:
+            config = self.config
+            scan = Ssm(
+                A_log=self.A_log,
+                D=self.D,
+                dt_bias=self.dt_bias,
+                d_state=config.state_size,
+                heads=config.num_heads,
+                groups=config.n_groups,
+                time_step_limit=config.time_step_limit,
+                step=config.chunk_size,
+            )
+            reference = DefaultSsm.build(
+                A_log=self.A_log,
+                D=self.D,
+                dt_bias=self.dt_bias,
+                d_state=config.state_size,
+                heads=config.num_heads,
+                groups=config.n_groups,
+                time_step_limit=config.time_step_limit,
+                step=config.chunk_size,
+            )
+            self._scan, self._reference = scan, reference
+        return scan, reference
 
     def __call__(self, x: mx.array, cache: DeltaCache) -> mx.array:
         config = self.config
@@ -69,47 +105,9 @@ class Mamba2Mixer(nn.Module):
                 (1, config.num_heads, config.head_dim, config.state_size),
                 dtype=mx.float32,
             )
-        if flags.SSM_KERNEL and ssm_step_applies(
-            config.state_size, config.num_heads, config.n_groups
-        ):
-            if length == 1:
-                out, state = ssm_step(
-                    hidden,
-                    self.A_log,
-                    b,
-                    c,
-                    self.D,
-                    dt,
-                    self.dt_bias,
-                    state,
-                    config.time_step_limit,
-                )
-            else:
-                out, state = ssm_attn(
-                    hidden,
-                    self.A_log,
-                    b,
-                    c,
-                    self.D,
-                    dt,
-                    self.dt_bias,
-                    state,
-                    time_step_limit=config.time_step_limit,
-                    step=config.chunk_size,
-                )
-            out = out.astype(x.dtype)
-        else:
-            out, state = ssm_step_ref(
-                hidden,
-                self.A_log,
-                b,
-                c,
-                self.D,
-                dt,
-                self.dt_bias,
-                state,
-                config.time_step_limit,
-            )
+        scan, reference = self._kernels()
+        out, state = (scan if flags.SSM_KERNEL else reference)(hidden, b, c, dt, state)
+        out = out.astype(x.dtype)
 
         cache.state = state
         cache.offset += length

@@ -20,9 +20,8 @@ from sideros.model import ModelInput, ModelSignature
 from sideros.models.step3p7.config import FULL, SLIDING, Step3p7Config
 from sideros.models.step3p7.layers.block import Step3p7Trunk
 from sideros.models.step3p7.vision import Step3p7Vision
+from sideros.parsers import Parser, Segment
 from sideros.processors.step3p7 import ImageFeatures, Step3p7Processor, process_images
-from sideros.suppress import Segment
-from sideros.tools import ToolFamily
 from sideros.vision import RGB_IMAGE, Image
 
 
@@ -240,7 +239,7 @@ class Step3p7LanguageModel:
 
     def stream(self, input: Step3p7Input, options: GenerationOptions) -> Iterator[Segment]:
         stop = self.stop if options.stop is None else options.stop
-        family = _family(input)
+        parser = _parser(input)
         match input:
             case Text(value=rendered):
                 self.prefix = prefix_cache(self.prefix, options.prefix_budget)  # type: ignore[arg-type]
@@ -271,7 +270,7 @@ class Step3p7LanguageModel:
             case _:
                 assert_never(input)
 
-        yield from stream_text(ids, self.tokenizer, tools=family, prompt=rendered)
+        yield from stream_text(ids, self.tokenizer, parser=parser, prompt=rendered)
 
     def _vision_embeddings(
         self, ids: mx.array, image_features: ImageFeatures
@@ -294,12 +293,12 @@ class Step3p7LanguageModel:
         return tokens
 
 
-def _family(input: Step3p7Input) -> ToolFamily | None:
+def _parser(input: Step3p7Input) -> Parser | None:
     match input:
         case Text():
-            return input.tool_family
+            return input.parser
         case LanguagePrompt(parts=parts):
-            return next((part.tool_family for part in parts if isinstance(part, Text)), None)
+            return next((part.parser for part in parts if isinstance(part, Text)), None)
         case Image():
             return None
         case _:

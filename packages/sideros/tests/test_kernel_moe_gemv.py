@@ -22,8 +22,9 @@ bit-identical to the unclamped one, which the `limit=None` runs assert implicitl
 Shapes are the smallest the tiling accepts twice over (hidden 1024, inner 512: two
 iterations of each kernel's k loop), and `moe_gemv_applies` is asserted so a shape
 that stopped engaging the kernel fails here instead of passing vacuously. The shared
-expert rides as the last slot of both the index vector and the gate‖up stack, with
-its own 2-D down projection — the qwen3_5 layout.
+expert rides as the last slot of the index vector, with its own 2-D gate‖up and down
+projections — the qwen3_5 layout — and its own bit width and group size, which is what
+a per-leaf quantization plan produces and what the spare slot of both kernels decodes.
 """
 
 import mlx.core as mx
@@ -53,7 +54,15 @@ class Replica:
     """One token through the routed gate‖up, silu, down, router sum and residual."""
 
     def __init__(
-        self, bits: int, gate_group: int = 64, down_group: int = 64, *, shared: bool, seed: int = 3
+        self,
+        bits: int,
+        gate_group: int = 64,
+        down_group: int = 64,
+        *,
+        shared: bool,
+        shared_bits: int | None = None,
+        shared_group: int | None = None,
+        seed: int = 3,
     ) -> None:
         rng = np.random.default_rng(seed)
 
@@ -63,26 +72,36 @@ class Replica:
         self.bits, self.gate_group, self.down_group, self.shared = (
             bits, gate_group, down_group, shared
         )
+        self.shared_bits = bits if shared_bits is None else shared_bits
+        self.shared_group = gate_group if shared_group is None else shared_group
         self.x = normal(HIDDEN)
         self.residual = normal(HIDDEN)
-        stacks = EXPERTS + (1 if shared else 0)
         self.gw, self.gs, self.gb = mx.quantize(
-            normal(stacks, 2 * INNER, HIDDEN, fan_in=HIDDEN), group_size=gate_group, bits=bits
+            normal(EXPERTS, 2 * INNER, HIDDEN, fan_in=HIDDEN), group_size=gate_group, bits=bits
         )
-        # The routed down stack gets the same spare row: the "drop the shared slot"
-        # mutation below indexes it with the shared slot's EXPERTS, and an out-of-bounds
-        # gather is a crash, not a failed assertion. The correct path never reads it.
         self.dw, self.ds, self.db = mx.quantize(
-            normal(stacks, HIDDEN, INNER, fan_in=INNER), group_size=down_group, bits=bits
+            normal(EXPERTS, HIDDEN, INNER, fan_in=INNER), group_size=down_group, bits=bits
         )
-        self.shared_packed = (
-            mx.quantize(normal(HIDDEN, INNER, fan_in=INNER), group_size=down_group, bits=bits)
+        self.shared_gate_up = (
+            mx.quantize(
+                normal(2 * INNER, HIDDEN, fan_in=HIDDEN),
+                group_size=self.shared_group, bits=self.shared_bits,
+            )
             if shared
             else None
         )
-        self.indices = mx.array(
-            np.array(ROUTED + ([EXPERTS] if shared else []), dtype=np.uint32)
+        self.shared_down = (
+            mx.quantize(
+                normal(HIDDEN, INNER, fan_in=INNER),
+                group_size=self.shared_group, bits=self.shared_bits,
+            )
+            if shared
+            else None
         )
+        # The shared slot's index is never read on the correct path; it stays in bounds
+        # so the "drop the shared slot" mutations gather a routed expert (a wrong answer)
+        # instead of running off the stack (a crash).
+        self.indices = mx.array(np.array(ROUTED + ([0] if shared else []), dtype=np.uint32))
         self.routing = mx.array(
             np.array([0.4, 0.3, 0.2, 0.1] + ([0.6] if shared else []), dtype=np.float32)
         )
@@ -91,21 +110,40 @@ class Replica:
     def slots(self) -> int:
         return self.indices.shape[0]
 
+    @property
+    def spare_gate_up(self) -> tuple[mx.array, mx.array, mx.array, int, int] | None:
+        pair = self.shared_gate_up
+        return None if pair is None else (*pair, self.shared_group, self.shared_bits)
+
+    @property
+    def spare_down(self) -> tuple[mx.array, mx.array, mx.array, int, int] | None:
+        pair = self.shared_down
+        return None if pair is None else (*pair, self.shared_group, self.shared_bits)
+
     def kernels(self) -> tuple[mx.array, mx.array]:
-        act = AffineGateUp(self.gw, self.gs, self.gb, self.gate_group, self.bits, None)(
-            self.x, self.indices
-        )
+        act = AffineGateUp(
+            self.gw, self.gs, self.gb, self.gate_group, self.bits, None, self.spare_gate_up
+        )(self.x, self.indices)
         out = AffineDownCombine(
-            self.dw, self.ds, self.db, self.down_group, self.bits, self.shared_packed
+            self.dw, self.ds, self.db, self.down_group, self.bits, self.spare_down
         )(act, self.indices, self.routing, self.residual)
         return act, out
 
     def op_chain(self) -> tuple[mx.array, mx.array]:
         fused = mx.gather_qmm(
             self.x[None, None, None], self.gw, self.gs, self.gb,
-            rhs_indices=self.indices[None], transpose=True,
+            rhs_indices=self.indices[None, :TOPK], transpose=True,
             group_size=self.gate_group, bits=self.bits,
-        )
+        ).reshape(TOPK, 2 * INNER)
+        if self.shared_gate_up is not None:
+            sw, ss, sb = self.shared_gate_up
+            fused = mx.concatenate([
+                fused,
+                mx.quantized_matmul(
+                    self.x[None], sw, ss, sb, transpose=True,
+                    group_size=self.shared_group, bits=self.shared_bits,
+                ),
+            ], axis=0)
         pairs = fused.reshape(self.slots, INNER, 2)
         gated = pairs[..., 0]
         act = gated * mx.sigmoid(gated) * pairs[..., 1]
@@ -115,11 +153,11 @@ class Replica:
             group_size=self.down_group, bits=self.bits,
         ).squeeze((0, 2))
         out = (routed * self.routing[:TOPK, None]).sum(axis=0) + self.residual
-        if self.shared_packed is not None:
-            sw, ss, sb = self.shared_packed
+        if self.shared_down is not None:
+            sw, ss, sb = self.shared_down
             out = out + self.routing[TOPK] * mx.quantized_matmul(
                 act[TOPK][None], sw, ss, sb, transpose=True,
-                group_size=self.down_group, bits=self.bits,
+                group_size=self.shared_group, bits=self.shared_bits,
             ).reshape(-1)
         return act, out
 
@@ -148,6 +186,20 @@ def test_matches_op_chain_fp32(bits: int, shared: bool) -> None:
     assert relative_diff(out, ref_out) < 1e-5
 
 
+@pytest.mark.parametrize("widths", [(3, 8), (8, 3), (4, 2), (2, 5)])
+def test_the_spare_slot_decodes_on_its_own_width(widths: tuple[int, int]) -> None:
+    """A per-leaf plan gives the shared expert a width and a group of its own, on both
+    halves of the step. Both kernels have to read it there while the routed stack keeps
+    its own — the reference dequantizes each leaf with the parameters it was packed at."""
+    bits, shared_bits = widths
+    replica = Replica(bits, 64, 64, shared=True, shared_bits=shared_bits, shared_group=128)
+    assert (replica.bits, replica.gate_group) != (replica.shared_bits, replica.shared_group)
+    act, out = replica.kernels()
+    ref_act, ref_out = replica.op_chain()
+    assert relative_diff(act, ref_act) < 1e-5
+    assert relative_diff(out, ref_out) < 1e-5
+
+
 @pytest.mark.parametrize("bits", BITS)
 def test_clamped_gate_up_matches_op_chain(bits: int) -> None:
     """With a limit low enough to bite, the kernel's clamp must match the stock order:
@@ -155,7 +207,7 @@ def test_clamped_gate_up_matches_op_chain(bits: int) -> None:
     replica = Replica(bits, shared=False)
     limit = 0.5
     act = AffineGateUp(
-        replica.gw, replica.gs, replica.gb, replica.gate_group, replica.bits, limit
+        replica.gw, replica.gs, replica.gb, replica.gate_group, replica.bits, limit, None
     )(replica.x, replica.indices)
     fused = mx.gather_qmm(
         replica.x[None, None, None], replica.gw, replica.gs, replica.gb,
@@ -186,8 +238,12 @@ _GATE_UP_MUTATIONS = {
     "drop the zero point": ("result[row] += d * s + xsum * b;", "result[row] += d * s;"),
     "invert the silu sigmoid": ("metal::exp(-g)", "metal::exp(g)"),
     "drop the expert indirection": (
-        "size_t wbase = (size_t)IDX[expert] * rows;",
-        "size_t wbase = (size_t)expert * rows;",
+        "size_t wbase = last ? 0 : (size_t)IDX[expert] * rows;",
+        "size_t wbase = last ? 0 : (size_t)expert * rows;",
+    ),
+    "drop the shared slot": (
+        "bool last = SHARED && expert == (uint)TOPK - 1;",
+        "bool last = false;",
     ),
 }
 
@@ -203,9 +259,13 @@ _DOWN_MUTATIONS = {
 
 
 def _gate_up(source: str, name: str, replica: Replica) -> mx.array:
+    spare = replica.spare_gate_up
+    assert spare is not None
     return metal_kernel(
         name=name,
-        input_names=["X", "W", "S", "Bs", "IDX", "LIM", "N", "KD", "GSIZE"],
+        input_names=[
+            "X", "W", "S", "Bs", "IDX", "LIM", "N", "KD", "GSIZE", "SW", "SS", "SB", "SGSIZE"
+        ],
         output_names=["Y"],
         source=source,
         header=_HEADER,
@@ -216,8 +276,13 @@ def _gate_up(source: str, name: str, replica: Replica) -> mx.array:
             mx.array(INNER, dtype=mx.int32),
             mx.array(HIDDEN, dtype=mx.int32),
             mx.array(replica.gate_group, dtype=mx.int32),
+            spare[0], spare[1], spare[2],
+            mx.array(replica.shared_group, dtype=mx.int32),
         ],
-        template=[("T", mx.float32), ("BITS", replica.bits)],
+        template=[
+            ("T", mx.float32), ("BITS", replica.bits), ("SBITS", replica.shared_bits),
+            ("TOPK", replica.slots), ("SHARED", 1),
+        ],
         grid=(64, 2 * INNER // 8, replica.slots),
         threadgroup=(64, 1, 1),
         output_shapes=[(replica.slots, INNER)],
@@ -226,12 +291,13 @@ def _gate_up(source: str, name: str, replica: Replica) -> mx.array:
 
 
 def _down(source: str, name: str, replica: Replica, act: mx.array) -> mx.array:
-    spare = replica.shared_packed
+    spare = replica.spare_down
     assert spare is not None
     return metal_kernel(
         name=name,
         input_names=[
-            "ACT", "W", "S", "Bs", "IDX", "WTS", "RES", "SW", "SS", "SB", "N", "KD", "GSIZE"
+            "ACT", "W", "S", "Bs", "IDX", "WTS", "RES", "SW", "SS", "SB", "N", "KD",
+            "GSIZE", "SGSIZE",
         ],
         output_names=["Y"],
         source=source,
@@ -243,9 +309,11 @@ def _down(source: str, name: str, replica: Replica, act: mx.array) -> mx.array:
             mx.array(HIDDEN, dtype=mx.int32),
             mx.array(INNER, dtype=mx.int32),
             mx.array(replica.down_group, dtype=mx.int32),
+            mx.array(replica.shared_group, dtype=mx.int32),
         ],
         template=[
-            ("T", mx.float32), ("BITS", replica.bits), ("TOPK", replica.slots), ("SHARED", 1),
+            ("T", mx.float32), ("BITS", replica.bits), ("SBITS", replica.shared_bits),
+            ("TOPK", replica.slots), ("SHARED", 1),
             ("VPT", 16 if replica.bits == 2 and INNER % 512 == 0 else 8),
         ],
         grid=(64, HIDDEN // 8, 1),
@@ -261,11 +329,13 @@ def test_dropping_the_clamp_breaks_the_clamped_parity() -> None:
     replica = Replica(4, shared=False)
     limit = 0.5
     ref = AffineGateUp(
-        replica.gw, replica.gs, replica.gb, replica.gate_group, replica.bits, limit
+        replica.gw, replica.gs, replica.gb, replica.gate_group, replica.bits, limit, None
     )(replica.x, replica.indices)
     broken = metal_kernel(
         name="moe_gemv_gate_up_no_clamp",
-        input_names=["X", "W", "S", "Bs", "IDX", "LIM", "N", "KD", "GSIZE"],
+        input_names=[
+            "X", "W", "S", "Bs", "IDX", "LIM", "N", "KD", "GSIZE", "SW", "SS", "SB", "SGSIZE"
+        ],
         output_names=["Y"],
         source=source,
         header=_HEADER,
@@ -276,8 +346,13 @@ def test_dropping_the_clamp_breaks_the_clamped_parity() -> None:
             mx.array(INNER, dtype=mx.int32),
             mx.array(HIDDEN, dtype=mx.int32),
             mx.array(replica.gate_group, dtype=mx.int32),
+            replica.gw, replica.gs, replica.gb,
+            mx.array(replica.gate_group, dtype=mx.int32),
         ],
-        template=[("T", mx.float32), ("BITS", replica.bits)],
+        template=[
+            ("T", mx.float32), ("BITS", replica.bits), ("SBITS", replica.bits),
+            ("TOPK", replica.slots), ("SHARED", 0),
+        ],
         grid=(64, 2 * INNER // 8, replica.slots),
         threadgroup=(64, 1, 1),
         output_shapes=[(replica.slots, INNER)],

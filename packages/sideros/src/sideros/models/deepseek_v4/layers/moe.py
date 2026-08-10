@@ -3,7 +3,7 @@ import mlx.nn as nn
 
 from sideros.core.kernels.down_combine import DownCombine
 from sideros.core.kernels.gate_up import GateUp
-from sideros.core.kernels.moe_route import softmax_topk_applies, softplus_gather, softplus_topk
+from sideros.core.kernels.route import Route
 from sideros.core.layers import SORTED_GATHER_MIN, SwitchLinear, sorted_gather
 from sideros.models.deepseek_v4.config import DeepseekV4Config
 
@@ -34,24 +34,34 @@ class MoEGate(nn.Module):
             self.e_score_correction_bias = mx.zeros(
                 (config.n_routed_experts,), dtype=mx.float32
             )
+        self.experts = config.n_routed_experts
+        self._route: Route | None = None
+
+    def _router(self) -> Route:
+        """Resolved once, at the first T=1 step — after load, when the leaves'
+        formats are final."""
+        route = self._route
+        if route is None:
+            route = Route(
+                self.weight,
+                experts=self.experts,
+                k=self.k,
+                scoring="sqrt_softplus",
+                bias=None if self.hash else self.e_score_correction_bias,
+                normalize=self.norm_topk,
+                norm_eps=1e-20 if self.norm_topk else 0.0,
+                scale=self.scaling,
+                hash_table=self.tid2eid if self.hash else None,
+            )
+            self._route = route
+        return route
+
+    def step(self, x: mx.array, ids: mx.array) -> tuple[mx.array, mx.array]:
+        """One token: `(indices [k], weights [k])`, flat."""
+        return self._router()(x, ids=ids)
 
     def __call__(self, x: mx.array, ids: mx.array) -> tuple[mx.array, mx.array]:
         logits = x @ self.weight.T
-        if x.shape[-2] == 1 and softmax_topk_applies(logits.size, self.k):
-            if self.hash:
-                chosen = self.tid2eid[ids]
-                weights = softplus_gather(
-                    logits.reshape(-1), chosen.reshape(-1), scale=self.scaling, norm=self.norm_topk
-                )
-                return chosen, weights.reshape(chosen.shape)
-            chosen, weights = softplus_topk(
-                logits.reshape(-1),
-                self.e_score_correction_bias,
-                self.k,
-                scale=self.scaling,
-                norm=self.norm_topk,
-            )
-            return chosen.reshape(1, 1, self.k), weights.reshape(1, 1, self.k)
         scores = mx.sqrt(nn.softplus(logits.astype(mx.float32)))
         if self.hash:
             chosen = self.tid2eid[ids]
@@ -142,10 +152,10 @@ class DeepseekV4MoE(nn.Module):
         return combined.reshape(x.shape)
 
     def __call__(self, x: mx.array, ids: mx.array) -> mx.array:
-        chosen, weights = self.gate(x, ids)
         length = x.shape[-2]
         if length == 1:
-            return self.fused_step(x, chosen, weights)
+            return self.fused_step(x, *self.gate.step(x, ids))
+        chosen, weights = self.gate(x, ids)
         if length * self.k >= SORTED_GATHER_MIN:
 
             def apply(tokens: mx.array, experts: mx.array) -> mx.array:

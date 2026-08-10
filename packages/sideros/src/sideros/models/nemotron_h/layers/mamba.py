@@ -2,7 +2,7 @@ import mlx.core as mx
 import mlx.nn as nn
 
 from sideros.core.cache import DeltaCache
-from sideros.core.kernels.ssm import ssm_attn, ssm_step_ref
+from sideros.core.kernels.ssm import Ssm
 from sideros.models.nemotron_h.config import NemotronHConfig
 
 
@@ -52,6 +52,25 @@ class NemotronHMamba(nn.Module):
             inner, inner // config.n_groups, config.layer_norm_epsilon
         )
         self.out_proj = nn.Linear(inner, config.hidden_size, bias=config.mamba_proj_bias)
+        self._ssm: Ssm | None = None
+
+    def _scan(self) -> Ssm:
+        """Resolved once, at the first step — after load, when the weights are final."""
+        ssm = self._ssm
+        if ssm is None:
+            config = self.config
+            ssm = Ssm(
+                A_log=self.A_log,
+                D=self.D,
+                dt_bias=self.dt_bias,
+                d_state=config.ssm_state_size,
+                heads=config.mamba_num_heads,
+                groups=config.n_groups,
+                time_step_limit=config.time_step_bounds,
+                step=config.chunk_size,
+            )
+            self._ssm = ssm
+        return ssm
 
     def convolve(self, x: mx.array, cache: DeltaCache) -> mx.array:
         config = self.config
@@ -90,12 +109,7 @@ class NemotronHMamba(nn.Module):
                 (1, config.mamba_num_heads, config.mamba_head_dim, config.ssm_state_size),
                 dtype=mx.float32,
             )
-        arguments = (hidden, self.A_log, b, c, self.D, dt, self.dt_bias, state)
-        limit = config.time_step_bounds
-        if length == 1:
-            out, state = ssm_step_ref(*arguments, limit)
-        else:
-            out, state = ssm_attn(*arguments, time_step_limit=limit, step=config.chunk_size)
+        out, state = self._scan()(hidden, b, c, dt, state)
         cache.state = state
         cache.offset += length
         return self.out_proj(self.norm(out.reshape(1, length, inner).astype(x.dtype), gate))

@@ -20,12 +20,14 @@ import pytest
 from conftest import relative_diff
 
 from sideros.core.kernels.gated_delta import (
-    _KERNEL,
-    _SOURCE,
+    DefaultGatedDelta,
+    FusedGatedDelta,
+    GatedDelta,
     delta_rule,
     gated_delta,
     gated_delta_applies,
 )
+from sideros.core.kernels.gated_delta.fused import _KERNEL, _SOURCE
 from sideros.core.layers import l2norm
 from sideros.core.mxcompat import metal_kernel
 
@@ -163,6 +165,67 @@ def test_public_entry_point_matches() -> None:
     ref_y, ref_state = inputs.reference()
     assert relative_diff(y, ref_y) < 1e-5
     assert relative_diff(state.transpose(0, 1, 3, 2), ref_state) < 1e-5
+
+
+def test_default_strategy_matches_reference() -> None:
+    """The ops strategy takes the kernel's convention (decay past the exp, q pre-scaled,
+    q/k unrepeated, `[B, Hv, Dv, Dk]` state) and must land on `delta_rule`'s output —
+    the adaptation is transposes and a repeat, no arithmetic."""
+    inputs = Inputs(8, BROADCAST, mx.float32)
+    hk, hv, dk, dv = BROADCAST
+    strategy = DefaultGatedDelta.build(
+        key_dim=dk, key_heads=hk, value_heads=hv, value_dim=dv, enabled=False
+    )
+    y, state = strategy(*inputs.kernel_args())
+    ref_y, ref_state = inputs.reference()
+    assert relative_diff(y, ref_y) < 1e-5
+    assert relative_diff(state.transpose(0, 1, 3, 2), ref_state) < 1e-5
+
+
+def test_default_strategy_per_channel_decay() -> None:
+    """The per-channel decay branch, against the kernel variant that serves it."""
+    inputs = Inputs(8, SMALL, mx.float32)
+    hk, hv, dk, dv = SMALL
+    rng = np.random.default_rng(0xDECA7)
+    g = mx.array(np.exp(-np.abs(rng.standard_normal((1, 8, hv, dk))) * 0.1), mx.float32)
+    q, k, v, _g, beta, state = inputs.kernel_args()
+    args = (q, k, v, g, beta, state)
+    fused = FusedGatedDelta.build(
+        key_dim=dk, key_heads=hk, value_heads=hv, value_dim=dv, enabled=True
+    )
+    assert fused is not None
+    ops = DefaultGatedDelta.build(
+        key_dim=dk, key_heads=hk, value_heads=hv, value_dim=dv, enabled=True
+    )
+    y, state_out = fused(*args)
+    ref_y, ref_state = ops(*args)
+    assert relative_diff(y, ref_y) < 1e-5
+    assert relative_diff(state_out, ref_state) < 1e-5
+
+
+@pytest.mark.parametrize("enabled", [True, False])
+def test_delegator_resolves_and_matches(enabled: bool) -> None:
+    """Total either way: the kernel when its tiling admits the shapes and the switch is
+    on, the ops recurrence otherwise, same call and same result."""
+    hk, hv, dk, dv = BROADCAST
+    facade = GatedDelta(
+        key_dim=dk, key_heads=hk, value_heads=hv, value_dim=dv, enabled=enabled
+    )
+    expected = FusedGatedDelta if enabled else DefaultGatedDelta
+    assert isinstance(facade.strategy, expected)
+
+    inputs = Inputs(8, BROADCAST, mx.float32)
+    y, state = facade(*inputs.kernel_args())
+    ref_y, ref_state = inputs.reference()
+    assert relative_diff(y, ref_y) < 1e-5
+    assert relative_diff(state.transpose(0, 1, 3, 2), ref_state) < 1e-5
+
+
+def test_delegator_falls_back_on_unfit_shapes() -> None:
+    assert isinstance(
+        GatedDelta(key_dim=100, key_heads=4, value_heads=4, value_dim=100).strategy,
+        DefaultGatedDelta,
+    )
 
 
 MUTATIONS = {

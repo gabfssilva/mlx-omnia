@@ -32,7 +32,16 @@ import numpy as np
 import pytest
 from conftest import relative_diff
 
-from sideros.core.kernels.moe_route import (
+from sideros.core.kernels.route import (
+    BiasTopkRoute,
+    DefaultRoute,
+    OrdinalRoute,
+    Route,
+    Routing,
+    SigmoidTopkRoute,
+    SoftmaxTopkRoute,
+)
+from sideros.core.kernels.route.softmax_topk import (
     _SIGMOID_SOURCE,
     _SOFTPLUS_GATHER_SOURCE,
     _SOFTPLUS_HEADER,
@@ -559,3 +568,109 @@ def test_softplus_unmutated_replica_agrees_with_the_module() -> None:
     intact = _softplus_route(_SOFTPLUS_SOURCE, "moe_softplus_intact", logits, bias, k)
     assert mx.array_equal(intact[0], indices)
     assert mx.array_equal(intact[1], weights)
+
+
+# --- the delegator ------------------------------------------------------------------
+# Resolution is the contract under test: every gate is an arithmetic claim, so a
+# declaration the kernel does not compute has to fall through to `DefaultRoute` rather
+# than be served a near-miss. The chain itself is covered above, per kernel.
+
+
+def _gate(rows: int) -> mx.array:
+    return mx.zeros((rows, 128))
+
+
+def test_delegator_resolves_each_family() -> None:
+    bias = mx.zeros((128,), dtype=mx.float32)
+    wide = mx.zeros((256,), dtype=mx.float32)
+    narrow = mx.zeros((32,), dtype=mx.float32)
+    assert isinstance(Route(_gate(128), experts=128, k=8).strategy, SoftmaxTopkRoute)
+    assert isinstance(
+        Route(_gate(129), experts=128, k=8, shared=True).strategy, SoftmaxTopkRoute
+    )
+    assert isinstance(
+        Route(_gate(128), experts=128, k=8, scoring="sigmoid", bias=bias, scale=2.5).strategy,
+        SoftmaxTopkRoute,
+    )
+    assert isinstance(
+        Route(
+            _gate(128),
+            experts=128,
+            k=8,
+            scoring="sqrt_softplus",
+            bias=bias,
+            norm_eps=1e-20,
+            scale=2.5,
+        ).strategy,
+        SoftmaxTopkRoute,
+    )
+    assert isinstance(
+        Route(
+            _gate(128), experts=128, k=8, bias=bias, normalize=False, scale=6.0
+        ).strategy,
+        BiasTopkRoute,
+    )
+    assert isinstance(
+        Route(_gate(256), experts=256, k=8, scoring="sigmoid", bias=wide).strategy,
+        OrdinalRoute,
+    )
+    assert isinstance(
+        Route(
+            _gate(32), experts=32, k=4, scoring="sigmoid", bias=narrow, norm_eps=1e-6
+        ).strategy,
+        SigmoidTopkRoute,
+    )
+
+
+def test_delegator_falls_back_rather_than_substituting_arithmetic() -> None:
+    bias = mx.zeros((128,), dtype=mx.float32)
+    # The shape no kernel tiles.
+    assert isinstance(Route(_gate(100), experts=100, k=8).strategy, DefaultRoute)
+    # A softcap none of them applies.
+    assert isinstance(
+        Route(_gate(128), experts=128, k=8, softcap=30.0).strategy, DefaultRoute
+    )
+    # A scale the renormalizing softmax kernel would drop.
+    assert isinstance(
+        Route(_gate(128), experts=128, k=8, scale=2.5).strategy, DefaultRoute
+    )
+    # A selection bias the softmax kernel does not read.
+    assert isinstance(
+        Route(_gate(128), experts=128, k=8, bias=bias).strategy, DefaultRoute
+    )
+    # A `sqrt(softplus)` renormalization with the wrong epsilon.
+    assert isinstance(
+        Route(_gate(128), experts=128, k=8, scoring="sqrt_softplus", bias=bias).strategy,
+        DefaultRoute,
+    )
+    # The sigmoid kernel always renormalizes.
+    assert isinstance(
+        Route(
+            _gate(128), experts=128, k=8, scoring="sigmoid", bias=bias, normalize=False
+        ).strategy,
+        DefaultRoute,
+    )
+
+
+@pytest.mark.parametrize("dtype", [mx.float32, mx.bfloat16])
+@pytest.mark.parametrize("shared", [False, True])
+def test_default_route_agrees_with_the_softmax_kernel(dtype: mx.Dtype, shared: bool) -> None:
+    """The two ends of the delegator on one declaration: same pick, same weights within
+    the family's bound."""
+    experts, k = 128, 8
+    routing = Routing(experts=experts, k=k, shared=shared)
+    gate = mx.zeros((experts + (1 if shared else 0), 4), dtype=dtype)
+    fused = SoftmaxTopkRoute.build(gate, routing=routing)
+    eager = DefaultRoute.build(gate, routing=routing)
+    assert fused is not None
+    for seed in range(4):
+        logits = replica(experts, k, seed, dtype, shared=shared)
+        row = mx.zeros((4,), dtype=dtype)
+        indices, weights = fused(row, logits=logits)
+        ref_indices, ref_weights = eager(row, logits=logits)
+        assert mx.array_equal(mx.sort(indices), mx.sort(ref_indices))
+        ours, theirs = _by_index(indices, weights), _by_index(ref_indices, ref_weights)
+        order = sorted(theirs)
+        assert relative_diff(
+            mx.array([ours[i] for i in order]), mx.array([theirs[i] for i in order])
+        ) < _weight_bound(dtype)

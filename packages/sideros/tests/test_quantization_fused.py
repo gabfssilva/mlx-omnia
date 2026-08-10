@@ -1,11 +1,12 @@
 import re
+from pathlib import Path
 
 import mlx.core as mx
 import pytest
 
-from sideros.checkpoint import fuse_qkv, interleave_gate_up
+from sideros.checkpoint import fuse_qkv, interleave_gate_up, load_shards, stack_experts
 from sideros.models.gpt2.checkpoint import _transpose_conv1d
-from sideros.quant.quantization import Affine, QuantizationPlan, quantize_weights
+from sideros.quant.quantization import NVFP, Affine, QuantizationPlan, quantize_weights
 
 _FORMAT = Affine(group_size=64, bits=4)
 _SUFFIXES = ("weight", "scales", "biases")
@@ -131,3 +132,56 @@ def test_a_fused_leaf_outside_the_plan_stays_dense_beside_its_neighbours() -> No
     assert quantized[f"{_ATTENTION}qkv_proj.weight"].dtype == mx.uint32
     assert quantized[f"{_SWITCH}gate_up_proj.weight"].dtype == mx.float32
     assert f"{_SWITCH}gate_up_proj.scales" not in quantized
+
+
+def test_lazy_fusions_over_mmap_quantize_identically_to_evaluated_ones(
+    tmp_path: Path,
+) -> None:
+    # As fusões de dict não avaliam mais: a primeira avaliação sobre os pesos mmap
+    # acontece dentro do packing, folha a folha (armadilha 2 — mmap corrompia a
+    # primeira avaliação). Os códigos têm que bater com os da fusão avaliada em memória.
+    mx.random.seed(0)
+    experts = 4
+    source = {
+        f"model.layers.0.mlp.experts.{expert}.{name}.weight": mx.random.normal((16, 64))
+        for expert in range(experts)
+        for name in ("gate_proj", "up_proj", "down_proj")
+    }
+    mx.eval(list(source.values()))
+    mx.save_safetensors(str(tmp_path / "model.safetensors"), source)
+    format = NVFP(group_size=16, bits=4)
+    plan = {f"{_SWITCH}{name}": format for name in ("gate_up_proj", "down_proj")}
+
+    lazy = quantize_weights(
+        interleave_gate_up(stack_experts(load_shards(tmp_path), 1, experts), 1), dict(plan)
+    )
+    evaluated = interleave_gate_up(stack_experts(dict(source), 1, experts), 1)
+    mx.eval(list(evaluated.values()))
+    eager = quantize_weights(evaluated, dict(plan))
+
+    assert sorted(lazy) == sorted(eager)
+    for key in sorted(eager):
+        assert mx.array_equal(lazy[key], eager[key]).item(), key
+
+
+def test_a_lazy_transpose_over_mmap_quantizes_identically(tmp_path: Path) -> None:
+    # A forma exata da armadilha 2 (mmap + transpose), agora sem eval entre a fusão e o
+    # packing — o que _split_kv_b e _transpose_conv1d produzem no caminho quantizante.
+    mx.random.seed(0)
+    raw = mx.random.normal((128, 64))
+    mx.eval(raw)
+    mx.save_safetensors(str(tmp_path / "model.safetensors"), {"model.kv_b.weight": raw})
+    path = "model.embed_q"
+    plan = {path: NVFP(group_size=16, bits=4)}
+
+    loaded = load_shards(tmp_path)
+    lazy = quantize_weights(
+        {f"{path}.weight": mx.contiguous(mx.swapaxes(loaded.pop("model.kv_b.weight"), -1, -2))},
+        dict(plan),
+    )
+    transposed = mx.contiguous(mx.swapaxes(raw, -1, -2))
+    mx.eval(transposed)
+    eager = quantize_weights({f"{path}.weight": transposed}, dict(plan))
+
+    for suffix in ("weight", "scales"):
+        assert mx.array_equal(lazy[f"{path}.{suffix}"], eager[f"{path}.{suffix}"]).item()

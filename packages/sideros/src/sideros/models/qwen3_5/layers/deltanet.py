@@ -4,7 +4,7 @@ import mlx.core as mx
 import mlx.nn as nn
 
 from sideros.core.cache import DeltaCache
-from sideros.core.kernels.gated_delta import delta_rule, gated_delta, gated_delta_applies
+from sideros.core.kernels.gated_delta import GatedDelta, GatedDeltaStrategy
 from sideros.models.qwen3_5.config import Qwen35TextConfig
 from sideros.models.qwen3_5.layers import flags
 
@@ -51,6 +51,29 @@ class Qwen35DeltaNet(nn.Module):
         self.A_log = mx.zeros((heads,), dtype=mx.float32)
         self.dt_bias = mx.zeros((heads,))
         self.config = config
+        self._rule: GatedDeltaStrategy | None = None
+        self._rule_key: tuple[object, ...] | None = None
+
+    def rule(self) -> GatedDeltaStrategy:
+        """Resolved once, at the first step — after load, when the shapes are final.
+
+        The A/B switch is part of the declaration, so the cache key carries it (and the
+        delegator's own binding): flipping the flag re-resolves instead of returning a
+        strategy built under the other answer.
+        """
+        key = (GatedDelta, flags.GATED_DELTA_KERNEL)
+        rule = self._rule
+        if rule is None or self._rule_key != key:
+            config = self.config
+            rule = GatedDelta(
+                key_dim=config.linear_key_head_dim,
+                key_heads=config.linear_num_key_heads,
+                value_heads=config.linear_num_value_heads,
+                value_dim=config.linear_value_head_dim,
+                enabled=flags.GATED_DELTA_KERNEL,
+            )
+            self._rule, self._rule_key = rule, key
+        return rule
 
     def _conv(self, x: mx.array, cache: DeltaCache) -> mx.array:
         """The depthwise causal conv unrolled into taps, then silu. `[1, T, conv_dim]`
@@ -93,38 +116,25 @@ class Qwen35DeltaNet(nn.Module):
         g = -mx.exp(self.A_log) * nn.softplus(dt)
         beta = mx.sigmoid(b)
 
+        # The rule's convention, whichever strategy serves it: `q` pre-scaled and
+        # l2-normalized at float32, the key heads left unrepeated (the strategy
+        # broadcasts them), the decay past the exp, the state `[1, Hv, Dv, Dk]`.
+        scale = 1 / math.sqrt(config.linear_key_head_dim)
         state = cache.state
-        if flags.GATED_DELTA_KERNEL and gated_delta_applies(
-            config.linear_key_head_dim, key_heads, heads, config.linear_value_head_dim
-        ):
-            # The kernel broadcasts the key heads itself and carries the state
-            # transposed ([B, Hv, Dv, Dk]), so neither repeat nor the log decay survive.
-            scale = 1 / math.sqrt(config.linear_key_head_dim)
-            if state is None:
-                shape = (1, heads, config.linear_value_head_dim, config.linear_key_head_dim)
-                state = mx.zeros(shape, dtype=mx.float32)
-            out, state = gated_delta(
-                l2norm(q, scale, dtype=mx.float32),
-                l2norm(k, dtype=mx.float32),
-                v.astype(mx.float32),
-                mx.exp(g),
-                beta.astype(mx.float32),
-                state,
-            )
-            # transformers rounds here (the gated norm reads the rule's output in the
-            # model dtype), so the kernel's float32 y does too.
-            out = out.astype(v.dtype)
-        else:
-            q, k = l2norm(q), l2norm(k)
-            if heads != key_heads:
-                # The key heads are broadcast into the value heads *interleaved*
-                # (head hv reads hv // (Hv/Hk)), which is what repeat does.
-                q = mx.repeat(q, heads // key_heads, axis=2)
-                k = mx.repeat(k, heads // key_heads, axis=2)
-            if state is None:
-                shape = (1, heads, config.linear_key_head_dim, config.linear_value_head_dim)
-                state = mx.zeros(shape, dtype=mx.float32)
-            out, state = delta_rule(q, k, v, g, beta, state)
+        if state is None:
+            shape = (1, heads, config.linear_value_head_dim, config.linear_key_head_dim)
+            state = mx.zeros(shape, dtype=mx.float32)
+        out, state = self.rule()(
+            l2norm(q, scale, dtype=mx.float32),
+            l2norm(k, dtype=mx.float32),
+            v.astype(mx.float32),
+            mx.exp(g),
+            beta.astype(mx.float32),
+            state,
+        )
+        # transformers rounds here (the gated norm reads the rule's output in the model
+        # dtype), so the float32 y does too.
+        out = out.astype(v.dtype)
         cache.state = state
         cache.offset += length
 

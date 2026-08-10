@@ -27,8 +27,7 @@ from sideros.models.qwen3_5.vision import (
     multimodal_positions,
     process_image,
 )
-from sideros.suppress import Segment
-from sideros.tools import ToolFamily
+from sideros.parsers import Parser, Segment
 from sideros.vision import RGB_IMAGE, Image
 
 
@@ -209,16 +208,16 @@ def stream_multimodal_ids(
 type Qwen35Input = Text | Image | LanguagePrompt
 
 
-def _family(input: Qwen35Input) -> ToolFamily | None:
-    """Which envelope this prompt's checkpoint spells a call in, off the prompt itself — the
+def _parser(input: Qwen35Input) -> Parser | None:
+    """Which dialect this prompt's checkpoint speaks, off the prompt itself — the
     capability put it there when it rendered. Reading it from a field of the facade instead is
     how this model came to suppress nothing: the loader never set one, and the only writer was
     a test."""
     match input:
         case Text():
-            return input.tool_family
+            return input.parser
         case LanguagePrompt(parts=parts):
-            return next((part.tool_family for part in parts if isinstance(part, Text)), None)
+            return next((part.parser for part in parts if isinstance(part, Text)), None)
         case Image():
             return None
         case _:
@@ -306,7 +305,7 @@ class Qwen35LanguageModel:
 
     def stream(self, input: Qwen35Input, options: GenerationOptions) -> Iterator[Segment]:
         stop = self.stop if options.stop is None else options.stop
-        family = _family(input)
+        parser = _parser(input)
         match input:
             case Text(value=rendered):
                 self.prefix = prefix_cache(self.prefix, options.prefix_budget)
@@ -340,4 +339,4 @@ class Qwen35LanguageModel:
             case _:
                 assert_never(input)
 
-        yield from stream_text(ids, self.tokenizer, tools=family, prompt=rendered)
+        yield from stream_text(ids, self.tokenizer, parser=parser, prompt=rendered)

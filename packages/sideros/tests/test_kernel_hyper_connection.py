@@ -1,12 +1,12 @@
 """mHC junction and expansion in one dispatch each, against the op chain
-(`hyper_connection`).
+(`DefaultHyperConnection`).
 
 The junction replica is the stock path of `HyperConnection.__call__`: rms_norm + gemv,
 sigmoid gates, comb softmax `+ eps`, a column normalization, `iters - 1` Sinkhorn
 rounds, and the fp32 collapse under the `pre` gate. The kernel receives the *raw* gemv
 output — `rms_norm(y) @ fn.T == (y @ fn.T) * rsqrt(mean(y*y) + eps)` — and recovers the
 inverse rms from `x` itself, so the fold is under test together with the epilogue. The
-expansion replica is the stock `hc_expand` chain: `post * x` over the copies plus
+expansion replica is the default `expand` chain: `post * x` over the copies plus
 `comb^T @ residual`, in fp32.
 
 Nothing here is bit-exact and nothing is asserted to be: the kernel's reductions are
@@ -21,17 +21,20 @@ import pytest
 from conftest import relative_diff
 
 from sideros.core.kernels.hyper_connection import (
-    _EXPAND_EMIT_SOURCE,
-    _SOURCE,
-    hc_expand,
-    hc_junction,
-    hc_junction_applies,
+    DefaultHyperConnection,
+    FusedHyperConnection,
+    HyperConnection,
 )
+from sideros.core.kernels.hyper_connection.fused import _EXPAND_EMIT_SOURCE, _SOURCE
 from sideros.core.mxcompat import metal_kernel, softmax
 
 HC, D = 4, 4096
 ITERS, EPS, NEPS = 20, 1e-6, 1e-6
 MIX = (2 + HC) * HC
+
+
+def junction(hc: int = HC, hidden: int = D) -> HyperConnection:
+    return HyperConnection(hc_mult=hc, hidden=hidden, iters=ITERS, eps=EPS, norm_eps=NEPS)
 
 
 def _ulps(dtype: mx.Dtype, count: int) -> float:
@@ -72,14 +75,21 @@ def stock_mixes(x: mx.array) -> mx.array:
     return mx.fast.rms_norm(x.astype(mx.float32).flatten(-2), None, NEPS)
 
 
-def test_applies_predicate() -> None:
+@pytest.mark.parametrize(
+    ("hc", "hidden", "fused"),
+    [(4, 4096, True), (4, 8, True), (2, 4096, False), (8, 4096, False), (4, 4098, False)],
+)
+def test_the_delegator_resolves_the_kernel_only_on_its_shapes(
+    hc: int, hidden: int, fused: bool
+) -> None:
     """One float4 per comb row and a four-way unrolled collapse: hc_mult is exactly 4,
-    the hidden a multiple of 4."""
-    assert hc_junction_applies(4, 4096)
-    assert hc_junction_applies(4, 8)
-    assert not hc_junction_applies(2, 4096)
-    assert not hc_junction_applies(8, 4096)
-    assert not hc_junction_applies(4, 4098)
+    the hidden a multiple of 4. Everything else falls to the default, which accepts all."""
+    built = FusedHyperConnection.build(
+        hc_mult=hc, hidden=hidden, iters=ITERS, eps=EPS, norm_eps=NEPS
+    )
+    assert (built is not None) == fused
+    expected = FusedHyperConnection if fused else DefaultHyperConnection
+    assert isinstance(junction(hc, hidden).strategy, expected)
 
 
 @pytest.mark.parametrize("dtype", [mx.float32, mx.bfloat16])
@@ -89,9 +99,7 @@ def test_junction_matches_op_chain(length: int, dtype: mx.Dtype) -> None:
         x, fn, scale, base, nw = replica(seed, length, dtype)
         raw = (x.flatten(-2) @ fn.T)[..., None, :]
         mixes = stock_mixes(x) @ fn.T
-        normed, post, comb = hc_junction(
-            x, raw, scale, base, nw, iters=ITERS, eps=EPS, norm_eps=NEPS
-        )
+        normed, post, comb = junction()(x, raw, scale, base, nw)
         ref_normed, ref_post, ref_comb = op_chain_from(x, mixes, scale, base, nw)
         # 16 ulps, not 8: the folded output norm adds a reduction and two multiplies of
         # its own rounding on top of the collapse's — still two orders under the 1e-5
@@ -101,8 +109,24 @@ def test_junction_matches_op_chain(length: int, dtype: mx.Dtype) -> None:
         assert relative_diff(comb, ref_comb) < 1e-5
 
 
+def test_the_default_recovers_the_mixes_from_the_raw_partials() -> None:
+    """The default reads the same raw gemv the kernel does: `rms_norm(y, None, eps) @ fn.T
+    == (y @ fn.T) * rsqrt(mean(y*y) + eps)`, so no strategy needs `fn`."""
+    for seed in range(3):
+        x, fn, scale, base, nw = replica(seed, 7, mx.float32)
+        raw = (x.flatten(-2) @ fn.T)[..., None, :]
+        strategy = DefaultHyperConnection.build(
+            hc_mult=HC, hidden=D, iters=ITERS, eps=EPS, norm_eps=NEPS
+        )
+        normed, post, comb = strategy(x, raw, scale, base, nw)
+        ref_normed, ref_post, ref_comb = op_chain_from(x, stock_mixes(x) @ fn.T, scale, base, nw)
+        assert relative_diff(normed, ref_normed) < 1e-5
+        assert relative_diff(post, ref_post) < 1e-5
+        assert relative_diff(comb, ref_comb) < 1e-5
+
+
 def expand_chain(x: mx.array, residual: mx.array, post: mx.array, comb: mx.array) -> mx.array:
-    """The stock `hc_expand` op chain, verbatim."""
+    """The default `expand` op chain, verbatim."""
     y = post[..., None] * x[:, :, None, :].astype(mx.float32)
     return (y + mx.matmul(comb.swapaxes(-1, -2), residual.astype(mx.float32))).astype(x.dtype)
 
@@ -123,7 +147,7 @@ def expand_replica(
 def test_expand_matches_op_chain(length: int, dtype: mx.Dtype) -> None:
     for seed in range(3):
         x, residual, post, comb = expand_replica(seed, length, dtype)
-        got, partials = hc_expand(x, residual, post, comb)
+        got, partials = junction().expand(x, residual, post, comb)
         ref = expand_chain(x, residual, post, comb)
         assert partials is None
         assert relative_diff(got, ref) < _ulps(dtype, 8)
@@ -140,7 +164,7 @@ def test_expand_partials_match_the_gemv(length: int, dtype: mx.Dtype) -> None:
         fn = mx.random.normal((MIX, HC * D), scale=0.02, key=mx.random.key(70 + seed)).astype(
             mx.float32
         )
-        expanded, partials = hc_expand(x, residual, post, comb, fn)
+        expanded, partials = junction().expand(x, residual, post, comb, fn)
         assert partials is not None
         ref = expanded.flatten(-2).astype(mx.float32) @ fn.T
         assert relative_diff(partials.sum(axis=2), ref) < 1e-5
@@ -266,9 +290,7 @@ def test_mutations_break_the_expansion(mutation: str) -> None:
 def test_unmutated_replica_of_the_dispatch_agrees_with_the_module() -> None:
     x, fn, scale, base, nw = replica(4, 2, mx.float32)
     raw = (x.flatten(-2) @ fn.T)[..., None, :]
-    normed, post, comb = hc_junction(
-        x, raw, scale, base, nw, iters=ITERS, eps=EPS, norm_eps=NEPS
-    )
+    normed, post, comb = junction()(x, raw, scale, base, nw)
     intact = _junction(_SOURCE, "hc_junction_intact", x, raw, scale, base, nw)
     assert mx.array_equal(intact[0], normed)
     assert mx.array_equal(intact[1], post)

@@ -8,7 +8,7 @@ import mlx.core as mx
 import mlx.nn as nn
 
 from sideros.core.cache import FixedKVCache, KVCache, LayerCache, RingKVCache
-from sideros.core.kernels.rope_epilogue import rope_epilogue, rope_epilogue_applies
+from sideros.core.kernels.qkv_rope import QkvRope
 from sideros.core.layers import SwiGLU, split_qkv
 from sideros.core.masks import causal_mask
 from sideros.core.rope import LlamaRoPEScaling, ScalingJson, llama3_freqs
@@ -331,6 +331,7 @@ class NormalizedFusedQKVAttention(FusedQKVAttention):
         self.window = window
         self._automatic_mask = automatic_mask
         self._norm_layout = norm_layout
+        self._prologue_kernel: QkvRope | None = None
         if not normalize:
             return
         query_norm = query_norm or nn.RMSNorm(head_dim, eps=norm_eps)
@@ -386,28 +387,30 @@ class NormalizedFusedQKVAttention(FusedQKVAttention):
             values.transpose(0, 2, 1, 3),
         )
 
+    def _prologue(self) -> QkvRope:
+        """Resolved once, at the first fused step — after load, when the projection's
+        format is final."""
+        prologue = self._prologue_kernel
+        if prologue is None:
+            prologue = QkvRope(
+                self._qkv_projection,
+                heads=self.heads,
+                kv_heads=self.kv_heads,
+                head_dim=self.head_dim,
+                rope=self.rope,
+                eps=self.eps,
+                q_norm=self.q_norm.weight,
+                k_norm=self.k_norm.weight,
+                base=self.rope_theta,
+            )
+            self._prologue_kernel = prologue
+        return prologue
+
     def step_heads(
         self, x: mx.array, offset: int | mx.array
     ) -> tuple[mx.array, mx.array, mx.array]:
         """Fuse projection epilogue, QK normalization and RoPE for decode."""
-        fused = self._qkv_projection(x)
-        queries, keys = rope_epilogue(
-            fused,
-            query_heads=self.heads,
-            kv_heads=self.kv_heads,
-            head_dim=self.head_dim,
-            q_norm=self.q_norm.weight,
-            k_norm=self.k_norm.weight,
-            offset=offset,
-            base=self.rope_theta,
-            eps=self.eps,
-        )
-        values = fused[..., (self.heads + self.kv_heads) * self.head_dim :]
-        return (
-            queries.reshape(x.shape[0], self.heads, 1, self.head_dim),
-            keys.reshape(x.shape[0], self.kv_heads, 1, self.head_dim),
-            values.reshape(x.shape[0], self.kv_heads, 1, self.head_dim),
-        )
+        return self._prologue()(x, offset)
 
     def step_applies(self, length: int) -> bool:
         """Return whether the fused normalized-RoPE decode path applies."""
@@ -419,7 +422,6 @@ class NormalizedFusedQKVAttention(FusedQKVAttention):
             and self.rope_dims == self.head_dim
             and not self.traditional
             and length == 1
-            and rope_epilogue_applies(self.head_dim)
         )
 
     def attention_mask(self, queries: int, keys: int) -> AttentionMask:

@@ -2,10 +2,9 @@ import mlx.core as mx
 import mlx.nn as nn
 
 from sideros.core.cache import KVCache
-from sideros.core.kernels.add_rms_norm import add_rms_norm, add_rms_norm_applies
+from sideros.core.kernels.add_norm import AddRmsNorm
 from sideros.core.layers import SwiGLU
 from sideros.models.hy3.config import SPARSE, Hy3Config
-from sideros.models.hy3.layers import flags
 from sideros.models.hy3.layers.attention import Hy3Attention
 from sideros.models.hy3.layers.moe import Hy3SparseMoe
 
@@ -22,9 +21,8 @@ class Hy3Block(nn.Module):
         self.post_attention_layernorm = nn.RMSNorm(
             config.hidden_size, eps=config.rms_norm_eps
         )
-        self.eps = config.rms_norm_eps
-        self.hidden = config.hidden_size
         self.k = config.num_experts_per_tok
+        self._join_norm: AddRmsNorm | None = None
 
     def __call__(
         self, x: mx.array, mask: mx.array | str | None, cache: KVCache
@@ -35,20 +33,20 @@ class Hy3Block(nn.Module):
             return mlp.fused_step(h, attended)
         return attended + self.mlp(h)
 
+    def _add_norm(self) -> AddRmsNorm:
+        """Resolved once, at the first step — after load, when the leaf is final."""
+        join = self._join_norm
+        if join is None:
+            join = AddRmsNorm(self.post_attention_layernorm)
+            self._join_norm = join
+        return join
+
     def _join(
         self, x: mx.array, mask: mx.array | str | None, cache: KVCache
     ) -> tuple[mx.array, mx.array]:
-        """(x + attention, its post-norm). At T=1 one kernel does the pair."""
-        if flags.ADD_RMS_NORM_KERNEL and x.shape[1] == 1 and add_rms_norm_applies(self.hidden):
-            normed = mx.fast.rms_norm(x, self.input_layernorm.weight, self.eps)
-            return add_rms_norm(
-                x,
-                self.self_attn(normed, cache, mask),
-                self.post_attention_layernorm.weight,
-                self.eps,
-            )
-        attended = x + self.self_attn(self.input_layernorm(x), cache, mask)
-        return attended, self.post_attention_layernorm(attended)
+        """(x + attention, its post-norm)."""
+        attended = self.self_attn(self.input_layernorm(x), cache, mask)
+        return self._add_norm()(x, attended)
 
 
 class Hy3Trunk(nn.Module):

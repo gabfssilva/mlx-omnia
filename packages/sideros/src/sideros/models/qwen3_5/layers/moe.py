@@ -5,29 +5,40 @@ import mlx.nn as nn
 
 from sideros.core.kernels.down_combine import DownCombine
 from sideros.core.kernels.gate_up import GateUp
-from sideros.core.kernels.moe_route import softmax_topk, softmax_topk_applies
-from sideros.core.layers import SORTED_GATHER_MIN, SwitchLinear, sorted_gather
+from sideros.core.kernels.route import Route
+from sideros.core.layers import (
+    SORTED_GATHER_MIN,
+    SegmentedLinear,
+    SwitchLinear,
+    sorted_gather,
+)
 from sideros.core.mxcompat import softmax
 from sideros.models.qwen3_5.config import Qwen35TextConfig
 
 
 class Qwen35SharedExpert(nn.Module):
-    """Only the shared expert's `down_proj` lives here: its gate and up are row 256 of
-    the routed stack, but appending a 257th row to the *down* stack would materialize
-    the one tensor that goes mmap'd from the file into the model (5.4 GB at 6 bits)."""
+    """The shared expert as its own three leaves, beside the routed stack rather than
+    inside it — gate‖up in the stack's row-interleaved layout, so the same epilogue reads
+    both. A stack holds one quantization format and a per-leaf plan gives this expert its
+    own (the 35B oQ ships the routed experts at 3 bits and this one at 8); appending a
+    257th row would also materialize the *down* tensor, the one that goes mmap'd from the
+    file into the model (5.4 GB at 6 bits). The spare slot of the T=1 kernels is what
+    keeps it inside the fused step regardless."""
 
     def __init__(self, config: Qwen35TextConfig) -> None:
         super().__init__()
-        self.down_proj = nn.Linear(config.moe_intermediate_size, config.hidden_size, bias=False)
+        inner = config.moe_intermediate_size
+        self.gate_up_proj = nn.Linear(config.hidden_size, 2 * inner, bias=False)
+        self.down_proj = nn.Linear(inner, config.hidden_size, bias=False)
 
 
 class Qwen35SwitchGLU(nn.Module):
-    """gate‖up row-interleaved ([g0,u0,g1,…]) with the shared expert stacked as the
-    last row — one gather reads both projections of any slot, routed or shared."""
+    """gate‖up row-interleaved ([g0,u0,g1,…]) — one gather reads both projections of a
+    routed expert."""
 
     def __init__(self, experts: int, hidden: int, inner: int) -> None:
         super().__init__()
-        self.gate_up_proj = SwitchLinear(experts + 1, hidden, 2 * inner)
+        self.gate_up_proj = SwitchLinear(experts, hidden, 2 * inner)
         self.down_proj = SwitchLinear(experts, inner, hidden)
         self.inner = inner
 
@@ -60,6 +71,7 @@ class Qwen35MoE(nn.Module):
             config.num_experts, config.hidden_size, config.moe_intermediate_size
         )
         self.shared_expert = Qwen35SharedExpert(config)
+        self._route: Route | None = None
         self._gate_up: GateUp | None = None
         self._down: DownCombine | None = None
 
@@ -87,12 +99,9 @@ class Qwen35MoE(nn.Module):
         return switch.down_proj(act, chosen).squeeze(-2)
 
     def _shared(self, x: mx.array) -> mx.array:
-        """The shared expert reads slot 256 of the gate‖up stack and its own down."""
-        switch = self.switch_mlp
-        slot = mx.full((*x.shape[:-1], 1), self.experts, dtype=mx.uint32)
-        tokens = mx.expand_dims(x, (-2, -3))
-        act = switch.activate(switch.gate_up_proj(tokens, slot, sorted_indices=True))
-        return self.shared_expert.down_proj(act.squeeze(-2).squeeze(-2))
+        """The shared expert through its own leaves, in the stack's interleaved layout."""
+        shared = self.shared_expert
+        return shared.down_proj(self.switch_mlp.activate(shared.gate_up_proj(x)))
 
     def internals(self, x: mx.array) -> Qwen35MoEInternals:
         logits = self.gate(x)
@@ -101,31 +110,43 @@ class Qwen35MoE(nn.Module):
         shared = mx.sigmoid(logits[..., self.experts :]) * self._shared(x)
         return Qwen35MoEInternals(probs, chosen, weights, routed, shared, routed + shared)
 
-    def _kernels(self) -> tuple[GateUp, DownCombine]:
+    def _kernels(self) -> tuple[Route, GateUp, DownCombine]:
         """Resolved once, at the first T=1 step — after load, when the leaves'
         formats are final."""
-        gate_up, down = self._gate_up, self._down
-        if gate_up is None or down is None:
+        route, gate_up, down = self._route, self._gate_up, self._down
+        if route is None or gate_up is None or down is None:
             switch = self.switch_mlp
-            gate_up = GateUp(switch.gate_up_proj, hidden=self.hidden, inner=switch.inner)
+            gate = self.gate
+            # The gate runs its own gemv below (its leaf may be quantized), so the
+            # matrix here only ever serves a strategy that fuses one — and a router the
+            # loader kept segmented has no single matrix to hand it.
+            route = Route(
+                None if isinstance(gate, SegmentedLinear) else gate.weight,
+                experts=self.experts,
+                k=self.k,
+                shared=True,
+            )
+            gate_up = GateUp(
+                switch.gate_up_proj,
+                hidden=self.hidden,
+                inner=switch.inner,
+                shared=self.shared_expert.gate_up_proj,
+            )
             down = DownCombine(
                 switch.down_proj,
                 hidden=self.hidden,
                 inner=switch.inner,
                 shared=self.shared_expert.down_proj,
             )
-            self._gate_up, self._down = gate_up, down
-        return gate_up, down
-
-    def fused_step_applies(self) -> bool:
-        return softmax_topk_applies(self.experts, self.k)
+            self._route, self._gate_up, self._down = route, gate_up, down
+        return route, gate_up, down
 
     def fused_step(self, x: mx.array, residual: mx.array) -> mx.array:
         """Four dispatches for the whole sparse block at T=1: the shared expert rides
         along as the ninth slot, so routing, silu, weighting, the expert sum and the
         residual all stay inside the two gemv kernels."""
-        gate_up, down = self._kernels()
-        chosen, weights = softmax_topk(self.gate(x).reshape(-1), self.k, shared=True)
+        route, gate_up, down = self._kernels()
+        chosen, weights = route(x.reshape(-1), logits=self.gate(x).reshape(-1))
         act = gate_up(x.reshape(-1), chosen)
         return down(act, chosen, weights, residual.reshape(-1)).reshape(1, 1, self.hidden)
 

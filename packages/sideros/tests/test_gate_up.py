@@ -47,7 +47,15 @@ def default(
     bias: mx.array | None = None,
 ) -> DefaultGateUp:
     return DefaultGateUp.build(
-        quantized, hidden=HIDDEN, inner=INNER, activation=activation, limit=limit, bias=bias
+        quantized,
+        hidden=HIDDEN,
+        inner=INNER,
+        activation=activation,
+        limit=limit,
+        bias=bias,
+        layout="interleaved",
+        routing=None,
+        shared=None,
     )
 
 

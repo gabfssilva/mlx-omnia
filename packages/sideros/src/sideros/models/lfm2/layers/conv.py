@@ -2,8 +2,7 @@ import mlx.core as mx
 import mlx.nn as nn
 
 from sideros.core.cache import ConvCache
-from sideros.core.kernels.conv_mix import conv_mix, conv_mix_applies
-from sideros.models.lfm2.layers import flags
+from sideros.core.kernels.conv_mix import ConvMix
 
 
 class ShortConvWeight(nn.Module):
@@ -27,15 +26,29 @@ class LFM2Conv(nn.Module):
         self.conv = ShortConvWeight(hidden, kernel, bias)
         self.in_proj = nn.Linear(hidden, 3 * hidden, bias=bias)
         self.out_proj = nn.Linear(hidden, hidden, bias=bias)
+        self._mix: ConvMix | None = None
 
     def fused_step_applies(self) -> bool:
-        return (
-            flags.CONV_MIX_FUSED
-            and type(self.in_proj) is nn.Linear
-            and "bias" not in self.in_proj
-            and "bias" not in self.conv
-            and conv_mix_applies(self.hidden, self.kernel, has_bias=False)
-        )
+        """The primitive contracts on in_proj's matrix, which only a dense leaf carries."""
+        return type(self.in_proj) is nn.Linear
+
+    def mixer(self) -> ConvMix:
+        """Resolved once, at the first T=1 step — after load, when the leaf's format and
+        the biases are final."""
+        mix = self._mix
+        if mix is None:
+            proj_bias = self.in_proj.bias if "bias" in self.in_proj else None
+            conv_bias = self.conv.bias if "bias" in self.conv else None
+            assert proj_bias is None or isinstance(proj_bias, mx.array)
+            assert conv_bias is None or isinstance(conv_bias, mx.array)
+            mix = ConvMix(
+                hidden=self.hidden,
+                kernel=self.kernel,
+                proj_bias=proj_bias,
+                conv_bias=conv_bias,
+            )
+            self._mix = mix
+        return mix
 
     def fused_step(self, x: mx.array, cache: ConvCache) -> mx.array:
         """in_proj, B·x, the three taps and C's gate in one dispatch; out_proj follows."""
@@ -44,8 +57,11 @@ class LFM2Conv(nn.Module):
             window = mx.zeros((1, self.kernel - 1, self.hidden), dtype=x.dtype)
         weight = self.in_proj.weight
         assert isinstance(weight, mx.array)
-        gated, slid = conv_mix(
-            x.reshape(-1), weight, self.conv.weight.reshape(-1), window.reshape(2, self.hidden)
+        gated, slid = self.mixer()(
+            x.reshape(-1),
+            weight,
+            self.conv.weight.reshape(-1),
+            window.reshape(self.kernel - 1, self.hidden),
         )
         cache.window = slid[None]
         return self.out_proj(gated.reshape(1, 1, self.hidden))

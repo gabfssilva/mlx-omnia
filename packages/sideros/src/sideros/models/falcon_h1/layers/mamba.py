@@ -2,7 +2,7 @@ import mlx.core as mx
 import mlx.nn as nn
 
 from sideros.core.cache import DeltaCache
-from sideros.core.kernels.ssm import ssm_update
+from sideros.core.kernels.ssm import Ssm
 from sideros.models.falcon_h1.config import FalconH1Config
 
 
@@ -97,6 +97,24 @@ class FalconH1Mixer(nn.Module):
         self.out_proj = nn.Linear(
             self.intermediate_size, config.hidden_size, bias=config.projectors_bias
         )
+        self._ssm: Ssm | None = None
+
+    def _scan(self) -> Ssm:
+        """Resolved once, at the first step — after load, when the weights are final."""
+        ssm = self._ssm
+        if ssm is None:
+            ssm = Ssm(
+                A_log=self.A_log,
+                D=self.D,
+                dt_bias=self.dt_bias,
+                d_state=self.ssm_state_size,
+                heads=self.num_heads,
+                groups=self.n_groups,
+                time_step_limit=self.time_step_limit,
+                step=self.chunk_size,
+            )
+            self._ssm = ssm
+        return ssm
 
     def __call__(self, x: mx.array, cache: DeltaCache) -> mx.array:
         length = x.shape[1]
@@ -122,19 +140,12 @@ class FalconH1Mixer(nn.Module):
                 (1, self.num_heads, self.head_dim, self.ssm_state_size), dtype=mx.float32
             )
 
-        y, ssm_state = ssm_update(
-            hidden,
-            self.A_log,
-            B,
-            C,
-            self.D,
+        y, ssm_state = self._scan()(
+            hidden.reshape(1, length, self.num_heads, self.head_dim),
+            B.reshape(1, length, self.n_groups, self.ssm_state_size),
+            C.reshape(1, length, self.n_groups, self.ssm_state_size),
             dt,
-            self.dt_bias,
             ssm_state,
-            time_step_limit=self.time_step_limit,
-            step=self.chunk_size,
-            d_state=self.ssm_state_size,
-            groups=self.n_groups,
         )
         cache.state = ssm_state
         y = y.reshape(1, length, self.intermediate_size)

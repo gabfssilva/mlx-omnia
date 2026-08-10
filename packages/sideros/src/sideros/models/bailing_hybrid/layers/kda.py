@@ -2,10 +2,14 @@ import mlx.core as mx
 import mlx.nn as nn
 
 from sideros.core.cache import DeltaCache
-from sideros.core.kernels.gated_delta import gated_delta, gated_delta_applies
+from sideros.core.kernels.gated_delta import GatedDelta, gated_delta, gated_delta_applies
 from sideros.core.layers import l2norm, swish
 from sideros.models.bailing_hybrid.config import BailingHybridConfig
 from sideros.models.bailing_hybrid.layers import flags
+
+# `gated_delta` is re-exported: the compiled one-token step in `block.py` binds the
+# kernel directly, and its trace key reads it from here.
+__all__ = ["ConvWeight", "GatedRMSNorm", "KimiDeltaAttention", "gated_delta"]
 
 
 class ConvWeight(nn.Module):
@@ -29,23 +33,6 @@ class GatedRMSNorm(nn.Module):
         return normed * mx.sigmoid(gate.astype(mx.float32)).astype(normed.dtype)
 
 
-def kda_rule(
-    q: mx.array, k: mx.array, v: mx.array, g: mx.array, beta: mx.array, state: mx.array
-) -> tuple[mx.array, mx.array]:
-    """The delta rule with a diagonal decay, token by token — the reference the kernel's
-    per-channel variant is validated against. Same shapes the kernel takes, including its
-    `[B, H, Dv, Dk]` state, so the two are swappable."""
-    outputs: list[mx.array] = []
-    for step in range(q.shape[1]):
-        keys = k[:, step, :, None, :]
-        state = state * g[:, step, :, None, :]
-        memory = (state * keys).sum(axis=-1)
-        delta = (v[:, step] - memory) * beta[:, step, :, None]
-        state = state + keys * delta[..., None]
-        outputs.append((state * q[:, step, :, None, :]).sum(axis=-1))
-    return mx.stack(outputs, axis=1).astype(q.dtype), state
-
-
 class KimiDeltaAttention(nn.Module):
     def __init__(self, config: BailingHybridConfig) -> None:
         super().__init__()
@@ -60,6 +47,23 @@ class KimiDeltaAttention(nn.Module):
         self.o_norm = GatedRMSNorm(config.head_dim, config.rms_norm_eps)
         self.o_proj = nn.Linear(width, hidden, bias=False)
         self.splits = (3 * width, 4 * width, 5 * width)
+        self._rule: GatedDelta | None = None
+
+    def rule(self) -> GatedDelta:
+        """Resolved once, at the first step — after load, when the A/B switch is final."""
+        rule = self._rule
+        if rule is None:
+            config = self.config
+            heads = config.num_attention_heads
+            rule = GatedDelta(
+                key_dim=config.head_dim,
+                key_heads=heads,
+                value_heads=heads,
+                value_dim=config.head_dim,
+                enabled=flags.GATED_DELTA_KERNEL,
+            )
+            self._rule = rule
+        return rule
 
     def convolve(self, projected: mx.array, cache: DeltaCache) -> mx.array:
         """q‖k‖v through their depthwise causal conv: `projected` is `[1, length, 3·width]`
@@ -115,8 +119,7 @@ class KimiDeltaAttention(nn.Module):
         state = cache.state
         if state is None:
             state = mx.zeros((1, heads, head_dim, head_dim), dtype=mx.float32)
-        rule = gated_delta if self.fits() else kda_rule
-        out, state = rule(
+        out, state = self.rule()(
             l2norm(q, head_dim**-0.5, dtype=mx.float32),
             l2norm(k, dtype=mx.float32),
             v.astype(mx.float32),

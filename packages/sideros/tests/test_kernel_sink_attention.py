@@ -19,9 +19,9 @@ import mlx.core as mx
 import pytest
 from conftest import relative_diff
 
-import sideros.core.kernels.sink_attention as sa
+import sideros.core.kernels.attention.sink as sa
 from sideros.core.cache import KVCache
-from sideros.core.kernels.sink_attention import sink_attention, sink_attention_applies
+from sideros.core.kernels.attention.sink import sink_attention, sink_attention_applies
 from sideros.models.gpt_oss import (
     GPTOSSAttention,
     GPTOSSConfig,
@@ -93,8 +93,15 @@ class Step:
                 strict=True,
             )
         )
-        keys, values = cache.update_and_fetch(attention._rope(k, offset), v)
-        return attention._rope(q, offset), keys, values
+        def rope(x: mx.array) -> mx.array:
+            scaled = x * attention._mscale if attention._mscale != 1.0 else x
+            return mx.fast.rope(
+                scaled, attention.head_dim, traditional=False, base=None, scale=1.0,
+                offset=offset, freqs=attention._freqs,
+            )
+
+        keys, values = cache.update_and_fetch(rope(k), v)
+        return rope(q), keys, values
 
     def mask(self, sliding: bool) -> mx.array | None:
         if not sliding:

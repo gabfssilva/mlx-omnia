@@ -1,7 +1,7 @@
-"""The affine down/combine kernel. The dequant helper (`qmoeDot`) is the gate-up
-half's, imported from `gate_up.affine` — same bytes on both sides of the step. The
-spare slot serves a shared expert quantized exactly like the routed stack; a shared
-quantized differently folds into the residual on the caller's side instead."""
+"""The affine down/combine kernel. The dequant helper (`qmoeDot`) is shared with the
+gate-up half, from `shared.affine` — same bytes on both sides of the step. The
+spare slot serves a shared expert on its own bit width and group size: a stack holds one
+format and a per-leaf plan gives that expert another."""
 
 from dataclasses import dataclass
 from typing import Self
@@ -9,7 +9,8 @@ from typing import Self
 import mlx.core as mx
 import mlx.nn as nn
 
-from sideros.core.kernels.gate_up.affine import HEADER
+from sideros.core.kernels.down_combine.kernel import Layout
+from sideros.core.kernels.shared.affine import HEADER
 from sideros.core.layers import QuantizedSwitchLinear, SwitchLinear
 from sideros.core.mxcompat import metal_kernel
 
@@ -21,18 +22,21 @@ _SOURCE = """
 
     constexpr uint values_per_thread = VPT;
     constexpr uint block = values_per_thread * 32;
-    constexpr uint bytes_per_thread = values_per_thread * BITS / 8;
 
     uint kdim = (uint)KD;
-    uint kg = kdim / (uint)GSIZE;
-    uint kw_bytes = kdim * BITS / 8;
-    uint lanes_per_group = (uint)GSIZE / values_per_thread;
-
     uint row0 = tgy * 8 + sg * 4;
     uint rows = (uint)N;
     float acc[4] = {0.0f, 0.0f, 0.0f, 0.0f};
     for (uint e = 0; e < (uint)TOPK; e++) {
+        // The shared slot reads its own leaf on its own width and group; without the
+        // declaration `last` is a compile-time false and the whole branch folds away.
         bool last = SHARED && e == (uint)TOPK - 1;
+        uint bits = last ? (uint)SBITS : (uint)BITS;
+        uint group = last ? (uint)SGSIZE : (uint)GSIZE;
+        uint bytes_per_thread = values_per_thread * bits / 8;
+        uint kg = kdim / group;
+        uint kw_bytes = kdim * bits / 8;
+        uint lanes_per_group = group / values_per_thread;
         size_t base = last ? (size_t)row0 : (size_t)IDX[e] * rows + row0;
         const device uint8_t* ws = (const device uint8_t*)(last ? SW : W)
             + base * kw_bytes + lane * bytes_per_thread;
@@ -49,10 +53,13 @@ _SOURCE = """
                 xs_ += xt[j];
             }
             for (uint row = 0; row < 4; row++) {
-                float s = (float)sl[row * kg + k / (uint)GSIZE];
-                float b = (float)bl[row * kg + k / (uint)GSIZE];
-                float d = qmoeDot<BITS, values_per_thread>(
-                    ws + row * kw_bytes + k * BITS / 8, xt);
+                float s = (float)sl[row * kg + k / group];
+                float b = (float)bl[row * kg + k / group];
+                float d = last
+                    ? qmoeDot<SBITS, values_per_thread>(
+                        ws + row * kw_bytes + k * bits / 8, xt)
+                    : qmoeDot<BITS, values_per_thread>(
+                        ws + row * kw_bytes + k * bits / 8, xt);
                 res[row] += d * s + xs_ * b;
             }
         }
@@ -73,7 +80,9 @@ _SOURCE = """
 
 _KERNEL = metal_kernel(
     name="moe_down_combine",
-    input_names=["ACT", "W", "S", "Bs", "IDX", "WTS", "RES", "SW", "SS", "SB", "N", "KD", "GSIZE"],
+    input_names=[
+        "ACT", "W", "S", "Bs", "IDX", "WTS", "RES", "SW", "SS", "SB", "N", "KD", "GSIZE", "SGSIZE"
+    ],
     output_names=["Y"],
     source=_SOURCE,
     header=HEADER,
@@ -93,7 +102,7 @@ class AffineDownCombine:
     biases: mx.array
     group_size: int
     bits: int
-    shared: tuple[mx.array, mx.array, mx.array] | None
+    shared: tuple[mx.array, mx.array, mx.array, int, int] | None
 
     @classmethod
     def build(
@@ -104,24 +113,29 @@ class AffineDownCombine:
         inner: int,
         bias: mx.array | None,
         shared: nn.Linear | nn.QuantizedLinear | None,
+        layout: Layout,
     ) -> Self | None:
+        if layout != "interleaved":
+            return None
         if not isinstance(leaf, QuantizedSwitchLinear) or leaf.mode != "affine":
             return None
         if bias is not None or leaf.biases is None:
             return None
         if not applies(hidden, inner, leaf.group_size):
             return None
-        packed: tuple[mx.array, mx.array, mx.array] | None = None
+        packed: tuple[mx.array, mx.array, mx.array, int, int] | None = None
         if shared is not None:
-            # The kernel is templated on one BITS and reads one group size: the spare
-            # slot only serves a shared quantized exactly like the routed stack.
-            if not isinstance(shared, nn.QuantizedLinear):
+            # The spare slot decodes on its own width and group; what it cannot be is a
+            # mode this kernel has no decoder for, or a geometry the tiling misses.
+            if not isinstance(shared, nn.QuantizedLinear) or shared.mode != "affine":
                 return None
-            if (shared.bits, shared.group_size) != (leaf.bits, leaf.group_size):
+            if not isinstance(shared.biases, mx.array) or shared.bits > 8:
                 return None
-            if not isinstance(shared.biases, mx.array):
+            if "bias" in shared or not applies(hidden, inner, shared.group_size):
                 return None
-            packed = (shared.weight, shared.scales, shared.biases)
+            packed = (
+                shared.weight, shared.scales, shared.biases, shared.group_size, shared.bits
+            )
         return cls(leaf.weight, leaf.scales, leaf.biases, leaf.group_size, leaf.bits, packed)
 
     def __call__(
@@ -130,10 +144,18 @@ class AffineDownCombine:
         hidden = self.weight.shape[1]
         kdim = self.weight.shape[2] * 32 // self.bits
         assert self.bits <= 8 and kdim % 256 == 0 and self.group_size % 8 == 0 and hidden % 8 == 0
-        spare = self.shared if self.shared is not None else (self.weight, self.scales, self.biases)
+        spare = self.shared or (self.weight, self.scales, self.biases, self.group_size, self.bits)
         # 16 values per lane rides the word-at-a-time 2-bit unpack; every other width
-        # keeps the 8-value tiling the applies() contract was written for.
-        vpt = 16 if self.bits == 2 and kdim % 512 == 0 and self.group_size % 16 == 0 else 8
+        # keeps the 8-value tiling the applies() contract was written for. The spare
+        # slot's group has to hold a lane's values too, whatever its width decodes as.
+        vpt = (
+            16
+            if self.bits == 2
+            and kdim % 512 == 0
+            and self.group_size % 16 == 0
+            and spare[3] % 16 == 0
+            else 8
+        )
         return _KERNEL(
             inputs=[
                 act.reshape(-1), self.weight, self.scales, self.biases, chosen, weights,
@@ -142,9 +164,11 @@ class AffineDownCombine:
                 mx.array(hidden, dtype=mx.int32),
                 mx.array(kdim, dtype=mx.int32),
                 mx.array(self.group_size, dtype=mx.int32),
+                mx.array(spare[3], dtype=mx.int32),
             ],
             template=[
-                ("T", act.dtype), ("BITS", self.bits), ("TOPK", chosen.shape[0]),
+                ("T", act.dtype), ("BITS", self.bits), ("SBITS", spare[4]),
+                ("TOPK", chosen.shape[0]),
                 ("SHARED", 1 if self.shared is not None else 0), ("VPT", vpt),
             ],
             grid=(64, hidden // 8, 1),

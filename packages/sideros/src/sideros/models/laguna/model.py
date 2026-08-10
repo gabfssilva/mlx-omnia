@@ -6,18 +6,18 @@ import mlx.nn as nn
 
 from sideros.checkpoint import wire_resident
 from sideros.core.cache import FixedKVCache, KVCache, RingKVCache
-from sideros.core.kernels.lm_head_argmax import (
+from sideros.core.kernels.attention.sdpa import SCALED_DOT_PRODUCT_ATTENTION
+from sideros.core.kernels.lm_head.argmax import (
     Int5Planes,
     int5_planes,
     lm_head_argmax_applies,
     lm_head_argmax_row,
 )
-from sideros.core.kernels.sdpa_decode import SCALED_DOT_PRODUCT_ATTENTION
 from sideros.core.patch import uses
 from sideros.models.laguna.config import FULL, SLIDING, LagunaConfig
-from sideros.models.laguna.layers.attention import _ATLASES, _ATTENTION_BANKS
+from sideros.models.laguna.layers.attention import _ATLASES
 from sideros.models.laguna.layers.block import LagunaTrunk
-from sideros.models.laguna.layers.moe import _BANKS, LagunaSparseMoe
+from sideros.models.laguna.layers.moe import LagunaSparseMoe
 
 _LM_HEAD_PLANES: dict[int, tuple[mx.array, mx.array, mx.array]] = {}
 
@@ -85,13 +85,21 @@ class Laguna(nn.Module):
                 :, -1, :
             ]
 
-        for layer in self.model.layers:
+        for layer, layer_cache in zip(self.model.layers, promoted, strict=True):
             layer.self_attn._angles(offset)
-            layer.self_attn._prepare_decode()
+            layer.self_attn._prepare_decode(layer_cache)
+            layer._kernels()
             if isinstance(layer.mlp, LagunaSparseMoe):
-                layer.mlp.packed_step_applies()
+                layer.mlp.step_applies()
         wire_resident()
-        inputs = [self.state, _ATLASES, _ATTENTION_BANKS, _BANKS, state]
+        # Weights and the strategies' precomputed banks are deliberately NOT captured:
+        # mx.compile swaps arrays inside captured containers for tracers in place, and a
+        # frozen strategy field reads its original object — which trips the uncaptured-
+        # input check the moment that object is also in the capture list. Left out, they
+        # bake into the trace as constants, which is what a decode closure wants; only
+        # what changes across steps (the ring/fixed cache state, a regrown atlas) is
+        # captured, and both are read through live containers at trace time.
+        inputs = [_ATLASES, state]
         compiled = mx.compile(
             forward,
             inputs=inputs,
@@ -158,7 +166,7 @@ class Laguna(nn.Module):
             return None
         weight = self.lm_head.weight
         vocab, hidden = weight.shape
-        if not lm_head_argmax_applies(vocab, hidden, rows=1, dtype=weight.dtype, argmax_only=True):
+        if not lm_head_argmax_applies(vocab, hidden, rows=1, dtype=weight.dtype):
             return None
         key = id(weight)
         if cached := _LM_HEAD_PLANES.get(key):

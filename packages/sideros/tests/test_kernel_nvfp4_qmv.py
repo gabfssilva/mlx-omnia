@@ -15,12 +15,12 @@ import mlx.core as mx
 import pytest
 from conftest import relative_diff
 
-from sideros.core.kernels.nvfp4_lane_major import (
+from sideros.core.kernels.qmv.nvfp4 import nvfp4_qmv, nvfp4_qmv_applies
+from sideros.core.kernels.shared.nvfp4 import (
     LaneMajorScales,
     expand,
     lane_major_scales,
 )
-from sideros.core.kernels.nvfp4_qmv import nvfp4_qmv, nvfp4_qmv_applies
 from sideros.core.patch import original
 
 KDIM = 2048

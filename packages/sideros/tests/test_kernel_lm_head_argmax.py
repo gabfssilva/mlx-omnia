@@ -18,10 +18,13 @@ a sample separated by less than the rounding of either path decides nothing abou
 kernel. Samples above the guard decide everything.
 """
 
+from collections.abc import Callable
+
 import mlx.core as mx
 import pytest
 
-from sideros.core.kernels.lm_head_argmax import (
+from sideros.core.kernels.lm_head import ArgmaxGreedyHead, DefaultGreedyHead, GreedyHead
+from sideros.core.kernels.lm_head.argmax import (
     Int5Planes,
     int5_planes,
     lm_head_argmax_applies,
@@ -89,24 +92,21 @@ def decoded_int5(planes: Int5Planes) -> tuple[mx.array, mx.array]:
     return q.astype(mx.float32), sd
 
 
-def test_applies_refuses_anything_that_is_not_a_pure_argmax_request() -> None:
-    assert lm_head_argmax_applies(VOCAB, HIDDEN, rows=1, dtype=mx.bfloat16, argmax_only=True)
-    assert not lm_head_argmax_applies(
-        VOCAB, HIDDEN, rows=1, dtype=mx.bfloat16, argmax_only=False
-    )
+def test_applies_accepts_the_geometry_the_launches_tile() -> None:
+    assert lm_head_argmax_applies(VOCAB, HIDDEN, rows=1, dtype=mx.bfloat16)
 
 
 def test_applies_refuses_batches_and_other_dtypes() -> None:
-    assert not lm_head_argmax_applies(VOCAB, HIDDEN, rows=2, dtype=mx.bfloat16, argmax_only=True)
-    assert not lm_head_argmax_applies(VOCAB, HIDDEN, rows=1, dtype=mx.float32, argmax_only=True)
+    assert not lm_head_argmax_applies(VOCAB, HIDDEN, rows=2, dtype=mx.bfloat16)
+    assert not lm_head_argmax_applies(VOCAB, HIDDEN, rows=1, dtype=mx.float32)
 
 
 def test_applies_refuses_shapes_the_launch_cannot_tile() -> None:
     assert not lm_head_argmax_applies(
-        VOCAB + 32, HIDDEN, rows=1, dtype=mx.bfloat16, argmax_only=True
+        VOCAB + 32, HIDDEN, rows=1, dtype=mx.bfloat16
     )
     assert not lm_head_argmax_applies(
-        VOCAB, HIDDEN + 32, rows=1, dtype=mx.bfloat16, argmax_only=True
+        VOCAB, HIDDEN + 32, rows=1, dtype=mx.bfloat16
     )
 
 
@@ -198,3 +198,44 @@ def test_both_arms_pick_the_same_token() -> None:
         one_pass = lm_head_argmax_row(x, weight, planes, refine=False)
         refined = lm_head_argmax_row(x, weight, planes, refine=True)
         assert mx.argmax(one_pass).item() == mx.argmax(refined).item()
+
+
+def projection_of(weight: mx.array) -> Callable[[mx.array], mx.array]:
+    return lambda x: mx.matmul(x, weight.T)
+
+
+def test_delegator_picks_the_pruned_chain_and_falls_back_on_geometry() -> None:
+    weight = head_weight()
+    assert isinstance(GreedyHead(projection_of(weight), weight=weight).strategy, ArgmaxGreedyHead)
+    assert isinstance(GreedyHead(projection_of(weight)).strategy, DefaultGreedyHead)
+    fp32 = weight.astype(mx.float32)
+    assert isinstance(
+        GreedyHead(projection_of(fp32), weight=fp32).strategy, DefaultGreedyHead
+    )
+
+
+@pytest.mark.parametrize("refine", [False, True])
+def test_both_strategies_return_the_same_token_id(refine: bool) -> None:
+    """The greedy-step contract: the pruned head and the full projection are the same
+    function of `x`, so the delegator's choice is invisible to a model."""
+    weight = head_weight()
+    pruned = GreedyHead(projection_of(weight), weight=weight, refine=refine)
+    stock = GreedyHead(projection_of(weight))
+    assert isinstance(pruned.strategy, ArgmaxGreedyHead)
+
+    judged = 0
+    for x in hidden_states(SAMPLES, seed=11):
+        if not decided(stock_logits(weight, x)):
+            continue
+        judged += 1
+        assert pruned(x).item() == stock(x).item()
+    assert judged >= SAMPLES // 2, f"only {judged}/{SAMPLES} samples were decidable"
+
+
+def test_the_token_id_keeps_the_row_shape() -> None:
+    weight = head_weight()
+    head = GreedyHead(projection_of(weight), weight=weight)
+    (x,) = hidden_states(1, seed=13)
+
+    assert head(x).shape == ()
+    assert head(x.reshape(1, 1, HIDDEN)).shape == (1, 1)

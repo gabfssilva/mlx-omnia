@@ -3,7 +3,7 @@ import mlx.nn as nn
 
 from sideros.core.kernels.down_combine import DownCombine
 from sideros.core.kernels.gate_up import GateUp
-from sideros.core.kernels.moe_route import sigmoid_topk, softmax_topk_applies
+from sideros.core.kernels.route import Route
 from sideros.core.layers import SORTED_GATHER_MIN, SwiGLU, SwitchLinear, sorted_gather
 from sideros.models.hy3.config import Hy3Config
 
@@ -39,13 +39,15 @@ class Hy3SparseMoe(nn.Module):
         )
         shared_intermediate = config.moe_intermediate_size * config.num_shared_experts
         self.shared_expert = SwiGLU(config.hidden_size, shared_intermediate)
+        self.experts = config.num_experts
         self.k = config.num_experts_per_tok
-        self.split = config.num_experts - self.k
+        self.split = self.experts - self.k
         self.hidden = config.hidden_size
         self.scaling = config.router_scaling_factor
         self.fp32_combine = config.enable_moe_fp32_combine
         self._gate_up: GateUp | None = None
         self._down: DownCombine | None = None
+        self._route: Route | None = None
 
     def route(self, x: mx.array) -> tuple[mx.array, mx.array]:
         """Sigmoid routing (not softmax): scores are independent, selection adds the
@@ -59,28 +61,32 @@ class Hy3SparseMoe(nn.Module):
         weights = weights / weights.sum(axis=-1, keepdims=True)
         return chosen, weights.astype(x.dtype)
 
-    def _kernels(self) -> tuple[GateUp, DownCombine]:
+    def _kernels(self) -> tuple[GateUp, DownCombine, Route]:
         """Resolved once, at the first T=1 step — after load, when the leaves'
         formats are final."""
-        gate_up, down = self._gate_up, self._down
-        if gate_up is None or down is None:
+        gate_up, down, route = self._gate_up, self._down, self._route
+        if gate_up is None or down is None or route is None:
             switch = self.switch_mlp
             gate_up = GateUp(switch.gate_up_proj, hidden=self.hidden, inner=switch.inner)
             down = DownCombine(switch.down_proj, hidden=self.hidden, inner=switch.inner)
-            self._gate_up, self._down = gate_up, down
-        return gate_up, down
+            route = Route(
+                self.gate.weight,
+                experts=self.experts,
+                k=self.k,
+                scoring="sigmoid",
+                bias=self.e_score_correction_bias,
+                scale=self.scaling,
+            )
+            self._gate_up, self._down, self._route = gate_up, down, route
+        return gate_up, down, route
 
     def fused_step_applies(self) -> bool:
-        return not self.fp32_combine and softmax_topk_applies(self.split + self.k, self.k)
+        return not self.fp32_combine
 
     def fused_step(self, x: mx.array, residual: mx.array) -> mx.array:
-        gate_up, down = self._kernels()
-        chosen, weights = sigmoid_topk(
-            self.gate(x.astype(mx.float32)).astype(x.dtype).reshape(-1),
-            self.e_score_correction_bias,
-            self.k,
-            scale=self.scaling,
-        )
+        gate_up, down, route = self._kernels()
+        logits = self.gate(x.astype(mx.float32)).astype(x.dtype).reshape(-1)
+        chosen, weights = route(x.reshape(-1), logits=logits)
         act = gate_up(x.reshape(-1), chosen)
         joined = residual + self.shared_expert(x)
         return down(act, chosen, weights, joined.reshape(-1)).reshape(1, 1, self.hidden)

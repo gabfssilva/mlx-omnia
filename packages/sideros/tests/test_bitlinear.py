@@ -20,7 +20,7 @@ import numpy as np
 import pytest
 from conftest import relative_diff
 
-from sideros.core.kernels.bitlinear import _SOURCE, bitlinear, bitlinear_applies
+from sideros.core.kernels.qmv.ternary import _SOURCE, bitlinear, bitlinear_applies
 from sideros.core.mxcompat import metal_kernel
 
 # (batch, in_features, out_features): a real q_proj shape (2560->2560) and a small

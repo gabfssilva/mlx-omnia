@@ -1,5 +1,5 @@
-"""The mxfp4 down/combine kernel. The e2m1 lookup and the shape predicate are the
-gate-up half's, imported from `gate_up.mxfp4` — same bytes on both sides of the step.
+"""The mxfp4 down/combine kernel. The e2m1 lookup and the shape predicate are shared
+with the gate-up half, from `shared.mxfp4` — same bytes on both sides of the step.
 The per-row projection bias is folded before the routing weight; no spare slot."""
 
 from dataclasses import dataclass
@@ -8,7 +8,8 @@ from typing import Self
 import mlx.core as mx
 import mlx.nn as nn
 
-from sideros.core.kernels.gate_up.mxfp4 import HEADER, applies
+from sideros.core.kernels.down_combine.kernel import Layout
+from sideros.core.kernels.shared.mxfp4 import HEADER, applies
 from sideros.core.layers import QuantizedSwitchLinear, SwitchLinear
 from sideros.core.mxcompat import metal_kernel
 
@@ -86,7 +87,10 @@ class Mxfp4DownCombine:
         inner: int,
         bias: mx.array | None,
         shared: nn.Linear | nn.QuantizedLinear | None,
+        layout: Layout,
     ) -> Self | None:
+        if layout != "interleaved":
+            return None
         # The kernel bakes the per-row projection bias and has no spare slot.
         if not isinstance(leaf, QuantizedSwitchLinear) or leaf.mode != "mxfp4":
             return None

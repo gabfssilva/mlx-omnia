@@ -24,8 +24,8 @@ import mlx.core as mx
 import pytest
 from conftest import relative_diff
 
-import sideros.core.kernels.sliding_fused_attention as sfa
-from sideros.core.kernels.sliding_fused_attention import (
+import sideros.core.kernels.attention.sliding as sfa
+from sideros.core.kernels.attention.sliding import (
     sliding_fused_attention,
     sliding_fused_attention_applies,
 )

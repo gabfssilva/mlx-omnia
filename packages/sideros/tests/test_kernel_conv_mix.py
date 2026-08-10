@@ -16,7 +16,8 @@ import numpy as np
 import pytest
 from conftest import checkpoint_dir, load_golden, relative_diff, requires_checkpoint
 
-from sideros.core.kernels import conv_mix as cm
+from sideros.core.kernels.conv_mix import ConvMix, DefaultConvMix, FusedConvMix
+from sideros.core.kernels.conv_mix import fused as cm
 from sideros.core.mxcompat import metal_kernel
 
 HIDDEN = 2048
@@ -25,6 +26,8 @@ FIXTURE = Path(__file__).parent / "fixtures" / "lfm2_moe_forward.safetensors"
 REPO = "LiquidAI/LFM2.5-8B-A1B"
 
 DTYPES = [mx.float32, mx.bfloat16]
+
+MIX = ConvMix(hidden=HIDDEN, kernel=KERNEL)
 
 
 def ops_step(
@@ -80,7 +83,7 @@ def hidden_state() -> mx.array:
 @pytest.mark.parametrize("dtype", DTYPES)
 def test_exact_against_ops_path(dtype: mx.Dtype) -> None:
     x, weights, taps, window = onehot_case(dtype, seed=0)
-    gated, slid = cm.conv_mix(x, weights, taps, window)
+    gated, slid = MIX(x, weights, taps, window)
     reference, reference_window = ops_step(x, weights, taps, window)
     assert relative_diff(gated, reference) == 0
     assert mx.array_equal(slid, reference_window).item()
@@ -93,7 +96,7 @@ def test_window_slides_over_steps(dtype: mx.Dtype) -> None:
     ours, theirs = window, window
     for step in range(3):
         x = onehot_case(dtype, seed=10 + step)[0]
-        gated, ours = cm.conv_mix(x, weights, taps, ours)
+        gated, ours = MIX(x, weights, taps, ours)
         reference, theirs = ops_step(x, weights, taps, theirs)
         assert relative_diff(gated, reference) == 0
         assert mx.array_equal(ours, theirs).item()
@@ -113,7 +116,7 @@ def test_checkpoint_step(
     w, t, x = in_proj.astype(dtype), taps.astype(dtype), hidden_state.astype(dtype)
     window = mx.concatenate([hidden_state[None] * 0.3, hidden_state[None] * -0.2]).astype(dtype)
 
-    gated, slid = cm.conv_mix(x, w, t, window)
+    gated, slid = MIX(x, w, t, window)
     reference, reference_window = ops_step(x, w, t, window)
 
     exact = np.asarray(hidden_state, np.float64) @ np.asarray(
@@ -178,8 +181,28 @@ def test_mutation_is_caught(mutation: str) -> None:
     pytest.fail(f"{mutation} left the outputs unchanged in every dtype")
 
 
+@pytest.mark.parametrize("dtype", DTYPES)
+def test_default_matches_ops_path(dtype: mx.Dtype) -> None:
+    """The default strategy is the op chain: same boundaries, same numbers."""
+    x, weights, taps, window = onehot_case(dtype, seed=2)
+    default = DefaultConvMix.build(hidden=HIDDEN, kernel=KERNEL, proj_bias=None, conv_bias=None)
+    gated, slid = default(x, weights, taps, window)
+    reference, reference_window = ops_step(x, weights, taps, window)
+    assert relative_diff(gated, reference) == 0
+    assert mx.array_equal(slid, reference_window).item()
+
+
+def test_delegator_resolution() -> None:
+    """The fused strategy takes the declaration it serves; everything else falls back."""
+    assert isinstance(MIX.strategy, FusedConvMix)
+    biased = ConvMix(hidden=HIDDEN, kernel=KERNEL, conv_bias=mx.zeros((HIDDEN,)))
+    assert isinstance(biased.strategy, DefaultConvMix)
+    assert isinstance(ConvMix(hidden=HIDDEN, kernel=4).strategy, DefaultConvMix)
+    assert isinstance(ConvMix(hidden=HIDDEN + 2, kernel=KERNEL).strategy, DefaultConvMix)
+
+
 def test_applies_predicate() -> None:
-    assert cm.conv_mix_applies(HIDDEN, KERNEL, has_bias=False)
-    assert not cm.conv_mix_applies(HIDDEN, 4, has_bias=False)
-    assert not cm.conv_mix_applies(HIDDEN, KERNEL, has_bias=True)
-    assert not cm.conv_mix_applies(HIDDEN + 2, KERNEL, has_bias=False)
+    assert cm.applies(HIDDEN, KERNEL, has_bias=False)
+    assert not cm.applies(HIDDEN, 4, has_bias=False)
+    assert not cm.applies(HIDDEN, KERNEL, has_bias=True)
+    assert not cm.applies(HIDDEN + 2, KERNEL, has_bias=False)

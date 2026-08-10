@@ -10,7 +10,7 @@ import pytest
 from conftest import relative_diff
 
 from sideros.core import layers
-from sideros.core.kernels.segmented_qkv import qkv_step
+from sideros.core.kernels.qkv_rope.segmented import qkv_step
 from sideros.core.layers import SegmentedQKV
 
 _HIDDEN = 256

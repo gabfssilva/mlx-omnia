@@ -23,7 +23,7 @@ import numpy as np
 import pytest
 from conftest import relative_diff
 
-from sideros.core.kernels.router_ordinal import (
+from sideros.core.kernels.route.ordinal import (
     _SOURCE,
     ORDINAL_HEADER,
     router_tournament,

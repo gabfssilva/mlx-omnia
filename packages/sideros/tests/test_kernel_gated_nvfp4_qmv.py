@@ -14,9 +14,9 @@ The floor is the bf16 epilogue -- see `test_kernel_nvfp4_qmv` for the derivation
 import mlx.core as mx
 from conftest import relative_diff
 
-from sideros.core.kernels.gated_nvfp4_qmv import gated_nvfp4_qmv, gated_nvfp4_qmv_applies
-from sideros.core.kernels.nvfp4_lane_major import LaneMajorScales, lane_major_scales
-from sideros.core.kernels.nvfp4_qmv import nvfp4_qmv
+from sideros.core.kernels.qmv.gated_nvfp4 import gated_nvfp4_qmv, gated_nvfp4_qmv_applies
+from sideros.core.kernels.qmv.nvfp4 import nvfp4_qmv
+from sideros.core.kernels.shared.nvfp4 import LaneMajorScales, lane_major_scales
 from sideros.core.patch import original
 
 KDIM = 2048

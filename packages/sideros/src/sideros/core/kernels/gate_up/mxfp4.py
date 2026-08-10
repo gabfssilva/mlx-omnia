@@ -10,36 +10,12 @@ from dataclasses import dataclass
 from typing import Self
 
 import mlx.core as mx
+import mlx.nn as nn
 
-from sideros.core.kernels.gate_up.kernel import Activation
+from sideros.core.kernels.gate_up.kernel import Activation, Layout, OrdinalRouting
+from sideros.core.kernels.shared.mxfp4 import HEADER, applies
 from sideros.core.layers import QuantizedSwitchLinear, SwitchLinear
 from sideros.core.mxcompat import metal_kernel
-
-HEADER = """
-    // The signed e2m1 lookup: the full nibble (sign bit included) indexes the value
-    // directly, so the dot loop is a table load and an fma — no mask, no sign branch.
-    // The table lives in threadgroup memory, not `constant`: each lane looks up a
-    // different nibble and `constant` memory is broadcast-optimized, so divergent reads
-    // serialize it (measured 345 vs 608 GB/s in the Swift era). Seeded once per
-    // threadgroup.
-    inline void mxfp4Lut(threadgroup float* L, uint tid) {
-        if (tid < 16) {
-            const float v[16] = {0.0f, 0.5f, 1.0f, 1.5f, 2.0f, 3.0f, 4.0f, 6.0f,
-                                 -0.0f, -0.5f, -1.0f, -1.5f, -2.0f, -3.0f, -4.0f, -6.0f};
-            L[tid] = v[tid];
-        }
-        threadgroup_barrier(mem_flags::mem_threadgroup);
-    }
-    // Eight e2m1 nibbles from one uint32 word, scaled by their shared group's e8m0
-    // exponent — which is a float's exponent field, so 2^(byte-127) is a shift, not a
-    // transcendental.
-    inline float mxfp4Dot8(uint q, float s, const thread float* x,
-                           threadgroup const float* L) {
-        float d = 0.0f;
-        for (uint n = 0; n < 8; n++) d += x[n] * L[(q >> (n * 4)) & 0xF];
-        return d * s;
-    }
-"""
 
 _SOURCE = """
     uint tgy = threadgroup_position_in_grid.y;
@@ -97,12 +73,6 @@ _KERNEL = metal_kernel(
 )
 
 
-def applies(hidden: int, inner: int) -> bool:
-    """A lane reads one uint32 word (eight aligned values inside one e8m0 group) per
-    block, and both contractions have to cover whole 32-value groups."""
-    return hidden % 32 == 0 and inner % 32 == 0
-
-
 @dataclass(frozen=True)
 class Mxfp4GateUp:
     weight: mx.array
@@ -120,7 +90,16 @@ class Mxfp4GateUp:
         activation: Activation,
         limit: float | None,
         bias: mx.array | None,
+        layout: Layout,
+        routing: OrdinalRouting | None,
+        shared: nn.Linear | nn.QuantizedLinear | None,
     ) -> Self | None:
+        # The spare slot is the affine kernel's; every other format runs the routed
+        # stack alone, so a shared expert beside it has nowhere to go.
+        if shared is not None:
+            return None
+        if layout != "interleaved" or routing is not None:
+            return None
         # The kernel bakes the swiglu_oai activation, its mandatory clamp and the
         # per-row projection bias; anything less declared has no kernel here.
         if not isinstance(leaf, QuantizedSwitchLinear) or leaf.mode != "mxfp4":

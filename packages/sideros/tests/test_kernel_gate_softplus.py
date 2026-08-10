@@ -16,7 +16,7 @@ import mlx.nn as nn
 import pytest
 from conftest import relative_diff
 
-from sideros.core.kernels.gate_softplus import gate_softplus, gate_softplus_applies
+from sideros.core.kernels.qmv.softplus import gate_softplus, gate_softplus_applies
 from sideros.core.patch import original
 
 KDIM = 2048

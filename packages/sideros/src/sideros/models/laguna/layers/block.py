@@ -1,16 +1,12 @@
+from typing import NamedTuple
+
 import mlx.core as mx
 import mlx.nn as nn
 
-from sideros.core.cache import FixedKVCache, KVCache, RingKVCache
-from sideros.core.kernels.dense_mlp import (
-    dense_down_residual,
-    dense_down_residual_applies,
-    dense_gate_up_swiglu,
-    dense_gate_up_swiglu_applies,
-)
-from sideros.core.kernels.residual_rms_router import (
-    residual_rms_norm,
-    residual_rms_norm_applies,
+from sideros.core.kernels.add_norm import AddRmsNorm
+from sideros.core.kernels.attention import AttentionCache
+from sideros.core.kernels.mlp import Mlp
+from sideros.core.kernels.route.residual import (
     residual_rms_router,
     residual_rms_router_applies,
 )
@@ -18,6 +14,20 @@ from sideros.core.layers import SwiGLU
 from sideros.models.laguna.config import LagunaConfig
 from sideros.models.laguna.layers.attention import LagunaAttention
 from sideros.models.laguna.layers.moe import LagunaSparseMoe
+
+
+class _Kernels(NamedTuple):
+    """The residual join and, when the block is dense, its MLP — resolved once.
+
+    `router` is the router matrix and its correction bias when the fused join can also
+    carry the gate's gemv, `None` otherwise. That fusion has no delegator of its own: it
+    produces two extra outputs the residual primitive does not name, so it stays a
+    module-path dispatch whose predicate is answered here rather than per step.
+    """
+
+    add_norm: AddRmsNorm
+    mlp: Mlp | None
+    router: tuple[mx.array, mx.array] | None
 
 
 class LagunaBlock(nn.Module):
@@ -32,52 +42,61 @@ class LagunaBlock(nn.Module):
         self.post_attention_layernorm = nn.RMSNorm(
             config.hidden_size, eps=config.rms_norm_eps
         )
+        self._hidden = config.hidden_size
+        self._inner = config.intermediate_size
+        self._resolved: _Kernels | None = None
 
     def __call__(
         self,
         x: mx.array,
         mask: mx.array | str | None,
-        cache: KVCache | FixedKVCache | RingKVCache,
+        cache: AttentionCache,
     ) -> mx.array:
         branch = self.self_attn(self.input_layernorm(x), mask, cache)
+        kernels = self._kernels()
         mlp = self.mlp
+        step = x.shape[1] == 1
         router_logits: mx.array | None = None
         router_keys: mx.array | None = None
-        if (
-            x.shape[1] == 1
-            and isinstance(mlp, LagunaSparseMoe)
-            and residual_rms_router_applies(x.shape[-1], mlp.split + mlp.k, 8)
-        ):
+        if step and kernels.router is not None:
+            router_weight, correction = kernels.router
             attended, h, router_logits, router_keys = residual_rms_router(
                 x,
                 branch,
                 self.post_attention_layernorm.weight,
-                mlp.gate.weight,
-                mlp.e_score_correction_bias,
+                router_weight,
+                correction,
                 eps=self.post_attention_layernorm.eps,
             )
-        elif residual_rms_norm_applies(x.shape[-1]):
-            attended, h = residual_rms_norm(
-                x, branch, self.post_attention_layernorm.weight, self.post_attention_layernorm.eps
-            )
         else:
-            attended = x + branch
-            h = self.post_attention_layernorm(attended)
-        if x.shape[1] == 1 and isinstance(mlp, LagunaSparseMoe):
-            if mlp.packed_step_applies():
-                return mlp.packed_step(h, attended, router_logits, router_keys)
-            if mlp.fused_step_applies():
-                return mlp.fused_step(h, attended, router_logits)
-        if x.shape[1] == 1 and isinstance(mlp, SwiGLU):
-            fused = _dense_weights(mlp)
-            if fused is not None:
-                gate_up, down = fused
-                row = h.reshape(-1)
-                activated = dense_gate_up_swiglu(row, gate_up)
-                return dense_down_residual(activated, down, attended.reshape(-1)).reshape(
-                    attended.shape
-                )
-        return attended + self.mlp(h)
+            attended, h = kernels.add_norm(x, branch)
+        if step and isinstance(mlp, LagunaSparseMoe) and mlp.step_applies():
+            return mlp.step(h, attended, router_logits, router_keys)
+        if step and kernels.mlp is not None:
+            return kernels.mlp(h.reshape(-1), attended.reshape(-1)).reshape(attended.shape)
+        return attended + mlp(h)
+
+    def _kernels(self) -> _Kernels:
+        """Resolved once, at the first step — after load, when the leaves' formats are
+        final."""
+        kernels = self._resolved
+        if kernels is None:
+            mlp = self.mlp
+            router = (
+                (mlp.gate.weight, mlp.e_score_correction_bias)
+                if isinstance(mlp, LagunaSparseMoe)
+                and residual_rms_router_applies(self._hidden, mlp.experts, 8)
+                else None
+            )
+            kernels = _Kernels(
+                AddRmsNorm(self.post_attention_layernorm),
+                Mlp(mlp, hidden=self._hidden, inner=self._inner)
+                if isinstance(mlp, SwiGLU)
+                else None,
+                router,
+            )
+            self._resolved = kernels
+        return kernels
 
 
 class LagunaTrunk(nn.Module):
@@ -86,18 +105,3 @@ class LagunaTrunk(nn.Module):
         self.embed_tokens = nn.Embedding(config.vocab_size, config.hidden_size)
         self.layers = [LagunaBlock(config, i) for i in range(config.num_hidden_layers)]
         self.norm = nn.RMSNorm(config.hidden_size, eps=config.rms_norm_eps)
-
-
-def _dense_weights(mlp: SwiGLU) -> tuple[mx.array, mx.array] | None:
-    """The fused dense pair, when both projections are the plain bf16 arrays the kernels
-    read. A quantized dense MLP has no dense weight to hand them and stays on the ops."""
-    gate_up = mlp.gate_up_proj.weight
-    down = mlp.down_proj.weight
-    if gate_up.dtype != mx.bfloat16 or down.dtype != mx.bfloat16:
-        return None
-    inner, hidden = down.shape[1], down.shape[0]
-    if not dense_gate_up_swiglu_applies(hidden, inner, gate_up.dtype):
-        return None
-    if not dense_down_residual_applies(hidden, inner, gate_up.dtype):
-        return None
-    return gate_up, down

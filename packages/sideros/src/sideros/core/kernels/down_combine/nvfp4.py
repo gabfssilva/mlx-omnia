@@ -1,6 +1,6 @@
 """The nvfp4 down/combine kernel. The e4m3/e2m1 helpers and the shape predicate are
-the gate-up half's, imported from `gate_up.nvfp4` — same bytes on both sides of the
-step. No spare slot and no projection bias."""
+shared with the gate-up half, from `shared.nvfp4.qmoe` — same bytes on both sides of
+the step. No spare slot and no projection bias."""
 
 from dataclasses import dataclass
 from typing import Self
@@ -8,7 +8,8 @@ from typing import Self
 import mlx.core as mx
 import mlx.nn as nn
 
-from sideros.core.kernels.gate_up.nvfp4 import HEADER, applies
+from sideros.core.kernels.down_combine.kernel import Layout
+from sideros.core.kernels.shared.nvfp4.qmoe import HEADER, applies
 from sideros.core.layers import QuantizedSwitchLinear, SwitchLinear
 from sideros.core.mxcompat import metal_kernel
 
@@ -84,7 +85,10 @@ class Nvfp4DownCombine:
         inner: int,
         bias: mx.array | None,
         shared: nn.Linear | nn.QuantizedLinear | None,
+        layout: Layout,
     ) -> Self | None:
+        if layout != "interleaved":
+            return None
         if not isinstance(leaf, QuantizedSwitchLinear) or leaf.mode != "nvfp4":
             return None
         if bias is not None or shared is not None:

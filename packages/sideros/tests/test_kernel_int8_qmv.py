@@ -11,7 +11,7 @@ import mlx.core as mx
 import pytest
 from conftest import relative_diff
 
-from sideros.core.kernels.int8_qmv import (
+from sideros.core.kernels.qmv.int8 import (
     gated_int8_qmv,
     gated_int8_qmv_applies,
     int8_qmv,

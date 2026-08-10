@@ -17,7 +17,7 @@ import mlx.core as mx
 import pytest
 from conftest import relative_diff
 
-from sideros.core.kernels.sdpa_decode import sdpa_decode, sdpa_decode_applies
+from sideros.core.kernels.attention.sdpa import sdpa_decode, sdpa_decode_applies
 
 HEAD_DIM = 128
 SCALE = 1 / math.sqrt(HEAD_DIM)

@@ -23,20 +23,25 @@ import numpy as np
 import pytest
 from conftest import relative_diff
 
-from sideros.core.kernels.residual_rms_router import (
-    _NORM_SOURCE,
+from sideros.core.kernels.add_norm.rows import _NORM_SOURCE, RowsAddRmsNorm
+from sideros.core.kernels.add_norm.rows import applies as residual_rms_norm_applies
+from sideros.core.kernels.route.ordinal import ORDINAL_HEADER, router_tournament
+from sideros.core.kernels.route.residual import (
     _router_source,
-    residual_rms_norm,
-    residual_rms_norm_applies,
     residual_rms_router,
     residual_rms_router_applies,
 )
-from sideros.core.kernels.router_ordinal import ORDINAL_HEADER, router_tournament
 from sideros.core.mxcompat import metal_kernel
 
 EPS = 1e-6
 ROWS_PER_GROUP = [1, 2, 4, 8, 16, 32, 64]
 SHAPES = [(2048, 256), (512, 64)]
+
+
+def residual_rms_norm(
+    residual: mx.array, branch: mx.array, weight: mx.array, eps: float
+) -> tuple[mx.array, mx.array]:
+    return RowsAddRmsNorm(weight, eps)(residual, branch)
 
 
 def _ulps(dtype: mx.Dtype, count: int) -> float:
