@@ -180,7 +180,11 @@ def test_the_block_is_the_one_the_prompt_left_open() -> None:
     free = reasoning_budget(4, "hi", Tokenizer())
     assert free is not None
     assert free.inside is False
-    assert free.blocks == (ReasoningBlock((OPEN,), (CLOSE,)), ReasoningBlock((20,), (21,)))
+    # One block per spelling in circulation. Atem's `to=self` has no id in this vocabulary,
+    # so its block encodes as pieces the model never emits in that order — armed and inert,
+    # which is the documented cost of watching every spelling.
+    assert free.blocks[:2] == (ReasoningBlock((OPEN,), (CLOSE,)), ReasoningBlock((20,), (21,)))
+    assert len(free.blocks) == 3
 
     assert reasoning_budget(None, "hi <think>", Tokenizer()) is None
 

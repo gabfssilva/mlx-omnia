@@ -18,7 +18,7 @@ from conftest import floor, load_golden, relative_diff
 
 from sideros import stream_ids
 from sideros.core.cache import DeltaCache, KVCache
-from sideros.core.kernels.gated_delta import gated_delta
+from sideros.core.kernels.gated_delta import GatedDelta, gated_delta
 from sideros.core.layers import MultiLinear, SharedMLP, SwitchGLU
 from sideros.models.bailing_hybrid import (
     CHECKPOINT,
@@ -26,7 +26,7 @@ from sideros.models.bailing_hybrid import (
     BailingHybridActivations,
 )
 from sideros.models.bailing_hybrid.layers.attention import BailingHybridLatentAttention
-from sideros.models.bailing_hybrid.layers.kda import KimiDeltaAttention, kda_rule
+from sideros.models.bailing_hybrid.layers.kda import KimiDeltaAttention
 from sideros.models.bailing_hybrid.layers.moe import LimitedSharedMLP, LimitedSwitchGLU
 
 FIXTURES = Path(__file__).parent / "fixtures"
@@ -173,8 +173,8 @@ def test_kda_cache_holds_one_window_over_the_three_channels(
 
 
 def test_per_channel_kernel_matches_the_ops_rule() -> None:
-    """The `gated_delta` kernel's per-channel variant against the ops recurrence it was
-    added for — the decay indexes the key channel, not the head."""
+    """The `gated_delta` kernel's per-channel variant against the ops recurrence the
+    facade falls back to — the decay indexes the key channel, not the head."""
     mx.random.seed(7)
     shape = (1, 6, 4, 32)
     q, k, v = (mx.random.normal(shape) for _ in range(3))
@@ -182,7 +182,8 @@ def test_per_channel_kernel_matches_the_ops_rule() -> None:
     beta = mx.sigmoid(mx.random.normal((1, 6, 4)))
     state = mx.random.normal((1, 4, 32, 32))
     kernel_out, kernel_state = gated_delta(q, k, v, decay, beta, state)
-    ops_out, ops_state = kda_rule(q, k, v, decay, beta, state)
+    ops = GatedDelta(key_dim=32, key_heads=4, value_heads=4, value_dim=32, enabled=False)
+    ops_out, ops_state = ops(q, k, v, decay, beta, state)
     assert relative_diff(kernel_out, ops_out) < 1e-5
     assert relative_diff(kernel_state, ops_state) < 1e-5
 

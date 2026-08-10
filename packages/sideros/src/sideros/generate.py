@@ -7,8 +7,8 @@ between steps.
 
 import codecs
 import time
-from collections.abc import Callable, Collection, Generator, Iterable, Iterator
-from dataclasses import dataclass
+from collections.abc import Callable, Collection, Generator, Iterable, Iterator, Sequence
+from dataclasses import dataclass, field
 from typing import Protocol, runtime_checkable
 
 import mlx.core as mx
@@ -17,9 +17,8 @@ from sideros.core.cache import LayerCache
 from sideros.core.mxcompat import softmax
 from sideros.core.prefill import prefill
 from sideros.core.prompt_cache import PromptCache
+from sideros.parsers import FALLBACK, Parser, Segment, Segmenter
 from sideros.speculative import Acceptance, SpeculationRefused, stream_speculative_ids
-from sideros.suppress import Segment, Segmenter
-from sideros.tools import ToolFamily
 
 type Sampler = Callable[[mx.array], mx.array]
 type LogitFilter = Callable[[mx.array], mx.array]
@@ -30,6 +29,27 @@ class CausalLM[C: LayerCache](Protocol):
     def make_cache(self) -> list[C]: ...
 
     def __call__(self, ids: mx.array, cache: list[C] | None = None) -> mx.array: ...
+
+
+@runtime_checkable
+class BlockOutputs[C: LayerCache](Protocol):
+    """A forward that also hands back what the trunk held at depths the caller names.
+
+    The same computation as `__call__` — the ids go in once — with a second thing coming
+    out of it: `at` selects blocks by index, and the features are their outputs
+    concatenated on the last dim, `[batch, length, len(at) * hidden]`. Selection is the
+    caller's because the whole trunk is 52 tensors where the reader wants five: returning
+    all of them costs 1.4 GB per prefill block against 136 MB for the ones asked for.
+
+    What reads it is a proposer that conditions on the target's own reading of the context
+    instead of on its ids (`speculative.Proposer`). Nothing else in the package calls it,
+    and a model that does not implement it can still be spoken to and still be drafted for
+    — by a proposer that reads no blocks.
+    """
+
+    def block_outputs(
+        self, ids: mx.array, cache: list[C], *, at: Sequence[int]
+    ) -> tuple[mx.array, mx.array]: ...
 
 
 @runtime_checkable
@@ -277,6 +297,12 @@ class Meter:
     prefill_started: float | None = None
     first_token: float | None = None
     last_token: float | None = None
+    speculation: Acceptance = field(default_factory=Acceptance)
+    """What a drafter proposed and how much of it survived, all zeroes for a run that had
+    none. Here and not beside it because a caller measuring a generation is measuring this
+    too: whether the run speculated at all is not visible in the rate — a model paired with
+    a drafter still decodes plainly under a sampler, and the difference between the two is
+    a number and not a setting."""
 
     def prefill(self, prompt_tokens: int) -> None:
         self.prompt_tokens = prompt_tokens
@@ -401,7 +427,11 @@ def stream_ids[C: LayerCache, D: LayerCache](
             lookahead=lookahead,
             stop=stop,
             meter=meter,
-            acceptance=acceptance,
+            # A caller counting the run gets the counts without asking: whether a request
+            # speculated at all is not in its rate, and `acceptance` is the only place the
+            # answer exists. An explicit one still wins — it is a caller with somewhere
+            # else to put them.
+            acceptance=acceptance if acceptance is not None or meter is None else meter.speculation,
         )
         return
 
@@ -532,7 +562,7 @@ def stream_text(
     ids: Iterable[int],
     tokenizer: Detokenizer,
     *,
-    tools: ToolFamily | None = None,
+    parser: Parser | None = None,
     prompt: str = "",
 ) -> Iterator[Segment]:
     """Ids in, segments out: the incremental decoder holds a partial UTF-8 sequence and the
@@ -551,7 +581,7 @@ def stream_text(
     detokenization loop is a client reading half a marker again.
     """
     decoder = codecs.getincrementaldecoder("utf-8")("replace")
-    segmenter = Segmenter(tools, prompt=prompt)
+    segmenter = Segmenter(FALLBACK if parser is None else parser, prompt=prompt)
     for token in ids:
         piece = decoder.decode(tokenizer.decode_bytes([token]))
         if piece:
@@ -570,7 +600,7 @@ def stream_generate[C: LayerCache](
     max_tokens: int,
     sampler: Sampler = greedy,
     stop: Collection[int] | None = None,
-    tools: ToolFamily | None = None,
+    parser: Parser | None = None,
 ) -> Iterator[Segment]:
     """Streams decoded text on the channel it came out on, holding partial UTF-8 until it
     completes and a marker's prefix until it stops being one."""
@@ -581,4 +611,4 @@ def stream_generate[C: LayerCache](
         sampler=sampler,
         stop=_default_stop(tokenizer) if stop is None else stop,
     )
-    yield from stream_text(ids, tokenizer, tools=tools, prompt=prompt)
+    yield from stream_text(ids, tokenizer, parser=parser, prompt=prompt)

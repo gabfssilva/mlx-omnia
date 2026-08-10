@@ -13,10 +13,12 @@ open. `json.loads` answers whole documents and can do neither.
 import json
 from dataclasses import dataclass
 
-from sideros.tools.envelope import Body, EnvelopeScanner
-from sideros.tools.protocol import CallDelta, ToolFamily
+from sideros.parsers.envelope import Body, EnvelopeScanner
+from sideros.parsers.protocol import CallDelta, Parser, ToolFamily
 
-__all__ = ["FAMILY"]
+__all__ = ["PARSER", "REASONING"]
+
+REASONING = ("<think>", "</think>")
 
 _START = "<tool_call>"
 _END = "</tool_call>"
@@ -215,9 +217,8 @@ class QwenReader:
         return ()
 
 
-FAMILY = ToolFamily(
-    start=_START,
-    end=_END,
+PARSER = Parser(
     recognizes=lambda source: _START in source and _XML not in source,
-    reader=QwenReader,
+    reasoning=(REASONING,),
+    tools=ToolFamily(start=_START, end=_END, reader=QwenReader),
 )

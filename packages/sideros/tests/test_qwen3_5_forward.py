@@ -18,10 +18,16 @@ from huggingface_hub import snapshot_download
 
 from sideros import stream_ids
 from sideros.core.cache import DeltaCache, KVCache
-from sideros.core.kernels.add_rms_norm import add_rms_norm, add_rms_norm_applies
-from sideros.core.kernels.gated_delta import delta_rule, gated_delta
+from sideros.core.kernels.add_norm import AddRmsNorm, FusedAddRmsNorm
+from sideros.core.kernels.gated_delta import (
+    DefaultGatedDelta,
+    FusedGatedDelta,
+    GatedDelta,
+    delta_rule,
+)
 from sideros.models.qwen3_5 import CHECKPOINT, Qwen35, Qwen35Activations
 from sideros.models.qwen3_5.layers import block, deltanet, flags
+from sideros.models.qwen3_5.layers.block import Qwen35Block
 from sideros.models.qwen3_5.layers.deltanet import l2norm
 
 FIXTURE = Path(__file__).parent / "fixtures" / "qwen3_5_forward.safetensors"
@@ -279,11 +285,19 @@ def testl2norm_eps_is_inside_the_sum() -> None:
 
 # --- The two kernel seams ------------------------------------------------------------
 #
-# `gated_delta` replaces the recurrence in every DeltaNet layer (all sizes) and
-# `add_rms_norm` the residual join of every block at T=1. Both are on by default where
-# their predicate holds; `flags.GATED_DELTA_KERNEL` / `flags.ADD_RMS_NORM_KERNEL`
-# are read on every call, so an A/B needs no edit — only a fresh cache, since the
-# recurrent state's layout is the transpose of the op chain's.
+# `GatedDelta` resolves the recurrence of every DeltaNet layer (all sizes) and
+# `AddRmsNorm` the residual join of every block at T=1. Both delegators are total, so
+# the seam is which strategy they bind, not whether they run: `flags.GATED_DELTA_KERNEL`
+# / `flags.ADD_RMS_NORM_KERNEL` are part of the resolution's cache key, so an A/B needs
+# no edit — only a fresh cache, since the recurrent state carries across steps.
+
+
+def blocks(model: Qwen35) -> list[Qwen35Block]:
+    return model.model.layers
+
+
+def linear_blocks(model: Qwen35) -> list[Qwen35Block]:
+    return [layer for layer in blocks(model) if not layer.attends]
 
 
 def stepwise(model: Qwen35, ids: mx.array) -> mx.array:
@@ -293,30 +307,22 @@ def stepwise(model: Qwen35, ids: mx.array) -> mx.array:
     )
 
 
-def test_kernels_are_the_default_path(
-    model: Qwen35, golden: dict[str, mx.array], monkeypatch: pytest.MonkeyPatch
-) -> None:
-    """A silent fallback would leave every parity test here measuring the op chain."""
+def test_kernels_are_the_default_path(model: Qwen35, golden: dict[str, mx.array]) -> None:
+    """A silent fallback would leave every parity test here measuring the op chain. The
+    delegators resolve lazily, so a step has to run before the bindings can be read."""
     assert flags.GATED_DELTA_KERNEL and flags.ADD_RMS_NORM_KERNEL
-    assert add_rms_norm_applies(model.config.text_config.hidden_size)
+    mx.eval(stepwise(model, golden["input_ids"][:2]))
 
-    calls = {"delta": 0, "join": 0}
+    joins = [layer._join() for layer in blocks(model)]
+    assert len(joins) == N_LAYER
+    assert all(isinstance(join, AddRmsNorm) for join in joins)
+    assert all(isinstance(join.strategy, FusedAddRmsNorm) for join in joins)
 
-    def counted_delta(*args: mx.array) -> tuple[mx.array, mx.array]:
-        calls["delta"] += 1
-        return gated_delta(*args)
-
-    def counted_join(
-        x: mx.array, projected: mx.array, weight: mx.array, eps: float
-    ) -> tuple[mx.array, mx.array]:
-        calls["join"] += 1
-        return add_rms_norm(x, projected, weight, eps)
-
-    monkeypatch.setattr(deltanet, "gated_delta", counted_delta)
-    monkeypatch.setattr(block, "add_rms_norm", counted_join)
-    mx.eval(model(golden["input_ids"][None, :1]))
+    rules = [layer.linear_attn.rule() for layer in linear_blocks(model)]
     linear = sum(1 for kind in model.config.text_config.layer_types if kind != "full_attention")
-    assert calls == {"delta": linear, "join": N_LAYER}
+    assert len(rules) == linear
+    assert all(isinstance(rule, GatedDelta) for rule in rules)
+    assert all(isinstance(rule.strategy, FusedGatedDelta) for rule in rules)
 
 
 def test_gated_delta_kernel_matches_ops(
@@ -327,31 +333,71 @@ def test_gated_delta_kernel_matches_ops(
     ids = golden["input_ids"][None]
     with_kernel = model(ids)
     monkeypatch.setattr(flags, "GATED_DELTA_KERNEL", False)
-    assert relative_diff(with_kernel, model(ids)) < 1e-5
+    without_kernel = model(ids)
+    assert all(
+        isinstance(layer.linear_attn.rule().strategy, DefaultGatedDelta)
+        for layer in linear_blocks(model)
+    )
+    assert relative_diff(with_kernel, without_kernel) < 1e-5
 
 
 def test_add_rms_norm_kernel_matches_ops(
     model: Qwen35, golden: dict[str, mx.array], monkeypatch: pytest.MonkeyPatch
 ) -> None:
-    """Single-token only, so it is the stepwise path that has to agree."""
+    """Single-token only, so it is the stepwise path that has to agree — and the
+    stepwise path is the compiled one, so the flag has to reach inside the trace."""
     ids = golden["greedy_ids"]
     with_kernel = stepwise(model, ids)
+    calls = {"join": 0}
+
+    class Counted(AddRmsNorm):
+        def __call__(self, x: mx.array, projected: mx.array) -> tuple[mx.array, mx.array]:
+            calls["join"] += 1
+            return super().__call__(x, projected)
+
     monkeypatch.setattr(flags, "ADD_RMS_NORM_KERNEL", False)
-    assert relative_diff(with_kernel, stepwise(model, ids)) < 1e-5
+    monkeypatch.setattr(block, "AddRmsNorm", Counted)
+    without_kernel = stepwise(model, ids)
+    assert calls["join"] == 0
+    assert relative_diff(with_kernel, without_kernel) < 1e-5
+
+
+def test_delta_kernel_flag_reaches_the_compiled_step(
+    model: Qwen35, golden: dict[str, mx.array], monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """The one-token DeltaNet step runs inside `mx.compile` and the resolved strategy is
+    read at trace time: unless `_trace_key` carries the flag, the old trace — and its
+    kernel — stays in place."""
+    ids = golden["greedy_ids"]
+    with_kernel = stepwise(model, ids)
+    monkeypatch.setattr(flags, "GATED_DELTA_KERNEL", False)
+    without_kernel = stepwise(model, ids)
+    assert all(
+        isinstance(layer.linear_attn.rule().strategy, DefaultGatedDelta)
+        for layer in linear_blocks(model)
+    )
+    assert relative_diff(without_kernel, with_kernel) < 1e-5
 
 
 def test_mutation_of_decay_exponentiation_breaks_parity(
     model: Qwen35, golden: dict[str, mx.array], monkeypatch: pytest.MonkeyPatch
 ) -> None:
-    """The wiring's own step: the kernel takes the decay *past* the exp, where
+    """The wiring's own step: the rule takes the decay *past* the exp, where
     `delta_rule` takes the log decay. Handing it the log form must not survive."""
 
-    def mutated(
-        q: mx.array, k: mx.array, v: mx.array, g: mx.array, beta: mx.array, state: mx.array
-    ) -> tuple[mx.array, mx.array]:
-        return gated_delta(q, k, v, mx.log(g), beta, state)
+    class LogDecay(GatedDelta):
+        def __call__(
+            self,
+            q: mx.array,
+            k: mx.array,
+            v: mx.array,
+            g: mx.array,
+            beta: mx.array,
+            state: mx.array,
+        ) -> tuple[mx.array, mx.array]:
+            return super().__call__(q, k, v, mx.log(g), beta, state)
 
-    monkeypatch.setattr(deltanet, "gated_delta", mutated)
+    monkeypatch.setattr(deltanet, "GatedDelta", LogDecay)
     logits = model(golden["input_ids"][None])
     assert relative_diff(logits, golden["logits"]) > floor(golden, "logits")
 
@@ -359,84 +405,40 @@ def test_mutation_of_decay_exponentiation_breaks_parity(
 def test_mutation_of_state_layout_breaks_stepwise(
     model: Qwen35, golden: dict[str, mx.array], monkeypatch: pytest.MonkeyPatch
 ) -> None:
-    """The cache's state is `[1, Hv, Dv, Dk]` for the kernel and the transpose of it for
-    the op chain, and at Dk == Dv (this checkpoint) the wrong one has the right shape.
-    Reading it in the op chain's layout is what a mis-wired cache would do; only a second
-    step notices, since a zero state transposes to itself."""
+    """The cache's state is `[1, Hv, Dv, Dk]` and the transpose of it is what a
+    mis-wired cache would hand over; at Dk == Dv (this checkpoint) the wrong one has the
+    right shape. Only a second step notices, since a zero state transposes to itself."""
 
-    def mutated(
-        q: mx.array, k: mx.array, v: mx.array, g: mx.array, beta: mx.array, state: mx.array
-    ) -> tuple[mx.array, mx.array]:
-        return gated_delta(q, k, v, g, beta, state.transpose(0, 1, 3, 2))
+    class Transposed(GatedDelta):
+        def __call__(
+            self,
+            q: mx.array,
+            k: mx.array,
+            v: mx.array,
+            g: mx.array,
+            beta: mx.array,
+            state: mx.array,
+        ) -> tuple[mx.array, mx.array]:
+            return super().__call__(q, k, v, g, beta, state.transpose(0, 1, 3, 2))
 
     ids = golden["greedy_ids"]
     prefill = model(ids[None])
-    monkeypatch.setattr(deltanet, "gated_delta", mutated)
+    monkeypatch.setattr(deltanet, "GatedDelta", Transposed)
     assert relative_diff(stepwise(model, ids), prefill) > 1e-5
 
 
 def test_mutation_of_join_outputs_breaks_stepwise(
     model: Qwen35, golden: dict[str, mx.array], monkeypatch: pytest.MonkeyPatch
 ) -> None:
-    """The kernel returns (sum, normed sum) and the block feeds the first to the residual
+    """The join returns (sum, normed sum) and the block feeds the first to the residual
     and the second to the MLP; swapping them still type-checks and still runs."""
 
-    def mutated(
-        x: mx.array, projected: mx.array, weight: mx.array, eps: float
-    ) -> tuple[mx.array, mx.array]:
-        added, normed = add_rms_norm(x, projected, weight, eps)
-        return normed, added
+    class Swapped(AddRmsNorm):
+        def __call__(self, x: mx.array, projected: mx.array) -> tuple[mx.array, mx.array]:
+            added, normed = super().__call__(x, projected)
+            return normed, added
 
     ids = golden["greedy_ids"]
     prefill = model(ids[None])
-    monkeypatch.setattr(block, "add_rms_norm", mutated)
+    monkeypatch.setattr(block, "AddRmsNorm", Swapped)
     assert relative_diff(stepwise(model, ids), prefill) > 1e-5
-
-
-# The one-token path runs inside `mx.compile`, and the traced branches read the
-# applicability predicates at trace time: unless `_trace_key` carries their *value*, a
-# patched predicate leaves the old trace — and its kernel — in place.
-
-
-def test_join_predicate_reaches_the_compiled_step(
-    model: Qwen35, golden: dict[str, mx.array], monkeypatch: pytest.MonkeyPatch
-) -> None:
-    ids = golden["greedy_ids"]
-    with_kernel = stepwise(model, ids)
-    calls = {"join": 0}
-
-    def counted_join(
-        x: mx.array, projected: mx.array, weight: mx.array, eps: float
-    ) -> tuple[mx.array, mx.array]:
-        calls["join"] += 1
-        return add_rms_norm(x, projected, weight, eps)
-
-    def never(hidden: int) -> bool:
-        return False
-
-    monkeypatch.setattr(block, "add_rms_norm", counted_join)
-    monkeypatch.setattr(block, "add_rms_norm_applies", never)
-    without_kernel = stepwise(model, ids)
-    assert calls["join"] == 0
-    assert relative_diff(without_kernel, with_kernel) < 1e-5
-
-
-def test_delta_predicate_reaches_the_compiled_step(
-    model: Qwen35, golden: dict[str, mx.array], monkeypatch: pytest.MonkeyPatch
-) -> None:
-    ids = golden["greedy_ids"]
-    with_kernel = stepwise(model, ids)
-    calls = {"delta": 0}
-
-    def counted_delta(*args: mx.array) -> tuple[mx.array, mx.array]:
-        calls["delta"] += 1
-        return gated_delta(*args)
-
-    def never(key_dim: int, key_heads: int, value_heads: int, value_dim: int) -> bool:
-        return False
-
-    monkeypatch.setattr(deltanet, "gated_delta", counted_delta)
-    monkeypatch.setattr(deltanet, "gated_delta_applies", never)
-    without_kernel = stepwise(model, ids)
-    assert calls["delta"] == 0
-    assert relative_diff(without_kernel, with_kernel) < 1e-5

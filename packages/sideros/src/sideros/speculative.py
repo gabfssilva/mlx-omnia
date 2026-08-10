@@ -12,11 +12,12 @@ on token equality under a temperature would bias the output without saying so. T
 non-greedy path is refused by name (in `generate.stream_ids`) rather than approximated.
 """
 
-from collections.abc import Collection, Iterator, Sequence
+from collections.abc import Callable, Collection, Iterator, Sequence
 from dataclasses import dataclass
-from typing import TYPE_CHECKING
+from typing import TYPE_CHECKING, Protocol, runtime_checkable
 
 import mlx.core as mx
+import mlx.nn as nn
 
 from sideros.core.cache import LayerCache
 from sideros.core.prefill import prefill
@@ -30,6 +31,72 @@ if TYPE_CHECKING:
 class SpeculationRefused(Exception):
     """A draft that cannot be verified is refused before the first token. There is no
     degraded mode: a wrong number costs more than the speculation was worth."""
+
+
+@runtime_checkable
+class Drafting(Protocol):
+    """A model facade that can be handed a second checkpoint to speculate with.
+
+    The pairing is not the loader's: what drafts for a checkpoint is a decision made
+    outside the engine — a setting, a measurement, a checkpoint quantized this morning —
+    and `sideros.load` takes an id and no opinion about it. So the facade is loaded first
+    and given its drafter after, by whoever knows.
+
+    `drafter` is out so that whoever accounts for the memory can weigh it: two checkpoints
+    are resident and only one of them is under the model's own tree.
+    """
+
+    drafter: nn.Module | None
+
+    def speculate_with(self, drafter: nn.Module, *, block_size: int | None = None) -> None:
+        """Take this checkpoint as the drafter, or refuse it by name. A tree of the wrong
+        architecture, or one whose shapes do not meet the target's, is a `TypeError` or a
+        `ValueError` here rather than a wrong number in the middle of a generation."""
+        ...
+
+
+@runtime_checkable
+class Proposer(Protocol):
+    """What writes the ids a round verifies. One round asks for one proposal, whatever the
+    thing behind it costs to produce: a small language model run `width` times, or a
+    block-diffusion drafter run once.
+
+    The round owns the target and nothing else; a proposer owns whatever state it needs
+    between rounds — its own cache, and the target's reading of the context when it reads
+    one — and rewinds it in `settle`.
+
+    `taps` is the whole of what a proposer asks the target for beyond its ids: the blocks
+    whose output it conditions on, empty for one that conditions on ids alone. A non-empty
+    `taps` is what makes the round take `BlockOutputs` instead of a plain forward, and a
+    target that does not implement it refuses the draft by name.
+    """
+
+    @property
+    def taps(self) -> Sequence[int]:
+        """Which of the target's blocks this reads, by index. Empty asks for none."""
+        ...
+
+    @property
+    def width(self) -> int:
+        """Ids proposed per round."""
+        ...
+
+    def absorb(self, features: mx.array) -> None:
+        """The target's reading of the positions its cache has just taken and kept, in
+        order, `[1, new, len(taps) * hidden]`. Exactly the positions this has not been
+        given before, and `committed[-1]` in the next `propose` is the one token past
+        them. Never called when `taps` is empty."""
+        ...
+
+    def propose(self, committed: Sequence[int]) -> mx.array:
+        """`width` ids continuing `committed`, whose last entry the target's cache has not
+        seen yet."""
+        ...
+
+    def settle(self, length: int) -> None:
+        """The round kept `length` ids. Whatever this wrote past them describes a sequence
+        that never happened and goes now."""
+        ...
 
 
 @dataclass
@@ -46,9 +113,63 @@ class Acceptance:
         return None if self.proposed == 0 else self.accepted / self.proposed
 
 
+class Autoregressive[D: LayerCache]:
+    """A small language model as a proposer: `width` steps, each one conditioned on the id
+    the last one drew. It reads no blocks of the target — its whole input is the ids — so
+    the round never asks the target for features.
+
+    It is the original speculative draft, and it is a `Proposer` and not the special case
+    the loop is written around: the round is single, and what a checkpoint costs to propose
+    with is the checkpoint's business.
+    """
+
+    def __init__(self, model: "CausalLM[D]", width: int) -> None:
+        if width < 1:
+            raise ValueError(f"lookahead must be at least 1: {width}")
+        self._model = model
+        self._cache = model.make_cache()
+        self._width = width
+        _must_rewind(self._cache, "draft")
+
+    @property
+    def taps(self) -> Sequence[int]:
+        return ()
+
+    @property
+    def width(self) -> int:
+        return self._width
+
+    def absorb(self, features: mx.array) -> None:
+        raise AssertionError("an autoregressive draft reads no blocks of the target")
+
+    def propose(self, committed: Sequence[int]) -> mx.array:
+        """Fed whatever committed ids its own cache has not seen — after a full acceptance
+        that is one token, and round one is where it meets the whole prompt."""
+        catchup = mx.array(committed[self._cache[0].offset :])
+        window = prefill(
+            lambda block: self._model(catchup[block][None], self._cache),
+            catchup.size,
+            self._cache,
+        )
+        ids = catchup[window][None]
+        proposals: list[mx.array] = []
+        for _ in range(self._width):
+            token = mx.argmax(self._model(ids, self._cache)[:, -1, :], axis=-1)
+            # Queued as it is built: the GPU runs draft step n while the CPU builds step
+            # n + 1, instead of idling until the round's single sync.
+            mx.async_eval(token)
+            proposals.append(token)
+            ids = token[None]
+        return mx.concatenate(proposals)
+
+    def settle(self, length: int) -> None:
+        for layer in self._cache:
+            layer.trim(length)
+
+
 def stream_speculative_ids[C: LayerCache, D: LayerCache](
     target: "CausalLM[C]",
-    draft: "CausalLM[D]",
+    draft: "CausalLM[D] | Proposer",
     prompt: list[int],
     *,
     max_tokens: int,
@@ -59,37 +180,57 @@ def stream_speculative_ids[C: LayerCache, D: LayerCache](
 ) -> Iterator[int]:
     """The target's greedy stream, token for token, with the draft only paying for speed.
 
-    `lookahead` is how many tokens a round proposes; `acceptance` collects what the rounds
-    actually accepted, for whoever is measuring.
+    A `Proposer` says for itself how many ids a round proposes; a plain language model is
+    wrapped in `Autoregressive` and `lookahead` is what it proposes. `acceptance` collects
+    what the rounds actually accepted, for whoever is measuring.
     """
-    if lookahead < 1:
-        raise ValueError(f"lookahead must be at least 1: {lookahead}")
+    from sideros.generate import BlockOutputs
+
+    proposer: Proposer = draft if isinstance(draft, Proposer) else Autoregressive(draft, lookahead)
+    taps = proposer.taps
+    if taps and not isinstance(target, BlockOutputs):
+        raise SpeculationRefused(
+            f"this draft conditions on the target's blocks {list(taps)} and the target has "
+            "no `block_outputs`: what it would read instead is nothing at all"
+        )
     target_cache = target.make_cache()
-    draft_cache = draft.make_cache()
     _must_rewind(target_cache, "target")
-    _must_rewind(draft_cache, "draft")
 
     if meter is not None:
         meter.prefill(len(prompt))
+
+    def forward(ids: mx.array) -> tuple[mx.array, mx.array | None]:
+        """One forward of the target: its logits, and what the proposer reads of it when it
+        reads anything. The verification forward needs both out of the same pass, which is
+        also why it can never take the compiled decode path."""
+        if not taps:
+            return target(ids, target_cache), None
+        assert isinstance(target, BlockOutputs)
+        return target.block_outputs(ids, target_cache, at=taps)
+
+    def feed(ids: mx.array) -> mx.array:
+        """Prefill: every row a block writes is kept, so the proposer gets all of them."""
+        logits, features = forward(ids)
+        if features is not None:
+            proposer.absorb(features)
+        return logits
 
     committed = list(prompt)
     # The first token is the target's alone: the prompt's own forward already yields one
     # (that is ttft), and the draft has nothing to propose before it.
     ids = mx.array(committed)
-    window = prefill(lambda block: target(ids[block][None], target_cache), ids.size, target_cache)
-    pending = _ints(mx.argmax(target(ids[window][None], target_cache)[:, -1, :], axis=-1))
+    window = prefill(lambda block: feed(ids[block][None]), ids.size, target_cache)
+    pending = _ints(mx.argmax(feed(ids[window][None])[:, -1, :], axis=-1))
     committed += pending
 
     emitted = 0
     while emitted < max_tokens:
         if not pending:
-            pending, accepted = _round(
-                target, draft, target_cache, draft_cache, committed, lookahead
-            )
+            pending, accepted = _round(forward, proposer, target_cache, committed)
             committed += pending
             if acceptance is not None:
                 acceptance.rounds += 1
-                acceptance.proposed += lookahead
+                acceptance.proposed += proposer.width
                 acceptance.accepted += accepted
         token = pending.pop(0)
         if token in stop:
@@ -100,56 +241,42 @@ def stream_speculative_ids[C: LayerCache, D: LayerCache](
         emitted += 1
 
 
-def _round[C: LayerCache, D: LayerCache](
-    target: "CausalLM[C]",
-    draft: "CausalLM[D]",
+def _round[C: LayerCache](
+    forward: Callable[[mx.array], tuple[mx.array, mx.array | None]],
+    proposer: Proposer,
     target_cache: list[C],
-    draft_cache: list[D],
     committed: list[int],
-    lookahead: int,
 ) -> tuple[list[int], int]:
     """One round, returning the tokens it settled and how many of them were the draft's.
 
-    Each model is fed whatever committed ids its own cache has not seen — after a full
-    acceptance the draft is exactly one token behind the target. Row j of the target's
-    logits predicts the token after `verified[j]`, so the last `lookahead + 1` rows judge
-    every proposal and hand back the target's own token past the accepted run.
+    The target is fed whatever committed ids its cache has not seen, then the proposals.
+    Row j of its logits predicts the token after `verified[j]`, so the last `width + 1`
+    rows judge every proposal and hand back the target's own token past the accepted run.
 
-    A rejected proposal leaves keys in both caches describing a sequence that never
-    happened: both are rewound to the accepted prefix before the round returns.
+    A rejected proposal leaves keys describing a sequence that never happened: the target's
+    cache is rewound to the accepted prefix, and the proposer is told the same length. What
+    the target *kept* is what the proposer is given to read — the gap plus the accepted
+    proposals, never the rejected tail.
     """
-    catchup = mx.array(committed[draft_cache[0].offset :])
-    # Round one is where the draft meets the whole prompt; every round after it is a token
-    # or two behind, and the split collapses to the single block it already was.
-    window = prefill(
-        lambda block: draft(catchup[block][None], draft_cache), catchup.size, draft_cache
-    )
-    ids = catchup[window][None]
-    proposals: list[mx.array] = []
-    for _ in range(lookahead):
-        token = mx.argmax(draft(ids, draft_cache)[:, -1, :], axis=-1)
-        # Queued as it is built: the GPU runs draft step n while the CPU builds step n + 1,
-        # instead of idling until the round's single sync below.
-        mx.async_eval(token)
-        proposals.append(token)
-        ids = token[None]
-
-    drafted = mx.concatenate(proposals)
+    drafted = proposer.propose(committed)
+    width = drafted.size
     gap = mx.array(committed[target_cache[0].offset :], dtype=drafted.dtype)
     verified = mx.concatenate([gap, drafted])
-    judged = mx.argmax(target(verified[None], target_cache)[0, -(lookahead + 1) :], axis=-1)
+    logits, features = forward(verified[None])
+    judged = mx.argmax(logits[0, -(width + 1) :], axis=-1)
     mx.eval(judged, drafted)
 
     proposed, predicted = _ints(drafted), _ints(judged)
     accepted = 0
-    while accepted < lookahead and proposed[accepted] == predicted[accepted]:
+    while accepted < width and proposed[accepted] == predicted[accepted]:
         accepted += 1
 
+    if features is not None:
+        proposer.absorb(features[:, : gap.size + accepted])
     length = len(committed) + accepted
     for layer in target_cache:
         layer.trim(length)
-    for layer in draft_cache:
-        layer.trim(length)
+    proposer.settle(length)
     return [*proposed[:accepted], predicted[accepted]], accepted
 
 

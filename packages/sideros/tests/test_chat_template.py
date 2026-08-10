@@ -28,14 +28,13 @@ from sideros.chat import (
     MultimodalChatCapability,
     chat_capabilities,
     chat_template,
-    tool_family_of,
+    parser_of,
 )
 from sideros.language import TEXT, GenerationOptions, LanguagePrompt, Text
 from sideros.model import CompositeModel, ModelInput, ModelSignature, UnsupportedInput
-from sideros.suppress import Segment
-from sideros.tools import ToolFamily
-from sideros.tools.families.qwen import FAMILY as QWEN
-from sideros.tools.families.qwen_xml import FAMILY as QWEN_XML
+from sideros.parsers import Parser, Segment
+from sideros.parsers.qwen import PARSER as QWEN
+from sideros.parsers.qwen_xml import PARSER as QWEN_XML
 from sideros.vision import Image
 
 FIXTURE = Path(__file__).parent / "fixtures" / "chat_template.json"
@@ -172,7 +171,7 @@ def test_multimodal_capability_without_images_prepares_text() -> None:
     case = next(c for c in GOLDEN["cases"] if c["name"] == "user")
     template = template_of(case)
     capability = MultimodalChatCapability(template, marker_of(FIRST_IMAGE_CASE["repo"]))
-    assert capability.prepare(chat_of(case)) == Text(case["rendered"], template.tool_family)
+    assert capability.prepare(chat_of(case)) == Text(case["rendered"], template.parser)
 
 
 def test_multimodal_capability_rejects_a_template_without_the_marker() -> None:
@@ -220,7 +219,7 @@ def test_the_template_keeps_the_source_it_compiled(repo: str) -> None:
 
 @pytest.mark.parametrize(("repo", "family"), FAMILIES)
 def test_the_prepared_prompt_carries_the_family_of_the_template_that_rendered_it(
-    repo: str, family: ToolFamily | None
+    repo: str, family: Parser | None
 ) -> None:
     """What the streamer is handed is the rendered text and nothing else, so the family
     travels with it: the template is on this side of `prepare`, the suppression machine on
@@ -228,7 +227,7 @@ def test_the_prepared_prompt_carries_the_family_of_the_template_that_rendered_it
     meta = GOLDEN["repos"][repo]
     template = ChatTemplate.from_source(meta["template"], meta["special_tokens"])
     prepared = ChatCapability(template).prepare(Chat(({"role": "user", "content": "Hi"},)))
-    assert prepared.tool_family is family
+    assert prepared.parser is family
 
 
 class _Echo:
@@ -259,16 +258,16 @@ def test_composite_model_routes_a_chat_through_the_capability() -> None:
 
 
 @pytest.mark.parametrize(("repo", "family"), FAMILIES)
-def test_the_family_is_reachable_from_the_model_alone(repo: str, family: ToolFamily | None) -> None:
+def test_the_family_is_reachable_from_the_model_alone(repo: str, family: Parser | None) -> None:
     """The other reader is the server, which holds the model and nothing else — it hands
     over a `Chat` and reads back text, so the route to the checkpoint's own answer is down
     the facades to the capability that renders the conversation."""
     meta = GOLDEN["repos"][repo]
     template = ChatTemplate.from_source(meta["template"], meta["special_tokens"])
-    assert tool_family_of(CompositeModel(_Echo(), [ChatCapability(template)])) is family
+    assert parser_of(CompositeModel(_Echo(), [ChatCapability(template)])) is family
     # A model that takes no conversation answers nothing rather than a family by default.
-    assert tool_family_of(CompositeModel(_Echo(), [])) is None
-    assert tool_family_of(_Echo()) is None
+    assert parser_of(CompositeModel(_Echo(), [])) is None
+    assert parser_of(_Echo()) is None
 
 
 def test_a_call_that_arrived_as_text_reaches_the_template_as_data() -> None:
@@ -304,6 +303,7 @@ def test_generation_prompt_is_optional() -> None:
 ECHO = ChatTemplate.from_source(
     "{% if enable_thinking is defined %}on={{ enable_thinking }};{% endif %}"
     "{% if reasoning_effort is defined %}effort={{ reasoning_effort }};{% endif %}"
+    "{% if reasoning_strength is defined %}strength={{ reasoning_strength }};{% endif %}"
 )
 """A template that reports which thinking kwargs reached it. `is defined` is the branch the
 templates in circulation take, which is why an unset kwarg has to be absent and not false."""
@@ -327,8 +327,10 @@ def test_the_switch_travels_without_a_level() -> None:
 
 
 def test_a_level_travels_with_the_switch() -> None:
-    """Both kwargs, because a template that reads only `enable_thinking` would otherwise
-    have thinking turned off by omission — and the rung is passed through as written."""
-    assert rendered("high") == "on=True;effort=high;"
-    assert rendered("xhigh") == "on=True;effort=xhigh;"
-    assert rendered("max") == "on=True;effort=max;"
+    """All three kwargs, because each family spells the same rung differently and a template
+    that reads none of the others would otherwise have thinking turned off by omission, or —
+    the atem case — take its own default while the client's level reached nothing. The rung
+    is passed through as written."""
+    assert rendered("high") == "on=True;effort=high;strength=high;"
+    assert rendered("xhigh") == "on=True;effort=xhigh;strength=xhigh;"
+    assert rendered("max") == "on=True;effort=max;strength=max;"

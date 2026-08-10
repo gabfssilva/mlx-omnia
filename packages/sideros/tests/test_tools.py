@@ -13,10 +13,25 @@ from pathlib import Path
 
 import pytest
 
-from sideros.tools import MalformedToolCall, ToolCall, ToolFamily, tool_family
-from sideros.tools.families.harmony import FAMILY as HARMONY
-from sideros.tools.families.qwen import FAMILY as QWEN
-from sideros.tools.families.qwen_xml import FAMILY as QWEN_XML
+from sideros.parsers import (
+    MalformedToolCall,
+    Parser,
+    ToolCall,
+    atem,
+    harmony,
+    parser_for,
+    qwen,
+    qwen_xml,
+)
+
+assert qwen.PARSER.tools is not None
+assert qwen_xml.PARSER.tools is not None
+assert harmony.PARSER.tools is not None
+assert atem.PARSER.tools is not None
+QWEN = qwen.PARSER.tools
+QWEN_XML = qwen_xml.PARSER.tools
+HARMONY = harmony.PARSER.tools
+ATEM = atem.PARSER.tools
 
 FIXTURE = Path(__file__).parent / "fixtures" / "chat_template.json"
 GOLDEN = json.loads(FIXTURE.read_text(encoding="utf-8"))
@@ -162,29 +177,29 @@ def test_harmony_reports_broken_json_in_the_arguments() -> None:
 
 
 FAMILIES = [
-    ("mlx-community/Qwen3-0.6B-4bit", QWEN),
-    ("openai/gpt-oss-20b", HARMONY),
+    ("mlx-community/Qwen3-0.6B-4bit", qwen.PARSER),
+    ("openai/gpt-oss-20b", harmony.PARSER),
     # Qwen3.6 keeps Qwen's marker and fills it with `<function=...><parameter=...>` XML: the
     # two are told apart by what follows the marker in the template, which is the only place
     # the difference is written down.
-    ("mlx-community/Qwen3.6-35B-A3B-6bit", QWEN_XML),
+    ("mlx-community/Qwen3.6-35B-A3B-6bit", qwen_xml.PARSER),
     # One more spelling, none of these three: LFM2.5 writes
     # `<|tool_call_start|>[fn(arg=1)]<|tool_call_end|>`.
     ("LiquidAI/LFM2.5-8B-A1B", None),
 ]
 
 
-@pytest.mark.parametrize(("repo", "family"), FAMILIES, ids=[repo for repo, _ in FAMILIES])
-def test_the_family_comes_off_the_checkpoints_own_template(
-    repo: str, family: ToolFamily | None
+@pytest.mark.parametrize(("repo", "parser"), FAMILIES, ids=[repo for repo, _ in FAMILIES])
+def test_the_dialect_comes_off_the_checkpoints_own_template(
+    repo: str, parser: Parser | None
 ) -> None:
-    """Unknown is an answer: a family picked by resemblance parses an envelope into a call
+    """Unknown is an answer: a dialect picked by resemblance parses an envelope into a call
     that was never made."""
-    assert tool_family(template_source(repo)) is family
+    assert parser_for(template_source(repo)) is parser
 
 
-def test_a_template_that_never_writes_a_call_has_no_family() -> None:
-    assert tool_family("{% for message in messages %}{{ message['content'] }}{% endfor %}") is None
+def test_a_template_that_never_writes_a_call_has_no_dialect() -> None:
+    assert parser_for("{% for message in messages %}{{ message['content'] }}{% endfor %}") is None
 
 
 def test_the_markers_are_the_ones_the_templates_write() -> None:
@@ -202,3 +217,74 @@ def test_the_markers_are_the_ones_the_templates_write() -> None:
     # Only the negative carries weight: that the opener is in `HARMONY_CALL` is one constant
     # of this module inside another, and can only fail if the test's own string is edited.
     assert HARMONY.start not in "<|channel|>commentary<|message|>I'll check first.<|end|>"
+
+
+ATEM_CALL = (
+    "<atem:function_calls>\n"
+    '<atem:invoke name="get_weather">\n'
+    '<atem:parameter name="city">Paris</atem:parameter>\n'
+    '<atem:parameter name="days">3</atem:parameter>\n'
+    "</atem:invoke>\n"
+    "</atem:function_calls>"
+)
+
+
+def test_atem_reads_the_invoke_and_types_its_parameters() -> None:
+    """The format leaves values untyped: what parses as JSON is what the template's own
+    `tojson` wrote, what does not is the string the model typed — `Paris` a string, `3` a
+    number, by the same convention Qwen3.6's XML reads back."""
+    assert ATEM.parse_tool_call(ATEM_CALL) == (
+        ToolCall("get_weather", {"city": "Paris", "days": 3}),
+    )
+
+
+def test_atem_reads_two_invokes_out_of_one_envelope() -> None:
+    """One `<atem:function_calls>` block carries several invokes, so the reader counts calls
+    by invoke and not by envelope — an envelope-indexed reader merges them into one call."""
+    output = (
+        "<atem:function_calls>\n"
+        '<atem:invoke name="get_weather">\n'
+        '<atem:parameter name="city">Paris</atem:parameter>\n'
+        "</atem:invoke>\n"
+        '<atem:invoke name="get_time">\n'
+        '<atem:parameter name="zone">Europe/Paris</atem:parameter>\n'
+        "</atem:invoke>\n"
+        "</atem:function_calls>"
+    )
+    assert ATEM.parse_tool_call(output) == (
+        ToolCall("get_weather", {"city": "Paris"}),
+        ToolCall("get_time", {"zone": "Europe/Paris"}),
+    )
+
+
+def test_atem_keeps_json_values_the_template_wrote() -> None:
+    output = (
+        "<atem:function_calls>\n"
+        '<atem:invoke name="f">\n'
+        '<atem:parameter name="flag">true</atem:parameter>\n'
+        '<atem:parameter name="items">[1, 2]</atem:parameter>\n'
+        "</atem:invoke>\n"
+        "</atem:function_calls>"
+    )
+    assert ATEM.parse_tool_call(output) == (ToolCall("f", {"flag": True, "items": [1, 2]}),)
+
+
+def test_an_atem_call_cut_mid_invoke_is_reported() -> None:
+    output = (
+        '<atem:function_calls>\n<atem:invoke name="get_weather">\n<atem:parameter name="city">Par'
+    )
+    with pytest.raises(MalformedToolCall, match="never closes"):
+        ATEM.parse_tool_call(output)
+
+
+def test_an_atem_envelope_that_never_invokes_is_reported() -> None:
+    output = "<atem:function_calls>\nnothing here\n</atem:function_calls>"
+    with pytest.raises(MalformedToolCall, match="no name"):
+        ATEM.parse_tool_call(output)
+
+
+def test_the_atem_dialect_comes_off_its_template() -> None:
+    """No Muse repo in the fixture yet — released the day of the port — so the sniff is
+    measured against the one string its template writes the envelope with."""
+    source = "{{- '<atem:function_calls>\\n<atem:invoke name=\"' + tc.function.name + '\">\\n' -}}"
+    assert parser_for(source) is atem.PARSER

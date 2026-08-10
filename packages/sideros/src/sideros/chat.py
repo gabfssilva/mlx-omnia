@@ -35,7 +35,7 @@ from jinja2.sandbox import ImmutableSandboxedEnvironment
 
 from sideros.language import TEXT, LanguagePrompt, Text
 from sideros.model import AtomicInput, ContentType, Modality, ModelInput, Wrapping
-from sideros.tools import ToolFamily, tool_family
+from sideros.parsers import Parser, parser_for
 from sideros.vision import RGB_IMAGE, Image
 
 __all__ = [
@@ -51,8 +51,8 @@ __all__ = [
     "TextPart",
     "chat_capabilities",
     "chat_template",
+    "parser_of",
     "template_of",
-    "tool_family_of",
 ]
 
 CHAT = ContentType(Modality.TEXT, "application/vnd.sideros.chat")
@@ -80,6 +80,12 @@ def _thinking(effort: Effort) -> dict[str, object]:
     `enable_thinking` travels with every level because it is the kwarg the templates in
     circulation actually branch on — `reasoning_effort` alone reaches a Qwen template that
     never reads it and turns thinking off by omission.
+
+    `reasoning_strength` is the same rung under the name the atem templates read: they write
+    it into their system block as prose and default it to `high`. Sending all three is safe
+    for the reason the type's docstring gives — a template ignores a kwarg it does not read —
+    and sending only the other two meant the level a client asked for reached that whole
+    family as nothing at all.
     """
     match effort:
         case "auto":
@@ -89,7 +95,11 @@ def _thinking(effort: Effort) -> dict[str, object]:
         case "on":
             return {"enable_thinking": True}
         case _:
-            return {"enable_thinking": True, "reasoning_effort": effort}
+            return {
+                "enable_thinking": True,
+                "reasoning_effort": effort,
+                "reasoning_strength": effort,
+            }
 
 
 class TextPart(TypedDict):
@@ -270,8 +280,8 @@ class ChatTemplate:
         )
 
     @property
-    def tool_family(self) -> ToolFamily | None:
-        return tool_family(self.source)
+    def parser(self) -> Parser | None:
+        return parser_for(self.source)
 
     def render(self, chat: Chat, *, add_generation_prompt: bool = True) -> str:
         return self.template.render(
@@ -329,7 +339,7 @@ class ChatCapability:
 
     def prepare(self, input: ModelInput) -> Text:
         assert isinstance(input, Chat)
-        return Text(self.template.render(input), self.template.tool_family)
+        return Text(self.template.render(input), self.template.parser)
 
 
 @dataclass(frozen=True)
@@ -354,26 +364,26 @@ class MultimodalChatCapability:
         return isinstance(input, Chat)
 
     def prepare(self, input: ModelInput) -> Text | LanguagePrompt:
-        """The family rides on the text the same way it does without images: what the
+        """The dialect rides on the text the same way it does without images: what the
         streamer is handed is all it gets, and a checkpoint that spells `<tool_call>` spells
         it whether or not the turn carried a picture. The pieces after the first carry it
         too — which of them the generation continues from is not this side's to know."""
         assert isinstance(input, Chat)
         rendered = self.template.render(input)
-        family = self.template.tool_family
+        parser = self.template.parser
         images = _images(input)
         if not images:
-            return Text(rendered, family)
+            return Text(rendered, parser)
         chunks = rendered.split(self.image_marker)
         if len(chunks) != len(images) + 1:
             raise ImageMarkerMismatch(len(images), len(chunks) - 1)
         parts: list[AtomicInput] = []
         for chunk, image in zip(chunks, images, strict=False):
             if chunk:
-                parts.append(Text(chunk, family))
+                parts.append(Text(chunk, parser))
             parts.append(image)
         if chunks[-1]:
-            parts.append(Text(chunks[-1], family))
+            parts.append(Text(chunks[-1], parser))
         return LanguagePrompt(tuple(parts))
 
 
@@ -404,9 +414,9 @@ def template_of(model: object) -> ChatTemplate | None:
         model = model.model
 
 
-def tool_family_of(model: object) -> ToolFamily | None:
-    """Which envelope the checkpoint behind a loaded model spells a call in, or `None` when
-    nothing here can say. It is a fact of the chat template, so it is read off the one
-    `template_of` walks down to rather than looked for a second time."""
+def parser_of(model: object) -> Parser | None:
+    """Which dialect the checkpoint behind a loaded model speaks, or `None` when nothing
+    here can say. It is a fact of the chat template, so it is read off the one `template_of`
+    walks down to rather than looked for a second time."""
     template = template_of(model)
-    return None if template is None else template.tool_family
+    return None if template is None else template.parser

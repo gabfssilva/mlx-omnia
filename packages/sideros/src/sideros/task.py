@@ -13,7 +13,7 @@ import huggingface_hub
 import mlx.core as mx
 import mlx.nn as nn
 
-from sideros.checkpoint import Pending, save_quantized
+from sideros.checkpoint import Drafter, Pending, save_quantized
 from sideros.core.cache import LayerCache
 from sideros.generate import CausalLM
 from sideros.language import LanguageModel
@@ -51,6 +51,7 @@ from sideros.models import (
     longcat_flash_ngram,
     mamba2,
     mimo_v2,
+    muse_glimmer,
     nemotron_h,
     olmo2,
     olmoe,
@@ -75,7 +76,16 @@ from sideros.quant.quantization import (
     quantize_weights,
 )
 
-__all__ = ["Source", "digest", "load", "provenance", "source", "tree", "write_entry"]
+__all__ = [
+    "Source",
+    "digest",
+    "load",
+    "load_drafter",
+    "provenance",
+    "source",
+    "tree",
+    "write_entry",
+]
 
 
 class _Config(TypedDict):
@@ -115,23 +125,29 @@ def _download_snapshot(
     )
 
 
-class _Registered(Protocol):
+class _Packaged(Protocol):
+    """What resolving a checkpoint needs of whoever declared it, which is less than being
+    a model: the patterns an entry has to carry over, and the split where quantization
+    happens. A `Checkpoint` satisfies it and so does a `Drafter`."""
+
+    @property
+    def patterns(self) -> tuple[str, ...]: ...
+
+    @property
+    def quantize(self) -> Callable[[Path, mx.Dtype | None], Pending[object]] | None: ...
+
+
+class _Registered(_Packaged, Protocol):
     """What `load` and `tree` read off an architecture's `Checkpoint`. The tree loader
     is typed at `nn.Module`, not at the architecture's own class — a read-only callable
     return is covariant, and that erasure is what lets one dict hold declarations typed
     on nine different trees."""
 
     @property
-    def patterns(self) -> tuple[str, ...]: ...
-
-    @property
     def load(self) -> Callable[[Path, mx.Dtype | None], nn.Module]: ...
 
     @property
     def task(self) -> Callable[[Path, mx.Dtype | None], LanguageModel[ModelInput]]: ...
-
-    @property
-    def quantize(self) -> Callable[[Path, mx.Dtype | None], Pending] | None: ...
 
 
 _MODEL_SPECS: dict[str, _Registered] = {
@@ -172,6 +188,7 @@ _MODEL_SPECS: dict[str, _Registered] = {
     "longcat_flash_ngram": longcat_flash_ngram.CHECKPOINT,
     "mamba2": mamba2.CHECKPOINT,
     "mimo_v2": mimo_v2.CHECKPOINT,
+    "muse_glimmer": muse_glimmer.CHECKPOINT,
     "nemotron_h": nemotron_h.CHECKPOINT,
     "olmo2": olmo2.CHECKPOINT,
     "olmoe": olmoe.CHECKPOINT,
@@ -305,13 +322,19 @@ def provenance(
     }
 
 
-def _resolve(
+def _resolve[S: _Packaged](
     model: str | Path,
     revision: str | None,
     local_files_only: bool,
-) -> tuple[Path, _Registered, _Config, str | None]:
+    registry: Mapping[str, S],
+) -> tuple[Path, S, _Config, str | None]:
     """The config that says which architecture this is, the declaration that architecture
-    registered, and the directory its weights are in."""
+    registered, and the directory its weights are in.
+
+    The registry is a parameter because not every door opens onto the same set: `load` and
+    `tree` resolve against the models, and quantizing resolves against everything with
+    weights to pack — a drafter is a checkpoint on disk without being a model that
+    answers."""
     candidate = Path(model)
     repository = None if isinstance(model, Path) or candidate.is_dir() else model
     config_path = (
@@ -326,7 +349,7 @@ def _resolve(
     config: _Config = json.loads(config_path.read_text())
     model_type = config["model_type"]
     try:
-        spec = _MODEL_SPECS[model_type]
+        spec = registry[model_type]
     except KeyError:
         raise ValueError(f"unsupported model_type {model_type!r}") from None
 
@@ -344,11 +367,11 @@ def _resolve(
 
 
 def _pending(
-    spec: _Registered,
+    spec: _Packaged,
     model_type: str,
     directory: Path,
     dtype: mx.Dtype | None,
-) -> Pending:
+) -> Pending[object]:
     if spec.quantize is None:
         raise ValueError(f"quantize= is not supported for model_type {model_type!r}")
     return spec.quantize(directory, dtype)
@@ -364,7 +387,7 @@ class Source:
     directory: Path
     config: Mapping[str, object]
     patterns: tuple[str, ...]
-    pending: Pending
+    pending: Pending[object]
     fingerprint: Mapping[str, object]
 
 
@@ -378,8 +401,13 @@ def source(
     """The resolution `load` does, handed over instead of consumed. What it buys is the
     plan before a weight is read: a caller that reports leaf by leaf, or that addresses the
     entry by something other than the cache's digest, needs both halves separately.
+
+    It resolves against `_quantizable()` and not the models, so a drafter is addressable
+    here: what it lacks is a task, and packing a checkpoint never asks for one.
     """
-    directory, spec, config, repository = _resolve(model, revision, local_files_only)
+    directory, spec, config, repository = _resolve(
+        model, revision, local_files_only, _quantizable()
+    )
     return Source(
         directory=directory,
         config=config,
@@ -427,7 +455,7 @@ def load(
         If the checkpoint architecture is unsupported, or if ``quantize`` is asked of an
         already quantized checkpoint.
     """
-    directory, spec, config, repository = _resolve(model, revision, local_files_only)
+    directory, spec, config, repository = _resolve(model, revision, local_files_only, _MODEL_SPECS)
     if quantize is None:
         return spec.task(directory, dtype)
 
@@ -450,6 +478,47 @@ def load(
             plan,
         )
     return spec.task(entry, None)
+
+
+_DRAFTER_SPECS: dict[str, Drafter[nn.Module]] = {
+    "muse_glimmer_assistant": muse_glimmer.ASSISTANT,
+}
+"""The checkpoints that are not models: a drafter serves no task, has no tokenizer and no
+head of its own, so it has no `Checkpoint` and does not answer to `load`. It is a tree
+bound to a target — `speculative.Drafting.speculate_with` is where the two meet."""
+
+
+def drafts(model_type: str) -> bool:
+    """Whether an architecture is a drafter. A caller with a checkpoint in hand and no
+    tree yet asks this: what a drafter cannot do is not a shape it fails at but a fact
+    about the checkpoint — it has no tokenizer, so nothing that reads a corpus reaches it."""
+    return model_type in _DRAFTER_SPECS
+
+
+def _quantizable() -> dict[str, _Packaged]:
+    """Everything with weights to pack. Wider than `_MODEL_SPECS` on purpose and read by
+    `source` alone: quantizing a checkpoint asks it for a lazy tree and a weight dict, and
+    neither is what makes something a model — while `load` and `tree` stay on the models,
+    so a drafter named where a model belongs still fails at the door.
+
+    Built per call and not once at import: the two registries are what a test registers a
+    double into, and a snapshot would not see it."""
+    return {**_MODEL_SPECS, **_DRAFTER_SPECS}
+
+
+def load_drafter(directory: Path, dtype: mx.Dtype | None = None) -> nn.Module:
+    """The drafter in `directory`, by the `model_type` its config declares.
+
+    A directory and not an id: a drafter is something the caller already found on disk —
+    nothing downloads one on demand, because nothing in a checkpoint says which drafter it
+    wants.
+    """
+    config: _Config = json.loads((directory / "config.json").read_text())
+    architecture = config["model_type"]
+    spec = _DRAFTER_SPECS.get(architecture)
+    if spec is None:
+        raise ValueError(f"{architecture!r} is not a drafter architecture this engine loads")
+    return spec.load(directory, dtype)
 
 
 def tree(
@@ -483,7 +552,7 @@ def tree(
     ValueError
         If the checkpoint architecture is unsupported.
     """
-    directory, spec, _, _ = _resolve(model, revision, local_files_only)
+    directory, spec, _, _ = _resolve(model, revision, local_files_only, _MODEL_SPECS)
     # The one erasure point. `CausalLM[C]` is invariant in C (the cache leaves through
     # `make_cache` and returns through `__call__`), so nine trees with nine concrete
     # caches share no honest supertype, and nothing in a `str | Path` argument can bind

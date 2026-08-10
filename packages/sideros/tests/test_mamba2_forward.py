@@ -16,7 +16,7 @@ from huggingface_hub import snapshot_download
 
 from sideros import stream_ids
 from sideros.core.cache import DeltaCache
-from sideros.core.kernels.ssm_step import ssm_step
+from sideros.core.kernels.ssm.step import ssm_step
 from sideros.models.mamba2 import CHECKPOINT, Mamba2, Mamba2Activations
 from sideros.models.mamba2.layers import flags, ssd
 

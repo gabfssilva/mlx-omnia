@@ -109,7 +109,7 @@ from sideros.models.qwen3_5.vision import Grid, ProcessorConfig, Qwen35Vision, p
 from sideros.models.qwen3_next import Qwen3Next, Qwen3NextConfig
 from sideros.models.seed_oss import SeedOss, SeedOssConfig
 from sideros.models.step3p7 import Step3p7, Step3p7Config
-from sideros.task import load, tree
+from sideros.task import load, load_drafter, tree
 from sideros.vision import RGB_IMAGE, Image
 
 __all__ = [
@@ -256,6 +256,7 @@ __all__ = [
     "decode_clock",
     "greedy",
     "load",
+    "load_drafter",
     "min_p",
     "multimodal_prompt",
     "process_image",

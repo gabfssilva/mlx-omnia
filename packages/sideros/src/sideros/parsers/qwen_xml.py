@@ -18,10 +18,11 @@ convention read back here.
 import json
 from collections.abc import Iterator
 
-from sideros.tools.envelope import Body, EnvelopeScanner
-from sideros.tools.protocol import CallDelta, ToolFamily
+from sideros.parsers.envelope import Body, EnvelopeScanner
+from sideros.parsers.protocol import CallDelta, Parser, ToolFamily
+from sideros.parsers.qwen import REASONING
 
-__all__ = ["FAMILY"]
+__all__ = ["PARSER"]
 
 _START = "<tool_call>"
 _END = "</tool_call>"
@@ -122,9 +123,8 @@ class QwenXmlReader:
         return value
 
 
-FAMILY = ToolFamily(
-    start=_START,
-    end=_END,
+PARSER = Parser(
     recognizes=lambda source: _XML in source,
-    reader=QwenXmlReader,
+    reasoning=(REASONING,),
+    tools=ToolFamily(start=_START, end=_END, reader=QwenXmlReader),
 )

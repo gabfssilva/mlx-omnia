@@ -52,7 +52,7 @@ root_packages = ["sideros"]
 [[tool.importlinter.contracts]]
 name = "core and bpe never reach up"
 type = "forbidden"
-source_modules = ["sideros.core", "sideros.bpe", "sideros.tools", "sideros.quant"]
+source_modules = ["sideros.core", "sideros.bpe", "sideros.parsers", "sideros.quant"]
 forbidden_modules = ["sideros.models"]
 
 [[tool.importlinter.contracts]]
@@ -62,10 +62,15 @@ modules = ["sideros.models.*"]
 ignore_imports = ["sideros.models.** -> sideros.models.*.tokenizer"]
 
 [[tool.importlinter.contracts]]
-name = "models never name a tool envelope"
+name = "models never name a dialect"
 type = "forbidden"
 source_modules = ["sideros.models"]
-forbidden_modules = ["sideros.tools.families"]
+forbidden_modules = [
+    "sideros.parsers.qwen",
+    "sideros.parsers.qwen_xml",
+    "sideros.parsers.harmony",
+    "sideros.parsers.atem",
+]
 allow_indirect_imports = true
 
 [tool.pyright]

@@ -14,7 +14,7 @@ from conftest import floor, load_golden, relative_diff
 from huggingface_hub import snapshot_download
 
 from sideros import KVCache, stream_ids
-from sideros.core.kernels.rope_epilogue import rope_epilogue
+from sideros.core.kernels.qkv_rope.epilogue import rope_epilogue
 from sideros.models.qwen3.dense import CHECKPOINT
 from sideros.models.qwen3.model import Qwen3, Qwen3Activations
 

@@ -18,7 +18,7 @@ import mlx.core as mx
 import mlx.nn as nn
 
 from sideros.core.config import load_config
-from sideros.core.layers import MultiLinear, SegmentedQKV, SwitchLinear
+from sideros.core.layers import MultiLinear, SegmentedLinear, SegmentedQKV, SwitchLinear
 from sideros.language import LanguageModel
 from sideros.model import ModelInput
 from sideros.quant.quantization import (
@@ -191,24 +191,26 @@ _QKV = ("q", "k", "v")
 _QKV_SUFFIXES = ("weight", "scales", "biases", "bias")
 
 
+def fusible(weights: Mapping[str, mx.array], keys: Sequence[str]) -> bool:
+    """Whether leaves sharing an input carry the same format, read off the tensors alone.
+    The packed weight's trailing dims fix the bit width, the scales' trailing dims fix the
+    group, and the scales dtype fixes the mode family (uint8 is an exponent, a float is
+    affine) — shape and dtype already say everything `bits`, `group_size` and `mode`
+    would, with no config and no input_dims to hand. A suffix only some of them carry is
+    not a common format either."""
+    present = [key for key in keys if key in weights]
+    if not present:
+        return True
+    if len(present) != len(keys):
+        return False
+    return len({(weights[key].shape[1:], weights[key].dtype) for key in present}) == 1
+
+
 def _same_qkv_format(weights: Mapping[str, mx.array], prefix: str) -> bool:
-    """Whether q/k/v carry the same format, read off the tensors alone. The three share
-    the input, so the packed weight's trailing dims fix the bit width, the scales'
-    trailing dims fix the group, and the scales dtype fixes the mode family (uint8 is an
-    exponent, a float is affine) — shape and dtype already say everything `bits`,
-    `group_size` and `mode` would, with no config and no input_dims to hand."""
-    for suffix in _QKV_SUFFIXES:
-        keys = [f"{prefix}{name}_proj.{suffix}" for name in _QKV]
-        present = [key for key in keys if key in weights]
-        if not present:
-            continue
-        if len(present) != len(keys):
-            return False
-        if suffix == "bias":
-            continue
-        if len({(weights[key].shape[1:], weights[key].dtype) for key in keys}) != 1:
-            return False
-    return True
+    return all(
+        fusible(weights, [f"{prefix}{name}_proj.{suffix}" for name in _QKV])
+        for suffix in _QKV_SUFFIXES
+    )
 
 
 def fuse_qkv(weights: dict[str, mx.array], layers: int) -> dict[str, mx.array]:
@@ -252,9 +254,9 @@ def concat_gate_up(
             keys = [f"{leaf}{name}_proj.{suffix}" for name in ("gate", "up")]
             if not all(key in weights for key in keys):
                 continue
-            fused = mx.concatenate([weights.pop(key) for key in keys], axis=0)
-            mx.eval(fused)
-            weights[f"{leaf}gate_up_proj.{suffix}"] = fused
+            weights[f"{leaf}gate_up_proj.{suffix}"] = mx.concatenate(
+                [weights.pop(key) for key in keys], axis=0
+            )
     return weights
 
 
@@ -266,7 +268,11 @@ def stack_experts(
 
     Two layouts ship for the same architecture: HuggingFace writes one leaf per expert,
     the mlx conversions write the stack. A checkpoint already in the second form has no
-    per-expert key and passes through untouched, so both load through one path."""
+    per-expert key and passes through untouched, so both load through one path.
+
+    Lazy on purpose, like every dict-side fusion: the quantizing load packs leaf by
+    leaf, and an eval here materializes every dense expert of the checkpoint at once —
+    the load path still evaluates everything through the loader's final `mx.eval`."""
     for layer in range(layers):
         source = f"model.layers.{layer}.{prefix}.experts."
         target = f"model.layers.{layer}.{prefix}.switch_mlp."
@@ -274,11 +280,9 @@ def stack_experts(
             for suffix in ("weight", "scales", "biases"):
                 if f"{source}0.{name}.{suffix}" not in weights:
                     continue
-                stacked = mx.stack(
+                weights[f"{target}{name}.{suffix}"] = mx.stack(
                     [weights.pop(f"{source}{expert}.{name}.{suffix}") for expert in range(experts)]
                 )
-                mx.eval(stacked)
-                weights[f"{target}{name}.{suffix}"] = stacked
     return weights
 
 
@@ -329,9 +333,9 @@ def interleave_gate_up(
                 continue
             parts = [weights.pop(key) for key in keys]
             experts, rows, cols = parts[0].shape
-            fused = mx.stack(parts, axis=2).reshape(experts, 2 * rows, cols)
-            mx.eval(fused)
-            weights[f"{leaf}gate_up_proj.{suffix}"] = fused
+            weights[f"{leaf}gate_up_proj.{suffix}"] = mx.stack(parts, axis=2).reshape(
+                experts, 2 * rows, cols
+            )
     return weights
 
 
@@ -385,25 +389,43 @@ def _modules_by_path(model: nn.Module) -> dict[str, nn.Module]:
     return found
 
 
+def _numbered_parts(weights: Mapping[str, mx.array], path: str) -> list[int]:
+    """The output width of each `<leaf>.parts.<i>.weight`, in order, from 0 until one is
+    missing — an empty list when the checkpoint addresses the leaf some other way."""
+    outputs: list[int] = []
+    while (key := f"{path}.parts.{len(outputs)}.weight") in weights:
+        outputs.append(weights[key].shape[0])
+    return outputs
+
+
 def _build_segments(model: nn.Module, weights: Mapping[str, mx.array]) -> None:
-    """A leaf the checkpoint addresses by parts — `<leaf>.q_proj.weight` and siblings,
-    with no `<leaf>.weight` — is a qkv the loader chose not to fuse. The tree declares one
-    `nn.Linear` there, so the swap happens before `nn.quantize`: each segment is a leaf of
-    its own from then on, and the per-leaf format comes off its own tensors."""
+    """A leaf the checkpoint addresses by parts — `<leaf>.q_proj.weight` and siblings, or
+    `<leaf>.parts.<i>.weight`, with no `<leaf>.weight` — is a projection the loader chose
+    not to fuse. The tree declares one `nn.Linear` there, so the swap happens before
+    `nn.quantize`: each segment is a leaf of its own from then on, and the per-leaf format
+    comes off its own tensors."""
     modules = _modules_by_path(model)
     for path, module in sorted(modules.items()):
         if not isinstance(module, nn.Linear) or f"{path}.weight" in weights:
+            continue
+        input_dims = module.weight.shape[-1]
+        parent, _, attribute = path.rpartition(".")
+        if outputs := _numbered_parts(weights, path):
+            setattr(
+                modules[parent],
+                attribute,
+                SegmentedLinear(input_dims, outputs, bias=f"{path}.parts.0.bias" in weights),
+            )
             continue
         segments = [f"{path}.{name}_proj.weight" for name in _QKV]
         if not all(key in weights for key in segments):
             continue
         queries, keys, values = (weights[key].shape[0] for key in segments)
-        parent, _, attribute = path.rpartition(".")
         setattr(
             modules[parent],
             attribute,
             SegmentedQKV(
-                module.weight.shape[-1],
+                input_dims,
                 queries=queries,
                 keys=keys,
                 values=values,
@@ -544,15 +566,18 @@ def load_checkpoint[M: nn.Module](
 
 
 @dataclass(frozen=True, slots=True)
-class Pending:
+class Pending[M]:
     """The same load split where quantization happens: the lazy tree (which is what the
     plan resolves against and costs nothing to build), the prepared weight dict, and the
     tail that binds one to the other. The split is what lets `cache=False` quantize
-    without a file, and what keeps the hit from touching a single tensor."""
+    without a file, and what keeps the hit from touching a single tensor.
+
+    `M` is what the tail produces, because it is not always a model that answers: a
+    drafter's is the tree itself."""
 
     model: nn.Module
     weights: Callable[[], dict[str, mx.array]]
-    attach: Callable[[dict[str, mx.array]], LanguageModel[ModelInput]]
+    attach: Callable[[dict[str, mx.array]], M]
 
 
 @dataclass(frozen=True, slots=True)
@@ -568,7 +593,19 @@ class Checkpoint[M: nn.Module]:
     patterns: tuple[str, ...]
     load: Callable[[Path, mx.Dtype | None], M]
     task: Callable[[Path, mx.Dtype | None], LanguageModel[ModelInput]]
-    quantize: Callable[[Path, mx.Dtype | None], Pending] | None = None
+    quantize: Callable[[Path, mx.Dtype | None], Pending[LanguageModel[ModelInput]]] | None = None
+
+
+@dataclass(frozen=True, slots=True)
+class Drafter[M: nn.Module]:
+    """`Checkpoint` without `task`, which is the whole difference: a drafter serves none.
+    What it keeps is what quantizing a checkpoint needs — the patterns an entry has to
+    carry over, the loader, and the same split `Pending` — so a drafter is quantized by
+    the code that quantizes a model rather than by a second path."""
+
+    patterns: tuple[str, ...]
+    load: Callable[[Path, mx.Dtype | None], M]
+    quantize: Callable[[Path, mx.Dtype | None], Pending[M]]
 
 
 def checkpoint[M: nn.Module, C](
@@ -622,7 +659,7 @@ def checkpoint[M: nn.Module, C](
     def task(directory: Path, dtype: mx.Dtype | None) -> LanguageModel[ModelInput]:
         return composite(directory, load(directory, dtype))
 
-    def quantize(directory: Path, dtype: mx.Dtype | None) -> Pending:
+    def quantize(directory: Path, dtype: mx.Dtype | None) -> Pending[LanguageModel[ModelInput]]:
         parsed = parse(directory / "config.json")
         tree = build(parsed)
         return Pending(

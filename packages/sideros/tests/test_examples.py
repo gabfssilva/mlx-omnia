@@ -7,7 +7,7 @@ import numpy as np
 import pytest
 
 from sideros import Chat, GenerationOptions, Image, LanguagePrompt, Text
-from sideros.suppress import Segment
+from sideros.parsers import Segment
 
 ROOT = Path(__file__).parents[3]
 

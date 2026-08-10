@@ -8,6 +8,7 @@ measured floors carried in the fixture (noise.logits, noise.batching).
 from pathlib import Path
 
 import mlx.core as mx
+import mlx.nn as nn
 import numpy as np
 import pytest
 from conftest import (
@@ -19,11 +20,11 @@ from conftest import (
 )
 
 from sideros import KVCache, stream_ids
-from sideros.core.kernels.add_rms_norm import add_rms_norm
+from sideros.core.kernels.add_norm import AddRmsNorm
 from sideros.core.kernels.down_combine.affine import AffineDownCombine
 from sideros.core.kernels.gate_up.affine import AffineGateUp
-from sideros.core.kernels.moe_route import softmax_topk, softmax_topk_applies
-from sideros.core.kernels.rope_epilogue import rope_epilogue
+from sideros.core.kernels.qkv_rope.epilogue import rope_epilogue
+from sideros.core.kernels.route.softmax_topk import softmax_topk, softmax_topk_applies
 from sideros.core.mxcompat import softmax
 from sideros.models.qwen3.model import Qwen3MoE
 from sideros.models.qwen3.moe import CHECKPOINT
@@ -143,7 +144,7 @@ def test_moe_gemv_matches_op_chain_fp32() -> None:
     gw, gs, gb = mx.quantize(gate_up, group_size=group, bits=bits)
     dw, ds, db = mx.quantize(down, group_size=group, bits=bits)
 
-    act = AffineGateUp(gw, gs, gb, group, bits, None)(x, indices)
+    act = AffineGateUp(gw, gs, gb, group, bits, None, None)(x, indices)
     out = AffineDownCombine(dw, ds, db, group, bits, None)(act, indices, routing, residual)
 
     fused = mx.gather_qmm(
@@ -169,9 +170,14 @@ def never_head_dim(head_dim: int) -> bool:
     return False
 
 
-def never_hidden(hidden: int) -> bool:
-    """A/B switch for add_rms_norm."""
-    return False
+class WithoutResidual:
+    """Mutation seam: the facade the block resolves, with `x` dropped from the join."""
+
+    def __init__(self, leaf: nn.RMSNorm, *, tokens: int | None = None) -> None:
+        self.inner = AddRmsNorm(leaf, tokens=tokens)
+
+    def __call__(self, x: mx.array, projected: mx.array) -> tuple[mx.array, mx.array]:
+        return self.inner(mx.zeros_like(x), projected)
 
 
 def stepwise(model: Qwen3MoE, ids: mx.array) -> mx.array:
@@ -183,7 +189,7 @@ def stepwise(model: Qwen3MoE, ids: mx.array) -> mx.array:
 def test_step_kernels_match_op_path(
     model: Qwen3MoE, golden: dict[str, mx.array], monkeypatch: pytest.MonkeyPatch
 ) -> None:
-    """Kernels on (the default) against both predicates falsified. Same path, same
+    """Both kernels on against both switched off. Same path, same
     inputs, only the rounding of the fused arithmetic differs — bounded by the
     fixture's own measured batching floor, which is the same kind of bf16 reordering."""
     monkeypatch.setattr("sideros.models.qwen3.layers.flags.ROPE_EPILOGUE_KERNEL", True)
@@ -193,7 +199,7 @@ def test_step_kernels_match_op_path(
     monkeypatch.setattr(
         "sideros.models.qwen3.layers.attention.rope_epilogue_applies", never_head_dim
     )
-    monkeypatch.setattr("sideros.models.qwen3.layers.block.add_rms_norm_applies", never_hidden)
+    monkeypatch.setattr("sideros.models.qwen3.layers.flags.ADD_RMS_NORM_KERNEL", False)
     assert relative_diff(fused, stepwise(model, ids)) < 3 * golden["noise.batching"].item()
 
 
@@ -235,15 +241,12 @@ def test_add_rms_norm_mutation_breaks_stepwise(
     model: Qwen3MoE, golden: dict[str, mx.array], monkeypatch: pytest.MonkeyPatch
 ) -> None:
     """The residual join is the kernel's first output; dropping `x` from it must break
-    the step-vs-prefill agreement."""
-
-    def without_residual(
-        x: mx.array, projected: mx.array, weight: mx.array, eps: float
-    ) -> tuple[mx.array, mx.array]:
-        return add_rms_norm(mx.zeros_like(x), projected, weight, eps)
-
+    the step-vs-prefill agreement. The facade resolves lazily, so clearing the cached
+    join is what makes the swapped class the one the block binds."""
     monkeypatch.setattr("sideros.models.qwen3.layers.flags.ADD_RMS_NORM_KERNEL", True)
-    monkeypatch.setattr("sideros.models.qwen3.layers.block.add_rms_norm", without_residual)
+    monkeypatch.setattr("sideros.models.qwen3.layers.block.AddRmsNorm", WithoutResidual)
+    for layer in model.model.layers:
+        monkeypatch.setattr(layer, "_add_norm", None)
     ids = golden["greedy_ids"]
     gap = relative_diff(stepwise(model, ids), model(ids[None]))
     assert gap > 3 * golden["noise.batching"].item()

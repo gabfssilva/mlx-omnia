@@ -37,10 +37,9 @@ from sideros.models.qwen3_5 import (
     Qwen35RoPEParameters,
     Qwen35TextConfig,
 )
-from sideros.suppress import Segment, Segmenter
-from sideros.tools import ToolCall, ToolFamily
-from sideros.tools.families.harmony import FAMILY as HARMONY
-from sideros.tools.families.qwen import FAMILY as QWEN
+from sideros.parsers import FALLBACK, Parser, Segment, Segmenter, ToolCall
+from sideros.parsers.harmony import PARSER as HARMONY
+from sideros.parsers.qwen import PARSER as QWEN
 
 CALL = '<tool_call>{"name": "f", "arguments": {"x": 1}}</tool_call>'
 HARMONY_CALL = (
@@ -88,11 +87,11 @@ class Tokenizer:
         return b"".join(self.pieces[token - 1] for token in ids)
 
 
-def streamed(pieces: list[bytes], tools: ToolFamily | None = None) -> list[Segment]:
+def streamed(pieces: list[bytes], parser: Parser | None = None) -> list[Segment]:
     ids = list(range(1, len(pieces) + 1))
     model, tokenizer = ScriptedLM(ids), Tokenizer(pieces)
     return list(
-        stream_generate(model, tokenizer, "prompt", max_tokens=len(ids), stop=(), tools=tools)
+        stream_generate(model, tokenizer, "prompt", max_tokens=len(ids), stop=(), parser=parser)
     )
 
 
@@ -129,7 +128,7 @@ def scripted_sampler(ids: list[int]) -> Sampler:
     return lambda _logits: mx.array([next(steps, ids[-1])])
 
 
-type Facade = Callable[[list[bytes], ToolFamily | None, str], tuple[Iterator[Segment], Tokenizer]]
+type Facade = Callable[[list[bytes], Parser | None, str], tuple[Iterator[Segment], Tokenizer]]
 
 
 def text_stream(prompt: Text, pieces: list[bytes]) -> tuple[Iterator[Segment], Tokenizer]:
@@ -140,13 +139,13 @@ def text_stream(prompt: Text, pieces: list[bytes]) -> tuple[Iterator[Segment], T
 
 
 def text_facade(
-    pieces: list[bytes], tools: ToolFamily | None, prompt: str
+    pieces: list[bytes], parser: Parser | None, prompt: str
 ) -> tuple[Iterator[Segment], Tokenizer]:
-    return text_stream(Text(prompt, tools), pieces)
+    return text_stream(Text(prompt, parser), pieces)
 
 
 def qwen35_facade(
-    pieces: list[bytes], tools: ToolFamily | None, prompt: str
+    pieces: list[bytes], parser: Parser | None, prompt: str
 ) -> tuple[Iterator[Segment], Tokenizer]:
     tokenizer = Tokenizer(pieces)
     model = Qwen35LanguageModel(Qwen35(TINY_QWEN35), tokenizer, None)
@@ -158,7 +157,7 @@ def qwen35_facade(
     # On the prompt and not on the model: the capability puts the family there when it
     # renders, and this is the only configuration the loader ever builds. A `tools=` on the
     # constructor was what let this arm pass green over a model that suppressed nothing.
-    return model.stream(Text(prompt, tools), options), tokenizer
+    return model.stream(Text(prompt, parser), options), tokenizer
 
 
 FACADES = [
@@ -206,7 +205,7 @@ def test_a_marker_split_across_two_pieces_is_still_a_marker() -> None:
         Segment("tool", CALL),
         Segment("content", " done"),
     )
-    assert QWEN.parse_tool_call(CALL) == (ToolCall("f", {"x": 1}),)
+    assert QWEN.tools is not None and QWEN.tools.parse_tool_call(CALL) == (ToolCall("f", {"x": 1}),)
 
 
 def test_text_that_starts_like_a_marker_and_is_not_leaves_whole() -> None:
@@ -262,7 +261,10 @@ def test_the_markers_are_the_family_s_own() -> None:
     would suppress nothing on GPT-OSS and hold prose that only looks like a call."""
     harmony = Segmenter(HARMONY)
     assert harmony.push(HARMONY_CALL) == (Segment("tool", HARMONY_CALL),)
-    assert HARMONY.parse_tool_call(HARMONY_CALL) == (ToolCall("get_weather", {"city": "Paris"}),)
+    assert HARMONY.tools is not None
+    assert HARMONY.tools.parse_tool_call(HARMONY_CALL) == (
+        ToolCall("get_weather", {"city": "Paris"}),
+    )
     assert Segmenter(HARMONY).push("use <tool_call> literally") == (
         Segment("content", "use <tool_call> literally"),
     )
@@ -271,7 +273,7 @@ def test_the_markers_are_the_family_s_own() -> None:
 def test_a_checkpoint_with_no_known_family_only_has_a_reasoning_block() -> None:
     """`tool_family` answers `None` for Qwen3.6's XML spelling: the envelope is there and
     nothing can parse it. Held, it would suppress content for a call that never arrives."""
-    machine = Segmenter()
+    machine = Segmenter(FALLBACK)
     assert machine.push(f"<think>why</think>{CALL}") == (
         Segment("reasoning", "<think>why</think>"),
         Segment("content", CALL),
@@ -281,7 +283,11 @@ def test_a_checkpoint_with_no_known_family_only_has_a_reasoning_block() -> None:
 def test_the_segments_of_a_generation_concatenate_back_into_what_the_model_wrote() -> None:
     """The machine partitions, it never filters — the invariant that lets the stream keep
     returning the same text while cutting it at marker boundaries. Chunked one character at
-    a time, every marker in the text arrives split."""
+    a time, every marker in the text arrives split.
+
+    The one thing that does leave is the prompt copied back at the top of the reasoning
+    block, which is why every machine here is built without a prompt: with none there is
+    nothing a restatement could be measured against, and the partition is total again."""
     text = f"<think>I should call it.</think>Sure.{CALL}bye"
     for size in (1, 3, 7):
         machine = Segmenter(QWEN)
@@ -331,7 +337,7 @@ def test_the_first_piece_does_not_wait_for_the_second_token() -> None:
     tell the two apart: one id detokenized when the first piece leaves is what does."""
     tokenizer = Tokenizer([b"Hello", b" there"])
     stream = stream_generate(
-        ScriptedLM([1, 2]), tokenizer, "prompt", max_tokens=2, stop=(), tools=QWEN
+        ScriptedLM([1, 2]), tokenizer, "prompt", max_tokens=2, stop=(), parser=QWEN
     )
     assert next(stream) == Segment("content", "Hello")
     assert tokenizer.detokenized == 1
@@ -455,16 +461,22 @@ def test_a_prompt_that_ends_inside_the_reasoning_block_starts_the_generation_in_
 
 
 def test_harmony_reasons_on_a_channel_and_not_on_a_tag() -> None:
-    """gpt-oss' generation prompt ends at `<|start|>assistant`, so nothing is open and the
-    block is the one the model opens itself — `<|channel|>analysis`, closed by `<|end|>`. A
+    """gpt-oss' generation prompt ends at `<|start|>assistant`, so the first generated text
+    is already a header's: `<|channel|>analysis` routes to reasoning, closed by `<|end|>`. A
     machine that only knows `<think>` leaves gpt-oss' reasoning on the content channel, and
-    the dialect has no way to tell it from the answer."""
+    the dialect has no way to tell it from the answer.
+
+    The headers leave on a channel of their own — they route, they are nobody's prose — and
+    what used to reach a client as `<|start|>assistant<|channel|>final<|message|>Answer` is
+    now the answer alone."""
     machine = Segmenter(HARMONY, prompt=generation_prompt(GPT_OSS))
     assert machine.push("<|channel|>analysis<|message|>Weighing it.<|end|>") == (
-        Segment("reasoning", "<|channel|>analysis<|message|>Weighing it.<|end|>"),
+        Segment("header", "<|channel|>analysis<|message|>"),
+        Segment("reasoning", "Weighing it.<|end|>"),
     )
     assert machine.push("<|start|>assistant<|channel|>final<|message|>Answer") == (
-        Segment("content", "<|start|>assistant<|channel|>final<|message|>Answer"),
+        Segment("header", "<|start|>assistant<|channel|>final<|message|>"),
+        Segment("content", "Answer"),
     )
 
 
@@ -478,7 +490,7 @@ def test_the_harmony_preamble_is_text_and_only_the_recipient_opens_an_envelope()
     assert machine.push("<|channel|>") == ()
     assert machine.push("commentary") == ()
     assert machine.push("<|message|>") == (
-        Segment("content", "<|channel|>commentary<|message|>"),
+        Segment("header", "<|channel|>commentary<|message|>"),
     )
     assert machine.push("I'll check the weather") == (
         Segment("content", "I'll check the weather"),
@@ -514,3 +526,137 @@ def test_a_reasoning_tag_the_user_typed_does_not_open_the_block() -> None:
     assert machine.push('<tool_call>\n{"name": "f"}\n</tool_call>') == (
         Segment("tool", '<tool_call>\n{"name": "f"}\n</tool_call>'),
     )
+
+
+# --- atem: harmony's channels with Anthropic's envelope (Muse-Glimmer) ------------------
+
+
+def atem_parser() -> Parser:
+    from sideros.parsers.atem import PARSER
+
+    return PARSER
+
+
+def test_atem_routes_the_turn_by_recipient_and_drops_the_headers() -> None:
+    """The generation prompt ends at `<|start|>assistant`, so the first text is a header's:
+    `to=self` is the reasoning channel, closed by `<|eom|>`; the answer follows under a new
+    header naming `to=user`. Both headers leave on their own channel — before this, the raw
+    stream reached the client with `to=self` word-counting shown as the answer."""
+    machine = Segmenter(atem_parser(), prompt="...<|start|>assistant")
+    assert machine.push(" to=self<|message|>Count words.") == (
+        Segment("header", " to=self<|message|>"),
+        Segment("reasoning", "Count words."),
+    )
+    assert machine.push("<|eom|><|start|>assistant to=user<|message|>Colonization is") == (
+        Segment("reasoning", "<|eom|>"),
+        Segment("header", "<|start|>assistant to=user<|message|>"),
+        Segment("content", "Colonization is"),
+    )
+
+
+def test_atem_segments_concatenate_back_whatever_the_chunking() -> None:
+    turn = (
+        " to=self<|message|>Weighing.<|eom|>"
+        "<|start|>assistant to=user<|message|>Answer"
+    )
+    for size in (1, 3, 7):
+        machine = Segmenter(atem_parser(), prompt="<|start|>assistant")
+        segments = [
+            segment
+            for start in range(0, len(turn), size)
+            for segment in machine.push(turn[start : start + size])
+        ]
+        segments += machine.flush()
+        assert "".join(segment.text for segment in segments) == turn
+        reasoned = "".join(s.text for s in segments if s.channel == "reasoning")
+        assert reasoned == "Weighing.<|eom|>"
+        assert "".join(s.text for s in segments if s.channel == "content") == "Answer"
+
+
+def test_an_atem_tool_turn_is_one_envelope_on_the_tool_channel() -> None:
+    """The header names the recipient, the envelope carries the call: held whole with its
+    header, which is the same rule harmony's reader relies on one dialect over."""
+    parser = atem_parser()
+    envelope = (
+        "<atem:function_calls>\n"
+        '<atem:invoke name="get_weather">\n'
+        '<atem:parameter name="city">Paris</atem:parameter>\n'
+        "</atem:invoke>\n"
+        "</atem:function_calls>"
+    )
+    machine = Segmenter(parser, prompt="<|start|>assistant")
+    pushed = machine.push(f" to=get_weather<|message|>{envelope}")
+    assert pushed == (Segment("tool", f" to=get_weather<|message|>{envelope}"),)
+    assert parser.tools is not None
+    assert parser.tools.parse_tool_call(pushed[0].text) == (
+        ToolCall("get_weather", {"city": "Paris"}),
+    )
+
+
+ASKED = "write a dense autoencoder returned by a function, typed and trivial, in Keras 3"
+"""Long enough to be a restatement rather than a phrase two texts happen to share."""
+
+PROMPT = f"<|start|>system<|message|>You are helpful.<|eot|><|start|>user<|message|>{ASKED}<|eot|><|start|>assistant"
+
+
+def _reasoning(machine: Segmenter, text: str, size: int = 5) -> str:
+    """What the reader is shown on the reasoning channel, fed one small piece at a time —
+    the restatement has to be decided across pushes and not inside one."""
+    segments = [
+        segment
+        for start in range(0, len(text), size)
+        for segment in machine.push(text[start : start + size])
+    ]
+    segments += machine.flush()
+    return "".join(segment.text for segment in segments if segment.channel == "reasoning")
+
+
+def test_the_prompt_written_back_at_the_top_of_the_reasoning_does_not_reach_the_reader() -> None:
+    """The habit this exists for: the checkpoint opens its analysis by transcribing the
+    request, verbatim, before the first line of its own. It costs the forwards either way —
+    the ids were drawn — but it is the reader's own words handed back, and it would
+    otherwise be stripped again by every client that speaks to this daemon."""
+    machine = Segmenter(atem_parser(), prompt=PROMPT)
+    shown = _reasoning(machine, f" to=self<|message|>{ASKED}\n\nWe need to provide code.<|eom|>")
+
+    assert ASKED not in shown
+    assert shown == "\n\nWe need to provide code.<|eom|>"
+
+
+def test_a_phrase_the_prompt_also_contains_is_not_a_restatement() -> None:
+    """The floor, and what it protects: a block opening on a few words it shares with the
+    request is a model referring to what it was asked. Only transcription is dropped."""
+    machine = Segmenter(atem_parser(), prompt=PROMPT)
+    shown = _reasoning(machine, " to=self<|message|>in Keras 3, use Sequential.<|eom|>")
+
+    assert shown == "in Keras 3, use Sequential.<|eom|>"
+
+
+def test_a_generation_that_wrote_nothing_but_the_prompt_back_shows_nothing() -> None:
+    """The copy still running when the budget ran out. Held text normally leaves on
+    `flush` — this is the one thing that does not, because holding it was the decision."""
+    machine = Segmenter(atem_parser(), prompt=PROMPT)
+
+    assert _reasoning(machine, f" to=self<|message|>{ASKED}") == ""
+
+
+def test_only_the_reasoning_channel_is_read_for_a_restatement() -> None:
+    """An answer that quotes the request is an answer. What is dropped is the model talking
+    to itself about what it was just told, and the channel is what says which is which."""
+    machine = Segmenter(atem_parser(), prompt=PROMPT)
+    text = f" to=user<|message|>You asked me to {ASKED}. Here it is.<|eot|>"
+    segments = [segment for piece in (text,) for segment in machine.push(piece)]
+
+    assert "".join(s.text for s in segments if s.channel == "content").count(ASKED) == 1
+
+
+def test_the_restatement_is_decided_the_same_however_the_stream_is_chunked() -> None:
+    """The copy breaks off mid-piece as often as not, and where the pieces fall is the
+    tokenizer's business. Character by character or in one push, the reader sees the same."""
+    written = f" to=self<|message|>{ASKED}\n\nWe need to provide code.<|eom|>"
+    shown = {
+        size: _reasoning(Segmenter(atem_parser(), prompt=PROMPT), written, size)
+        for size in (1, 2, 13, len(written))
+    }
+
+    assert set(shown.values()) == {"\n\nWe need to provide code.<|eom|>"}

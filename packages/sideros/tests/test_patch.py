@@ -10,7 +10,7 @@ original comes back on exit.
 import mlx.core as mx
 from conftest import relative_diff
 
-from sideros.core.kernels.int8_qmv import QUANTIZED_MATMUL
+from sideros.core.kernels.qmv.int8 import QUANTIZED_MATMUL
 from sideros.core.patch import Patch, patched, uses
 
 

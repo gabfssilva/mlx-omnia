@@ -4,7 +4,7 @@ The channel alone is not an envelope — harmony writes the preamble to the user
 too, closed by `<|end|>` and not by `<|call|>` — so what opens one is the recipient. That is
 also what makes this family's reader see more than the stream does: generating, the model
 writes the channel first and the recipient after it; replaying a history, the template writes
-the same recipient into the role header instead. `FAMILY.start` is the generated spelling,
+the same recipient into the role header instead. The family's `start` is the generated spelling,
 because that is the only one the `Segmenter` is ever shown, while the reader opens on
 `to=functions.` and reads both.
 
@@ -14,10 +14,12 @@ nothing on the other side to route them to, which the opener excludes by constru
 
 import re
 
-from sideros.tools.envelope import Body, EnvelopeScanner
-from sideros.tools.protocol import CallDelta, ToolFamily
+from sideros.parsers.envelope import Body, EnvelopeScanner
+from sideros.parsers.protocol import CallDelta, Channel, Headers, Parser, ToolFamily
 
-__all__ = ["FAMILY"]
+__all__ = ["PARSER", "REASONING"]
+
+REASONING = ("<|channel|>analysis", "<|end|>")
 
 _CHANNEL = "<|channel|>commentary"
 _START = f"{_CHANNEL} to="
@@ -65,9 +67,26 @@ class HarmonyReader:
         return tuple(out)
 
 
-FAMILY = ToolFamily(
-    start=_START,
-    end=_END,
+def _classify(header: str) -> tuple[Channel, str] | None:
+    """The channel a harmony header opens. The recipient is what makes an envelope — the
+    preamble to the user rides the commentary channel too, closed by `<|end|>` and not by
+    `<|call|>` — and `analysis` is the reasoning channel gpt-oss opens every turn on.
+    Anything else (`final`, bare commentary) is the answer."""
+    if REASONING[0] in header:
+        return "reasoning", REASONING[1]
+    if _START in header:
+        return "tool", _END
+    return None
+
+
+PARSER = Parser(
     recognizes=lambda source: _CHANNEL in source,
-    reader=HarmonyReader,
+    reasoning=(),
+    tools=ToolFamily(start=_START, end=_END, reader=HarmonyReader),
+    headers=Headers(
+        openers=("<|start|>", "<|channel|>"),
+        body=_BODY,
+        tail="<|start|>assistant",
+        classify=_classify,
+    ),
 )

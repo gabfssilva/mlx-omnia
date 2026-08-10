@@ -28,8 +28,7 @@ from sideros.model import (
     ModelSignature,
     Wrapping,
 )
-from sideros.suppress import REASONING, Segment, opened
-from sideros.tools import ToolFamily
+from sideros.parsers import REASONING, Parser, Segment, opened
 
 TEXT = ContentType(Modality.TEXT, "text/plain")
 
@@ -37,11 +36,11 @@ TEXT = ContentType(Modality.TEXT, "text/plain")
 @dataclass(frozen=True)
 class Text:
     value: str
-    tool_family: ToolFamily | None = None
-    """Which envelope the checkpoint spells a call in, as the source of the chat template
-    that rendered this prompt says. It travels with the prompt because the prompt is all the
-    streamer is handed — the template stays on the capability's side of `prepare` — and a
-    `Text` no template rendered continues none and declares nothing."""
+    parser: Parser | None = None
+    """Which dialect the checkpoint speaks, as the source of the chat template that rendered
+    this prompt says. It travels with the prompt because the prompt is all the streamer is
+    handed — the template stays on the capability's side of `prepare` — and a `Text` no
+    template rendered continues none and declares nothing."""
 
     @property
     def content_type(self) -> ContentType:
@@ -92,6 +91,15 @@ class GenerationOptions:
 
     Part of the comparison: two requests differing only in how long the model may think are
     not the same generation."""
+    speculate: bool = field(default=True, compare=False)
+    """Whether this run may use the drafter the model was paired with, when it was paired
+    with one. It is a permission and not a request: a model with no drafter, and a request
+    that cannot be verified greedily, decode the same way either way.
+
+    It travels here because the two levels that decide it — the model's own setting and the
+    profile over it — are the caller's, and what holds the drafter is the facade. Out of
+    the comparison for the same reason the meter is: two requests asking for the same
+    generation are the same options, however each one was proposed."""
     context_limit: int | None = None
     """The checkpoint's own ceiling on prompt and generation together — the config's
     `max_position_embeddings`, when the caller read it. `max_tokens` alone cannot honour
@@ -259,6 +267,6 @@ class TextLanguageModel[C: LayerCache]:
                 options.reasoning_budget, input.value, self.tokenizer
             ),
         )
-        # No family — unknown, or a prompt no template rendered — still holds the reasoning
-        # block back: that one is the model's own spelling and not the family's.
-        yield from stream_text(ids, self.tokenizer, tools=input.tool_family, prompt=input.value)
+        # No dialect — unknown, or a prompt no template rendered — still holds the reasoning
+        # block back: that one is the model's own spelling and not the dialect's.
+        yield from stream_text(ids, self.tokenizer, parser=input.parser, prompt=input.value)

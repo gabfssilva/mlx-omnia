@@ -1,6 +1,9 @@
-"""The mixed-width case the spine has to carry: in a sparse Qwen3.5 the router's matrix
+"""The mixed-width cases the spine has to carry: in a sparse Qwen3.5 the router's matrix
 and the shared expert's logit row ship at 8 bits while every other leaf ships at 4, and
-nothing in the config says so — the tensors do."""
+nothing in the config says so — the tensors do. A per-leaf plan takes that further: the
+shared expert at a width the routed stack does not have, and a dense router beside a
+packed shared gate. Every fusion the loader performs is conditional on the tensors
+agreeing, and what does not fuse stays addressable as separate leaves."""
 
 import json
 from pathlib import Path
@@ -8,7 +11,7 @@ from pathlib import Path
 import mlx.core as mx
 import mlx.nn as nn
 
-from sideros.core.layers import QuantizedSwitchLinear
+from sideros.core.layers import QuantizedSwitchLinear, SegmentedLinear
 from sideros.models.qwen3_5 import CHECKPOINT, Qwen35MoE
 
 HIDDEN = 64
@@ -71,22 +74,31 @@ def _packed(path: str, shape: tuple[int, ...], bits: int) -> dict[str, mx.array]
     return {f"{path}.weight": weight, f"{path}.scales": scales, f"{path}.biases": biases}
 
 
-def _moe(prefix: str) -> dict[str, mx.array]:
+def _moe(prefix: str, *, shared_bits: int = EXPERT_BITS, dense_router: bool = False) -> (
+    dict[str, mx.array]
+):
     """The router and the shared expert's logit at 8 bits; the expert stacks at 4. The
-    loader concatenates the two 8-bit rows into one leaf, so both have to agree."""
+    loader concatenates the two 8-bit rows into one leaf, so both have to agree — and
+    when they do not (`dense_router`), it keeps them apart instead. `shared_bits` is the
+    other half of the same rule, on the expert stacks."""
     weights = {
-        **_packed(f"{prefix}gate", (EXPERTS, HIDDEN), ROUTER_BITS),
         **_packed(f"{prefix}shared_expert_gate", (1, HIDDEN), ROUTER_BITS),
         **_packed(f"{prefix}switch_mlp.down_proj", (EXPERTS, HIDDEN, INNER), EXPERT_BITS),
-        **_packed(f"{prefix}shared_expert.down_proj", (HIDDEN, INNER), EXPERT_BITS),
+        **_packed(f"{prefix}shared_expert.down_proj", (HIDDEN, INNER), shared_bits),
     }
+    if dense_router:
+        weights[f"{prefix}gate.weight"] = _dense(EXPERTS, HIDDEN)
+    else:
+        weights |= _packed(f"{prefix}gate", (EXPERTS, HIDDEN), ROUTER_BITS)
     for part in ("gate", "up"):
         weights |= _packed(f"{prefix}switch_mlp.{part}_proj", (EXPERTS, INNER, HIDDEN), EXPERT_BITS)
-        weights |= _packed(f"{prefix}shared_expert.{part}_proj", (INNER, HIDDEN), EXPERT_BITS)
+        weights |= _packed(f"{prefix}shared_expert.{part}_proj", (INNER, HIDDEN), shared_bits)
     return weights
 
 
-def _checkpoint(directory: Path) -> None:
+def _checkpoint(
+    directory: Path, *, shared_bits: int = EXPERT_BITS, dense_router: bool = False
+) -> None:
     mx.random.seed(0)
     queries = HEADS * HEAD_DIM
     key_values = KV_HEADS * HEAD_DIM
@@ -113,7 +125,9 @@ def _checkpoint(directory: Path) -> None:
     for layer in (0, 1):
         weights[f"model.layers.{layer}.input_layernorm.weight"] = _dense(HIDDEN)
         weights[f"model.layers.{layer}.post_attention_layernorm.weight"] = _dense(HIDDEN)
-        weights |= _moe(f"model.layers.{layer}.mlp.")
+        weights |= _moe(
+            f"model.layers.{layer}.mlp.", shared_bits=shared_bits, dense_router=dense_router
+        )
     mx.eval(list(weights.values()))
     directory.mkdir(parents=True, exist_ok=True)
     (directory / "config.json").write_text(json.dumps(_CONFIG))
@@ -142,4 +156,50 @@ def test_the_router_keeps_its_eight_bits_next_to_four_bit_experts(tmp_path: Path
         experts = mlp.switch_mlp.gate_up_proj
         assert isinstance(experts, QuantizedSwitchLinear)
         assert (experts.bits, experts.group_size) == (EXPERT_BITS, GROUP)
-        assert experts.weight.shape == (EXPERTS + 1, 2 * INNER, HIDDEN * EXPERT_BITS // 32)
+        assert experts.weight.shape == (EXPERTS, 2 * INNER, HIDDEN * EXPERT_BITS // 32)
+        # The shared expert is a leaf of its own, gate‖up interleaved like the stack.
+        shared = mlp.shared_expert.gate_up_proj
+        assert isinstance(shared, nn.QuantizedLinear)
+        assert shared.weight.shape == (2 * INNER, HIDDEN * EXPERT_BITS // 32)
+
+
+def test_the_shared_expert_keeps_a_width_the_routed_stack_does_not_have(
+    tmp_path: Path,
+) -> None:
+    # mutação: empilhar o par do shared como slot `EXPERTS` do stack roteado (o layout
+    # antigo) quebra — 8 bits ao lado de 4 não têm matriz comum e o concatenate estoura.
+    _checkpoint(tmp_path, shared_bits=ROUTER_BITS)
+
+    model = CHECKPOINT.load(tmp_path, None)
+
+    for layer in model.model.layers:
+        mlp = layer.mlp
+        assert isinstance(mlp, Qwen35MoE)
+        assert mlp.switch_mlp.gate_up_proj.weight.shape[0] == EXPERTS
+        for leaf in (mlp.shared_expert.gate_up_proj, mlp.shared_expert.down_proj):
+            assert isinstance(leaf, nn.QuantizedLinear)
+            assert leaf.bits == ROUTER_BITS
+        routed = mlp.switch_mlp.gate_up_proj
+        assert isinstance(routed, QuantizedSwitchLinear)
+        assert routed.bits == EXPERT_BITS
+
+
+def test_a_dense_router_beside_a_quantized_shared_gate_stays_segmented(tmp_path: Path) -> None:
+    # mutação: concatenar as duas folhas sem testar formato (o `fusible`) quebra — uma
+    # matriz densa [experts, hidden] e uma linha empacotada [1, hidden*bits/32] não
+    # concatenam, e o load estoura antes de chegar ao módulo.
+    _checkpoint(tmp_path, dense_router=True)
+
+    model = CHECKPOINT.load(tmp_path, None)
+
+    for layer in model.model.layers:
+        mlp = layer.mlp
+        assert isinstance(mlp, Qwen35MoE)
+        gate = mlp.gate
+        assert isinstance(gate, SegmentedLinear)
+        router, shared = gate.parts
+        assert not isinstance(router, nn.QuantizedLinear)
+        assert isinstance(shared, nn.QuantizedLinear)
+        assert shared.bits == ROUTER_BITS
+        # The routing logits and the shared gate still arrive as one row of 257.
+        assert mlp.gate(mx.zeros((1, 1, HIDDEN))).shape == (1, 1, EXPERTS + 1)

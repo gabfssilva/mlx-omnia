@@ -29,11 +29,10 @@ from conftest import (
 from sideros import KVCache, stream_ids
 from sideros.checkpoint import stop_tokens
 from sideros.core.config import load_config
+from sideros.core.kernels.attention import SinkAttentionStep
 from sideros.core.kernels.down_combine import DownCombine
-from sideros.core.kernels.sink_attention import sink_attention
 from sideros.core.layers import QuantizedSwitchLinear
 from sideros.models.gpt_oss import CHECKPOINT, GPTOSS, GPTOSSConfig
-from sideros.models.gpt_oss.layers import attention as attention_module
 from sideros.models.gpt_oss.layers import flags
 
 FIXTURE = Path(__file__).parent / "fixtures" / "gpt_oss_120b_mlxlm.safetensors"
@@ -200,16 +199,17 @@ def test_kernels_are_engaged_at_step(model: GPTOSS, monkeypatch: pytest.MonkeyPa
     assert block.mlp.fused_step(x, x) is not None
 
     engaged: list[bool] = []
+    original = SinkAttentionStep.__call__
 
     def spy(
-        queries: mx.array, keys: mx.array, values: mx.array, sinks: mx.array,
-        mask: mx.array | None, scale: float,
+        self: SinkAttentionStep, queries: mx.array, keys: mx.array, values: mx.array,
+        mask: mx.array | str | None = None,
     ) -> mx.array:
         engaged.append(True)
-        return sink_attention(queries, keys, values, sinks, mask, scale)
+        return original(self, queries, keys, values, mask)
 
     monkeypatch.setattr(flags, "USE_SINK_ATTENTION", True)
-    monkeypatch.setattr(attention_module, "sink_attention", spy)
+    monkeypatch.setattr(SinkAttentionStep, "__call__", spy)
     mx.eval(model(mx.array([[1]])))
     assert len(engaged) == len(model.model.layers)
 
@@ -258,14 +258,16 @@ def test_sink_attention_ignoring_mask_breaks_parity(
     `None` turns them into full attention, which the 128-token window must expose."""
     ids = golden["greedy_ids"]
 
+    original = SinkAttentionStep.__call__
+
     def without_mask(
-        queries: mx.array, keys: mx.array, values: mx.array, sinks: mx.array,
-        mask: mx.array | None, scale: float,
+        self: SinkAttentionStep, queries: mx.array, keys: mx.array, values: mx.array,
+        mask: mx.array | str | None = None,
     ) -> mx.array:
-        return sink_attention(queries, keys, values, sinks, None, scale)
+        return original(self, queries, keys, values, None)
 
     monkeypatch.setattr(flags, "USE_SINK_ATTENTION", True)
-    monkeypatch.setattr(attention_module, "sink_attention", without_mask)
+    monkeypatch.setattr(SinkAttentionStep, "__call__", without_mask)
     broken = _stepwise(model, ids)
     monkeypatch.undo()
     assert relative_diff(broken, model(ids[None])) > 3 * golden["noise.batching"].item()

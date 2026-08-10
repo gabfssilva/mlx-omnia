@@ -8,6 +8,7 @@ below makes the target's script exact, and the counts pinned in
 over-accepting loop breaks both the ids and the numbers.
 """
 
+from collections.abc import Sequence
 from pathlib import Path
 
 import mlx.core as mx
@@ -165,6 +166,55 @@ def test_the_meter_counts_the_ids_the_speculative_loop_emitted(target: ScriptedL
     assert meter.ttft is not None
 
 
+def test_a_meter_carries_the_acceptance_without_being_asked(target: ScriptedLM) -> None:
+    """What a screen needs to say a turn speculated at all. It is not in the rate — the same
+    model answers a sampled request with no drafter at all — and a caller that measures a
+    generation should not have to know that speculation is a second object to pass.
+
+    A run with no draft leaves it at zero, which is what "did not speculate" is: the same
+    reading for a model with no drafter and for a request one could not verify."""
+    meter = Meter()
+    list(
+        stream_ids(
+            target,
+            PROMPT,
+            max_tokens=6,
+            meter=meter,
+            draft=ScriptedLM(TARGET, VOCAB),
+            lookahead=LOOKAHEAD,
+        )
+    )
+    assert meter.speculation.rounds > 0
+    assert meter.speculation.accepted == meter.speculation.proposed
+
+    plain = Meter()
+    list(stream_ids(target, PROMPT, max_tokens=6, meter=plain))
+
+    assert (plain.speculation.rounds, plain.speculation.proposed) == (0, 0)
+
+
+def test_an_explicit_acceptance_still_wins(target: ScriptedLM) -> None:
+    """The meter's is a default and not a redirection: a caller with somewhere else to put
+    the counts — the bench keeps them per arm — gets them there, and the meter's own stays
+    at zero rather than holding half a tally."""
+    counts = Acceptance()
+    meter = Meter()
+    list(
+        stream_ids(
+            target,
+            PROMPT,
+            max_tokens=6,
+            meter=meter,
+            acceptance=counts,
+            draft=ScriptedLM(TARGET, VOCAB),
+            lookahead=LOOKAHEAD,
+        )
+    )
+
+    assert counts.rounds > 0
+    assert meter.speculation.rounds == 0
+
+
 def test_a_recurrent_cache_refuses_the_draft(target: ScriptedLM) -> None:
     """Qwen3.6's DeltaNet state cannot be rewound to the accepted prefix. Refused by name at
     either end, before a single forward runs — the double asserts as much."""
@@ -250,3 +300,98 @@ def test_a_draft_that_is_the_target_is_almost_always_accepted(
     assert drafted == list(stream_ids(gpt2, prompt, max_tokens=16))
     assert counts.rate is not None
     assert counts.rate > 0.5
+
+
+class ScriptedBlockLM(ScriptedLM):
+    """The same script, through `generate.BlockOutputs`. The features are the rows' own
+    absolute positions repeated once per tap, which is what lets a test say exactly which
+    positions the loop handed over — a loop that passed the rejected tail, or passed a
+    block twice, spells it here as a gap or a repeat."""
+
+    def block_outputs(
+        self, ids: mx.array, cache: list[KVCache], *, at: Sequence[int]
+    ) -> tuple[mx.array, mx.array]:
+        offset = cache[0].offset
+        length = ids.shape[-1]
+        logits = self(ids, cache)
+        positions = mx.arange(offset, offset + length).astype(mx.float32)
+        return logits, mx.stack([positions] * len(at), axis=-1)[None]
+
+
+class BlockProposer:
+    """One forward per round, like DFlash: it proposes `width` ids at once and reads the
+    target's blocks instead of its ids."""
+
+    def __init__(self, script: list[int], width: int, taps: tuple[int, ...] = (1, 3)) -> None:
+        self._script = script
+        self._width = width
+        self._taps = taps
+        self.absorbed: list[int] = []
+        self.anchors: list[int] = []
+        self.settled: list[int] = []
+
+    @property
+    def taps(self) -> Sequence[int]:
+        return self._taps
+
+    @property
+    def width(self) -> int:
+        return self._width
+
+    def absorb(self, features: mx.array) -> None:
+        assert features.shape[-1] == len(self._taps)
+        rows = features[0, :, 0].tolist()
+        assert isinstance(rows, list)
+        self.absorbed.extend(int(row) for row in rows)
+
+    def propose(self, committed: Sequence[int]) -> mx.array:
+        self.anchors.append(committed[-1])
+        base = len(committed) - 1
+        last = len(self._script) - 1
+        return mx.array([self._script[min(base + i, last)] for i in range(self._width)])
+
+    def settle(self, length: int) -> None:
+        self.settled.append(length)
+
+
+@pytest.mark.parametrize("script", [TARGET, HOSTILE, ALTERNATING])
+def test_a_block_proposer_reproduces_the_greedy_stream(script: list[int]) -> None:
+    """The same invariant as the autoregressive draft, over a proposer that writes a whole
+    block per round: what changes is who proposes, never what is emitted."""
+    target = ScriptedBlockLM(TARGET, VOCAB)
+    drafted = list(stream_ids(target, PROMPT, max_tokens=6, draft=BlockProposer(script, 3)))
+    assert drafted == list(stream_ids(ScriptedLM(TARGET, VOCAB), PROMPT, max_tokens=6))
+    assert drafted == TARGET[:6]
+
+
+def test_the_proposer_reads_every_kept_position_exactly_once() -> None:
+    """What `absorb` is: the positions the target's cache took and kept, in order, with the
+    rejected tail of every round left out. Contiguous from zero and as long as the cache is
+    — a loop that handed over the whole verification block would repeat positions here, and
+    one that forgot the prefill would start past zero.
+
+    The hostile script is the discriminating one: every round rejects, so every round has a
+    tail to leave out."""
+    target = ScriptedBlockLM(TARGET, VOCAB)
+    proposer = BlockProposer(HOSTILE, 3)
+
+    generated = list(stream_ids(target, PROMPT, max_tokens=6, draft=proposer))
+
+    assert generated == TARGET[:6]
+    assert proposer.absorbed == list(range(len(proposer.absorbed)))
+    # One row per position the target committed: the prompt, plus every id but the last —
+    # which is the anchor of the round that never ran.
+    assert len(proposer.absorbed) == len(PROMPT) + len(generated) - 1
+    assert proposer.anchors == TARGET[:5]
+    assert proposer.settled == [2, 3, 4, 5, 6]
+
+
+def test_a_target_with_no_blocks_to_read_refuses_the_proposer() -> None:
+    """A proposer that conditions on the trunk against a model that does not hand it out.
+    Refused by name before the first forward: what it would read instead is nothing."""
+    with pytest.raises(SpeculationRefused, match="block_outputs"):
+        list(
+            stream_ids(
+                ScriptedLM(TARGET, VOCAB), PROMPT, max_tokens=4, draft=BlockProposer(TARGET, 3)
+            )
+        )

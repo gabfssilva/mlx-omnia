@@ -24,6 +24,7 @@ from conftest import (
 
 from sideros import stream_ids
 from sideros.core.cache import DeltaCache
+from sideros.core.kernels.route import SoftmaxTopkRoute
 from sideros.core.layers import QuantizedSwitchLinear
 from sideros.models.qwen3_5 import CHECKPOINT, Qwen35, Qwen35MoE
 
@@ -65,8 +66,8 @@ def sparse(model: Qwen35) -> Qwen35MoE:
 
 @requires_checkpoint(REPO)
 def test_shapes_after_fusion(model: Qwen35) -> None:
-    """The shared expert rides in two of the three sparse tensors: row 256 of the
-    router and slot 256 of the gate‖up stack, never in the down stack."""
+    """The shared expert rides in one of the sparse tensors — row 256 of the router —
+    and keeps its own leaves for gate‖up and down."""
     config = model.config
     text = config.text_config
     assert (text.num_experts, text.num_experts_per_tok) == (256, 8)
@@ -75,11 +76,13 @@ def test_shapes_after_fusion(model: Qwen35) -> None:
     assert text.moe_intermediate_size == 1024
     mlp = sparse(model)
     assert mlp.gate.weight.shape[0] == 257
-    assert mlp.switch_mlp.gate_up_proj.weight.shape[0] == 257
+    assert mlp.switch_mlp.gate_up_proj.weight.shape[0] == 256
     assert mlp.switch_mlp.down_proj.weight.shape[0] == 256
+    assert mlp.shared_expert.gate_up_proj.weight.shape[0] == 2 * text.moe_intermediate_size
     # Without this the T=1 step silently falls back to the op chain and the fused
     # kernels below would never be under test.
-    assert mlp.fused_step_applies()
+    route, _, _ = mlp._kernels()
+    assert isinstance(route.strategy, SoftmaxTopkRoute)
 
 
 @requires_checkpoint(REPO)

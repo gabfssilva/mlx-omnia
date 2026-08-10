@@ -29,7 +29,7 @@ from sideros import (
     load,
 )
 from sideros.language import Prefill, tokenizer_of, trunk_of
-from sideros.suppress import Segment
+from sideros.parsers import Segment
 
 GEMMA = "google/gemma-3-270m"
 

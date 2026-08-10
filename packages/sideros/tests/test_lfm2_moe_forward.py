@@ -11,11 +11,11 @@ import mlx.core as mx
 import numpy as np
 import pytest
 from conftest import checkpoint_dir, floor, load_golden, relative_diff, requires_checkpoint
+from sideros.core.kernels.moe_gemv_dense import moe_dense_down
 
 from sideros import KVCache, stream_ids
 from sideros.core.cache import ConvCache
 from sideros.core.kernels.conv_mix import conv_mix
-from sideros.core.kernels.moe_gemv_dense import moe_dense_down
 from sideros.models.lfm2.layers import conv as conv_layer
 from sideros.models.lfm2.layers import experts as experts_layer
 from sideros.models.lfm2.layers import flags

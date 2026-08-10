@@ -11,7 +11,7 @@ from sideros.language import (
     TextLanguageModel,
 )
 from sideros.model import ContentType, Modality, ModelSignature
-from sideros.suppress import Segment
+from sideros.parsers import Segment
 
 TOKENS = {
     "prompt": [1],

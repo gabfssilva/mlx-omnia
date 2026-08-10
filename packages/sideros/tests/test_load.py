@@ -18,7 +18,7 @@ from sideros import (
     Text,
 )
 from sideros.checkpoint import Checkpoint
-from sideros.suppress import Segment
+from sideros.parsers import Segment
 
 
 class TextBackend:
