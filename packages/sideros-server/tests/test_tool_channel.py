@@ -12,10 +12,12 @@ leaves as content, and a request whose generation writes no envelope gets back e
 text it always did.
 """
 
-from sideros.suppress import Segment
-from sideros.tools import ToolCall
-from sideros.tools.families.qwen import FAMILY as QWEN
+from sideros.parsers import Segment, ToolCall
+from sideros.parsers.qwen import PARSER
 from sideros_server.responses import Calls
+
+assert PARSER.tools is not None
+QWEN = PARSER.tools
 
 CALL = '<tool_call>{"name": "f", "arguments": {"x": 1}}</tool_call>'
 

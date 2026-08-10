@@ -113,7 +113,7 @@ from sideros.quant.quantization import (
     quantize_weights,
 )
 from sideros_server import catalog
-from sideros_server.jobs import Job, Jobs, JobsDep, Progress, Work, accepted
+from sideros_server.jobs import Job, Jobs, JobsDep, Progress, Quantize, Work, accepted
 
 STAGING = ".quantizing"
 """Public because `download`'s staging window lists it: what is taking space and can be
@@ -264,9 +264,7 @@ def _admissible(request: PlanRequest) -> None:
                 ),
             )
         named = sorted(
-            pattern
-            for pattern, override in request.overrides.items()
-            if override is not None
+            pattern for pattern, override in request.overrides.items() if override is not None
         )
         if named:
             raise HTTPException(
@@ -286,6 +284,24 @@ def _admissible(request: PlanRequest) -> None:
         )
 
 
+def _drafter_refusal(source: str, config: Mapping[str, object], method: str) -> str | None:
+    """Why a drafter takes `rtn` and nothing else, or `None` when the pair is fine.
+
+    Nothing structural: `intercepted_collect` finds the blocks in any tree and the packing
+    never knew what a model is. What a drafter has not got is a way to be *read* — its
+    input is not tokens but the target's hidden states, so there is no tokenizer to run a
+    corpus through and no forward that a sequence of ids alone can drive. Calibrating one
+    means loading its target too, and nothing in a drafter's config names one.
+    """
+    model_type = config.get("model_type")
+    if method == "rtn" or not isinstance(model_type, str) or not task.drafts(model_type):
+        return None
+    return (
+        f"{source!r} is a drafter: its input is the target's hidden states and not tokens, "
+        f"so there is no corpus to calibrate it against — {method!r} needs one, 'rtn' does not"
+    )
+
+
 def _format(request: PlanRequest, bits: int, group_size: int | None = None) -> Quantization:
     match request.mode:
         case "affine":
@@ -303,9 +319,7 @@ def _selection(request: PlanRequest) -> ByPath:
     engine's table, not a second one here: an unsupported pair raises out of `Affine` and
     this route answers with what it said."""
     overrides: dict[str | re.Pattern[str], Quantization | None] = {
-        pattern: None
-        if override is None
-        else _format(request, override.bits, override.group_size)
+        pattern: None if override is None else _format(request, override.bits, override.group_size)
         for pattern, override in request.overrides.items()
     }
     return ByPath(_format(request, request.bits), overrides)
@@ -355,9 +369,7 @@ def _observe(
 
     def prefill(ids: mx.array) -> mx.array:
         nonlocal observed
-        job.report(
-            Progress(message=f"calibrating {source}", completed=observed, total=total)
-        )
+        job.report(Progress(message=f"calibrating {source}", completed=observed, total=total))
         observed += 1
         return forward(ids)
 
@@ -532,11 +544,14 @@ def _calibrated(
 
 
 def _quantize(source: str, repo: str, selection: ByPath, request: QuantizeRequest) -> Work:
-    def work(job: Job) -> None:
+    def run(job: Job) -> None:
         # A report first: a job cancelled while it waited for a thread must not open the
         # checkpoint, let alone start packing it.
         job.report(Progress(message=f"reading {source}"))
         checkpoint = task.source(source, local_files_only=True)
+        refusal = _drafter_refusal(source, checkpoint.config, request.method)
+        if refusal is not None:
+            raise ValueError(refusal)
         plan = expand_plan(checkpoint.pending.model, selection)
         calibrated = (
             _Calibrated(plan, {}, {}, {})
@@ -561,9 +576,7 @@ def _quantize(source: str, repo: str, selection: ByPath, request: QuantizeReques
         try:
             if request.method == "awq":
                 pairs = derive_pairs(checkpoint.pending.model)
-                outcomes = apply_awq(
-                    weights, plan, calibrated.statistics, pairs, prefix=""
-                )
+                outcomes = apply_awq(weights, plan, calibrated.statistics, pairs, prefix="")
                 recorded["awq"] = [_outcome_json(outcome) for outcome in outcomes]
             if request.method == "gptq":
                 recorded["gptq"] = _pack_gptq(job, weights, plan, calibrated.statistics)
@@ -589,6 +602,19 @@ def _quantize(source: str, repo: str, selection: ByPath, request: QuantizeReques
             # resume, so a failure ends the way a cancellation does.
             shutil.rmtree(staging, ignore_errors=True)
             raise
+
+    def work(job: Job) -> None:
+        """`run` in a frame of its own, and the reason is the order: the packed weights are
+        a whole checkpoint and they are only unreachable once that frame is gone, so a
+        `clear_cache` from inside it would find them live and free nothing. Outside it, what
+        the job read and packed goes back to the system instead of into MLX's own pool —
+        an unload's reason, and the same one: the footprint is what the memory rail reads
+        and what admission decides against, and a quantization is the largest thing this
+        process ever allocates."""
+        try:
+            run(job)
+        finally:
+            mx.clear_cache()
 
     return work
 
@@ -617,7 +643,8 @@ async def create(request: QuantizeRequest, registry: JobsDep) -> JSONResponse:
     if (catalog.HUB_CACHE / _slug(request.repo)).exists():
         raise HTTPException(status_code=409, detail=f"{request.repo!r} is already on disk")
     job = registry.start(
-        "quantize", _quantize(request.source, request.repo, selection, request)
+        Quantize(model=request.source, target=request.repo),
+        _quantize(request.source, request.repo, selection, request),
     )
     _QUANTIZING[request.repo] = job.id
     return accepted(job)
@@ -685,9 +712,10 @@ def price(request: PlanRequest) -> PricedPlan:
             status_code=404, detail=f"{request.source!r} is not on this disk"
         ) from error
     if "quantization" in resolved.config:
-        raise HTTPException(
-            status_code=409, detail=f"{request.source!r} is already quantized"
-        )
+        raise HTTPException(status_code=409, detail=f"{request.source!r} is already quantized")
+    refusal = _drafter_refusal(request.source, resolved.config, request.method)
+    if refusal is not None:
+        raise HTTPException(status_code=409, detail=refusal)
     stored = catalog.weights_dtype(resolved.directory)
     dtype = _DTYPES.get(stored or "")
     if dtype is None:

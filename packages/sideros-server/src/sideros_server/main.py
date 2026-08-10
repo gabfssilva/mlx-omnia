@@ -8,13 +8,13 @@ from collections.abc import Callable
 import uvicorn
 
 from sideros import LanguageModel, ModelInput, load
-from sideros_server import auth, config
+from sideros_server import auth, config, features
 from sideros_server.app import create_app
 from sideros_server.engine import Engine
 from sideros_server.store import Store
 
 
-def _resident(model_id: str) -> LanguageModel[ModelInput]:
+def _resident(store: Store) -> Callable[[str], LanguageModel[ModelInput]]:
     """Only what is already on disk. Fetching a repository is a job of its own
     (`POST /admin/models`), and the catalog lists exactly what a client may name — so an id
     that is not there has to be an error rather than a download nobody asked for.
@@ -22,8 +22,19 @@ def _resident(model_id: str) -> LanguageModel[ModelInput]:
     It also decides who wins a collision: a quantization written into the hub cache under its
     own repo id would otherwise lose to a real repository of the same name on the Hub, and the
     daemon would serve someone else's weights under the id the user quantized.
+
+    The store is here for the model's own settings: whether a second checkpoint — the
+    drafter — lands with it is a row, and this is the one place that both loads a model and
+    can read one.
     """
-    return load(model_id, local_files_only=True)
+
+    def loader(model_id: str) -> LanguageModel[ModelInput]:
+        model = load(model_id, local_files_only=True)
+        settings = features.parse(store.model_settings(model_id).features)
+        features.pair(model_id, model, settings.dflash)
+        return model
+
+    return loader
 
 
 def watch_parent(pid: int, gone: Callable[[], None], every: float = 1.0) -> None:
@@ -75,7 +86,7 @@ def main() -> None:
         # kill takes, so uvicorn drains what is open instead of dropping it mid-stream.
         watch_parent(args.parent_pid, lambda: os.kill(os.getpid(), signal.SIGTERM))
     port = config.current(store).port if args.port is None else args.port
-    app = create_app(Engine(_resident, store), store, host=args.host)
+    app = create_app(Engine(_resident(store), store), store, host=args.host)
     uvicorn.run(app, host=args.host, port=port)
 
 

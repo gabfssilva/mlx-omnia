@@ -38,6 +38,7 @@ from sideros import GenerationOptions, Text
 from sideros.footprint import ceiling
 from sideros_server.engine import Engine
 from sideros_server.engine import Job as Generation
+from sideros_server.jobs import Bench as BenchJob
 from sideros_server.jobs import Cancelled, Job, JobsDep, Progress, Work, accepted
 from sideros_server.profiles import StoreDep
 from sideros_server.store import Bench, Store
@@ -173,7 +174,7 @@ async def create(
     """On the loop: `start` captures it, and the work drives the engine's queue back through
     it from the thread it runs in."""
     work = _bench(engine, store, body.model, body.prompt, body.rounds)
-    return accepted(registry.start("bench", work))
+    return accepted(registry.start(BenchJob(model=body.model), work))
 
 
 @router.get("/admin/benches")

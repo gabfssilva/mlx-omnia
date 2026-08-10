@@ -25,6 +25,7 @@ does, which is what the turn a template renders is keyed by here.
 
 import json
 from collections.abc import AsyncIterator, Mapping
+from dataclasses import replace
 from typing import Annotated, Literal
 
 from fastapi import APIRouter, Depends, Request
@@ -48,12 +49,11 @@ from sideros import (
     top_k,
     top_p,
 )
-from sideros.chat import Effort, tool_family_of
+from sideros.chat import Effort, parser_of
 from sideros.generate import Constraint, Meter
 from sideros.grammar import GrammarRefused
+from sideros.parsers import Segment, ToolCall
 from sideros.schema import MalformedJSON, SchemaViolation
-from sideros.suppress import Segment
-from sideros.tools import ToolCall
 from sideros_server import profiles
 from sideros_server.engine import Engine, Job, NotConstrainable
 from sideros_server.profiles import Sampling, StoreDep
@@ -628,7 +628,14 @@ async def generate(
         # client: this model is not available here, with the reason in the message rather than
         # in a second status. A `model:typo` arrives here whole — no profile matched, so the
         # name was never split.
-        job = await engine.submit(model_id, conversation, _options(asked, preset, constrained))
+        job = await engine.submit(
+                model_id,
+                conversation,
+                replace(
+                    _options(asked, preset, constrained),
+                    speculate=profiles.speculating(store, model_id, profile),
+                ),
+            )
     except GrammarRefused as refusal:
         # The compiler's own words — `Unimplemented keys: ["uniqueItems"]` is a reason where
         # "grammar error" is not, and it is what tells the client which keyword to drop.
@@ -643,7 +650,8 @@ async def generate(
     # No tools offered, nothing to read back; no family, nothing that could read it. Both
     # reach the client the way the generation always did, piece for piece: suppressing an
     # envelope no parser answers to costs the client the text and gives back no call.
-    family = tool_family_of(job.model) if tools else None
+    parser = parser_of(job.model) if tools else None
+    family = None if parser is None else parser.tools
     calls = None if family is None else Calls(family)
 
     if method == "streamGenerateContent":

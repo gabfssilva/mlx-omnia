@@ -53,7 +53,7 @@ from sideros import (
     greedy,
 )
 from sideros.generate import Constraint
-from sideros.suppress import Segment, Segmenter
+from sideros.parsers import FALLBACK, Segment, Segmenter
 from sideros_server import anthropic as dialect
 from sideros_server import catalog
 from sideros_server.app import _invalid_request
@@ -113,7 +113,7 @@ SOURCE = (
 checkpoint ships, and that is the point: what these tests read is which turns reached the
 render, and in which order.
 
-A call is spelled `<call>`, which is no family's marker, so `tool_family_of` says nothing about
+A call is spelled `<call>`, which is no family's marker, so `parser_of` says nothing about
 this template and the tool channel stays shut. That is what the echo needs: it answers with the
 prompt it was handed, and a prompt describing a call must not come back read as one.
 """
@@ -205,7 +205,9 @@ class Echo:
         # A real model segments its own text on the way out — the server reads
         # `segment.channel` and no longer runs a `Segmenter` of its own. A double
         # that labels a scripted envelope `content` scripts no call at all.
-        segmenter = Segmenter(input.tool_family, prompt=input.value)
+        segmenter = Segmenter(
+            FALLBACK if input.parser is None else input.parser, prompt=input.value
+        )
         for piece in pieces[: options.max_tokens]:
             meter.token()
             yield from segmenter.push(piece)
@@ -238,7 +240,9 @@ class Caller:
         # A real model segments its own text on the way out — the server reads
         # `segment.channel` and no longer runs a `Segmenter` of its own. A double
         # that labels a scripted envelope `content` scripts no call at all.
-        segmenter = Segmenter(input.tool_family, prompt=input.value)
+        segmenter = Segmenter(
+            FALLBACK if input.parser is None else input.parser, prompt=input.value
+        )
         for piece in (ANSWERED,) if result == RESULT else self.pieces:
             meter.token()
             yield from segmenter.push(piece)

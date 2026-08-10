@@ -27,7 +27,7 @@ import asyncio
 import json
 import time
 from collections import deque
-from collections.abc import AsyncIterator, Generator
+from collections.abc import AsyncIterator, Callable, Generator
 from contextlib import contextmanager
 from dataclasses import asdict, dataclass
 from typing import Annotated, Literal
@@ -47,6 +47,13 @@ below count every request, so what falls off the end is detail and never a total
 RequestState = Literal["queued", "running", "completed", "cancelled", "error"]
 """The engine's states; `engine.Job.state` is this and the record carries whichever one the
 request ended in."""
+
+
+@dataclass(frozen=True)
+class Speculation:
+    rounds: int
+    proposed: int
+    accepted: int
 
 
 @dataclass(frozen=True)
@@ -74,6 +81,11 @@ class Sample:
     prefill_tokens_per_second: float | None
     bytes_per_token: int | None
     ceiling_fraction: float | None
+    speculation: Speculation | None
+    """What a drafter proposed and how much of it the target confirmed, `None` for a request
+    that did not speculate — no drafter loaded, or one this request could not be verified
+    against. The rate above never says which: a paired model under a sampler decodes exactly
+    as an unpaired one."""
 
 
 @dataclass(frozen=True)
@@ -164,6 +176,15 @@ def _measure(live: _Live, state: RequestState) -> Sample:
         prefill_tokens_per_second=prefill_rate(meter.prompt_tokens, meter.ttft),
         bytes_per_token=live.bytes_per_token,
         ceiling_fraction=_fraction(rate, live.bytes_per_token),
+        speculation=(
+            None
+            if meter.speculation.rounds == 0
+            else Speculation(
+                rounds=meter.speculation.rounds,
+                proposed=meter.speculation.proposed,
+                accepted=meter.speculation.accepted,
+            )
+        ),
     )
 
 
@@ -182,6 +203,10 @@ def _aggregate(model: str, totals: _Totals) -> Aggregate:
     )
 
 
+def _nothing() -> None:
+    pass
+
+
 class Metrics:
     """The register. Mutated only on the event loop — the engine calls `begin` and `end`
     from its worker task — so a snapshot read there sees a whole state."""
@@ -191,6 +216,10 @@ class Metrics:
         self._totals: dict[str, _Totals] = {}
         self._live: _Live | None = None
         self.watchers: set[asyncio.Queue[Snapshot]] = set()
+        self.on_change: Callable[[], None] = _nothing
+        """Raised on the same two edges `_publish` fans out on. Separate from `watchers`
+        because the unified stream subscribes by name and not by queue, and because a
+        register nobody watches still has to raise them."""
 
     def begin(
         self,
@@ -233,6 +262,7 @@ class Metrics:
         )
 
     def _publish(self) -> None:
+        self.on_change()
         if not self.watchers:
             # The usual case — nobody has the dashboard open — and building a snapshot for
             # it would be the loop's work between two requests, for nothing.

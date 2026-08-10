@@ -15,6 +15,11 @@ from sideros_server.store import (
     Bench,
     JobRecord,
     Profile,
+    QualityResult,
+    ReferenceCache,
+    Run,
+    RunState,
+    SpeedResult,
     Store,
     default_path,
     migrate,
@@ -108,6 +113,29 @@ def test_the_migration_finishes_a_database_left_at_the_previous_version(
     assert row == ("kept", None)
 
 
+def test_the_upgrade_drops_the_job_rows_that_predate_the_subject(tmp_path: Path) -> None:
+    """The one step of the ladder that throws something away, on purpose: a row written
+    before `subject` existed cannot say what its job was about, and `jobs._subject` refuses
+    it — so keeping it would be a listing that raises from the upgrade onwards. What it
+    costs is the recent-jobs list, once; what it must not touch is anybody else's table."""
+    path = tmp_path / "server.db"
+    with closing(sqlite3.connect(path)) as connection:
+        connection.executescript(store._SCHEMA_V1 + store._SCHEMA_V2)
+        connection.execute("PRAGMA user_version = 2")
+        connection.execute(
+            "INSERT INTO jobs (id, kind, state, progress, created_at, updated_at)"
+            " VALUES ('old', 'download', 'ok', '{}', 1.0, 2.0)"
+        )
+        connection.execute("INSERT INTO config (key, value) VALUES ('port', '8642')")
+        connection.commit()
+
+    database = Store(path)
+
+    assert user_version(path) == SCHEMA_VERSION
+    assert database.jobs() == []
+    assert database.config() == {"port": "8642"}
+
+
 def test_what_was_written_is_read_back_after_reopening_the_file(tmp_path: Path) -> None:
     path = tmp_path / "server.db"
     profile = Profile(
@@ -127,6 +155,7 @@ def test_what_was_written_is_read_back_after_reopening_the_file(tmp_path: Path) 
     job = JobRecord(
         id="job-1",
         kind="download",
+        subject='{"model": "mlx-community/qwen3-30b"}',
         state="running",
         progress='{"shards": 3}',
         created_at=1.5,
@@ -179,9 +208,12 @@ def test_bench_history_comes_back_newest_first_and_filtered_by_model(tmp_path: P
 
 
 def test_a_job_is_updated_in_place_by_its_id(tmp_path: Path) -> None:
-    failed = JobRecord("job-1", "quantize", "error", '{"step": 2}', 1.0, 9.0, "out of memory")
+    subject = '{"model": "a", "target": "b"}'
+    failed = JobRecord(
+        "job-1", "quantize", subject, "error", '{"step": 2}', 1.0, 9.0, "out of memory"
+    )
     database = Store(tmp_path / "server.db")
-    database.save_job(JobRecord("job-1", "quantize", "running", '{"step": 1}', 1.0, 1.0))
+    database.save_job(JobRecord("job-1", "quantize", subject, "running", '{"step": 1}', 1.0, 1.0))
     database.save_job(failed)
 
     assert database.jobs() == [failed]
@@ -202,7 +234,15 @@ def test_two_stores_writing_from_threads_keep_every_row(tmp_path: Path) -> None:
     def write(writer: Store, tag: str) -> None:
         for index in range(rows):
             writer.save_job(
-                JobRecord(f"{tag}-{index}", "toy", "ok", "{}", float(index), float(index))
+                JobRecord(
+                    f"{tag}-{index}",
+                    "load",
+                    '{"model": "toy"}',
+                    "ok",
+                    "{}",
+                    float(index),
+                    float(index),
+                )
             )
 
     def read() -> None:
@@ -236,3 +276,181 @@ def test_the_database_sits_beside_the_app_config(
     monkeypatch.setenv("XDG_CONFIG_HOME", str(tmp_path))
 
     assert default_path() == tmp_path / "sideros" / "server.db"
+
+
+def speed_run(
+    run_id: str,
+    model: str,
+    key: str = "4k→256·1streams·r8+2",
+    created_at: float = 1.0,
+    engine_version: str = "0.9.2",
+    state: RunState = "ok",
+    decode_tps: float | None = 100.0,
+    reason: str | None = None,
+) -> tuple[Run, SpeedResult]:
+    header = Run(
+        id=run_id,
+        kind="speed",
+        model=model,
+        key=key,
+        state=state,
+        reason=reason,
+        engine_version=engine_version,
+        mlx_version="0.30.1",
+        created_at=created_at,
+    )
+    body = SpeedResult(
+        context=4096,
+        generate=256,
+        concurrency=1,
+        rounds=8,
+        warmup=2,
+        stream_source="queue",
+        page_cache="warm",
+        decode_tps=decode_tps,
+    )
+    return header, body
+
+
+def test_the_benchmark_migration_takes_a_file_at_the_previous_head(tmp_path: Path) -> None:
+    """A database the last release left at v3 reaches the head with its rows intact."""
+    path = tmp_path / "server.db"
+    with closing(sqlite3.connect(path)) as connection:
+        connection.executescript(store._SCHEMA_V1 + store._SCHEMA_V2 + store._SCHEMA_V3)
+        connection.execute("PRAGMA user_version = 3")
+        connection.execute("INSERT INTO config (key, value) VALUES ('port', '8642')")
+        connection.commit()
+
+    database = Store(path)
+
+    assert user_version(path) == SCHEMA_VERSION
+    assert SCHEMA_VERSION == 5
+    assert database.config() == {"port": "8642"}
+    assert {"benchmark_runs", "benchmark_speed", "benchmark_datasets"} <= table_names(path)
+
+
+def test_the_features_migration_leaves_a_profile_written_before_it_unchanged(
+    tmp_path: Path,
+) -> None:
+    """A profile saved at v4 has no `features` column; after the migration it has one, and
+    what it says is that the profile opines on nothing — not that it turns anything off."""
+    path = tmp_path / "server.db"
+    with closing(sqlite3.connect(path)) as connection:
+        connection.executescript(
+            store._SCHEMA_V1 + store._SCHEMA_V2 + store._SCHEMA_V3 + store._SCHEMA_V4
+        )
+        connection.execute("PRAGMA user_version = 4")
+        connection.execute(
+            "INSERT INTO profiles (model, name, sampling) VALUES ('m', 'code', '{}')"
+        )
+        connection.commit()
+
+    database = Store(path)
+
+    profile = database.profile("m", "code")
+    assert profile is not None
+    assert profile.features == "{}"
+    assert database.model_settings("m").features == "{}"
+
+
+def test_deleting_a_run_takes_its_body_with_it(tmp_path: Path) -> None:
+    """The cascade only runs because `_connect` turns `foreign_keys` on: with the pragma
+    removed this test finds the body still there."""
+    path = tmp_path / "server.db"
+    database = Store(path)
+    database.insert_run(*speed_run("one", "qwen3-30b"))
+
+    assert database.delete_run("one") is True
+    assert database.run("one") is None
+    with closing(sqlite3.connect(path)) as connection:
+        rows = connection.execute("SELECT COUNT(*) FROM benchmark_speed").fetchone()
+    assert rows == (0,)
+
+
+def test_a_body_that_does_not_match_its_header_leaves_no_row(tmp_path: Path) -> None:
+    """One door, one transaction: a write that fails writes neither half."""
+    database = Store(tmp_path / "server.db")
+    header, _ = speed_run("one", "qwen3-30b")
+    quality = QualityResult(dataset="mmlu", items=1400, seed=42, shots=5, scoring="loglikelihood")
+
+    with pytest.raises(ValueError):
+        database.insert_run(header, quality)
+
+    assert database.run("one") is None
+    assert database.runs("speed") == []
+
+
+def test_a_key_answers_with_the_latest_run_of_each_model(tmp_path: Path) -> None:
+    """The band asks who was measured under this shape and gets one line per model."""
+    database = Store(tmp_path / "server.db")
+    database.insert_run(*speed_run("old", "qwen3-30b", created_at=1.0, engine_version="0.9.2"))
+    database.insert_run(*speed_run("new", "qwen3-30b", created_at=2.0, engine_version="0.9.3"))
+    database.insert_run(*speed_run("other", "gpt-oss-20b", created_at=1.5))
+    database.insert_run(*speed_run("elsewhere", "qwen3-30b", key="8k→256·1streams·r8+2"))
+
+    found = database.runs_by_key("speed", "4k→256·1streams·r8+2")
+
+    assert [(entry.run.model, entry.run.engine_version) for entry in found] == [
+        ("gpt-oss-20b", "0.9.2"),
+        ("qwen3-30b", "0.9.3"),
+    ]
+    assert len(database.runs_of("speed", "qwen3-30b")) == 3
+
+
+def test_a_shape_that_did_not_fit_is_a_row_and_not_an_absence(tmp_path: Path) -> None:
+    """`not_run` keeps the shape it was decided against, which is what makes the reason
+    readable at all."""
+    database = Store(tmp_path / "server.db")
+    database.insert_run(
+        *speed_run("one", "qwen3-30b", state="not_run", reason="kv_over_budget", decode_tps=None)
+    )
+
+    (found,) = database.runs_by_key("speed", "4k→256·1streams·r8+2")
+
+    assert found.run.state == "not_run"
+    assert found.run.reason == "kv_over_budget"
+    assert isinstance(found.result, SpeedResult)
+    assert (found.result.context, found.result.concurrency) == (4096, 1)
+    assert found.result.decode_tps is None
+
+
+def test_measured_is_what_skip_if_already_run_asks(tmp_path: Path) -> None:
+    database = Store(tmp_path / "server.db")
+    database.insert_run(*speed_run("one", "qwen3-30b"))
+    database.insert_run(*speed_run("two", "gpt-oss-20b", state="error"))
+
+    assert database.measured("speed", "qwen3-30b", "4k→256·1streams·r8+2") is True
+    assert database.measured("speed", "gpt-oss-20b", "4k→256·1streams·r8+2") is False
+    assert database.measured("speed", "unknown", "4k→256·1streams·r8+2") is False
+
+
+def test_the_preset_datasets_are_rows_of_the_table(tmp_path: Path) -> None:
+    """MMLU is data, not a branch in a scoring function."""
+    database = Store(tmp_path / "server.db")
+
+    found = {dataset.id: dataset for dataset in database.datasets()}
+
+    assert {"mmlu", "arc-challenge", "hellaswag", "gsm8k", "wikitext103"} <= set(found)
+    assert found["mmlu"].builtin is True
+    assert found["mmlu"].use == "multiple_choice"
+    assert found["wikitext103"].use == "corpus"
+
+
+def test_a_reference_entry_is_indexed_here_and_stored_on_disk(tmp_path: Path) -> None:
+    database = Store(tmp_path / "server.db")
+    entry = ReferenceCache(
+        id="ref-1",
+        reference="qwen3-30b-bf16",
+        corpus="wikitext103",
+        tokens=10000,
+        seed=42,
+        topk=64,
+        path=str(tmp_path / "ref-1.npz"),
+        bytes=5_120_000,
+        created_at=1.0,
+    )
+    database.save_reference(entry)
+
+    assert database.references() == [entry]
+    assert database.delete_reference("ref-1") is True
+    assert database.reference("ref-1") is None

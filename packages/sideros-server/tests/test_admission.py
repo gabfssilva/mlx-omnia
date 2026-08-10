@@ -38,7 +38,7 @@ from sideros import (
     Text,
     TextLanguageModel,
 )
-from sideros.suppress import Segment
+from sideros.parsers import Segment
 from sideros_server import Engine, catalog, create_app
 from sideros_server.engine import Job, ModelTooLarge
 from sideros_server.state import footprint_bytes
@@ -307,9 +307,7 @@ def test_a_model_larger_than_the_whole_ceiling_is_refused_and_evicts_nothing(
     assert [model["id"] for model in models] == [FIRST], "evicted for space that cannot exist"
 
 
-def test_the_idle_ttl_expires_and_the_weights_actually_come_back(
-    hub: Path, tmp_path: Path
-) -> None:
+def test_the_idle_ttl_expires_and_the_weights_actually_come_back(hub: Path, tmp_path: Path) -> None:
     """The reading is MLX's and never the engine's accounting, which reports the model gone
     the instant the key is dropped: the bug this task can introduce is exactly a sweep whose
     bookkeeping and whose memory disagree.

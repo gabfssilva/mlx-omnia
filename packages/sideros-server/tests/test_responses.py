@@ -50,8 +50,8 @@ from sideros import (
     Text,
 )
 from sideros.generate import Constraint
+from sideros.parsers import FALLBACK, Segment, Segmenter
 from sideros.schema import json_instruction
-from sideros.suppress import Segment, Segmenter
 from sideros_server import catalog
 from sideros_server import responses as responses_module
 from sideros_server.engine import Engine, Loader
@@ -132,11 +132,11 @@ TEMPLATE = ChatTemplate.from_source(SOURCE)
 
 FOREIGN = ChatTemplate.from_source(SOURCE.replace("tool_call", "call"))
 """The same template with a call spelled in no family's marker, which is what leaves
-`tool_family_of` with nothing to say and the tool channel shut."""
+`parser_of` with nothing to say and the tool channel shut."""
 """Written out rather than downloaded: what is under test is which turns and which tools the
 dialect builds, and a template that spells them back is what makes the prompt readable. A call
 is spelled Qwen's way because that spelling is also what says which family this checkpoint
-speaks — `tool_family_of` reads the source, not the generated text — so a stand whose template
+speaks — `parser_of` reads the source, not the generated text — so a stand whose template
 spells no envelope has no tool channel at all. The checkpoint's own template is what
 `sideros.load` brings, and that path is `test_api.py`'s."""
 
@@ -228,7 +228,9 @@ class Script:
         # A real model segments its own text on the way out — the server reads
         # `segment.channel` and no longer runs a `Segmenter` of its own. A double
         # that labels a scripted envelope `content` scripts no call at all.
-        segmenter = Segmenter(input.tool_family, prompt=input.value)
+        segmenter = Segmenter(
+            FALLBACK if input.parser is None else input.parser, prompt=input.value
+        )
         for piece in (f"It is {result}.",) if result else self.pieces:
             meter.token()
             yield from segmenter.push(piece)

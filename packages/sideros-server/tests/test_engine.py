@@ -21,7 +21,7 @@ from sideros import (
     UnsupportedInput,
 )
 from sideros.grammar import GrammarRefused
-from sideros.suppress import Segment
+from sideros.parsers import Segment
 from sideros_server import Engine, catalog
 from sideros_server.engine import Job, NotConstrainable, NotResident
 from sideros_server.store import Store

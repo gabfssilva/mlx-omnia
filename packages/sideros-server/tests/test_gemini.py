@@ -45,8 +45,8 @@ from sideros import (
     greedy,
 )
 from sideros.generate import Constraint
+from sideros.parsers import FALLBACK, Segment, Segmenter
 from sideros.schema import json_instruction
-from sideros.suppress import Segment, Segmenter
 from sideros_server import catalog, gemini
 from sideros_server.engine import Engine, Job, Loader
 from sideros_server.profiles import Sampling
@@ -97,7 +97,7 @@ _TEMPLATE = (
 """One line per turn, the role first, and a line per call after the turn that made it. Not a
 checkpoint's — what is being read back is the conversation the dialect built, and a real
 template would spell it in special tokens. A call is spelled Qwen's way because that spelling
-is also what says which family this checkpoint speaks: `tool_family_of` reads the template's
+is also what says which family this checkpoint speaks: `parser_of` reads the template's
 source, not the generated text, so a stand whose template spells no envelope has no tool
 channel at all."""
 
@@ -200,13 +200,16 @@ class Caller:
         # A real model segments its own text on the way out — the server reads
         # `segment.channel` and no longer runs a `Segmenter` of its own. A double
         # that labels a scripted envelope `content` scripts no call at all.
-        segmenter = Segmenter(input.tool_family, prompt=input.value)
+        segmenter = Segmenter(
+            FALLBACK if input.parser is None else input.parser, prompt=input.value
+        )
         for piece in (ANSWERED,) if result == RESULT else self.pieces:
             meter.token()
             yield from segmenter.push(piece)
 
-
         yield from segmenter.flush()
+
+
 @dataclass(frozen=True)
 class Script:
     """A model whose generation is fixed text, handed out in the pieces it was given. What a
@@ -229,18 +232,21 @@ class Script:
         # A real model segments its own text on the way out — the server reads
         # `segment.channel` and no longer runs a `Segmenter` of its own. A double
         # that labels a scripted envelope `content` scripts no call at all.
-        segmenter = Segmenter(input.tool_family, prompt=input.value)
+        segmenter = Segmenter(
+            FALLBACK if input.parser is None else input.parser, prompt=input.value
+        )
         for piece in self.pieces:
             meter.token()
             yield from segmenter.push(piece)
 
-
         yield from segmenter.flush()
+
+
 TEMPLATE = ChatTemplate.from_source(_TEMPLATE)
 
 FOREIGN = ChatTemplate.from_source(_TEMPLATE.replace("tool_call", "call"))
 """The same template with a call spelled in no family's marker, which is what leaves
-`tool_family_of` with nothing to say and the tool channel shut."""
+`parser_of` with nothing to say and the tool channel shut."""
 
 
 def loader(model_id: str) -> LanguageModel[ModelInput]:
@@ -623,9 +629,7 @@ def test_a_tool_call_round_trips_through_two_turns_of_the_official_sdk(
                 parts=[
                     types.Part(text=PREAMBLE),
                     types.Part(
-                        function_call=types.FunctionCall(
-                            name="get_weather", args={"city": "Paris"}
-                        )
+                        function_call=types.FunctionCall(name="get_weather", args={"city": "Paris"})
                     ),
                 ],
             ),

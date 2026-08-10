@@ -438,6 +438,39 @@ def test_a_shard_that_is_not_safetensors_leaves_the_entry_listed_without_a_price
     assert entry.bytes_per_token is None
 
 
+def test_a_second_scan_reads_no_header_and_a_shard_that_moves_is_repriced(
+    caches: tuple[Path, Path], monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """The scan is on the app's poll and on every event the watcher raises, so the headers
+    are read once per state of the disk and not once per caller. What decides that state is
+    the stamp: rewriting a shard reprices the entry even though its name never changed."""
+    hub, _ = caches
+    snapshot = _installed(hub, DENSE)
+    reads: list[Path] = []
+    inner = catalog._tensors
+    monkeypatch.setattr(catalog, "_tensors", lambda path: reads.append(path) or inner(path))
+
+    first = catalog.scan()
+    assert reads == [snapshot]
+
+    assert catalog.scan() == first
+    assert reads == [snapshot]
+
+    _shard(snapshot / "model.safetensors", extra=[("model.extra.weight", [512], SHARD_BYTES)])
+    (second,) = catalog.scan()
+
+    assert reads == [snapshot, snapshot]
+    assert second.bytes_per_token == 2 * SHARD_BYTES
+
+    # The same bytes at the same length, written again: only the clock moved, and a stamp
+    # that cannot see it would answer a checkpoint that was rebuilt in place with the
+    # numbers of the one it replaced.
+    _shard(snapshot / "model.safetensors", extra=[("model.extra.weight", [512], SHARD_BYTES)])
+
+    assert catalog.scan() == [second]
+    assert reads == [snapshot, snapshot, snapshot]
+
+
 @pytest.mark.parametrize("bits", [None, 4])
 def test_the_scan_prices_a_step_at_what_the_loaded_tree_reads(
     caches: tuple[Path, Path], bits: int | None
@@ -594,3 +627,217 @@ def test_a_real_repository_from_the_hub_cache_reads_its_own_numbers() -> None:
     assert entry.context == 40960
     assert (entry.directory / "model.safetensors").is_file()
     assert 0.30 < entry.bytes_on_disk / 1e9 < 0.45
+
+
+# The cache arithmetic, one entry per family shape the port covers. `kv` is elements per
+# token summed over the attending layers, worked out by hand from the config beside it;
+# the entry answers with those elements at the shards' float width (BF16, so two bytes).
+KV_FIXTURES: list[tuple[str, dict[str, object], int | None, int | None]] = [
+    (
+        "qwen3_moe: full attention, grouped keys — 2 · 4 kv heads · 128 · 48 layers",
+        {
+            "model_type": "qwen3_moe",
+            "num_hidden_layers": 48,
+            "num_attention_heads": 32,
+            "num_key_value_heads": 4,
+            "head_dim": 128,
+            "hidden_size": 2048,
+            "vocab_size": 151936,
+        },
+        2 * 4 * 128 * 48,
+        None,
+    ),
+    (
+        "llama dense: head_dim absent, so hidden_size ÷ heads",
+        {
+            "model_type": "llama",
+            "num_hidden_layers": 32,
+            "num_attention_heads": 32,
+            "num_key_value_heads": 8,
+            "hidden_size": 4096,
+            "vocab_size": 128256,
+        },
+        2 * 8 * 128 * 32,
+        None,
+    ),
+    (
+        "gpt_oss: half the layers slide and half do not, so every layer still caches and "
+        "no window is reported",
+        {
+            "model_type": "gpt_oss",
+            "num_hidden_layers": 4,
+            "num_attention_heads": 64,
+            "num_key_value_heads": 8,
+            "head_dim": 64,
+            "hidden_size": 2880,
+            "vocab_size": 201088,
+            "sliding_window": 128,
+            "layer_types": [
+                "sliding_attention",
+                "full_attention",
+                "sliding_attention",
+                "full_attention",
+            ],
+        },
+        2 * 8 * 64 * 4,
+        None,
+    ),
+    (
+        "a checkpoint that slides on every layer reports the window",
+        {
+            "model_type": "qwen3",
+            "num_hidden_layers": 2,
+            "num_attention_heads": 8,
+            "num_key_value_heads": 2,
+            "head_dim": 64,
+            "hidden_size": 512,
+            "vocab_size": 1024,
+            "sliding_window": 4096,
+            "layer_types": ["sliding_attention", "sliding_attention"],
+        },
+        2 * 2 * 64 * 2,
+        4096,
+    ),
+    (
+        "lfm2_moe: only the attention layers of a hybrid keep a growing cache",
+        {
+            "model_type": "lfm2_moe",
+            "num_hidden_layers": 6,
+            "num_attention_heads": 16,
+            "num_key_value_heads": 4,
+            "head_dim": 64,
+            "hidden_size": 1024,
+            "vocab_size": 65536,
+            "layer_types": ["conv", "conv", "full_attention", "conv", "conv", "full_attention"],
+        },
+        2 * 4 * 64 * 2,
+        None,
+    ),
+    (
+        "bailing_hybrid: a latent cache is the compressed vector plus the rotated key, "
+        "over the attending layers alone",
+        {
+            "model_type": "bailing_hybrid",
+            "num_hidden_layers": 4,
+            "num_attention_heads": 16,
+            "head_dim": 128,
+            "hidden_size": 2048,
+            "vocab_size": 157184,
+            "kv_lora_rank": 512,
+            "qk_rope_head_dim": 64,
+            "full_attn_idxs": [3],
+        },
+        (512 + 64) * 1,
+        None,
+    ),
+    (
+        "a config that names no head count is not priced at all",
+        {"model_type": "mystery", "num_hidden_layers": 4, "vocab_size": 32},
+        None,
+        None,
+    ),
+]
+
+
+@pytest.mark.parametrize(
+    ("case", "config", "elements", "window"),
+    KV_FIXTURES,
+    ids=[case.split(":")[0] for case, _, _, _ in KV_FIXTURES],
+)
+def test_the_cache_cost_of_a_token_comes_off_the_config(
+    caches: tuple[Path, Path],
+    case: str,
+    config: dict[str, object],
+    elements: int | None,
+    window: int | None,
+) -> None:
+    hub, _ = caches
+    _main(hub, "house/kv", "sha")
+    _checkpoint(_repository(hub, "house/kv") / "snapshots" / "sha", config)
+
+    (entry,) = catalog.scan()
+
+    assert entry.kv_bytes_per_token == (None if elements is None else elements * 2), case
+    assert entry.attention_window == window, case
+
+
+def test_a_recurrent_layer_is_not_charged_for_a_cache_it_does_not_grow(
+    caches: tuple[Path, Path],
+) -> None:
+    """The mutation this guards: counting `num_hidden_layers` instead of the attending
+    ones charges a hybrid three times what its cache costs."""
+    hub, _ = caches
+    hybrid: dict[str, object] = {
+        "model_type": "lfm2_moe",
+        "num_hidden_layers": 6,
+        "num_attention_heads": 16,
+        "num_key_value_heads": 4,
+        "head_dim": 64,
+        "hidden_size": 1024,
+        "vocab_size": 65536,
+        "layer_types": ["conv", "conv", "full_attention", "conv", "conv", "full_attention"],
+    }
+    _main(hub, "house/hybrid", "sha")
+    _checkpoint(_repository(hub, "house/hybrid") / "snapshots" / "sha", hybrid)
+
+    (entry,) = catalog.scan()
+
+    dense = 2 * 4 * 64 * 6 * 2
+    assert entry.kv_bytes_per_token is not None
+    assert entry.kv_bytes_per_token * 3 == dense
+
+
+def test_the_text_tower_of_a_nested_config_is_what_answers(caches: tuple[Path, Path]) -> None:
+    """qwen3.5 declares the shape under `text_config`, and the root describes the whole
+    multimodal thing."""
+    hub, _ = caches
+    nested: dict[str, object] = {
+        "model_type": "qwen3_5",
+        "text_config": {
+            "num_hidden_layers": 2,
+            "num_attention_heads": 8,
+            "num_key_value_heads": 2,
+            "head_dim": 64,
+            "hidden_size": 512,
+            "vocab_size": 4096,
+        },
+    }
+    _main(hub, "house/nested", "sha")
+    _checkpoint(_repository(hub, "house/nested") / "snapshots" / "sha", nested)
+
+    (entry,) = catalog.scan()
+
+    assert entry.kv_bytes_per_token == 2 * 2 * 64 * 2 * 2
+    assert entry.vocab_size == 4096
+    assert entry.shape == "qwen3_5/L2/H512/A8/V4096"
+
+
+def test_a_fine_tune_prints_the_same_shape_as_its_base(caches: tuple[Path, Path]) -> None:
+    """Which is why the print validates a declared pair and never proposes one."""
+    hub, _ = caches
+    base: dict[str, object] = {
+        "model_type": "qwen3",
+        "num_hidden_layers": 2,
+        "num_attention_heads": 8,
+        "hidden_size": 512,
+        "vocab_size": 1024,
+    }
+    for name in ("house/base", "house/tuned"):
+        _main(hub, name, "sha")
+        _checkpoint(_repository(hub, name) / "snapshots" / "sha", base)
+
+    prints = {entry.shape for entry in catalog.scan()}
+
+    assert prints == {"qwen3/L2/H512/A8/V1024"}
+
+
+def test_the_model_route_carries_the_cache_facts(caches: tuple[Path, Path]) -> None:
+    hub, _ = caches
+    _main(hub, "house/kv", "sha")
+    _checkpoint(_repository(hub, "house/kv") / "snapshots" / "sha", CONFIG)
+
+    body = _client().get("/admin/models").json()
+
+    assert body
+    for entry in body:
+        assert {"kv_bytes_per_token", "attention_window", "vocab_size", "shape"} <= set(entry)

@@ -13,6 +13,7 @@ here may write into, or read out of, the machine's real cache, and no test reach
 network: every source is on the disk the fixtures built.
 """
 
+import gc
 import json
 import math
 import threading
@@ -41,7 +42,8 @@ from sideros import (
     ModelSignature,
     Text,
 )
-from sideros.checkpoint import Checkpoint, Pending, attach_weights, save_quantized
+from sideros.checkpoint import Checkpoint, Drafter, Pending, attach_weights, save_quantized
+from sideros.parsers import Segment
 from sideros.quant.quantization import (
     MXFP,
     NVFP,
@@ -51,7 +53,6 @@ from sideros.quant.quantization import (
     inventory,
     quantize_weights,
 )
-from sideros.suppress import Segment
 from sideros_server import catalog, jobs, quantize
 from sideros_server.store import Store
 
@@ -131,7 +132,7 @@ def _model(directory: Path, dtype: mx.Dtype | None) -> LanguageModel[ModelInput]
     return CompositeModel(_Backend(_tree(directory, dtype)), [])
 
 
-def _pending(directory: Path, dtype: mx.Dtype | None) -> Pending:
+def _pending(directory: Path, dtype: mx.Dtype | None) -> Pending[LanguageModel[ModelInput]]:
     tree = _Tiny()
     return Pending(
         tree,
@@ -260,7 +261,7 @@ def _blocked_model(directory: Path, dtype: mx.Dtype | None) -> LanguageModel[Mod
     return CompositeModel(_TrunkBackend(_blocked_tree(directory, dtype)), [])
 
 
-def _blocked_pending(directory: Path, dtype: mx.Dtype | None) -> Pending:
+def _blocked_pending(directory: Path, dtype: mx.Dtype | None) -> Pending[LanguageModel[ModelInput]]:
     tree = _Blocked()
     return Pending(
         tree,
@@ -275,6 +276,51 @@ BLOCKED = Checkpoint(
     _blocked_model,
     _blocked_pending,
 )
+
+class _Draft(nn.Module):
+    """A drafter's shape and the whole of what makes it one: weights, and no way in from a
+    token. No embedding, no head, no tokenizer beside it on disk."""
+
+    def __init__(self) -> None:
+        super().__init__()
+        self.fc = nn.Linear(_HIDDEN, _HIDDEN, bias=False)
+        self.out = nn.Linear(_HIDDEN, _HIDDEN, bias=False)
+
+    def __call__(self, hidden: mx.array) -> mx.array:
+        return self.out(nn.silu(self.fc(hidden)))
+
+
+def _draft_tree(directory: Path, dtype: mx.Dtype | None) -> _Draft:
+    return attach_weights(_Draft(), _tensors(directory, dtype))
+
+
+def _draft_pending(directory: Path, dtype: mx.Dtype | None) -> Pending[_Draft]:
+    tree = _Draft()
+    return Pending(
+        tree, lambda: _tensors(directory, dtype), lambda packed: attach_weights(tree, packed)
+    )
+
+
+DRAFTER = Drafter(("config.json", "model.safetensors"), _draft_tree, _draft_pending)
+
+_DRAFT_LEAVES = ("fc", "out")
+
+
+def _draft_checkpoint(directory: Path) -> Path:
+    mx.random.seed(0)
+    directory.mkdir(parents=True)
+    (directory / "config.json").write_text(json.dumps({"model_type": "drafting"}))
+    mx.save_safetensors(
+        str(directory / "model.safetensors"),
+        {f"{leaf}.weight": mx.random.normal((_HIDDEN, _HIDDEN)) for leaf in _DRAFT_LEAVES},
+    )
+    return directory
+
+
+@pytest.fixture
+def drafter(tmp_path: Path, caches: Path) -> Path:
+    return _draft_checkpoint(tmp_path / "drafter")
+
 
 _BLOCK_LEAVES = tuple(
     sorted(
@@ -330,6 +376,7 @@ def caches(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> Path:
     monkeypatch.setattr(huggingface_hub.constants, "HF_HUB_CACHE", str(hub))
     monkeypatch.setitem(task._MODEL_SPECS, "tiny", CHECKPOINT)
     monkeypatch.setitem(task._MODEL_SPECS, "blocked", BLOCKED)
+    monkeypatch.setitem(task._DRAFTER_SPECS, "drafting", DRAFTER)
     return hub
 
 
@@ -380,9 +427,7 @@ class Packer:
     reached: threading.Event = field(default_factory=threading.Event)
     proceed: threading.Event = field(default_factory=threading.Event)
 
-    def __call__(
-        self, weights: dict[str, mx.array], plan: QuantizationPlan
-    ) -> dict[str, mx.array]:
+    def __call__(self, weights: dict[str, mx.array], plan: QuantizationPlan) -> dict[str, mx.array]:
         self.calls += 1
         if self.calls == self.at:
             self.reached.set()
@@ -477,6 +522,48 @@ def _difference(ours: mx.array, reference: mx.array) -> float:
     value = mx.abs(ours.astype(mx.float32) - reference.astype(mx.float32)).max().item()
     assert isinstance(value, float)
     return value
+
+
+def test_a_drafter_is_quantized_by_the_route_that_quantizes_a_model(
+    client: TestClient, drafter: Path, caches: Path
+) -> None:
+    """It has no task, no tokenizer and no head, and the job never asks for one: what it
+    reads off a source is a lazy tree and a weight dict. The entry lands in the catalog
+    under the id that was asked for, which is the id `dflash.drafter` names."""
+    finished = wait_for(
+        client,
+        start(client, source=str(drafter), repo="local/draft-4bit", bits=4, method="rtn"),
+        "ok",
+    )
+
+    assert progress(finished) == (len(_DRAFT_LEAVES), len(_DRAFT_LEAVES))
+    entries = catalog.scan()
+    assert [(entry.id, entry.quantization) for entry in entries] == [("local/draft-4bit", "4-bit")]
+
+    packed = task.load_drafter(entries[0].directory)
+    assert {
+        path for path, module in packed.named_modules() if isinstance(module, nn.QuantizedLinear)
+    } == set(_DRAFT_LEAVES)
+
+
+@pytest.mark.parametrize("method", _CALIBRATED)
+def test_a_drafter_takes_rtn_and_refuses_every_method_that_reads_a_corpus(
+    client: TestClient, drafter: Path, method: str
+) -> None:
+    """Not a shape it fails at — `intercepted_collect` would find its blocks. It is that a
+    drafter is not read from tokens: its input is the target's hidden states, so there is
+    no corpus to run through it and nothing in its config names the target that could. The
+    pricing refuses it up front, and the job refuses it before it opens the checkpoint."""
+    body: dict[str, object] = {"source": str(drafter), "method": method}
+    priced = client.post("/admin/quantizations/plan", json=body)
+
+    assert priced.status_code == 409, priced.text
+    assert "is a drafter" in priced.json()["detail"]
+
+    failed = wait_for(client, start(client, **body, repo="local/draft-4bit"), "error")
+
+    assert "is a drafter" in str(failed["error"])
+    assert catalog.scan() == []
 
 
 def test_a_job_writes_an_entry_the_catalog_offers_by_the_repo_id_that_was_asked_for(
@@ -710,9 +797,7 @@ def test_every_calibrated_method_records_the_pass_it_read_and_the_entry_still_lo
     what identifies what was read — and what `load` opens by that id is a model that runs."""
     for method in _CALIBRATED:
         repo = f"local/{method}"
-        directory = _finish(
-            client, source=str(blocked), repo=repo, method=method, **_CALIBRATION
-        )
+        directory = _finish(client, source=str(blocked), repo=repo, method=method, **_CALIBRATION)
         recorded = _recorded(directory)
         calibration = _calibration_of(directory)
 
@@ -749,9 +834,7 @@ def test_awq_takes_the_pairs_the_tree_admits_and_writes_no_trace_of_having_run(
     assert all(pair["improvement"] >= 0.0 for pair in pairs)
 
     written = _written(directory)
-    rtn = _finish(
-        client, source=str(blocked), repo="local/rtn", method="rtn", bits=4
-    )
+    rtn = _finish(client, source=str(blocked), repo="local/rtn", method="rtn", bits=4)
     assert set(written) == set(_written(rtn))
     assert any(
         not mx.array_equal(written[name], _written(rtn)[name]).item()
@@ -848,9 +931,9 @@ def test_oqe_keeps_oq_s_plan_and_changes_only_what_the_imatrix_rounds(
     assert block["rtn_fallback"] == list(_OUTSIDE)
 
     config = json.loads((directory / "config.json").read_text())
-    assert config["quantization"] == json.loads((plain / "config.json").read_text())[
-        "quantization"
-    ], "the imatrix moved a width: oQe's plan is oQ's"
+    assert (
+        config["quantization"] == json.loads((plain / "config.json").read_text())["quantization"]
+    ), "the imatrix moved a width: oQe's plan is oQ's"
     assert config["oq"]["recipe_identifier"] == "oQ4"
 
     written, reference = _written(directory), _written(plain)
@@ -924,8 +1007,10 @@ def test_awq_and_gptq_are_priced_as_rtn_and_oq_by_the_scoreless_allocator(
         "oQe was priced as something other than the plan it shares with oQ"
     )
     assert projected["entry_bytes"] > baseline["entry_bytes"]
-    assert baseline["bits_per_weight"] < projected["bits_per_weight"] <= (
-        baseline["bits_per_weight"] + 1.0
+    assert (
+        baseline["bits_per_weight"]
+        < projected["bits_per_weight"]
+        <= (baseline["bits_per_weight"] + 1.0)
     )
     protected = {
         str(leaf["path"]): leaf["bits"]
@@ -1066,9 +1151,7 @@ def _written(entry_directory: Path) -> dict[str, mx.array]:
     return tensors
 
 
-def test_the_priced_plan_is_the_bytes_the_job_then_writes(
-    client: TestClient, source: Path
-) -> None:
+def test_the_priced_plan_is_the_bytes_the_job_then_writes(client: TestClient, source: Path) -> None:
     """What the screen draws before anybody commits to minutes of packing. `total_bytes` is
     the leaves the plan touches — codes plus scales plus biases, never the four bits alone —
     and `entry_bytes` adds what no plan touches and the entry carries unchanged. Both are
@@ -1146,3 +1229,27 @@ def test_an_entry_that_is_already_quantized_is_not_priced_again(
 
     assert response.status_code == 409, response.text
     assert REPO in response.json()["detail"]
+
+
+def test_a_finished_job_gives_the_buffers_back_to_the_system(
+    client: TestClient, blocked: Path
+) -> None:
+    """What a quantization allocates is a whole checkpoint twice over — the dense model the
+    pass runs and the packed dict it writes — and dropping the last reference to them only
+    returns them to MLX's buffer pool, which is inside the process footprint the memory rail
+    reads and admission decides against. The reading is the cache and not the active memory:
+    the references die either way, and what this covers is the pool they die into.
+
+    `ok` is enough of a barrier: the terminal frame is published after the job body returns,
+    and the body is where the cache is emptied.
+    """
+    gc.collect()
+    mx.clear_cache()
+
+    wait_for(
+        client,
+        start(client, source=str(blocked), repo=REPO, method="oqe", **_CALIBRATION),
+        "ok",
+    )
+
+    assert mx.get_cache_memory() == 0, "the job left its checkpoint in MLX's buffer pool"

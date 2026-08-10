@@ -16,8 +16,8 @@ import asyncio
 import json
 import threading
 import time
-from collections.abc import Callable, Collection, Mapping
-from contextlib import suppress
+from collections.abc import AsyncIterator, Callable, Collection, Mapping
+from contextlib import asynccontextmanager, suppress
 from dataclasses import dataclass, field, replace
 from types import MappingProxyType
 from typing import NotRequired, Protocol, TypedDict, runtime_checkable
@@ -31,7 +31,7 @@ from sideros.generate import Constraint, Meter
 from sideros.grammar import Grammar, Vocabulary
 from sideros.language import tokenizer_of
 from sideros.model import Wrapping
-from sideros.suppress import Segment
+from sideros.parsers import Segment
 from sideros_server.metrics import Metrics, RequestState
 from sideros_server.store import Store
 
@@ -115,6 +115,14 @@ def _checkpoint_size(model_id: str) -> int:
     return 0 if entry is None else checkpoint_bytes(entry.directory)
 
 
+def _incoming_size(model_id: str, store: Store) -> int:
+    """Everything the load is about to put in memory: the checkpoint, plus the drafter that
+    lands with it when the model's settings name one."""
+    from sideros_server.features import drafter_bytes
+
+    return _checkpoint_size(model_id) + drafter_bytes(model_id, store)
+
+
 class _TextConfigJson(TypedDict):
     vocab_size: NotRequired[int]
 
@@ -181,6 +189,16 @@ def _vocabulary(model_id: str, model: LanguageModel[ModelInput]) -> Vocabulary:
             "The same schema without strict is checked after the answer and needs neither."
         )
     return Vocabulary(tokenizer, size=size, stop=stop)
+
+
+def drafter(model: object) -> nn.Module | None:
+    """The second checkpoint under this model, when one was paired with it. It is not in
+    the model's own tree — two checkpoints are two trees — so nothing that walks `tree`
+    ever weighs it, and residency has to ask for it by name."""
+    from sideros_server.features import drafting
+
+    facade = drafting(model)
+    return None if facade is None else facade.drafter
 
 
 def tree(model: object) -> nn.Module | None:
@@ -280,6 +298,10 @@ class _Release:
     done: asyncio.Event = field(default_factory=asyncio.Event)
 
 
+def _nothing() -> None:
+    pass
+
+
 class Engine:
     def __init__(self, loader: Loader, store: Store | None = None) -> None:
         self._loader = loader
@@ -308,6 +330,19 @@ class Engine:
         """Set when a model lands and when a lease is let go — the two ways the next expiry
         can move earlier than the one the sweep went to sleep on."""
         self._metrics = Metrics()
+        self._reserving = asyncio.Lock()
+        """One reservation at a time — two benchmarks measuring at once would each be the
+        other's noise."""
+        self._reserved: object | None = None
+        """Who holds the queue, when somebody does. A token and not a flag: the holder's own
+        submissions have to pass, and comparing the token is what tells them apart from
+        everybody else's."""
+        self._free = asyncio.Event()
+        self._free.set()
+        self.on_change: Callable[[], None] = _nothing
+        """Raised at every transition `/admin/state` reports — a model landing or leaving,
+        the queue moving, the reservation changing hands. What listens is the event stream;
+        an engine nobody wired one to announces into the default and costs a call."""
 
     @property
     def resident(self) -> list[str]:
@@ -334,6 +369,13 @@ class Engine:
     @property
     def waiting(self) -> int:
         return self._queue.qsize()
+
+    @property
+    def reserved(self) -> bool:
+        """Whether somebody is holding the queue exclusively. Out on `/admin/state` so a
+        client can stop polling the expensive routes while a measurement runs: a catalog
+        walk every two seconds is disk the benchmark is also asking for."""
+        return self._reserved is not None
 
     def start(self) -> None:
         loop = asyncio.get_running_loop()
@@ -389,14 +431,20 @@ class Engine:
             # write the entry: the others would overwrite `last_used` with `None` for a
             # model that is already generating, and pay the walk over the tree again.
             found = tree(model)
+            drafted = drafter(model)
             self._models[model_id] = model
             self._residency[model_id] = Residency(
-                weights_bytes=0 if found is None else resident_bytes(found),
+                # The drafter's weights are as resident as the model's. They are not in
+                # `active_bytes`: what that denominator prices is one decode step, and a
+                # drafter is read once per round and not once per token.
+                weights_bytes=(0 if found is None else resident_bytes(found))
+                + (0 if drafted is None else resident_bytes(drafted)),
                 active_bytes=None if found is None else active_bytes_per_token(found),
                 loaded_at=time.time(),
             )
             self._loads += 1
             self._changed.set()
+            self.on_change()
         return model
 
     async def _load(self, model_id: str) -> LanguageModel[ModelInput]:
@@ -442,7 +490,7 @@ class Engine:
         limit = _config(self._store).limit
         # Off the loop: the scan stats every file of every checkpoint in the two caches, and
         # the loop it would otherwise sit on is carrying whatever is decoding.
-        incoming = await asyncio.to_thread(_checkpoint_size, model_id)
+        incoming = await asyncio.to_thread(_incoming_size, model_id, self._store)
         if incoming > limit:
             raise ModelTooLarge(
                 f"{model_id!r} weighs {incoming} bytes and the whole memory limit is {limit}"
@@ -529,6 +577,7 @@ class Engine:
             return False
         release = _Release(self._models.pop(model_id))
         del self._residency[model_id]
+        self.on_change()
         await self._queue.put(release)
         await release.done.wait()
         return True
@@ -572,12 +621,69 @@ class Engine:
                 entry.grammars[key] = grammar
         return grammar.constrain()
 
-    async def submit(self, model_id: str, input: ModelInput, options: GenerationOptions) -> Job:
+    async def acquire_queue(self) -> object:
+        """The queue, exclusively, until the token comes back.
+
+        A measurement is only worth what nothing else running beside it is worth, and the
+        gate alone does not give that: it serialises generation, so a chat request lands
+        *between* two rounds and moves the median without appearing anywhere. Holding the
+        queue is what closes it. Everybody else waits in `submit`, before being queued at
+        all, so nothing is dropped and the ordering stays the queue's own.
+
+        The token is what the holder passes back to `submit` to get through its own
+        reservation, and what `release_queue` is checked against.
+        """
+        await self._reserving.acquire()
+        token = object()
+        self._reserved = token
+        self._free.clear()
+        self.on_change()
+        # What was already queued when the reservation was taken is still somebody's
+        # request, and it is measured against nothing: let the worker finish it before the
+        # first round starts.
+        while self._current is not None or not self._queue.empty():
+            await asyncio.sleep(0.01)
+        return token
+
+    async def release_queue(self, token: object) -> None:
+        """Idempotent, and a no-op for a token that is not the holder's: the release rides a
+        `finally`, and a benchmark that raised after the daemon was already restarted must
+        not hand somebody else's reservation back."""
+        if self._reserved is not token:
+            return
+        self._reserved = None
+        self._free.set()
+        self._reserving.release()
+        self.on_change()
+
+    @asynccontextmanager
+    async def reserve(self) -> AsyncIterator[object]:
+        """`acquire_queue` and `release_queue` as a block, for a caller that lives on the
+        loop. The work of a job does not — it runs in a thread and drives the loop through
+        `run_coroutine_threadsafe` — which is why the two halves exist separately."""
+        token = await self.acquire_queue()
+        try:
+            yield token
+        finally:
+            await self.release_queue(token)
+
+    async def submit(
+        self,
+        model_id: str,
+        input: ModelInput,
+        options: GenerationOptions,
+        reservation: object | None = None,
+    ) -> Job:
         """Raises `UnsupportedInput` before queueing: a model that cannot take this input
         never becomes a job, so the caller answers with a client error instead of the
         worker failing mid-generation. `NotResident` comes before even that, when the config
         says so — see `_reachable`.
         """
+        # Before anything else, including the load: a request that waits here has not taken
+        # a lease, has not moved a model's `last_used`, and has not put a byte on the GPU
+        # while somebody is measuring.
+        while self._reserved is not None and reservation is not self._reserved:
+            await self._free.wait()
         # Cold decided before the await, because after it the model is resident either way.
         # What is timed is the whole wait — admission and the eviction it may order included:
         # they are the request's seconds too, and a load timed from the loader alone reports
@@ -611,6 +717,7 @@ class Engine:
             load_seconds=loaded,
         )
         await self._queue.put(job)
+        self.on_change()
         return job
 
     async def _run(self) -> None:
@@ -626,6 +733,7 @@ class Engine:
                 continue
             job = item
             self._current = job
+            self.on_change()
             entry = self._residency.get(job.model_id)
             # Both ends of the record are taken here rather than in `_decode`: the meter is
             # written from the decode thread, but nothing about publishing it belongs there.
@@ -654,6 +762,7 @@ class Engine:
                     # lease back to it costs nothing.
                     job.lease.leases -= 1
                 self._changed.set()
+                self.on_change()
                 # The loop suspends on the next `get` with this frame alive, and a local
                 # still naming the finished job keeps its model reachable past an unload —
                 # the `_Release` riding the queue rebinds `item`, never `job`.
@@ -674,6 +783,11 @@ class Engine:
             for piece in stream:
                 if job.cancelled.is_set():
                     break
+                if piece.channel == "header":
+                    # Routing, nobody's prose: `<|start|>assistant to=user<|message|>` names
+                    # the channel the next text rides, and no API dialect has a field for
+                    # it. Dropped here once, so the four dialects never see one.
+                    continue
                 job.loop.call_soon_threadsafe(job.chunks.put_nowait, piece)
         finally:
             self._account(job.model_id, settled, loads)

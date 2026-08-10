@@ -5,6 +5,7 @@ import time
 import uuid
 from collections.abc import AsyncGenerator, AsyncIterator, Mapping
 from contextlib import asynccontextmanager
+from dataclasses import replace
 from importlib.metadata import version
 from typing import Annotated, Literal
 
@@ -31,20 +32,24 @@ from sideros import (
     top_p,
 )
 from sideros import ChatMessage as Turn
-from sideros.chat import tool_family_of
+from sideros.chat import parser_of
 from sideros.footprint import ceiling
 from sideros.generate import Constraint, Meter
 from sideros.grammar import GrammarRefused
+from sideros.parsers import Segment, ToolCall, unmarked
 from sideros.schema import MalformedJSON, SchemaViolation
-from sideros.suppress import Segment, unmarked
-from sideros.tools import ToolCall
 from sideros_server import (
     anthropic,
     auth,
     bench,
+    benchmarks,
     catalog,
     config,
+    datasets,
     download,
+    events,
+    features,
+    fidelity,
     gemini,
     jobs,
     metrics,
@@ -521,8 +526,21 @@ def _timings(job: Job) -> dict[str, object]:
     meter = job.meter
     rate = meter.tokens_per_second
     per_token = None if job.lease is None else job.lease.active_bytes
+    speculation = meter.speculation
     return {
         "load_seconds": job.load_seconds,
+        # Absent for a turn that did not speculate, which is every model with no drafter and
+        # every request a drafter could not verify — a sampled one, a grammar. Present, it is
+        # the one place the difference shows: the rate alone never says a drafter was there.
+        "speculation": (
+            None
+            if speculation.rounds == 0
+            else {
+                "rounds": speculation.rounds,
+                "proposed": speculation.proposed,
+                "accepted": speculation.accepted,
+            }
+        ),
         "ttft_seconds": meter.ttft,
         "prefill_tokens_per_second": metrics.prefill_rate(meter.prompt_tokens, meter.ttft),
         "tokens_per_second": rate,
@@ -728,7 +746,14 @@ async def chat(
             # same answer to the client: this model is not available here. The reason travels
             # in the message rather than in a second status code. A `model:typo` lands here
             # too, whole: no profile matched, so the name was never split.
-            job = await engine.submit(model_id, conversation, _options(asked, preset, constrained))
+            job = await engine.submit(
+                model_id,
+                conversation,
+                replace(
+                    _options(asked, preset, constrained),
+                    speculate=profiles.speculating(store, model_id, profile),
+                ),
+            )
         except GrammarRefused as refusal:
             # The compiler's own words — `Unimplemented keys: ["uniqueItems"]` is a reason
             # where "grammar error" is not, and what the client does with it is send the same
@@ -749,7 +774,8 @@ async def chat(
         # reach the client the way the generation always did, piece for piece: suppressing an
         # envelope no parser answers to costs the client the text and gives back no call, which
         # is what a checkpoint whose spelling this server does not know would pay.
-        family = tool_family_of(job.model) if tools else None
+        parser = parser_of(job.model) if tools else None
+        family = None if parser is None else parser.tools
         calls = None if family is None else Calls(family)
 
         if request.stream:
@@ -876,30 +902,80 @@ def create_app(engine: Engine, store: Store, *, host: str = "127.0.0.1") -> Fast
     `/admin/config` refuses to clear it. The default is the one every test wants and the one
     the daemon comes up on."""
 
+    registry = Jobs(store)
+
+    async def _health() -> object:
+        return await health(engine)
+
+    async def _models() -> object:
+        return catalog.models(
+            {model_id: entry.active_bytes for model_id, entry in engine.residency.items()}
+        )
+
+    async def _state() -> object:
+        return await state.state(engine)
+
+    async def _jobs() -> object:
+        """The live ones. The history is a list that only grows and only one screen reads,
+        and it is a fetch there — a stream is for what moves."""
+        return jobs.jobs(registry, active=True)
+
+    async def _config() -> object:
+        return config.config(store)
+
+    async def _metrics() -> object:
+        return engine.metrics.snapshot()
+
+    hub = events.Hub(
+        {
+            # The order is the order the opening burst arrives in, and it is the order a
+            # screen needs it: what the daemon is, then what it was told, then what it has.
+            "health": _health,
+            "config": _config,
+            "models": _models,
+            "state": _state,
+            "jobs": _jobs,
+            "metrics": _metrics,
+        }
+    )
+    engine.on_change = lambda: hub.publish("state")
+    engine.metrics.on_change = lambda: hub.publish("metrics")
+    registry.on_change = lambda: hub.publish("jobs")
+
     @asynccontextmanager
     async def lifespan(_app: FastAPI) -> AsyncGenerator[None]:
+        hub.bind(asyncio.get_running_loop())
+        watcher = events.observe(hub, (catalog.HUB_CACHE, catalog.QUANTIZED_CACHE))
         engine.start()
         yield
         engine.stop()
+        events.shutdown(watcher)
 
     app = FastAPI(lifespan=lifespan)
     app.state.engine = engine
     app.state.store = store
     app.state.host = host
-    app.state.jobs = Jobs(store)
+    app.state.jobs = registry
     app.state.metrics = engine.metrics
+    app.state.events = hub
     # Ahead of every route, including the ones no router claims: an unrouted path under a
     # dialect prefix answers 401 rather than a 404 that enumerates what is mounted.
     app.add_middleware(auth.ApiKey)
+    if os.environ.get("SIDEROS_DEV") == "1":
+        # Outside the key check, so a stream that was refused is a refusal on stdout too.
+        # The shell already sets this for the daemon it spawns in dev.
+        app.add_middleware(events.Tap)
     app.include_router(router)
-    # These three before the catalog's: its `{model_id:path}` matches slashes, so it would
+    # These four before the catalog's: its `{model_id:path}` matches slashes, so it would
     # answer for `/admin/models/{id}/profiles/{name}` as if the profile were part of the
     # model's name. And `profiles` before `residency`, in the other direction: a profile
     # actually named `residency` would otherwise be read as a model id ending in `/profiles`.
     app.include_router(profiles.router)
+    app.include_router(features.router)
     app.include_router(residency.router)
     app.include_router(tokenization.router)
     app.include_router(catalog.router)
+    app.include_router(events.router)
     app.include_router(system.router)
     app.include_router(jobs.router)
     app.include_router(state.router)
@@ -909,6 +985,9 @@ def create_app(engine: Engine, store: Store, *, host: str = "127.0.0.1") -> Fast
     app.include_router(download.router)
     app.include_router(quantize.router)
     app.include_router(bench.router)
+    app.include_router(benchmarks.router)
+    app.include_router(datasets.router)
+    app.include_router(fidelity.router)
     app.include_router(responses.router)
     app.include_router(anthropic.router)
     app.include_router(gemini.router)

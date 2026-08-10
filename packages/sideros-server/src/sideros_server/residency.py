@@ -25,7 +25,7 @@ from fastapi import APIRouter, Depends, HTTPException, Request
 from fastapi.responses import JSONResponse
 
 from sideros_server.engine import Engine
-from sideros_server.jobs import Job, JobsDep, Progress, Work, accepted
+from sideros_server.jobs import Job, JobsDep, Load, Progress, Work, accepted
 
 
 async def _engine(request: Request) -> Engine:
@@ -72,7 +72,7 @@ def _load(engine: Engine, model_id: str) -> Work:
 
 @router.put("/admin/models/{model_id:path}/residency", status_code=202)
 async def load(model_id: str, engine: EngineDep, registry: JobsDep) -> JSONResponse:
-    return accepted(registry.start("load", _load(engine, model_id)))
+    return accepted(registry.start(Load(model=model_id), _load(engine, model_id)))
 
 
 @router.delete("/admin/models/{model_id:path}/residency", status_code=204)

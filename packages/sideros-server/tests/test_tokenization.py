@@ -31,7 +31,7 @@ from sideros import (
     TextLanguageModel,
     Tokenizer,
 )
-from sideros.suppress import Segment
+from sideros.parsers import Segment
 from sideros_server import catalog
 from sideros_server.engine import Engine
 from sideros_server.tokenization import router
@@ -185,6 +185,7 @@ def test_a_model_that_is_not_resident_is_refused_and_nothing_is_loaded() -> None
 def test_an_id_with_a_slash_reaches_the_route_and_not_the_catalogs_model_path() -> None:
     """Model ids carry `/`, and the catalog's `{model_id:path}` matches slashes: without the
     same converter here, `mlx-community/x/tokenize` is a path this route never sees."""
+
     async def run() -> httpx.Response:
         engine = Engine(lambda _: resident(CharTokenizer()))
         await engine.resolve(SLASHED)

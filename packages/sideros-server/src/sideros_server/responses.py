@@ -40,7 +40,7 @@ import time
 import uuid
 import zlib
 from collections.abc import AsyncIterator, Iterator, Mapping, Sequence
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from itertools import count
 from typing import Annotated, Final, Literal
 
@@ -69,9 +69,10 @@ from sideros import (
     top_p,
 )
 from sideros import ChatMessage as Turn
-from sideros.chat import Effort, tool_family_of
+from sideros.chat import Effort, parser_of
 from sideros.generate import Constraint, Meter
 from sideros.grammar import GrammarRefused
+from sideros.parsers import MalformedToolCall, Segment, ToolCall, ToolFamily
 from sideros.schema import (
     MalformedJSON,
     SchemaViolation,
@@ -79,8 +80,6 @@ from sideros.schema import (
     json_instruction,
     validate,
 )
-from sideros.suppress import Segment
-from sideros.tools import MalformedToolCall, ToolCall, ToolFamily
 from sideros_server import profiles
 from sideros_server.engine import Engine, Job, NotConstrainable
 from sideros_server.profiles import Sampling, StoreDep
@@ -107,8 +106,8 @@ class Calls:
     at all. A second machine here would answer differently about the same text, and an
     envelope the model wrote while reasoning is the case where it does.
 
-    The family is still needed, and only for `parse_tool_call`: `tool_family_of` reads it off
-    the source the capability compiled, so a checkpoint whose spelling nothing here parses
+    The family is still needed, and only for `parse_tool_call`: `parser_of` reads the dialect
+    off the source the capability compiled, so a checkpoint whose spelling nothing here parses
     never reaches this class.
 
     Reasoning is the dialect's to name, not this class's: `chat/completions` answers with
@@ -1142,7 +1141,14 @@ async def respond(
         constrained = None if strict is None else await engine.constrain(model_id, strict)
         # A name that does not resolve to a checkpoint and one whose load fails are the same
         # answer to the client: this model is not available here.
-        job = await engine.submit(model_id, conversation, _options(asked, preset, constrained))
+        job = await engine.submit(
+                model_id,
+                conversation,
+                replace(
+                    _options(asked, preset, constrained),
+                    speculate=profiles.speculating(store, model_id, profile),
+                ),
+            )
     except GrammarRefused as refusal:
         # The compiler's own words — `Unimplemented keys: ["uniqueItems"]` is a reason where
         # "grammar error" is not, and what the client does with it is send the same schema
@@ -1162,7 +1168,8 @@ async def respond(
     # No tools offered, nothing to read back; no family, nothing that could read it. Both
     # reach the client the way the generation always did, piece for piece: suppressing an
     # envelope no parser answers to costs the client the text and gives back no call.
-    family = tool_family_of(job.model) if tools else None
+    parser = parser_of(job.model) if tools else None
+    family = None if parser is None else parser.tools
     calls = None if family is None else Calls(family)
 
     if request.stream:

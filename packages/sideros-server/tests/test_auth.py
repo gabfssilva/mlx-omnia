@@ -196,9 +196,7 @@ def test_a_rotation_counts_from_the_next_request(client: TestClient, store: Stor
     assert client.get("/admin/config", headers=new).status_code == 200
 
 
-def test_an_unrouted_path_is_refused_before_it_is_routed(
-    client: TestClient, store: Store
-) -> None:
+def test_an_unrouted_path_is_refused_before_it_is_routed(client: TestClient, store: Store) -> None:
     """404 would answer which routes exist to someone holding no key, and the dialect of the
     refusal is the prefix's even where no route matches."""
     set_key(store, KEY)

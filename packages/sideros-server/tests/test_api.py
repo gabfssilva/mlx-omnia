@@ -37,8 +37,8 @@ from sideros import (
     chat_template,
     load,
 )
+from sideros.parsers import FALLBACK, Segment, Segmenter
 from sideros.schema import json_instruction
-from sideros.suppress import Segment, Segmenter
 from sideros_server import Engine, create_app
 from sideros_server.engine import Job, Loader
 from sideros_server.store import Store
@@ -207,7 +207,9 @@ class Script:
         # A real model segments its own text on the way out — the server reads
         # `segment.channel` and no longer runs a `Segmenter` of its own. A double
         # that labels a scripted envelope `content` scripts no call at all.
-        segmenter = Segmenter(input.tool_family, prompt=input.value)
+        segmenter = Segmenter(
+            FALLBACK if input.parser is None else input.parser, prompt=input.value
+        )
         for piece in self.pieces:
             # Counted like the loop counts: a double that hands out text without marking ids
             # leaves every number the dialect reports at zero, and a test reading one of them
@@ -415,9 +417,7 @@ def resident(base_url: str) -> list[str]:
     return [entry["id"] for entry in response.json()]
 
 
-def test_nothing_is_resident_until_a_request_names_a_model(
-    base_url: str, client: OpenAI
-) -> None:
+def test_nothing_is_resident_until_a_request_names_a_model(base_url: str, client: OpenAI) -> None:
     """The dialect lists the catalog, so `models.list()` answers the same before and after
     a load — what proves the load was lazy is the resident set, and residency is an
     `/admin` question because no dialect's schema carries the notion.
@@ -439,9 +439,7 @@ def test_nothing_is_resident_until_a_request_names_a_model(
 
 def test_unknown_model_is_openai_error(client: OpenAI) -> None:
     with pytest.raises(NotFoundError):
-        client.chat.completions.create(
-            model="nope", messages=[{"role": "user", "content": "x"}]
-        )
+        client.chat.completions.create(model="nope", messages=[{"role": "user", "content": "x"}])
 
 
 def test_chat_completion_deterministic(client: OpenAI) -> None:
@@ -611,6 +609,9 @@ def test_the_usage_frame_carries_what_the_turn_cost_in_seconds(base_url: str) ->
     assert timings["tokens_per_second"] > 0
     assert timings["bytes_per_token"] > 0
     assert 0 < timings["ceiling_fraction"] < 1
+    # Present and null, not absent: a turn that did not speculate says so, and a reader that
+    # only ever sees this model would otherwise not know the key exists.
+    assert timings["speculation"] is None
 
 
 def test_the_official_sdk_accumulates_the_usage_frame(client: OpenAI) -> None:
@@ -713,8 +714,10 @@ def test_sampling_reaches_the_engine(base_url: str) -> None:
         # Retries of a check nobody asked for: the field would be read by nobody, which is
         # the one case a request-level schema cannot catch on its own.
         ({"max_schema_attempts": 2}, "max_schema_attempts"),
-        ({"max_schema_attempts": 9, "response_format": {"type": "json_object"}},
-         "max_schema_attempts"),
+        (
+            {"max_schema_attempts": 9, "response_format": {"type": "json_object"}},
+            "max_schema_attempts",
+        ),
         ({"response_format": {"type": "yaml"}}, "response_format"),
     ],
 )
@@ -774,9 +777,7 @@ def test_a_tool_call_round_trips_through_two_turns_of_the_official_sdk(client: O
     of its own, and the second answer is one only a model that was handed the result can
     give — `Script` reads it out of the `<tool_response>` the checkpoint's own template
     renders, so nothing but the conversion having worked puts it there."""
-    messages: list[ChatCompletionMessageParam] = [
-        {"role": "user", "content": "Weather in Paris?"}
-    ]
+    messages: list[ChatCompletionMessageParam] = [{"role": "user", "content": "Weather in Paris?"}]
     first = client.chat.completions.create(model=CALLER, messages=messages, tools=TOOLS)
     choice = first.choices[0]
     assert choice.finish_reason == "tool_calls"
@@ -968,7 +969,9 @@ def test_a_checkpoint_whose_envelope_nothing_can_parse_answers_with_the_text_it_
     payload = offer(base_url, XML_CALLER, tools=TOOLS).json()
     choice = payload["choices"][0]
     assert choice["message"] == {
-        "role": "assistant", "content": "", "reasoning_content": XML_ANSWER
+        "role": "assistant",
+        "content": "",
+        "reasoning_content": XML_ANSWER,
     }
     assert choice["finish_reason"] == "stop"
 
@@ -1302,7 +1305,9 @@ def test_the_thinking_block_is_a_field_of_its_own_and_never_the_answer(base_url:
     """
     message = offer(base_url, THINKER).json()["choices"][0]["message"]
     assert message == {
-        "role": "assistant", "content": "\nParis.", "reasoning_content": "\nWeighing it.\n"
+        "role": "assistant",
+        "content": "\nParis.",
+        "reasoning_content": "\nWeighing it.\n",
     }
 
     frames = [json.loads(frame) for frame in sse(base_url, THINKER)]

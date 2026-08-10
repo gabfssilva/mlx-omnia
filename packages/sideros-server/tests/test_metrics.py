@@ -44,7 +44,7 @@ from sideros import (
     TextLanguageModel,
 )
 from sideros.generate import Meter
-from sideros.suppress import Segment
+from sideros.parsers import Segment
 from sideros_server import metrics as metrics_module
 from sideros_server.engine import Engine
 from sideros_server.metrics import Metrics, router

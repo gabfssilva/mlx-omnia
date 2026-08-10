@@ -30,7 +30,7 @@ from sideros import (
     TextLanguageModel,
 )
 from sideros.footprint import resident_bytes
-from sideros.suppress import Segment
+from sideros.parsers import Segment
 from sideros_server import engine as engine_module
 from sideros_server import state
 from sideros_server.engine import Engine, Job, tree
@@ -280,6 +280,7 @@ def test_two_requests_racing_a_cold_load_leave_one_entry_that_keeps_its_stamps(
     """
     loads: list[str] = []
     walks: list[object] = []
+
     def counting(module: nn.Module) -> int:
         walks.append(module)
         return resident_bytes(module)

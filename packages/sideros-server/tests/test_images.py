@@ -56,7 +56,7 @@ from sideros import (
     MultimodalChatCapability,
     Text,
 )
-from sideros.suppress import Segment
+from sideros.parsers import Segment
 from sideros_server import Engine, catalog, create_app
 from sideros_server.engine import Job, Loader
 from sideros_server.responses import UnreadableImage, image_part

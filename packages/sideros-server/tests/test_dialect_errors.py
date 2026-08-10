@@ -40,7 +40,7 @@ from sideros import (
     ModelSignature,
     Text,
 )
-from sideros.suppress import Segment
+from sideros.parsers import Segment
 from sideros_server import Engine, catalog, create_app
 from sideros_server.store import Store
 

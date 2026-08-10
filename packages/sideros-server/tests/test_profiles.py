@@ -38,7 +38,7 @@ from sideros import (
     Text,
     TextLanguageModel,
 )
-from sideros.suppress import Segment
+from sideros.parsers import Segment
 from sideros_server import Engine, catalog, create_app
 from sideros_server.store import Store
 
@@ -257,6 +257,7 @@ def test_a_profile_is_written_read_replaced_and_deleted_under_its_model(
             "reasoning_budget": None,
         },
         "system_prompt": "be terse",
+        "features": {"dflash": None},
     }
     assert client.get(url).json() == created.json()
 

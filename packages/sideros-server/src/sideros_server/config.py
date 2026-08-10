@@ -38,6 +38,7 @@ from fastapi import APIRouter, Depends, HTTPException, Request
 from pydantic import BaseModel, ConfigDict, Field, ValidationError
 
 from sideros_server import catalog
+from sideros_server.events import announce
 from sideros_server.store import Store
 
 _RESERVED_BYTES = 8 * 1024**3
@@ -189,7 +190,9 @@ def config(store: StoreDep) -> dict[str, Setting]:
 
 
 @router.patch("/admin/config")
-def update(body: ConfigPatch, store: StoreDep, host: HostDep) -> dict[str, Setting]:
+def update(
+    body: ConfigPatch, store: StoreDep, host: HostDep, request: Request
+) -> dict[str, Setting]:
     """What is validated is the whole config and not the body: a bound belongs to the field,
     not to the request that happened to carry it. Only what the body named is written, so a
     field left alone goes on tracking its computed default — and `set_config` is one
@@ -215,4 +218,5 @@ def update(body: ConfigPatch, store: StoreDep, host: HostDep) -> dict[str, Setti
         )
     values = merged.model_dump()
     store.set_config({name: json.dumps(values[name]) for name in sent})
+    announce(request, "config")
     return _view(merged)

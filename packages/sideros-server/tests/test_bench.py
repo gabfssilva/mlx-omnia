@@ -41,7 +41,7 @@ from sideros import (
     Text,
     TextLanguageModel,
 )
-from sideros.suppress import Segment
+from sideros.parsers import Segment
 from sideros_server import bench, jobs
 from sideros_server.engine import Engine, Loader
 from sideros_server.store import Store

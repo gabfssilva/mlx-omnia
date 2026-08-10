@@ -22,7 +22,7 @@ fluent, wrong text, which is the same reason a base model gets no guessed templa
 than accepted and ignored.
 """
 
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from typing import Annotated
 
 from fastapi import APIRouter, Depends, HTTPException, Request
@@ -30,7 +30,8 @@ from pydantic import BaseModel, ConfigDict, Field
 
 from sideros.chat import Effort
 from sideros.checkpoint import SamplingDefaults
-from sideros_server import catalog
+from sideros_server import catalog, features
+from sideros_server.features import Features
 from sideros_server.store import Profile, Store
 
 
@@ -73,6 +74,9 @@ class ProfileBody(BaseModel):
 
     sampling: Sampling = Sampling()
     system_prompt: str | None = None
+    features: Features = Features()
+    """What this preset changes about the model's own switches. A feature left unset is one
+    the profile does not opine on — the model's setting stands (`features.resolve`)."""
 
 
 @dataclass(frozen=True)
@@ -84,6 +88,7 @@ class ProfileView:
     name: str
     sampling: Sampling
     system_prompt: str | None = None
+    features: Features = field(default_factory=Features)
 
 
 def _view(profile: Profile) -> ProfileView:
@@ -95,6 +100,7 @@ def _view(profile: Profile) -> ProfileView:
         name=profile.name,
         sampling=Sampling.model_validate_json(profile.sampling),
         system_prompt=profile.system_prompt,
+        features=features.parse(profile.features),
     )
 
 
@@ -129,6 +135,22 @@ def preset(model_id: str, profile: ProfileView | None) -> Sampling:
 
 
 assert set(vars(SamplingDefaults())) <= set(Sampling.model_fields)
+
+
+def speculating(store: Store, model_id: str, profile: ProfileView | None) -> bool:
+    """Whether this request may use the drafter the model was loaded with. A profile that
+    names no feature inherits; one that turned DFlash off decodes without it, on a model
+    that is holding the drafter for everybody else."""
+    dflash = switches(store, model_id, profile).dflash
+    return dflash is not None and dflash.drafter is not None
+
+
+def switches(store: Store, model_id: str, profile: ProfileView | None) -> Features:
+    """The features this request runs under: the model's settings, with the profile's
+    overrides over them. Two levels and not three — a checkpoint has no opinion about what
+    this daemon keeps in memory."""
+    model = features.parse(store.model_settings(model_id).features)
+    return features.resolve(model, None if profile is None else profile.features)
 
 
 def served_ids(store: Store) -> list[str]:
@@ -180,16 +202,34 @@ def save(model_id: str, name: str, body: ProfileBody, store: StoreDep) -> Profil
     """
     if ":" in name:
         raise HTTPException(status_code=400, detail=f"profile name {name!r} may not contain ':'")
+    asked = body.features.dflash
+    if asked is not None and asked.drafter is not None:
+        # A profile may turn a feature off; a drafter is a second checkpoint in memory, and
+        # which one is loaded is decided once for the model. Refused rather than stored and
+        # ignored, which is a preset that says it drafts with something it never touches.
+        loaded = features.parse(store.model_settings(model_id).features).dflash
+        if loaded is None or loaded.drafter != asked.drafter:
+            named = "no drafter" if loaded is None else repr(loaded.drafter)
+            raise HTTPException(
+                status_code=409,
+                detail=f"{model_id!r} loads {named}: a profile may turn DFlash off, not "
+                "name another drafter",
+            )
     store.save_profile(
         Profile(
             model=model_id,
             name=name,
             sampling=body.sampling.model_dump_json(exclude_none=True),
             system_prompt=body.system_prompt,
+            features=body.features.model_dump_json(exclude_none=True),
         )
     )
     return ProfileView(
-        model=model_id, name=name, sampling=body.sampling, system_prompt=body.system_prompt
+        model=model_id,
+        name=name,
+        sampling=body.sampling,
+        system_prompt=body.system_prompt,
+        features=body.features,
     )
 
 

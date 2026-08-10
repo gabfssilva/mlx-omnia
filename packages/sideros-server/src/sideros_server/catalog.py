@@ -33,6 +33,7 @@ from collections.abc import Iterator, Mapping
 from dataclasses import dataclass, field, replace
 from functools import lru_cache
 from pathlib import Path, PurePosixPath
+from stat import S_ISREG
 from typing import Annotated, NotRequired, TypedDict
 
 import huggingface_hub.constants
@@ -59,22 +60,35 @@ class _QuantizationJson(TypedDict):
     leaves: NotRequired[dict[str, QuantizationJson]]
 
 
-class _TextConfigJson(TypedDict):
-    """Where qwen3.5 keeps everything a text checkpoint declares, including the fields the
-    per-token arithmetic reads."""
+class _ShapeJson(TypedDict):
+    """The keys the cache arithmetic reads, all of them transformers' own names and none of
+    them any architecture's private vocabulary. They appear at the root or under
+    `text_config`, which is where qwen3.5 keeps everything a text checkpoint declares."""
 
     max_position_embeddings: NotRequired[int]
     vocab_size: NotRequired[int]
     tie_word_embeddings: NotRequired[bool]
+    hidden_size: NotRequired[int]
+    num_hidden_layers: NotRequired[int]
+    num_attention_heads: NotRequired[int]
+    num_key_value_heads: NotRequired[int]
+    head_dim: NotRequired[int]
+    sliding_window: NotRequired[int | None]
+    use_sliding_window: NotRequired[bool]
+    layer_types: NotRequired[list[str]]
+    full_attn_idxs: NotRequired[list[int]]
+    kv_lora_rank: NotRequired[int]
+    qk_rope_head_dim: NotRequired[int]
 
 
-class _ConfigJson(TypedDict):
+class _TextConfigJson(_ShapeJson):
+    pass
+
+
+class _ConfigJson(_ShapeJson):
     model_type: NotRequired[str]
-    max_position_embeddings: NotRequired[int]
     dtype: NotRequired[str]
     torch_dtype: NotRequired[str]
-    vocab_size: NotRequired[int]
-    tie_word_embeddings: NotRequired[bool]
     quantization: NotRequired[_QuantizationJson]
     text_config: NotRequired[_TextConfigJson]
 
@@ -120,6 +134,20 @@ class CatalogEntry:
     bytes_per_token: int | None = None
     """Bytes a decode step reads, and the denominator of every "% of the ceiling" the house
     reports. `None` when the shards' headers cannot be read."""
+    kv_bytes_per_token: int | None = None
+    """What the cache grows by per token, over every attending layer. The other half of the
+    ceiling — weights amortise over the streams of a batch, this does not — and what decides
+    whether a shape fits at all. `None` when the config does not answer."""
+    attention_window: int | None = None
+    """Where the cache stops growing. `None` for full attention, and also for a checkpoint
+    that only slides on some of its layers: there the full ones keep growing, and a window
+    reported for the whole model would price a saving it does not have."""
+    vocab_size: int | None = None
+    """What decides whether two checkpoints' logits can be subtracted at all."""
+    shape: str | None = None
+    """A print of the architecture — enough to tell a fine-tune's twin from a different
+    model. It validates a fidelity pair somebody declared; it never invents kinship, since
+    a fine-tune's print is identical to its base's."""
     resident: bool = False
     """Filled by the handler from the engine, not by the scan."""
 
@@ -269,6 +297,112 @@ def _bytes_per_token(directory: Path, config: _ConfigJson) -> int | None:
     return read
 
 
+_ATTENDING = frozenset({"full_attention", "sliding_attention", "attention"})
+"""What transformers calls a layer that keeps a key-value cache. Everything else a
+`layer_types` names — `linear_attention`, `conv`, `mamba`, `recurrent` — holds a state of
+fixed size that does not grow with the context, so it is not in this arithmetic at all."""
+
+_DTYPE_BYTES = {"BF16": 2, "F16": 2, "F32": 4, "F64": 8}
+
+
+def _shape(config: _ConfigJson) -> _ShapeJson:
+    """Where the architecture's numbers are, root or nested. A key present at both is the
+    nested one's: `text_config` is the text tower's own declaration, and the root of a
+    multimodal config describes the whole thing."""
+    text = config.get("text_config")
+    if text is None:
+        return config
+    merged: _ShapeJson = {**config, **text}
+    return merged
+
+
+def _attending_layers(shape: _ShapeJson) -> int | None:
+    """How many layers keep a growing cache. A hybrid says so itself — `layer_types` names
+    every layer, `full_attn_idxs` lists the attending ones — and counting all of them
+    instead would charge a recurrent trunk for a cache it does not have."""
+    layers = shape.get("num_hidden_layers")
+    if layers is None:
+        return None
+    if (types := shape.get("layer_types")) is not None:
+        return sum(1 for kind in types if kind in _ATTENDING)
+    if (indices := shape.get("full_attn_idxs")) is not None:
+        return len(indices)
+    return layers
+
+
+def _kv_elements_per_layer(shape: _ShapeJson) -> int | None:
+    """Elements one token adds to one attending layer's cache.
+
+    Two cache shapes, both transformers' own declaration and neither any one port's: a
+    latent cache (`kv_lora_rank`), which keeps one compressed vector plus the rotated key,
+    and the ordinary one, which keeps a key and a value per key-value head.
+    """
+    if (rank := shape.get("kv_lora_rank")) is not None:
+        rope = shape.get("qk_rope_head_dim")
+        return None if rope is None else rank + rope
+    heads = shape.get("num_attention_heads")
+    if heads is None:
+        return None
+    kv_heads = shape.get("num_key_value_heads", heads)
+    head_dim = shape.get("head_dim")
+    if head_dim is None:
+        hidden = shape.get("hidden_size")
+        if hidden is None or heads == 0:
+            return None
+        head_dim = hidden // heads
+    return 2 * kv_heads * head_dim
+
+
+def _kv_bytes_per_token(directory: Path, config: _ConfigJson) -> int | None:
+    """What one token costs the cache, over the whole model.
+
+    The width comes off the config and the element size off the shards: the cache carries
+    the activations' dtype, which is the checkpoint's float dtype — a 4-bit checkpoint
+    computes and caches in the bfloat16 its norms are stored in, not in four bits. A config
+    that does not answer gets `None`, the way `_bytes_per_token` already does with a stack
+    no tree accounts for.
+    """
+    shape = _shape(config)
+    layers = _attending_layers(shape)
+    elements = _kv_elements_per_layer(shape)
+    if layers is None or elements is None:
+        return None
+    width = _DTYPE_BYTES.get(weights_dtype(directory) or "")
+    return None if width is None else layers * elements * width
+
+
+def _attention_window(shape: _ShapeJson) -> int | None:
+    """The context past which the cache stops growing, and `None` whenever it does not stop.
+
+    Only when *every* attending layer slides. A checkpoint that alternates — gpt-oss keeps
+    a full layer beside each sliding one — has a cache that still grows linearly, and
+    reporting the window here would price a saving the model does not have.
+    """
+    window = shape.get("sliding_window")
+    if window is None or not shape.get("use_sliding_window", True):
+        return None
+    types = shape.get("layer_types")
+    if types is None:
+        return window
+    attending = [kind for kind in types if kind in _ATTENDING]
+    return window if attending and all(kind == "sliding_attention" for kind in attending) else None
+
+
+def _print(config: _ConfigJson) -> str | None:
+    """`model_type` and the four numbers that decide whether two checkpoints are the same
+    architecture. Not a fingerprint of the weights: a fine-tune prints the same as its base,
+    which is exactly why this validates a declared pair and never proposes one."""
+    shape = _shape(config)
+    architecture = config.get("model_type")
+    layers = shape.get("num_hidden_layers")
+    hidden = shape.get("hidden_size")
+    heads = shape.get("num_attention_heads")
+    vocab = shape.get("vocab_size")
+    if architecture is None or None in (layers, hidden, heads, vocab):
+        return None
+    return f"{architecture}/L{layers}/H{hidden}/A{heads}/V{vocab}"
+
+
 def _complete(directory: Path) -> bool:
     """The `weight_map` is the list the loader will ask for, so it is the list that
     decides. `is_file` follows the link, which is what catches a snapshot pointing at a
@@ -280,7 +414,33 @@ def _complete(directory: Path) -> bool:
     return all((directory / shard).is_file() for shard in set(weights["weight_map"].values()))
 
 
-def _entry(model_id: str, directory: Path, store: Path) -> CatalogEntry | None:
+_Stamp = tuple[tuple[str, int, int], ...]
+
+
+def _stamp(directory: Path) -> _Stamp:
+    """Every file the entry is a function of, by name, size and mtime. A hub snapshot is
+    links into `blobs/` and `stat` follows them, so a shard landing moves the stamp; a link
+    whose blob is not there yet has no stat at all, and it moves when the blob appears.
+
+    This is the walk `bytes_on_disk` already paid for, so pricing an entry costs the stat of
+    its directory and nothing else once it is cached."""
+    found: list[tuple[str, int, int]] = []
+    for path in sorted(directory.iterdir()):
+        try:
+            info = path.stat()
+        except OSError:
+            continue
+        if S_ISREG(info.st_mode):
+            found.append((path.name, info.st_size, info.st_mtime_ns))
+    return tuple(found)
+
+
+@lru_cache(maxsize=256)
+def _build(model_id: str, directory: Path, store: Path, stamp: _Stamp) -> CatalogEntry | None:
+    """Keyed by the stamp, which is what every number below is read from: the headers of 77
+    checkpoints are 470 ms of json and regex, and nothing in them moves while the files do
+    not. `None` is cached too — an interrupted download is re-listed as often as a complete
+    one, and it stops being `None` when its last shard moves the stamp."""
     config_path = directory / "config.json"
     if not config_path.is_file() or not _complete(directory):
         return None
@@ -300,9 +460,17 @@ def _entry(model_id: str, directory: Path, store: Path) -> CatalogEntry | None:
         dtype=config.get("dtype") or config.get("torch_dtype"),
         context=context,
         defaults=sampling_defaults(directory),
-        bytes_on_disk=sum(path.stat().st_size for path in directory.iterdir() if path.is_file()),
+        bytes_on_disk=sum(size for _, size, _ in stamp),
         bytes_per_token=_bytes_per_token(directory, config),
+        kv_bytes_per_token=_kv_bytes_per_token(directory, config),
+        attention_window=_attention_window(_shape(config)),
+        vocab_size=_shape(config).get("vocab_size"),
+        shape=_print(config),
     )
+
+
+def _entry(model_id: str, directory: Path, store: Path) -> CatalogEntry | None:
+    return _build(model_id, directory, store, _stamp(directory))
 
 
 def _head(repository: Path) -> Path | None:

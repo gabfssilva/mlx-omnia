@@ -252,7 +252,15 @@ def test_the_sessions_table_lands_on_a_database_left_at_v1(
     path = tmp_path / "server.db"
     profile = Profile("qwen3.6-35b", "code", '{"temperature": 0.2}')
     monkeypatch.setattr(store_module, "_MIGRATIONS", (store_module._SCHEMA_V1,))
-    Store(path).save_profile(profile)
+    Store(path)
+    # v1's own INSERT, not the head's: a release that wrote this file had no `features`
+    # column to write, which is exactly what the migration has to survive.
+    with closing(sqlite3.connect(path)) as connection:
+        connection.execute(
+            "INSERT INTO profiles (model, name, sampling) VALUES (?, ?, ?)",
+            (profile.model, profile.name, profile.sampling),
+        )
+        connection.commit()
     assert user_version(path) == 1
     monkeypatch.undo()
 

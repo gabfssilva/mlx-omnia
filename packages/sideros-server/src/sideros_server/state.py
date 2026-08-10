@@ -78,6 +78,9 @@ class Resident:
 class Queue:
     running: int
     waiting: int
+    reserved: bool = False
+    """Somebody is holding the queue exclusively — a benchmark, today. What reads it is the
+    app, which drops to one cheap poll while it is true."""
 
 
 @dataclass(frozen=True)
@@ -117,7 +120,7 @@ async def state(engine: EngineDep) -> State:
     accumulator = sum(model.weights_bytes for model in models)
     return State(
         models=models,
-        queue=Queue(running=engine.running, waiting=engine.waiting),
+        queue=Queue(running=engine.running, waiting=engine.waiting, reserved=engine.reserved),
         resident_bytes=max(mx.get_active_memory(), footprint_bytes(), accumulator),
         kv_bytes=sum(model.kv_bytes for model in models),
     )

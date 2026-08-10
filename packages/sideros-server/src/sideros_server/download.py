@@ -55,7 +55,16 @@ from huggingface_hub.errors import RepositoryNotFoundError
 from pydantic import BaseModel, ConfigDict
 
 from sideros_server import catalog, quantize
-from sideros_server.jobs import Cancelled, Job, Jobs, JobsDep, Progress, Work, accepted
+from sideros_server.jobs import (
+    Cancelled,
+    Download,
+    Job,
+    Jobs,
+    JobsDep,
+    Progress,
+    Work,
+    accepted,
+)
 
 _STAGING = ".incomplete"
 _VARIANTS = "mlx-community"
@@ -345,7 +354,7 @@ async def create(request: DownloadRequest, registry: JobsDep) -> JSONResponse:
     # repository and only then failing on a rename into a directory that is already there.
     if (catalog.HUB_CACHE / _slug(repository)).exists():
         raise HTTPException(status_code=409, detail=f"{repository!r} is already on disk")
-    job = registry.start("download", _download(repository))
+    job = registry.start(Download(model=repository), _download(repository))
     _DOWNLOADING[repository] = job.id
     return accepted(job)
 

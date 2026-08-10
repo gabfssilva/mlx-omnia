@@ -27,7 +27,7 @@ import uvicorn
 from fastapi import FastAPI
 from fastapi.responses import JSONResponse
 
-from sideros_server.jobs import _WORKERS, Job, Jobs, Progress, accepted, router
+from sideros_server.jobs import _WORKERS, Job, Jobs, Load, Progress, accepted, router
 from sideros_server.store import JobRecord, Store
 
 
@@ -89,7 +89,7 @@ def stand(tmp_path_factory: pytest.TempPathFactory) -> Iterator[Stand]:
     async def start_toy() -> JSONResponse:
         """The creator's whole side of the contract, which is what `accepted` is for."""
         assert here.toy is not None
-        return accepted(registry.start("toy", here.toy))
+        return accepted(registry.start(Load(model="toy"), here.toy))
 
     app.post("/toy")(start_toy)
 
@@ -185,14 +185,13 @@ def test_creating_a_job_answers_202_with_its_location(stand: Stand) -> None:
     assert response.status_code == 202, response.text
     body = response.json()
     assert response.headers["location"] == f"/admin/jobs/{body['id']}"
-    assert body["kind"] == "toy"
+    assert body["kind"] == "load"
+    assert body["subject"] == {"model": "toy"}
     assert body["state"] == "pending"
     assert httpx.get(f"{stand.base_url}{response.headers['location']}").status_code == 200
 
 
-def test_a_job_reports_progress_finishes_and_leaves_the_active_list(
-    stand: Stand, toy: Toy
-) -> None:
+def test_a_job_reports_progress_finishes_and_leaves_the_active_list(stand: Stand, toy: Toy) -> None:
     job_id = start(stand)
 
     assert toy.step() == 1
@@ -346,7 +345,7 @@ def test_a_job_cancelled_before_its_turn_never_enters_the_work(tmp_path: Path) -
 
     async def run() -> str:
         registry = Jobs(Store(tmp_path / "server.db"))
-        job = registry.start("toy", work)
+        job = registry.start(Load(model="toy"), work)
         job.cancel()
         deadline = time.monotonic() + 5
         while registry.live(job.id) is not None:
@@ -392,7 +391,7 @@ def test_the_bodies_run_on_this_registry_s_own_pool_and_not_more_than_it_is_wide
 
     async def run() -> tuple[int, list[str]]:
         registry = Jobs(Store(tmp_path / "server.db"))
-        started = [registry.start("toy", work) for _ in range(_WORKERS + 2)]
+        started = [registry.start(Load(model="toy"), work) for _ in range(_WORKERS + 2)]
         deadline = time.monotonic() + 5
         try:
             while True:
@@ -432,7 +431,7 @@ def test_a_job_whose_loop_goes_away_does_not_stay_running(tmp_path: Path) -> Non
 
     async def run() -> str:
         registry = Jobs(Store(database))
-        job = registry.start("toy", work)
+        job = registry.start(Load(model="toy"), work)
         deadline = time.monotonic() + 5
         while True:
             view = registry.view(job.id)
@@ -484,6 +483,7 @@ def test_a_job_the_last_process_left_running_is_not_running_here(tmp_path: Path)
         JobRecord(
             id="abandoned",
             kind="download",
+            subject=json.dumps({"model": "mlx-community/qwen3-30b"}),
             state="running",
             progress=json.dumps({"message": "half a shard"}),
             created_at=time.time(),

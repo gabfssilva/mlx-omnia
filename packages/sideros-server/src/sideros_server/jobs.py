@@ -61,12 +61,85 @@ class Progress:
 
 
 @dataclass(frozen=True)
+class Download:
+    """The Hub repository the bytes are coming from."""
+
+    model: str
+
+
+@dataclass(frozen=True)
+class Load:
+    model: str
+
+
+@dataclass(frozen=True)
+class Quantize:
+    model: str
+    target: str
+
+
+@dataclass(frozen=True)
+class Bench:
+    model: str
+
+
+@dataclass(frozen=True)
+class Benchmark:
+    """A batch, which is about several checkpoints at once — the one subject that is not one
+    model. `kind` is which of the three views it fills."""
+
+    kind: str
+    models: list[str]
+
+
+Subject = Download | Load | Quantize | Bench | Benchmark
+"""What the job is about, which is the one thing `kind` alone never said. A screen that draws
+a job beside the thing it acts on — the download under its checkpoint — needs the pairing to
+survive a reload, and `progress.message` is a sentence for a person, not a key."""
+
+
+def _kind(subject: Subject) -> str:
+    match subject:
+        case Download():
+            return "download"
+        case Load():
+            return "load"
+        case Quantize():
+            return "quantize"
+        case Bench():
+            return "bench"
+        case Benchmark():
+            return "benchmark"
+
+
+def _subject(kind: str, text: str) -> Subject:
+    """The column is JSON text for the same reason `progress` is: a table under it would make
+    every field a kind grows a migration of the other three."""
+    match (kind, json.loads(text)):
+        case ("download", {"model": str(model)}):
+            return Download(model=model)
+        case ("load", {"model": str(model)}):
+            return Load(model=model)
+        case ("quantize", {"model": str(model), "target": str(target)}):
+            return Quantize(model=model, target=target)
+        case ("bench", {"model": str(model)}):
+            return Bench(model=model)
+        case ("benchmark", {"kind": str(kind), "models": list(models)}) if all(
+            isinstance(name, str) for name in models
+        ):
+            return Benchmark(kind=kind, models=[name for name in models if isinstance(name, str)])
+        case other:
+            raise ValueError(f"malformed job subject: {other!r}")
+
+
+@dataclass(frozen=True)
 class JobView:
     """One shape for the four windows on a job: the body of the `202`, of the `GET`, of the
-    listing, and of every SSE frame."""
+    listing, and of every SSE frame. `kind` is the tag `subject` is read back with."""
 
     id: str
     kind: str
+    subject: Subject
     state: JobState
     progress: Progress
     created_at: float
@@ -78,6 +151,7 @@ def _record(view: JobView) -> JobRecord:
     return JobRecord(
         id=view.id,
         kind=view.kind,
+        subject=json.dumps(asdict(view.subject)),
         state=view.state,
         progress=json.dumps(asdict(view.progress)),
         created_at=view.created_at,
@@ -104,12 +178,17 @@ def _view(record: JobRecord) -> JobView:
     return JobView(
         id=record.id,
         kind=record.kind,
+        subject=_subject(record.kind, record.subject),
         state=record.state,
         progress=_progress(record.progress),
         created_at=record.created_at,
         updated_at=record.updated_at,
         error=record.error,
     )
+
+
+def _nothing() -> None:
+    pass
 
 
 @dataclass
@@ -122,6 +201,9 @@ class Job:
     store: Store
     cancelled: threading.Event = field(default_factory=threading.Event)
     watchers: set[asyncio.Queue[JobView | None]] = field(default_factory=set)
+    announce: Callable[[], None] = _nothing
+    """That the list of jobs moved — the registry's `on_change`, handed down by `start`.
+    Called from whichever thread published, so whatever is behind it has to take one."""
 
     @property
     def id(self) -> str:
@@ -150,6 +232,7 @@ class Job:
         self.view = replace(view, updated_at=time.time())
         self.store.save_job(_record(self.view))
         self.loop.call_soon_threadsafe(self._fanout, self.view)
+        self.announce()
 
     def finish(self, state: JobState, error: str | None) -> None:
         """The terminal frame and then the end of every stream, in that order."""
@@ -194,6 +277,9 @@ class Jobs:
 
     def __init__(self, store: Store) -> None:
         self._store = store
+        self.on_change: Callable[[], None] = _nothing
+        """Raised whenever the list `GET /admin/jobs` answers with moves — a job starting,
+        reporting or ending. What listens is the event stream."""
         self._live: dict[str, Job] = {}
         self._tasks: set[asyncio.Task[None]] = set()
         self._threads = ThreadPoolExecutor(max_workers=_WORKERS, thread_name_prefix="sideros-job")
@@ -203,18 +289,24 @@ class Jobs:
         # 409, because the id belongs to no live job here.
         self._store.abandon_jobs()
 
-    def start(self, kind: str, work: Work) -> Job:
+    def start(self, subject: Subject, work: Work) -> Job:
         """Call from the loop: the job captures it to hand frames back from the thread."""
         now = time.time()
         view = JobView(
             id=uuid.uuid4().hex,
-            kind=kind,
+            kind=_kind(subject),
+            subject=subject,
             state="pending",
             progress=Progress(),
             created_at=now,
             updated_at=now,
         )
-        job = Job(view=view, loop=asyncio.get_running_loop(), store=self._store)
+        job = Job(
+            view=view,
+            loop=asyncio.get_running_loop(),
+            store=self._store,
+            announce=self.on_change,
+        )
         self._live[view.id] = job
         self._store.save_job(_record(view))
         task = asyncio.create_task(self._run(job, work))
@@ -259,6 +351,7 @@ class Jobs:
             job.finish("cancelled" if job.cancelled.is_set() else "ok", None)
         finally:
             del self._live[job.id]
+            self.on_change()
 
 
 def _registry(request: Request) -> Jobs:
