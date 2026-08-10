@@ -87,7 +87,7 @@ function Choice({
   onChange: (next: string) => void
 }): JSX.Element {
   return (
-    <div className="fieldcol">
+    <div className="field">
       <span className="eyebrow">{label}</span>
       <select
         className="input tn"
@@ -108,7 +108,7 @@ function Choice({
 
 function Knob({ label, value, step, min, onChange }: KnobProps): JSX.Element {
   return (
-    <div className="fieldcol">
+    <div className="field">
       <span className="eyebrow">{label}</span>
       <input
         className="input tn"
@@ -212,7 +212,7 @@ export function Profiles({ model }: { model: string }): JSX.Element {
   }
 
   return (
-    <div className="card profiles">
+    <div className="profiles">
       <h3>
         Profiles <span>{names.length === 0 ? 'none saved' : `${names.length} saved`}</span>
       </h3>
@@ -235,7 +235,7 @@ export function Profiles({ model }: { model: string }): JSX.Element {
 
       {draft !== null ? (
         <>
-          <div className="fieldcol">
+          <div className="field">
             <span className="eyebrow">Name</span>
             <input
               className="input mono"
@@ -257,7 +257,7 @@ export function Profiles({ model }: { model: string }): JSX.Element {
             <Choice label="Reasoning effort" value={draft.reasoning_effort} options={api.EFFORTS} onChange={(next) => edit({ reasoning_effort: next as api.Effort })} />
             <Knob label="Reasoning budget" value={draft.reasoning_budget} step="64" min="0" onChange={(next) => edit({ reasoning_budget: next })} />
           </div>
-          <div className="fieldcol">
+          <div className="field">
             <span className="eyebrow">System prompt</span>
             <textarea
               className="input"

@@ -1,0 +1,75 @@
+[tools]
+uv = "0.11"
+node = "26"
+
+[env]
+_.python.venv = { path = ".venv", create = false }
+
+[tasks.test]
+description = "pytest (pass paths/-k to narrow; the full suite is slow)"
+run = "uv run pytest -q"
+
+[tasks.lint]
+description = "ruff check"
+run = "uv run ruff check"
+
+[tasks.types]
+description = "pyright"
+run = "uv run pyright"
+
+[tasks.imports]
+description = "import-linter contracts"
+run = "uv run lint-imports"
+
+[tasks.gate]
+description = "full gate: pytest + ruff + pyright + lint-imports (sequential)"
+run = """
+uv run pytest -q
+uv run ruff check
+uv run pyright
+uv run lint-imports
+"""
+
+[tasks."bench:interleaved"]
+description = "interleaved bench vs mlx-lm git main"
+run = "uv run python bench/interleaved.py"
+
+[tasks."bench:selfpair"]
+description = "selfpair bench: working tree vs a git ref (args: <model> <ref>)"
+run = "uv run python bench/selfpair.py"
+
+[tasks."bench:constrained"]
+description = "constrained-decoding bench (args: <model>)"
+run = "uv run python bench/constrained.py"
+
+[tasks."bench:grammar"]
+description = "grammar bench (args: <model>)"
+run = "uv run python bench/grammar.py"
+
+[tasks.server]
+description = "run the FastAPI server"
+run = "uv run sideros-server"
+
+[tasks.cli]
+description = "run the HTTP-only CLI"
+run = "uv run sideros"
+
+[tasks."app:dev"]
+description = "electron app in dev mode"
+dir = "app"
+run = "npm run dev"
+
+[tasks."app:build"]
+description = "build renderer + main"
+dir = "app"
+run = "npm run build"
+
+[tasks."app:typecheck"]
+description = "tsc --noEmit for renderer and desktop"
+dir = "app"
+run = "npm run typecheck"
+
+[tasks."app:package"]
+description = "electron-builder --mac (produces app/release)"
+dir = "app"
+run = "npm run package"

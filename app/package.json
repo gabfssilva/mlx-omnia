@@ -26,9 +26,14 @@
       "dist/**",
       "package.json"
     ],
+    "compression": "maximum",
+    "electronLanguages": [
+      "en"
+    ],
     "mac": {
       "category": "public.app-category.developer-tools",
-      "target": "dmg"
+      "target": "dmg",
+      "icon": "build/icon.icns"
     }
   },
   "devDependencies": {

@@ -59,12 +59,19 @@ const suggest = (source: string, mode: Mode, bits: number): string =>
     ? ''
     : `local/${source.split('/').pop() ?? source}-${mode === 'affine' ? `${bits}bit` : mode}`
 
-export function Quantize(): JSX.Element {
+export function Quantize({
+  initial,
+  onClose
+}: {
+  /** The checkpoint Library asked to transform. */
+  initial?: string
+  onClose?: () => void
+}): JSX.Element {
   const [entries, setEntries] = useState<CatalogEntry[] | null>(null)
   const [system, setSystem] = useState<Machine | null>(null)
   const [state, setState] = useState<Residency | null>(null)
 
-  const [source, setSource] = useState('')
+  const [source, setSource] = useState(initial ?? '')
   const [method, setMethod] = useState<Method>('rtn')
   const [mode, setMode] = useState<Mode>('affine')
   const [bits, setBits] = useState(4)
@@ -218,12 +225,14 @@ export function Quantize(): JSX.Element {
   const packed = plan === null ? 0 : plan.leaves.filter((leaf) => leaf.bits !== null).length
 
   return (
-    <>
-      <div className="vhead qz">
-        <h1>Quantize</h1>
+    <div className="sheet">
+      <div className="sheetc qz">
+      <div className="sheeth">
+        <b>Quantize</b>
+        <span className="arrow">{source === '' ? 'pick a checkpoint' : source}</span>
         <div className="trail">
           {job !== null && (
-            <span className={running ? 'chip hot' : 'chip res'} title={job.error ?? job.progress.message}>
+            <span className="chip" title={job.error ?? job.progress.message}>
               <span className="dot" />
               <span className="what">
                 {job.progress.total !== null && job.progress.total > 0 && running
@@ -238,19 +247,24 @@ export function Quantize(): JSX.Element {
               Cancel
             </button>
           ) : (
-            <button className="btn ember" disabled={!ready} onClick={() => void launch()}>
+            <button className="btn pri" disabled={!ready} onClick={() => void launch()}>
               Quantize
+            </button>
+          )}
+          {onClose !== undefined && (
+            <button className="btn quiet" onClick={onClose}>
+              Close
             </button>
           )}
         </div>
       </div>
 
-      <div className="vbody qz">
+      <div className="qbody scroll">
         {failure !== null && <p className="refusal">{failure}</p>}
 
         <div className="qgrid">
-          <div className="card">
-            <div className="fieldcol">
+          <div className="blk">
+            <div className="field">
               <span className="eyebrow">Source</span>
               <select
                 className="input mono"
@@ -274,7 +288,7 @@ export function Quantize(): JSX.Element {
               </select>
             </div>
 
-            <div className="fieldcol">
+            <div className="field">
               <span className="eyebrow">Format</span>
               <div className="seg">
                 {MODES.map((entry) => (
@@ -307,7 +321,7 @@ export function Quantize(): JSX.Element {
 
             {exponent === null && (
               <>
-                <div className="fieldcol">
+                <div className="field">
                   <span className="eyebrow">Method</span>
                   <div className="seg">
                     {METHODS.map((entry) => (
@@ -325,7 +339,7 @@ export function Quantize(): JSX.Element {
                   </span>
                 </div>
 
-                <div className="fieldcol">
+                <div className="field">
                   <span className="eyebrow">Width</span>
                   <div className="seg">
                     {BITS.map((value) => (
@@ -340,7 +354,7 @@ export function Quantize(): JSX.Element {
                   </div>
                 </div>
 
-                <div className="fieldcol">
+                <div className="field">
                   <span className="eyebrow">Group size</span>
                   <div className="seg">
                     {GROUP_SIZES.map((value) => (
@@ -357,7 +371,7 @@ export function Quantize(): JSX.Element {
               </>
             )}
 
-            <div className="fieldcol">
+            <div className="field">
               <span className="eyebrow">Output id</span>
               <input
                 className="input mono"
@@ -433,7 +447,7 @@ export function Quantize(): JSX.Element {
           </div>
         </div>
 
-        <div className="card">
+        <div className="blk">
           <h3>
             Overrides <span>per leaf group, from the checkpoint itself</span>
           </h3>
@@ -462,7 +476,8 @@ export function Quantize(): JSX.Element {
           )}
         </div>
       </div>
-    </>
+      </div>
+    </div>
   )
 }
 

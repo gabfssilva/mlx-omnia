@@ -1,0 +1,177 @@
+/* The view's own drawing. Everything the house already has — .pane, .ph, .pbody, .pfoot,
+   .run, .num, .spark, .state, .qhead, .insph, .itabs, .ibody, .acts, .sheet, .seg, .fchip,
+   .kvs, .search, .input — comes from theme.css and is not restated here.
+
+   This file is the mockup's own stylesheet (task 59's approved interface spec), carried
+   over unchanged except for the page frame it drew itself in. */
+
+.bench { flex: 1; min-height: 0; display: flex; flex-direction: column; }
+.bench .band { margin: 12px 12px 0; }
+.bench .pane.mid .pbody { padding: 9px 11px; }
+
+/* ── the comparison band ─────────────────────────────────────────────────
+   Parallel coordinates: one axis per measurement, one line per checkpoint.
+   Speed and quality never share a chart — a line crossing from tok/s into
+   accuracy joins two things that don't trade against each other on the same
+   run, and context and concurrency only exist on the speed side. The band
+   follows the view switch instead. Load and TTFT are drawn upside down,
+   because lower is better there and "up" has to mean the same thing on every
+   axis. A dashed segment means that checkpoint has no run under this key —
+   either it hasn't been measured, or the combination doesn't fit in memory. */
+.tradeoff .track2 {
+  position: relative; border-radius: 6px;
+  background: color-mix(in oklab, var(--sunken) 55%, var(--surface));
+  box-shadow: inset 0 0 0 1px var(--hair);
+}
+.tradeoff svg { display: block; width: 100%; height: 152px; }
+.tradeoff .axnm { font-size: 10.5px; font-weight: 600; fill: var(--fg); }
+.tradeoff .axkey { font-family: var(--mono); font-size: 8.5px; fill: var(--fg3); letter-spacing: .03em; }
+.tradeoff .axend { font-family: var(--mono); font-size: 8.5px; fill: var(--fg3); }
+.tradeoff .rail { stroke: var(--hair2); stroke-width: 1; }
+.tradeoff .railghost { stroke: var(--hair); stroke-width: 1; stroke-dasharray: 2 3; }
+.tradeoff .link { fill: none; stroke-width: 1.5; opacity: .34; }
+.tradeoff .link.on { opacity: 1; stroke-width: 2.4; }
+.tradeoff .gap { stroke-dasharray: 3 3; opacity: .28; }
+.tradeoff .pt { r: 3.4; stroke: var(--surface); stroke-width: 1.4; }
+.tradeoff .pt.on { r: 4.6; }
+.tradeoff .pt.miss { fill: var(--surface); stroke: var(--fg3); }
+.tradeoff .val { font-family: var(--mono); font-size: 9.5px; fill: var(--fg); font-weight: 500; }
+.tradeoff .lane { cursor: pointer; }
+/* The row is reserved whether or not there are chips in it: a chip is 2.3px taller than the
+   note alone, and without the floor the whole band — and everything under it — moved by that
+   much on every switch between speed, fidelity and quality. */
+.tfoot { display: flex; align-items: center; gap: 7px; padding-top: 8px; min-height: 26px; }
+.tkey { display: inline-flex; align-items: center; gap: 6px; font-size: 10px; color: var(--fg2); cursor: pointer; }
+.tkey i { width: 9px; height: 2.5px; border-radius: 2px; background: var(--m); flex: none; }
+.tkey.off { color: var(--fg3); }
+.tkey.off i { background: var(--hair2); }
+
+/* the band header carries what scopes the view: two knobs on speed, none on quality */
+.bandh { align-items: center; }
+.seg[hidden] { display: none; }
+.knob { display: inline-flex; align-items: center; gap: 6px; }
+.knob > span { font-family: var(--mono); font-size: 9px; text-transform: uppercase; letter-spacing: .1em; color: var(--fg3); }
+.knob[hidden] { display: none; }
+.bandh .seg { margin-left: 14px; }
+.bandh #ctx, .bandh #ref { margin-left: auto; }
+.bandh #ref + #corp { margin-left: 0; }
+.bandh .knob#ref select.input { height: 22px; font-size: 11px; padding: 0 22px 0 8px; max-width: 210px; }
+.bandh .knob .seg { margin-left: 0; }
+.bandh .knob select.input { height: 22px; font-size: 11px; padding: 0 22px 0 8px; }
+.bandh .knob .seg button { font-variant-numeric: tabular-nums; min-width: 22px; padding: 2px 7px; }
+/* One line always: this span carries the running job's message, and a header that grows a
+   line under it moves the chart and everything below every time a knob set changes. */
+/* The title is the view's own name — "Speed", "Fidelity", "Quality" — and its width is what
+   places the switch next to it. A floor wide enough for the longest of the three keeps the
+   switch at one x instead of sliding 5px on every change of view. */
+.bench .bandh > b { min-width: 3.6em; }
+.bandh .seed { margin-left: auto; white-space: nowrap; overflow: hidden; text-overflow: ellipsis; min-width: 0; }
+
+/* ── run list ─────────────────────────────────────────────────────────── */
+.run.s { grid-template-columns: 1fr 68px 60px 66px 84px 120px; }
+.run.q { grid-template-columns: 1fr 78px 64px 84px 116px; }
+.run.nofit { opacity: .5; }
+/* a run already drawn in the band carries the band's mark; clicking one that isn't
+   adds it, which is the only way the comparison grows. */
+.run .inband { width: 9px; height: 2.5px; border-radius: 2px; background: var(--m); flex: none; }
+/* min-width:0 is what makes the ellipsis on the two lines actually engage: `white-space:
+   nowrap` puts the whole key into the column's min-content, and a grid item's automatic
+   minimum is that min-content — so a long key pushed the row wider than the pane and shoved
+   the last column past its right edge instead of truncating. */
+.run .id { display: flex; flex-direction: column; gap: 2px; min-width: 0; }
+.run .id .top { display: flex; align-items: center; gap: 7px; }
+.tfoot .tkey b { font-weight: 500; }
+.tfoot .more { font-size: 10px; color: var(--fg3); }
+.runbar { grid-column: 1 / -1; height: 3px; border-radius: 2px; background: var(--sunken); overflow: hidden; margin-top: 2px; }
+.runbar i { display: block; height: 100%; background: var(--m); border-radius: 2px; }
+
+.subj { display: flex; flex-direction: column; gap: 4px; }
+.subjr { display: grid; grid-template-columns: 1fr 34px 60px; align-items: center; gap: 8px; font-size: 10.5px; }
+.subjr .b { height: 5px; border-radius: 3px; background: var(--sunken); overflow: hidden; }
+.subjr .b i { display: block; height: 100%; background: var(--m); border-radius: 3px; }
+.subjr .n { font-family: var(--mono); font-size: 10px; text-align: right; color: var(--fg2); font-variant-numeric: tabular-nums; }
+.subjr .t { overflow: hidden; text-overflow: ellipsis; white-space: nowrap; color: var(--fg2); }
+
+.rounds { display: flex; align-items: flex-end; gap: 3px; height: 38px; }
+.rounds i { flex: 1; background: color-mix(in oklab, var(--m) 45%, var(--surface)); border-radius: 2px 2px 0 0; }
+.rounds i.warm { background: repeating-linear-gradient(135deg, var(--hair2) 0 3px, transparent 3px 6px); }
+
+/* how it scales with concurrency: one bar per level, the current one solid */
+.curve { display: flex; align-items: flex-end; gap: 4px; height: 52px; }
+.curve button { all: unset; cursor: pointer; flex: 1; display: flex; flex-direction: column; justify-content: flex-end; height: 100%; gap: 3px; }
+.curve b { display: block; background: color-mix(in oklab, var(--m) 26%, var(--surface)); border-radius: 2px 2px 0 0;
+  box-shadow: inset 0 0 0 1px color-mix(in oklab, var(--m) 40%, transparent); }
+.curve button.on b { background: var(--m); box-shadow: none; }
+.curve button.dead b { background: repeating-linear-gradient(135deg, var(--hair2) 0 3px, transparent 3px 6px); box-shadow: none; }
+.curve span { font-family: var(--mono); font-size: 8.5px; color: var(--fg3); text-align: center; }
+.curve button.on span { color: var(--fg); }
+.curvelab { display: flex; justify-content: space-between; font-family: var(--mono); font-size: 9px; color: var(--fg3); margin-top: 5px; }
+
+.pill { display: inline-flex; align-items: center; gap: 5px; height: 19px; padding: 0 8px; border-radius: 10px;
+  font-family: var(--mono); font-size: 9px; letter-spacing: .06em; text-transform: uppercase; }
+.pill.soon { color: var(--fg3); background: var(--sel); }
+
+.headrow { display: flex; align-items: center; gap: 9px; margin-bottom: 9px; }
+.seg button:disabled { cursor: default; opacity: .5; }
+
+.cost { display: flex; align-items: baseline; gap: 8px; padding: 8px 10px; border-radius: 7px;
+  background: var(--field); border: 1px solid var(--hair); font-size: 10.5px; color: var(--fg2); }
+.cost b { font-family: var(--mono); font-size: 11.5px; color: var(--fg); font-weight: 500; font-variant-numeric: tabular-nums; }
+.cost .r { margin-left: auto; font-family: var(--mono); font-size: 10px; color: var(--fg3); }
+
+.dsrow { display: grid; grid-template-columns: 18px 1fr 92px 58px; align-items: center; gap: 9px;
+  padding: 6px 4px; border-bottom: 1px solid var(--hair); font-size: 11px; cursor: pointer; }
+.dsrow:last-child { border-bottom: 0; }
+.dsrow .t b { font-weight: 500; }
+.dsrow .t span { display: block; font-family: var(--mono); font-size: 9px; color: var(--fg3); margin-top: 1px; }
+.dsrow .k { font-family: var(--mono); font-size: 9.5px; color: var(--fg3); }
+.dsrow .n { font-family: var(--mono); font-size: 10px; color: var(--fg2); text-align: right; font-variant-numeric: tabular-nums; }
+.dsrow input { accent-color: var(--m); }
+
+.keyline { display: flex; align-items: center; gap: 6px; padding: 7px 10px; border-radius: 7px;
+  background: var(--sunken); font-family: var(--mono); font-size: 10px; color: var(--fg2); }
+.keyline b { color: var(--fg); font-weight: 500; }
+.chips { display: flex; gap: 5px; flex-wrap: wrap; }
+/* Speed and Quality live in the same box — same three columns, same height — so
+   switching between them never resizes the sheet and neither one ever scrolls. */
+.sheetc { width: 1080px; }
+/* flex:1 from the house style lets a tall panel push the box taller, so the body opts
+   out of flexing and states its height outright — the same box on both panels. */
+.sheetb { flex: none; height: 540px; min-height: 0; grid-template-columns: 214px 1fr; }
+/* the library is the one list that grows without bound, so it is the one that scrolls */
+.pickscroll { max-height: 420px; overflow-y: auto; }
+.pickscroll::-webkit-scrollbar { width: 9px; }
+.pickscroll::-webkit-scrollbar-thumb { background: var(--hair2); border-radius: 5px; border: 3px solid transparent; background-clip: content-box; }
+.pair { display: grid; grid-template-columns: 18px 1fr 150px; align-items: center; gap: 9px;
+  padding: 5px 4px; border-bottom: 1px solid var(--hair); font-size: 11px; }
+.pair:last-child { border-bottom: 0; }
+.pair .t b { font-weight: 500; }
+.pair .t span { display: block; font-family: var(--mono); font-size: 9px; color: var(--fg3); margin-top: 1px; }
+.pair select.input { height: 23px; font-size: 10.5px; padding: 0 20px 0 7px; }
+.pair input { accent-color: var(--m); }
+.mrow { display: grid; grid-template-columns: 18px 1fr 62px; align-items: center; gap: 9px;
+  padding: 5px 4px; border-bottom: 1px solid var(--hair); font-size: 11px; cursor: pointer; }
+.mrow:last-child { border-bottom: 0; }
+.mrow b { font-weight: 500; }
+.mrow span { font-family: var(--mono); font-size: 9px; color: var(--fg3); }
+.mrow .g { text-align: right; font-variant-numeric: tabular-nums; }
+.mrow input { accent-color: var(--m); }
+.sheetl, .sheetr { min-height: 0; overflow: hidden; }
+.sheetl { gap: 11px; }
+.sheetr { padding: 13px 15px; }
+.two { display: grid; grid-template-columns: 1fr 1fr; gap: 16px; align-items: start; }
+.two > .span { grid-column: 1 / -1; }
+.two[hidden] { display: none; }
+.dsrow.custom .t b::after { content: "custom"; margin-left: 7px; font-family: var(--mono); font-size: 8px;
+  text-transform: uppercase; letter-spacing: .08em; color: var(--fg3); font-weight: 400; }
+.addrow { display: flex; align-items: center; gap: 8px; padding-top: 9px; }
+.form { display: grid; grid-template-columns: 1fr 1fr 1fr; gap: 9px; }
+.form .field.wide { grid-column: 1 / -1; }
+.prev { padding: 9px 10px; border-radius: 7px; background: var(--sunken); font-family: var(--mono);
+  font-size: 9.5px; line-height: 1.65; color: var(--fg2); white-space: pre-wrap; }
+.prev b { color: var(--fg); font-weight: 500; }
+.check { display: flex; align-items: center; gap: 8px; font-size: 11.5px; color: var(--fg2); cursor: pointer; }
+.check input { accent-color: var(--m); }
+.check b { color: var(--fg); font-weight: 500; }
+.chips .fchip { min-width: 34px; justify-content: center; font-variant-numeric: tabular-nums; }
+

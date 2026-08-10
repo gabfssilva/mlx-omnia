@@ -105,15 +105,23 @@ export interface Progress {
   total: number | null
 }
 
-export interface JobView {
+interface JobBase {
   id: string
-  kind: string
   state: JobState
   progress: Progress
   created_at: number
   updated_at: number
   error: string | null
 }
+
+/* `kind` is the tag `subject` is read back with, on this side too: a screen that draws a job
+   beside the thing it acts on gets there by narrowing, not by parsing `progress.message`. */
+export type JobView =
+  | (JobBase & { kind: 'download'; subject: { model: string } })
+  | (JobBase & { kind: 'load'; subject: { model: string } })
+  | (JobBase & { kind: 'quantize'; subject: { model: string; target: string } })
+  | (JobBase & { kind: 'bench'; subject: { model: string } })
+  | (JobBase & { kind: 'benchmark'; subject: { kind: string; models: string[] } })
 
 export const isFinished = (job: JobView): boolean =>
   job.state === 'ok' || job.state === 'error' || job.state === 'cancelled'

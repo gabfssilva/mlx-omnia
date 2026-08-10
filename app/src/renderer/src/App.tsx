@@ -1,199 +1,163 @@
 import { type JSX, useEffect, useState } from 'react'
-import { json } from './api/http'
-import { Overview } from './views/overview/Overview'
-import { Models } from './views/models/Models'
+import { EngineProvider, useEngine, whole } from './api/engine'
+import { DownloadsProvider, useDownloads, type Pull } from './api/downloads'
+import { Meter, scale } from './Memory'
+import { Resident } from './views/resident/Resident'
+import { Library } from './views/library/Library'
+import { Benchmark } from './views/benchmark/Benchmark'
 import { Chat } from './views/chat/Chat'
-import { Download } from './views/download/Download'
-import { Quantize } from './views/quantize/Quantize'
+import { Settings } from './views/settings/Settings'
 
-export type View = 'overview' | 'chat' | 'models' | 'download' | 'quantize'
+export type View = 'resident' | 'library' | 'benchmark' | 'chat' | 'settings'
+export type Theme = 'light' | 'dark' | 'system'
 
-/* A view that wants to hand off to another one says so on the window; the rail is the
-   only thing that owns which view is on. */
+/* A view that wants to hand off to another one says so on the window; the title bar is
+   the only thing that owns which view is on. `sideros:ghost` is Library telling the
+   meter what the checkpoint under the cursor would cost, and `sideros:theme` is
+   Settings telling the document what to stamp. */
 declare global {
   interface WindowEventMap {
     'sideros:view': CustomEvent<View>
+    'sideros:ghost': CustomEvent<number | null>
+    'sideros:theme': CustomEvent<Theme>
   }
 }
 
-const VIEWS: { id: View; title: string; icon: JSX.Element; render: () => JSX.Element }[] = [
-  {
-    id: 'overview',
-    title: 'Overview',
-    render: () => <Overview />,
-    icon: (
-      <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="1.6" strokeLinecap="round" strokeLinejoin="round">
-        <rect x="2" y="2" width="20" height="8" rx="2" />
-        <rect x="2" y="14" width="20" height="8" rx="2" />
-        <line x1="6" y1="6" x2="6.01" y2="6" />
-        <line x1="6" y1="18" x2="6.01" y2="18" />
-      </svg>
-    )
-  },
-  {
-    id: 'chat',
-    title: 'Chat',
-    render: () => <Chat />,
-    icon: (
-      <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="1.6" strokeLinecap="round" strokeLinejoin="round">
-        <path d="M21 11.5a8.38 8.38 0 0 1-.9 3.8 8.5 8.5 0 0 1-7.6 4.7 8.38 8.38 0 0 1-3.8-.9L3 21l1.9-5.7a8.38 8.38 0 0 1-.9-3.8 8.5 8.5 0 0 1 4.7-7.6 8.38 8.38 0 0 1 3.8-.9h.5a8.48 8.48 0 0 1 8 8v.5z" />
-      </svg>
-    )
-  },
-  {
-    id: 'models',
-    title: 'Models',
-    render: () => <Models />,
-    icon: (
-      <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="1.6" strokeLinecap="round" strokeLinejoin="round">
-        <polygon points="12 2 2 7 12 12 22 7 12 2" />
-        <polyline points="2 17 12 22 22 17" />
-        <polyline points="2 12 12 17 22 12" />
-      </svg>
-    )
-  },
-  {
-    id: 'download',
-    title: 'Download',
-    render: () => <Download />,
-    icon: (
-      <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="1.6" strokeLinecap="round" strokeLinejoin="round">
-        <path d="M21 15v4a2 2 0 0 1-2 2H5a2 2 0 0 1-2-2v-4" />
-        <polyline points="7 10 12 15 17 10" />
-        <line x1="12" y1="15" x2="12" y2="3" />
-      </svg>
-    )
-  },
-  {
-    id: 'quantize',
-    title: 'Quantize',
-    render: () => <Quantize />,
-    icon: (
-      <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="1.6" strokeLinecap="round" strokeLinejoin="round">
-        <line x1="4" y1="21" x2="4" y2="14" />
-        <line x1="4" y1="10" x2="4" y2="3" />
-        <line x1="12" y1="21" x2="12" y2="12" />
-        <line x1="12" y1="8" x2="12" y2="3" />
-        <line x1="20" y1="21" x2="20" y2="16" />
-        <line x1="20" y1="12" x2="20" y2="3" />
-        <line x1="1" y1="14" x2="7" y2="14" />
-        <line x1="9" y1="8" x2="15" y2="8" />
-        <line x1="17" y1="16" x2="23" y2="16" />
-      </svg>
-    )
-  }
+const VIEWS: { id: View; title: string; render: () => JSX.Element }[] = [
+  { id: 'resident', title: 'Resident', render: () => <Resident /> },
+  { id: 'library', title: 'Library', render: () => <Library /> },
+  { id: 'benchmark', title: 'Benchmark', render: () => <Benchmark /> },
+  { id: 'chat', title: 'Chat', render: () => <Chat /> },
+  { id: 'settings', title: 'Settings', render: () => <Settings /> }
 ]
 
-/* Only what the rail draws. Everything else about these two routes belongs to the
-   view that asks for it. */
-interface RailState {
-  resident_bytes: number
-  kv_bytes: number
+const KEY = 'sideros-theme'
+
+export function readTheme(): Theme {
+  const saved = localStorage.getItem(KEY)
+  return saved === 'light' || saved === 'dark' ? saved : 'system'
 }
 
-interface RailSystem {
-  memory_bytes: number
+/* Nothing stamped is the system following itself, which is what the stylesheet's
+   prefers-color-scheme block is for. */
+export function writeTheme(theme: Theme): void {
+  if (theme === 'system') {
+    localStorage.removeItem(KEY)
+    document.documentElement.removeAttribute('data-theme')
+  } else {
+    localStorage.setItem(KEY, theme)
+    document.documentElement.setAttribute('data-theme', theme)
+  }
 }
 
-interface Health {
-  status: string
-  pid: number
+/* The ring is one reading over every download at once — bytes, not jobs, so a 17 GB
+   checkpoint beside a 400 MB one does not report itself as half done. Absent totals are
+   absent from both sides of the division rather than counted as zero. */
+function Ring({ pulls }: { pulls: Pull[] }): JSX.Element {
+  const priced = pulls.filter((pull) => pull.total !== null)
+  const total = priced.reduce((sum, pull) => sum + (pull.total ?? 0), 0)
+  const done = priced.reduce((sum, pull) => sum + pull.completed, 0)
+  const circumference = 2 * Math.PI * 5
+  const arc = total === 0 ? 0 : (done / total) * circumference
+  return (
+    <svg viewBox="0 0 13 13" fill="none" aria-hidden="true">
+      <circle className="rail" cx="6.5" cy="6.5" r="5" strokeWidth="2" />
+      <circle
+        className="arc"
+        cx="6.5"
+        cy="6.5"
+        r="5"
+        strokeWidth="2"
+        strokeDasharray={`${arc} ${circumference}`}
+      />
+    </svg>
+  )
 }
-
-const GIB = 1024 ** 3
-const POLL_MS = 2000
 
 export function App(): JSX.Element {
-  const [view, setView] = useState<View>('overview')
-  const [state, setState] = useState<RailState | null>(null)
-  const [system, setSystem] = useState<RailSystem | null>(null)
-  const [health, setHealth] = useState<Health | null>(null)
+  const [view, setView] = useState<View>('resident')
+  const [ghost, setGhost] = useState<number | null>(null)
+  const engine = useEngine()
+  const downloads = useDownloads(engine.refresh)
 
   useEffect(() => {
-    json<RailSystem>('/admin/system').then(setSystem).catch(() => setSystem(null))
+    writeTheme(readTheme())
   }, [])
 
   useEffect(() => {
     const jump = (event: WindowEventMap['sideros:view']) => {
       if (VIEWS.some((entry) => entry.id === event.detail)) setView(event.detail)
     }
+    const shadow = (event: WindowEventMap['sideros:ghost']) => setGhost(event.detail)
+    const paint = (event: WindowEventMap['sideros:theme']) => writeTheme(event.detail)
     window.addEventListener('sideros:view', jump)
-    return () => window.removeEventListener('sideros:view', jump)
-  }, [])
-
-  useEffect(() => {
-    let live = true
-    const beat = async () => {
-      const [next, up] = await Promise.all([
-        json<RailState>('/admin/state').catch(() => null),
-        json<Health>('/admin/health').catch(() => null)
-      ])
-      if (!live) return
-      setState(next)
-      setHealth(up)
-    }
-    void beat()
-    const timer = setInterval(beat, POLL_MS)
+    window.addEventListener('sideros:ghost', shadow)
+    window.addEventListener('sideros:theme', paint)
     return () => {
-      live = false
-      clearInterval(timer)
+      window.removeEventListener('sideros:view', jump)
+      window.removeEventListener('sideros:ghost', shadow)
+      window.removeEventListener('sideros:theme', paint)
     }
   }, [])
 
-  const used = state === null ? null : state.resident_bytes + state.kv_bytes
-  const total = system?.memory_bytes ?? null
-  const share = used !== null && total ? Math.round((used / total) * 100) : null
-  const memTitle =
-    used !== null && total
-      ? `Memory · ${Math.round(used / GIB)} of ${Math.round(total / GIB)} GB`
-      : 'Memory · unknown'
+  const ceiling = whole(engine.config?.['memory_limit_bytes'])
+  const s = scale(engine.system, engine.state, ceiling)
+  const down = engine.health === null
+
+  const pulls = [...downloads.active.values()].filter((pull) => pull.state !== 'error')
 
   return (
+    <EngineProvider value={engine}>
+    <DownloadsProvider value={downloads}>
     <div className="window">
-      <aside className="side">
-        <div className="railpanel">
-          {/* The real traffic lights land here; see theme.css and desktop/main.ts. */}
-          <div className="lights" />
-          <div className="mark">S</div>
-          <div className="nav">
-            {VIEWS.map((entry) => (
-              <button
-                key={entry.id}
-                className={entry.id === view ? 'on' : undefined}
-                title={entry.title}
-                aria-label={entry.title}
-                aria-current={entry.id === view}
-                onClick={() => setView(entry.id)}
-              >
-                {entry.icon}
-              </button>
-            ))}
-          </div>
-          <div className="railfoot">
-            <div className="memfoot" title={memTitle}>
-              <b>
-                {share ?? '—'}
-                <small>%</small>
-              </b>
-              <span className="eyebrow">mem</span>
-            </div>
-            <span
-              className={health === null ? 'dot down' : 'dot'}
-              title={health === null ? 'Daemon not answering' : `Daemon answering · pid ${health.pid}`}
-            />
-          </div>
+      <div className="tb">
+        {/* The real traffic lights land here; see theme.css and desktop/main.ts. */}
+        <div className="lights" />
+        <div className="tabs" role="tablist">
+          {VIEWS.map((entry) => (
+            <button
+              key={entry.id}
+              role="tab"
+              aria-selected={entry.id === view}
+              className={entry.id === view ? 'on' : undefined}
+              onClick={() => setView(entry.id)}
+            >
+              {entry.title}
+            </button>
+          ))}
         </div>
-      </aside>
+        <div className="tbr">
+          {pulls.length > 0 && (
+            <button
+              className="chip pulls"
+              onClick={() => setView('library')}
+              title="Show the downloads in Library"
+            >
+              <Ring pulls={pulls} />
+              Downloading <b>{pulls.length}</b>
+            </button>
+          )}
+          {s !== null && view !== 'resident' && <Meter scale={s} ghost={ghost} />}
+          <button
+            className="chip"
+            onClick={() => setView('settings')}
+            title={down ? 'The engine is not answering' : `Engine · pid ${engine.health?.pid ?? '—'}`}
+          >
+            <i className={down ? 'dot bad' : 'dot ok'} />
+            Engine <b className="mono">:{engine.system?.constants['port'] ?? '8642'}</b>
+          </button>
+        </div>
+      </div>
 
-      {/* All views stay mounted — a switch is a display toggle, never a remount with
-          its refetch; re-adding `on` still replays the enter animation. */}
-      <main className="main">
-        {VIEWS.map((entry) => (
-          <section className={entry.id === view ? 'view on' : 'view'} key={entry.id}>
-            {entry.render()}
-          </section>
-        ))}
-      </main>
+      {/* Every view stays mounted — switching is a display toggle, never a remount with
+          its refetch, so a half-typed message survives a trip to Library. */}
+      {VIEWS.map((entry) => (
+        <div key={entry.id} className="view" hidden={entry.id !== view}>
+          {entry.render()}
+        </div>
+      ))}
     </div>
+    </DownloadsProvider>
+    </EngineProvider>
   )
 }

@@ -84,7 +84,11 @@ const CATALOG: Entry[] = [
   entry('openai/gpt-oss-20b', 'gpt_oss', 'mxfp4', 'bfloat16', 131072, 12.9, 940_500_000, NO_DEFAULTS),
   entry('mlx-community/gemma-3-12b-it-8bit', 'gemma3', '8-bit', 'bfloat16', 131072, 12.8, 12_250_000_000, declares(1.0, 0.95, 64)),
   entry('mlx-community/LFM2-8B-A1B-4bit', 'lfm2_moe', '4-bit', 'bfloat16', 32768, 4.5, 830_500_000, declares(0.3, 0.95, 50)),
-  entry('local/Qwen3.5-VL-27B-4bit', 'qwen3_5_vision', '4-bit', 'bfloat16', 131072, 15.6, 14_410_000_000, declares(0.7, 0.8, 20))
+  entry('local/Qwen3.5-VL-27B-4bit', 'qwen3_5_vision', '4-bit', 'bfloat16', 131072, 15.6, 14_410_000_000, declares(0.7, 0.8, 20)),
+  entry('meta-models/Muse-Glimmer-30B', 'muse_glimmer', '4-bit', 'bfloat16', 131072, 17.1, 16_920_000_000, declares(0.6, 0.95, 20)),
+  /* A drafter is a checkpoint on disk like any other, so it is listed like any other —
+     what makes it one is its architecture, which is what pairs it to a target. */
+  entry('meta-models/Muse-Glimmer-30B-assistant', 'muse_glimmer_assistant', null, 'bfloat16', 131072, 5.1, 5_110_000_000, NO_DEFAULTS)
 ]
 
 function entry(
@@ -118,6 +122,9 @@ const RESIDENT = new Map<string, { weights: number; kv: number; loaded_at: numbe
   [CATALOG[1].id, { weights: gib(12.9), kv: gib(1.2), loaded_at: now() - 3600, last_used: now() - 2 }]
 ])
 
+/* Per-model feature switches, as the daemon's `model_settings` table holds them. */
+const SWITCHES = new Map<string, unknown>()
+
 /* ── benches, metrics ─────────────────────────────────────────────────── */
 
 const BENCHES = [
@@ -144,6 +151,8 @@ function bench(model: string, rate: number, ttft: number) {
 interface JobView {
   id: string
   kind: string
+  /* What the job is about — the pairing a screen needs to draw it beside its checkpoint. */
+  subject: { model: string; target?: string }
   state: 'pending' | 'running' | 'ok' | 'error' | 'cancelled'
   progress: { message: string; completed: number; total: number | null }
   created_at: number
@@ -156,6 +165,7 @@ const JOBS = new Map<string, JobView>()
 JOBS.set('9f2c41ab7d5e4c0f8b1a', {
   id: '9f2c41ab7d5e4c0f8b1a',
   kind: 'download',
+  subject: { model: 'mlx-community/Qwen3-4B-Instruct-2507-4bit' },
   state: 'running',
   progress: {
     message: 'model-00002-of-00002.safetensors',
@@ -169,6 +179,7 @@ JOBS.set('9f2c41ab7d5e4c0f8b1a', {
 JOBS.set('1c7e0d93a4b2489f6a35', {
   id: '1c7e0d93a4b2489f6a35',
   kind: 'quantize',
+  subject: { model: 'mlx-community/Qwen3-32B-bf16', target: 'local/Qwen3-32B-4bit' },
   state: 'ok',
   progress: { message: 'wrote local/Qwen3-32B-4bit', completed: 1, total: 1 },
   created_at: now() - 5400,
@@ -267,36 +278,62 @@ function stream(frames: () => AsyncGenerator<string>): Response {
 
 const sleep = (ms: number) => new Promise((r) => setTimeout(r, ms))
 
+const HEALTH = () => ({
+  status: 'ok',
+  models: [...RESIDENT.keys()],
+  pid: process.pid,
+  uptime: (performance.now() - STARTED) / 1000,
+  version: VERSION
+})
+
+const STATE = () => {
+  const models = [...RESIDENT].map(([id, live]) => ({
+    id,
+    weights_bytes: live.weights,
+    kv_bytes: live.kv,
+    loaded_at: live.loaded_at,
+    last_used: live.last_used
+  }))
+  return {
+    models,
+    queue: { running: 1, waiting: 0, reserved: false },
+    resident_bytes: models.reduce((sum, m) => sum + m.weights_bytes, 0),
+    kv_bytes: models.reduce((sum, m) => sum + m.kv_bytes, 0)
+  }
+}
+
+/* The six of `/admin/events`, in the order the daemon opens with. */
+const RESOURCES = () => ({
+  health: HEALTH(),
+  config: CONFIG(),
+  models: CATALOG.map((e) => ({ ...e, resident: RESIDENT.has(e.id) })),
+  state: STATE(),
+  jobs: [...JOBS.values()].filter((j) => j.state === 'pending' || j.state === 'running'),
+  metrics: METRICS()
+})
+
 async function handle(request: Request): Promise<Response> {
   const url = new URL(request.url)
   const path = url.pathname
   const method = request.method
 
-  if (path === '/admin/health') {
-    return ok({
-      status: 'ok',
-      models: [...RESIDENT.keys()],
-      pid: process.pid,
-      uptime: (performance.now() - STARTED) / 1000,
-      version: VERSION
-    })
-  }
+  if (path === '/admin/health') return ok(HEALTH())
 
   if (path === '/admin/system') return ok(SYSTEM)
 
-  if (path === '/admin/state') {
-    const models = [...RESIDENT].map(([id, live]) => ({
-      id,
-      weights_bytes: live.weights,
-      kv_bytes: live.kv,
-      loaded_at: live.loaded_at,
-      last_used: live.last_used
-    }))
-    return ok({
-      models,
-      queue: { running: 1, waiting: 0 },
-      resident_bytes: models.reduce((sum, m) => sum + m.weights_bytes, 0),
-      kv_bytes: models.reduce((sum, m) => sum + m.kv_bytes, 0)
+  if (path === '/admin/state') return ok(STATE())
+
+  /* The daemon pushes a resource when it moves; nothing moves in a fixture on its own, so
+     this re-sends the six on a timer. The app cannot tell the difference — what it reads is
+     the envelope, and where the frame came from is the daemon's business. */
+  if (path === '/admin/events') {
+    return stream(async function* () {
+      for (;;) {
+        for (const [resource, value] of Object.entries(RESOURCES())) {
+          yield `data: ${JSON.stringify({ resource, value })}\n\n`
+        }
+        await sleep(1000)
+      }
     })
   }
 
@@ -318,7 +355,40 @@ async function handle(request: Request): Promise<Response> {
 
   if (path === '/admin/models' && method === 'POST') {
     const body = (await request.json()) as { repo: string }
-    return started('download', `fetching ${body.repo}`)
+    return started('download', body.repo, `fetching ${body.repo}`)
+  }
+
+  /* The model's own switches. The mock keeps them in memory and derives the suggestions
+     the way the daemon does — from what the catalog holds — while accepting any id that is
+     in it, paired or not. */
+  const settings = path.match(/^\/admin\/models\/(.+)\/settings$/)
+  if (settings) {
+    const id = decodeURIComponent(settings[1])
+    const found = CATALOG.find((e) => e.id === id)
+    if (!found) return refused(404, `${id} is not in the catalog`)
+    const drafts = CATALOG.filter((e) => e.architecture === `${found.architecture}_assistant`)
+    const view = (features: unknown): Response =>
+      ok({
+        model: id,
+        features,
+        available: drafts.map((e) => e.id),
+        unavailable_reason: drafts.length === 0 ? `no drafter for ${id} is installed` : null
+      })
+    if (method === 'PUT') {
+      type Spec = { drafter: string | null; block_size: number | null }
+      const body = (await request.json()) as { features: { dflash: Spec | null } }
+      const drafter = body.features.dflash?.drafter ?? null
+      if (drafter !== null && !CATALOG.some((e) => e.id === drafter)) {
+        return refused(409, `${drafter} is not in the catalog`)
+      }
+      const block = body.features.dflash?.block_size ?? null
+      if (drafter !== null && block !== null && block > 16) {
+        return refused(409, `${drafter} writes 16 ids a round, not ${block}`)
+      }
+      SWITCHES.set(id, body.features)
+      return view(body.features)
+    }
+    return view(SWITCHES.get(id) ?? { dflash: null })
   }
 
   const residency = path.match(/^\/admin\/models\/(.+)\/residency$/)
@@ -333,7 +403,7 @@ async function handle(request: Request): Promise<Response> {
         loaded_at: now(),
         last_used: now()
       })
-      return started('load', `loading ${id}`)
+      return started('load', id, `loading ${id}`)
     }
     if (method === 'DELETE') {
       if (!RESIDENT.delete(id)) return refused(404, `${id} is not resident`)
@@ -425,7 +495,9 @@ async function handle(request: Request): Promise<Response> {
     )
   }
 
-  if (path === '/admin/hub/staging') return ok([])
+  /* One repository whose download stopped, so the Incomplete filter has something to draw. */
+  if (path === '/admin/hub/staging')
+    return ok([{ repo: 'mlx-community/Qwen3-30B-A3B-Thinking-2507-4bit', bytes_on_disk: 7.1e9 }])
 
   if (path === '/admin/quantizations/plan' && method === 'POST') {
     const body = (await request.json()) as { mode?: string; bits?: number; group_size?: number }
@@ -434,8 +506,8 @@ async function handle(request: Request): Promise<Response> {
   }
 
   if (path === '/admin/quantizations' && method === 'POST') {
-    const body = (await request.json()) as { repo: string }
-    return started('quantize', `quantizing into ${body.repo}`)
+    const body = (await request.json()) as { repo: string; source: string }
+    return started('quantize', body.source, `quantizing into ${body.repo}`)
   }
 
   if (path === '/admin/sessions' && method === 'GET') {
@@ -502,10 +574,11 @@ async function handle(request: Request): Promise<Response> {
   return refused(404, `nothing is mounted at ${path}`)
 }
 
-function started(kind: string, message: string): Response {
+function started(kind: string, model: string, message: string): Response {
   const created: JobView = {
     id: crypto.randomUUID().replace(/-/g, '').slice(0, 20),
     kind,
+    subject: { model },
     state: 'running',
     progress: { message, completed: 0, total: 1e9 },
     created_at: now(),

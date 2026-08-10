@@ -129,6 +129,10 @@ export interface Sample {
   prefill_tokens_per_second: number | null
   bytes_per_token: number | null
   ceiling_fraction: number | null
+  /* What a drafter proposed and how much of it the target confirmed, absent for a request
+     that did not speculate. The rate alone never says which: a model paired with a drafter
+     decodes exactly like an unpaired one under a sampler. */
+  speculation: { rounds: number; proposed: number; accepted: number } | null
 }
 
 export interface Aggregate {

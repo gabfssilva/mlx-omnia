@@ -56,6 +56,26 @@ function Metrics({ metrics, waiting }: { metrics?: TurnMetrics; waiting?: number
       </span>
     )
   }
+  /* The one thing on this line that is not a cost: whether a drafter wrote any of it. Only
+     drawn when one did, because "no speculation" is what every turn on every other model
+     looks like, and a chip saying so on all of them says nothing. */
+  const speculation = metrics?.speculation
+  if (speculation != null && speculation.rounds > 0) {
+    /* Per round and not as a share of what was proposed: the share falls with the block
+       length whatever the drafter does — a block of 16 proposes 15 for the same two or
+       three that land — so two settings cannot be read against each other by it. What
+       decides whether a round paid is how many ids it settled against how wide it was. */
+    const landed = speculation.accepted / speculation.rounds
+    const width = speculation.proposed / speculation.rounds
+    parts.push(
+      <span
+        key={parts.length}
+        title={`${speculation.accepted} of ${speculation.proposed} ids proposed over ${speculation.rounds} rounds`}
+      >
+        dflash <b className="pct">{landed.toFixed(1)}</b> of {width.toFixed(0)} a round
+      </span>
+    )
+  }
   if (metrics?.finish === 'length') say('cut at the token budget')
   return <div className="metrics">{parts}</div>
 }

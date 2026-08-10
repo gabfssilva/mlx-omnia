@@ -18,16 +18,19 @@ export const ORIGIN = `${SCHEME}://app`
 export interface Origin {
   daemon: string
   dist: string
-  control: DaemonControl
+  control: Shell
 }
 
-/* The shell's authority over the daemon *it* spawned — main.ts implements it, this
-   module only routes to it. A daemon that was already up when the app arrived is not
-   ours to kill; `stop`/`restart` refuse with the reason instead. */
-export interface DaemonControl {
+/* What the window can ask of the process hosting it — main.ts implements it, this module
+   only routes to it. The daemon half is authority over the one *it* spawned: a daemon
+   that was already up when the app arrived is not ours to kill, and `stop`/`restart`
+   refuse with the reason instead. `ready` is the renderer saying its first poll landed,
+   which is what puts the window on screen. */
+export interface Shell {
   owned(): boolean
   stop(): Promise<void>
   restart(): Promise<void>
+  ready(): void
 }
 
 const TYPES: Record<string, string> = {
@@ -62,9 +65,13 @@ export function handler(origin: Origin): (request: Request) => Promise<Response>
 async function desktop(
   request: Request,
   url: URL,
-  control: DaemonControl
+  control: Shell
 ): Promise<Response | undefined> {
   if (url.pathname === '/desktop/open' && request.method === 'POST') return await open(request)
+  if (url.pathname === '/desktop/ready' && request.method === 'POST') {
+    control.ready()
+    return Response.json({ ok: true })
+  }
   if (url.pathname === '/desktop/daemon' && request.method === 'GET') {
     return Response.json({ owned: control.owned() })
   }
@@ -184,7 +191,7 @@ async function asset(dist: string, pathname: string): Promise<Response> {
    Vite proxies /admin and /api straight to the daemon and /desktop to this listener,
    which is the one thing neither of them owns. Bodies here are small JSON, so the
    Request is built whole rather than streamed. */
-export async function serveDesktop(control: DaemonControl): Promise<{ url: string; close(): void }> {
+export async function serveDesktop(control: Shell): Promise<{ url: string; close(): void }> {
   const server = createServer((incoming, outgoing) => {
     void answer(incoming, outgoing, control)
   })
@@ -197,7 +204,7 @@ export async function serveDesktop(control: DaemonControl): Promise<{ url: strin
 async function answer(
   incoming: IncomingMessage,
   outgoing: ServerResponse,
-  control: DaemonControl
+  control: Shell
 ): Promise<void> {
   const chunks: Buffer[] = []
   for await (const chunk of incoming) chunks.push(chunk as Buffer)

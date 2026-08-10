@@ -2,6 +2,8 @@
 __pycache__/
 *.py[oc]
 build/
+# electron-builder's resource dir, not a build output: the app icon lives there.
+!/app/build/
 dist/
 wheels/
 *.egg-info
@@ -14,6 +16,7 @@ wheels/
 .idea/
 .actor/
 /config.json
+mise.local.toml
 
 # Virtual environments
 .venv

@@ -128,18 +128,42 @@ export interface Sampling {
   reasoning_budget: number | null
 }
 
+/* features.DFlash — naming the drafter is what turns it on, and null is off. `block_size`
+   is how many ids to propose a round, null for the drafter checkpoint's own. */
+export interface DFlash {
+  drafter: string | null
+  block_size: number | null
+}
+
+/* features.Features. A field left null is unset, which on a profile means "inherit the
+   model's" and is not the same as off. */
+export interface Features {
+  dflash: DFlash | null
+}
+
 /* profiles.ProfileView */
 export interface ProfileView {
   model: string
   name: string
   sampling: Sampling
   system_prompt: string | null
+  features: Features
 }
 
 /* profiles.ProfileBody — extra fields are refused, `template` among them. */
 export interface ProfileBody {
   sampling: Partial<Sampling>
   system_prompt: string | null
+  features?: Partial<Features>
+}
+
+/* features.SettingsView — `available` is derived from the catalog on every read, so a
+   drafter deleted from disk turns the switch unavailable without rewriting the row. */
+export interface SettingsView {
+  model: string
+  features: Features
+  available: string[]
+  unavailable_reason: string | null
 }
 
 /* catalog.CheckpointFile — size through the symlink, not the link. */
@@ -220,3 +244,11 @@ export const saveProfile = (
 
 export const removeProfile = (model: string, name: string): Promise<void> =>
   send<void>('DELETE', `/admin/models/${at(model)}/profiles/${at(name)}`)
+
+export const getSettings = (model: string): Promise<SettingsView> =>
+  json<SettingsView>(`/admin/models/${at(model)}/settings`)
+
+/* 409 when the drafter named is not in the catalog, or when the block asked for is longer
+   than the drafter writes; the daemon's own sentence comes back as the refusal's detail. */
+export const saveSettings = (model: string, features: Features): Promise<SettingsView> =>
+  send<SettingsView>('PUT', `/admin/models/${at(model)}/settings`, { features })

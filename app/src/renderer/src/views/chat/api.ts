@@ -24,9 +24,20 @@ export interface TurnMetrics {
   prefill_tokens_per_second: number | null
   tokens_per_second: number | null
   ceiling_fraction: number | null
+  /* What a drafter proposed this turn and how much of it the target confirmed, absent when
+     the turn did not speculate — no drafter on the model, or a request no drafter could be
+     verified against (a sampler, a grammar). It is the only place the difference shows:
+     speculation never changes what is written, only how fast it arrives. */
+  speculation: Speculation | null
   /* Which of the three ended the turn, as the dialect spells it. `length` is the one a
      reader has to be told about: the answer stops mid-sentence and nothing is wrong. */
   finish: string | null
+}
+
+export interface Speculation {
+  rounds: number
+  proposed: number
+  accepted: number
 }
 
 export interface StoredMessage {
@@ -83,8 +94,17 @@ function readMetrics(value: unknown): TurnMetrics | undefined {
     prefill_tokens_per_second: numeric(row.prefill_tokens_per_second),
     tokens_per_second: numeric(row.tokens_per_second),
     ceiling_fraction: numeric(row.ceiling_fraction),
+    speculation: readSpeculation(row.speculation),
     finish: typeof row.finish === 'string' ? row.finish : null
   }
+}
+
+function readSpeculation(value: unknown): Speculation | null {
+  const row = record(value)
+  if (row === null) return null
+  const [rounds, proposed, accepted] = [row.rounds, row.proposed, row.accepted].map(numeric)
+  if (rounds === null || proposed === null || accepted === null) return null
+  return { rounds, proposed, accepted }
 }
 
 /* A turn this view cannot draw — a tool result, a message somebody hand-edited into the
@@ -249,6 +269,7 @@ export interface Timings {
   tokens_per_second: number | null
   bytes_per_token: number | null
   ceiling_fraction: number | null
+  speculation: Speculation | null
 }
 
 interface Delta {
@@ -302,6 +323,7 @@ export const metricsOf = (timings: Timings, finish: string | null): TurnMetrics 
   prefill_tokens_per_second: timings.prefill_tokens_per_second,
   tokens_per_second: timings.tokens_per_second,
   ceiling_fraction: timings.ceiling_fraction,
+  speculation: timings.speculation ?? null,
   finish
 })
 
@@ -313,6 +335,7 @@ export const metricsOfSample = (sample: Sample): TurnMetrics => ({
   prefill_tokens_per_second: sample.prefill_tokens_per_second,
   tokens_per_second: sample.tokens_per_second,
   ceiling_fraction: sample.ceiling_fraction,
+  speculation: sample.speculation,
   finish: null
 })
 

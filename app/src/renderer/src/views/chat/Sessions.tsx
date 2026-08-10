@@ -108,7 +108,7 @@ export function Sessions({
         </button>
       </div>
 
-      <div className={tab === 'chats' ? 'pane on' : 'pane'}>
+      <div className={tab === 'chats' ? 'sesspane on' : 'sesspane'}>
         <button className="newchat" onClick={onNew}>
           {PLUS}
           New chat
@@ -169,7 +169,7 @@ export function Sessions({
         </div>
       </div>
 
-      <div className={tab === 'params' ? 'pane on' : 'pane'}>
+      <div className={tab === 'params' ? 'sesspane on' : 'sesspane'}>
         <ParamsPane params={params} contextLimit={contextLimit} onChange={onParams} />
       </div>
     </div>

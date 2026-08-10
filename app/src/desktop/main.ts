@@ -45,13 +45,17 @@ protocol.registerSchemesAsPrivileged([
   }
 ])
 
-const control = { owned, stop: stopDaemon, restart }
+const control = { owned, stop: stopDaemon, restart, ready: reveal }
 
 /* `then`, not a top-level await: this module is ESM, and Electron only emits `ready`
    once it finishes evaluating — awaiting it up here deadlocks the boot. */
 void app.whenReady().then(boot)
 
 async function boot(): Promise<void> {
+  /* Packaged, the dock reads the icon out of the bundle; from a checkout it would show
+     Electron's own until told otherwise. */
+  if (!app.isPackaged) app.dock?.setIcon(join(appDir, 'build/icon.png'))
+
   if (!claimed && !(await isUp(`${daemonUrl}/admin/health`))) {
     /* Claimed before the spawn — a daemon that never comes up leaves the window open
        on the rail's "down" dot rather than taking the app with it. */
@@ -118,20 +122,43 @@ app.on('window-all-closed', () => {
 function createWindow(): BrowserWindow {
   const win = new BrowserWindow({
     title: '',
-    width: 1300,
-    height: 860,
+    /* One size, both axes. The layout is three measured columns and a memory band drawn
+       to scale — neither gains anything from stretching, and a fixed canvas is what makes
+       the band a real ruler: the same model is always the same width. 760 + the 37pt menu
+       bar clears the 800pt of the smallest current Mac display. */
+    width: 1160,
+    height: 760,
+    resizable: false,
+    maximizable: false,
+    fullscreenable: false,
     center: true,
+    /* Shown by `reveal`, not on creation: the app arrives already drawn rather than as
+       an empty dark rectangle waiting for React to mount and the first poll to land. */
+    show: false,
     titleBarStyle: 'hiddenInset',
-    /* Where theme.css leaves room for them: the rail is 76 CSS px inset 1px, and the
-       lights sit 11px below its top edge — all of it scaled by the page zoom, which
-       does not apply to native points. */
-    trafficLightPosition: { x: 18, y: 15 },
-    backgroundColor: '#0E0F12',
+    /* Where theme.css leaves room for them: `.lights` reserves 72px at the head of the
+       40px title bar. There is no page zoom any more, so these native points are the
+       same points the stylesheet counts. */
+    trafficLightPosition: { x: 16, y: 14 },
+    backgroundColor: '#1B1E20',
     webPreferences: { contextIsolation: true, nodeIntegration: false }
   })
   void win.loadURL(dev ? DEV_UI : `${ORIGIN}/`)
-  win.focus()
+  /* The renderer reveals itself over /desktop/ready once its first poll lands. These are
+     the two ways that signal never arrives — a renderer that failed to load, and one too
+     old or too broken to send it — and neither may leave the app with no window at all. */
+  win.webContents.once('did-fail-load', reveal)
+  win.webContents.once('did-finish-load', () => setTimeout(reveal, 10_000))
   return win
+}
+
+/* Idempotent: whichever of the ready signal and the fallbacks arrives first wins. */
+function reveal(): void {
+  const [win] = BrowserWindow.getAllWindows()
+  if (win !== undefined && !win.isVisible()) {
+    win.show()
+    win.focus()
+  }
 }
 
 function startDaemon(): ChildProcess {

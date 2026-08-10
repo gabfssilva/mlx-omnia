@@ -216,11 +216,15 @@ export function CardBlock({
   id,
   store,
   hub = false,
+  shown: asked,
   onFiles
 }: {
   id: string
   store?: string
   hub?: boolean
+  /** Which tab to show. Given one, the block drops its own tab bar: the caller's
+      inspector already carries it. */
+  shown?: Tab
   /** The one listing this block fetches, shared out so a caller can price it. */
   onFiles?: (files: api.CheckpointFile[]) => void
 }): JSX.Element | null {
@@ -248,11 +252,12 @@ export function CardBlock({
 
   const { front, body } = split(raw ?? '')
   const tabs: Tab[] = raw === null ? ['files'] : ['card', 'files', 'source']
-  const shown = raw === null ? 'files' : tab
+  const shown = raw === null ? 'files' : (asked ?? tab)
   const linked = /^[\w.-]+\/[\w.-]+$/.test(id)
 
   return (
     <div className="cardblock">
+      {asked === undefined && (
       <div className="mdhead">
         {tabs.length > 1 && (
           <div className="seg">
@@ -275,6 +280,7 @@ export function CardBlock({
           </button>
         )}
       </div>
+      )}
       {shown === 'card' && raw !== null && (
         <>
           {front !== null && <Chips front={front} />}

@@ -1,0 +1,111 @@
+/* What only Library draws: the checkpoint's own card, its file listing, its raw source,
+   and the profile form. Everything cross-view it leans on — .pane, .card, .kvs, .seg,
+   .input, .btn — is theme.css's. */
+
+/* ── the checkpoint's card ────────────────────────────────────────────── */
+
+.cardblock { margin-top: 11px; }
+.mdhead { display: none; }
+
+/* frontmatter, worn as chips instead of YAML */
+.fm { display: flex; flex-wrap: wrap; gap: 4px; margin-bottom: 11px; }
+.fm span {
+  display: inline-flex; align-items: center; gap: 5px;
+  font-family: var(--mono); font-size: 9.5px; color: var(--fg2);
+  border: 1px solid var(--hair2); border-radius: 11px; padding: 2px 7px;
+}
+.fm span i { font-style: normal; color: var(--fg3); }
+.fm .lic { color: var(--ok); }
+.fm .base { color: var(--m); }
+
+.mdcard { font-size: 11.5px; line-height: 1.62; color: var(--fg2); max-width: 68ch; }
+.mdcard > :first-child { margin-top: 0; }
+.mdcard > :last-child { margin-bottom: 0; }
+.mdcard h1 { font-size: 13.5px; font-weight: 600; letter-spacing: -.015em; margin: 16px 0 6px; color: var(--fg); }
+.mdcard h2 { font-size: 12.5px; font-weight: 600; margin: 18px 0 6px; padding-top: 12px; border-top: 1px solid var(--hair); color: var(--fg); }
+.mdcard h3, .mdcard h4, .mdcard h5, .mdcard h6 { font-size: 12px; font-weight: 600; margin: 14px 0 5px; color: var(--fg); }
+.mdcard p { margin: 0 0 9px; }
+.mdcard ul, .mdcard ol { margin: 0 0 9px; padding-left: 18px; }
+.mdcard li { margin: 2px 0; }
+.mdcard li::marker { color: var(--fg3); }
+.mdcard a { color: var(--m); text-decoration: none; border-bottom: 1px solid color-mix(in srgb, currentColor 35%, transparent); }
+.mdcard strong { font-weight: 600; color: var(--fg); }
+.mdcard code { font-family: var(--mono); font-size: 10.5px; color: var(--fg); background: var(--sunken); border-radius: 4px; padding: 1px 4px; }
+.mdcard pre { margin: 0 0 9px; background: var(--sunken); border-radius: 7px; padding: 9px 11px; overflow-x: auto; }
+.mdcard pre code { background: none; padding: 0; font-size: 10px; line-height: 1.7; color: var(--fg2); }
+.mdcard .tablewrap { overflow-x: auto; margin: 0 0 9px; }
+.mdcard table { border-collapse: collapse; font-size: 10.5px; font-variant-numeric: tabular-nums; }
+.mdcard th { text-align: left; font-size: 9px; font-weight: 500; letter-spacing: .05em; text-transform: uppercase; color: var(--fg3); padding: 5px 12px 5px 0; border-bottom: 1px solid var(--hair2); }
+.mdcard td { padding: 5px 12px 5px 0; border-bottom: 1px solid var(--hair); white-space: nowrap; }
+.mdcard img { max-width: 100%; border-radius: 7px; border: 1px solid var(--hair); margin: 3px 0 5px; }
+.mdcard blockquote { margin: 0 0 9px; padding: 2px 0 2px 11px; border-left: 3px solid var(--hair2); }
+.mdcard hr { border: none; border-top: 1px solid var(--hair); margin: 14px 0; }
+
+/* ── files ────────────────────────────────────────────────────────────── */
+
+.files { display: flex; flex-direction: column; }
+.frow {
+  display: flex; align-items: center; gap: 9px; padding: 5px 0; width: 100%;
+  font-family: var(--mono); font-size: 10.5px; color: var(--fg);
+  border-bottom: 1px solid var(--hair); box-sizing: border-box; text-align: left;
+}
+.frow:last-child { border-bottom: 0; }
+.frow .size { margin-left: auto; color: var(--fg3); font-variant-numeric: tabular-nums; white-space: nowrap; }
+.frow .tag { font-family: var(--sans); font-size: 8.5px; text-transform: uppercase; letter-spacing: .08em; color: var(--fg3); }
+.frow.group { cursor: pointer; border-top: none; border-left: none; border-right: none; background: none; }
+.frow .chev { width: 11px; height: 11px; color: var(--fg3); transition: transform .15s ease; flex: none; }
+.frow .chev.open { transform: rotate(90deg); }
+.frow.shard { padding-left: 20px; color: var(--fg2); }
+.filefoot { display: flex; justify-content: space-between; gap: 12px; padding: 9px 0 0; font-size: 10px; color: var(--fg3); font-variant-numeric: tabular-nums; }
+.filefoot span:last-child { overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+
+.srcview { margin: 0; font-family: var(--mono); font-size: 10px; line-height: 1.7; color: var(--fg2); overflow-x: auto; white-space: pre-wrap; word-break: break-word; }
+.srcview .fence { color: var(--fg3); }
+.srcview .k { color: var(--m); }
+.srcview .h { color: var(--fg); font-weight: 500; }
+
+.hublink { all: unset; cursor: pointer; font-size: 10.5px; color: var(--fg3); }
+.hublink:hover { color: var(--m); }
+
+/* ── a download in flight ─────────────────────────────────────────────── */
+
+/* Same slot and same height as `.acts`: while it is fetching, the Download button is not
+   missing from the panel, it is doing another job. */
+.pullbox { flex: none; border-top: 1px solid var(--hair); padding: 10px 11px 11px; display: flex; flex-direction: column; gap: 7px; }
+.pullhead { display: flex; align-items: baseline; gap: 9px; }
+.pullhead b { font-size: 11.5px; font-weight: 600; }
+.pullhead em { font-style: normal; font-size: 10.5px; color: var(--fg3); overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+.pullhead .pct { margin-left: auto; font-family: var(--mono); font-size: 12.5px; font-variant-numeric: tabular-nums; }
+.pullbar { height: 4px; border-radius: 3px; background: var(--sunken); overflow: hidden; display: flex; }
+.pullbar i { display: block; height: 100%; background: var(--fg2); }
+.pullbar u { display: block; height: 100%; flex: 1; }
+.pullfoot { display: flex; align-items: center; gap: 12px; font-family: var(--mono); font-size: 10px; color: var(--fg3); font-variant-numeric: tabular-nums; }
+.pullfoot .sep { color: var(--hair2); }
+.pullfoot .btn { margin-left: auto; height: 23px; font-family: var(--sans); }
+
+/* ── profiles ─────────────────────────────────────────────────────────── */
+
+.profiles { display: flex; flex-direction: column; }
+.profiles .profpick { margin-bottom: 11px; flex-wrap: wrap; }
+.profiles .hint { font-weight: 400; line-height: 1.5; margin: 0 0 4px; text-transform: none; letter-spacing: 0; font-family: var(--sans); font-size: 10.5px; }
+.profiles .hint code { font-size: 10px; color: var(--fg2); }
+.profiles .knobs { display: grid; grid-template-columns: 1fr 1fr; gap: 8px 10px; margin-top: 11px; }
+.profiles textarea.input { font-family: var(--sans); min-height: 54px; width: 100%; }
+.profiles footer { display: flex; align-items: center; gap: 8px; margin-top: 13px; }
+.profiles .field + .field { margin-top: 11px; }
+.profiles .knobs .field + .field { margin-top: 0; }
+
+.kvline { display: flex; justify-content: space-between; align-items: baseline; gap: 10px; padding: 5.5px 0; border-bottom: 1px solid var(--hair); font-size: 11px; }
+.kvline:last-child { border-bottom: 0; }
+.kvline b { font-weight: 500; font-family: var(--mono); font-variant-numeric: tabular-nums; }
+.kvline b.unset { color: var(--fg3); font-weight: 400; }
+
+/* The daemon's own sentence, kept where the action was asked for. */
+.notice {
+  display: flex; align-items: center; gap: 8px; margin: 9px 0;
+  background: color-mix(in srgb, var(--bad) 10%, transparent);
+  border: 1px solid color-mix(in srgb, var(--bad) 28%, transparent);
+  border-radius: 8px; padding: 8px 10px;
+  font-size: 11px; color: var(--bad); line-height: 1.5;
+}
+.notice .iconbtn { margin-left: auto; color: var(--bad); border-color: transparent; background: none; }
