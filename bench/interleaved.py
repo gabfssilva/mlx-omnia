@@ -199,6 +199,7 @@ OURS = {
     "gpt-oss-120b": lambda: tree(cached("openai/gpt-oss-120b")),
     "deepseek-v4": lambda: tree(cached("mlx-community/DeepSeek-V4-Flash-0731-2.4bit-mixed")),
     "laguna-xs": lambda: tree(cached("poolside/Laguna-XS-2.1-NVFP4-mlx")),
+    "nemotron-nvfp4": lambda: tree(cached("mlx-community/Nemotron-3.5-Lightning-30B-A3B-nvfp4")),
 }
 
 
@@ -215,6 +216,7 @@ MLXLM_REPO = {
     "gpt-oss-120b": "openai/gpt-oss-120b",
     "deepseek-v4": "mlx-community/DeepSeek-V4-Flash-0731-2.4bit-mixed",
     "laguna-xs": "poolside/Laguna-XS-2.1-NVFP4-mlx",
+    "nemotron-nvfp4": "mlx-community/Nemotron-3.5-Lightning-30B-A3B-nvfp4",
 }
 
 DRAFTS = {

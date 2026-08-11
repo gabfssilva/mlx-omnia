@@ -27,6 +27,7 @@ from mlx_omnia.core.kernels.route.default import DefaultRoute
 from mlx_omnia.core.kernels.route.kernel import RouteStrategy, Routing, Scoring
 from mlx_omnia.core.kernels.route.ordinal import OrdinalRoute
 from mlx_omnia.core.kernels.route.sigmoid_topk import SigmoidTopkRoute
+from mlx_omnia.core.kernels.route.sigmoid_wide import SigmoidWideRoute
 from mlx_omnia.core.kernels.route.softmax_topk import SoftmaxTopkRoute
 
 __all__ = [
@@ -38,6 +39,7 @@ __all__ = [
     "Routing",
     "Scoring",
     "SigmoidTopkRoute",
+    "SigmoidWideRoute",
     "SoftmaxTopkRoute",
 ]
 
@@ -48,6 +50,7 @@ _BUILDS = (
     OrdinalRoute.build,
     SoftmaxTopkRoute.build,
     BiasTopkRoute.build,
+    SigmoidWideRoute.build,
     DefaultRoute.build,
 )
 

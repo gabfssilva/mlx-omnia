@@ -39,6 +39,7 @@ from mlx_omnia.core.kernels.route import (
     Route,
     Routing,
     SigmoidTopkRoute,
+    SigmoidWideRoute,
     SoftmaxTopkRoute,
 )
 from mlx_omnia.core.kernels.route.softmax_topk import (
@@ -643,12 +644,13 @@ def test_delegator_falls_back_rather_than_substituting_arithmetic() -> None:
         Route(_gate(128), experts=128, k=8, scoring="sqrt_softplus", bias=bias).strategy,
         DefaultRoute,
     )
-    # The sigmoid kernel always renormalizes.
+    # The renormalizing sigmoid kernel declines an unnormalized declaration; the wide
+    # sigmoid family carries an explicit NORM switch, so it serves it instead.
     assert isinstance(
         Route(
             _gate(128), experts=128, k=8, scoring="sigmoid", bias=bias, normalize=False
         ).strategy,
-        DefaultRoute,
+        SigmoidWideRoute,
     )
 
 
@@ -674,3 +676,80 @@ def test_default_route_agrees_with_the_softmax_kernel(dtype: mx.Dtype, shared: b
         assert relative_diff(
             mx.array([ours[i] for i in order]), mx.array([theirs[i] for i in order])
         ) < _weight_bound(dtype)
+
+
+# --- wide sigmoid routing (nemotron_h): sigmoid+bias selection past 32 experts ---
+
+
+@pytest.mark.parametrize("normalize", [True, False])
+def test_sigmoid_wide_matches_the_op_chain(normalize: bool) -> None:
+    """The DeepSeek-style sigmoid pick at 128 experts against the model's own ops:
+    same selection set, weights within the documented renorm-order bound."""
+    experts, k, hidden = 128, 6, 64
+    mx.random.seed(31)
+    gate = mx.random.normal((experts, hidden)).astype(mx.bfloat16)
+    bias = mx.random.normal((experts,)).astype(mx.float32)
+    routing = Routing(
+        experts=experts, k=k, scoring="sigmoid", bias=bias,
+        normalize=normalize, norm_eps=1e-20, scale=2.5,
+    )
+    wide = SigmoidWideRoute.build(gate, routing=routing)
+    assert wide is not None
+    for seed in range(4):
+        mx.random.seed(100 + seed)
+        row = mx.random.normal((hidden,)).astype(mx.bfloat16)
+        logits = row @ gate.T
+        indices, weights = wide(row, logits=logits)
+
+        scores = mx.sigmoid(logits.astype(mx.float32))
+        selector = scores + bias
+        chosen = mx.argpartition(-selector, kth=k - 1, axis=-1)[:k]
+        wanted = mx.take_along_axis(scores, chosen, axis=-1)
+        if normalize:
+            wanted = wanted / (wanted.sum() + 1e-20)
+        wanted = wanted * 2.5
+        assert mx.array_equal(mx.sort(indices), mx.sort(chosen.astype(mx.uint32)))
+        ours = _by_index(indices, weights)
+        theirs = _by_index(chosen.astype(mx.uint32), wanted)
+        order = sorted(theirs)
+        assert relative_diff(
+            mx.array([ours[i] for i in order]), mx.array([theirs[i] for i in order])
+        ) < 1e-6
+
+
+def test_sigmoid_wide_exact_ties_go_to_the_higher_index() -> None:
+    """Equal logits and a zero bias make the biased scores exactly equal; the cut falls
+    inside the tie group, so the rule alone decides which indices survive."""
+    experts, k, hidden = 128, 8, 64
+    logits, _ = tied_logits(mx.float32, shared=False)
+    routing = Routing(
+        experts=experts, k=k, scoring="sigmoid",
+        bias=mx.zeros((experts,), dtype=mx.float32),
+        normalize=True, norm_eps=1e-20, scale=2.5,
+    )
+    wide = SigmoidWideRoute.build(mx.zeros((experts, hidden)), routing=routing)
+    assert wide is not None
+    indices, _ = wide(mx.zeros((hidden,)), logits=logits)
+    assert indices.tolist() == [0, 1, 2, 120, 99, 67, 35, 11]
+
+
+def test_sigmoid_wide_rows_matches_per_row() -> None:
+    """T rows through the rows dispatch equal the single-row kernel row for row."""
+    experts, k, hidden = 128, 6, 64
+    mx.random.seed(41)
+    gate = mx.random.normal((experts, hidden)).astype(mx.bfloat16)
+    bias = mx.random.normal((experts,)).astype(mx.float32)
+    routing = Routing(
+        experts=experts, k=k, scoring="sigmoid", bias=bias,
+        normalize=True, norm_eps=1e-20, scale=2.5,
+    )
+    wide = SigmoidWideRoute.build(gate, routing=routing)
+    assert wide is not None
+    rows = mx.random.normal((3, hidden)).astype(mx.bfloat16)
+    logits = mx.stack([row @ gate.T for row in rows])
+    chosen, weights = wide.rows(logits)
+    for t in range(3):
+        one_c, one_w = wide(rows[t], logits=logits[t])
+        assert mx.array_equal(chosen[t], one_c).item(), t
+        assert mx.array_equal(weights[t], one_w).item(), t
+

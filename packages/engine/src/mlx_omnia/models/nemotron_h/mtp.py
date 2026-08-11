@@ -24,14 +24,16 @@ has to add it back before `final_layernorm` (`nemotron_h_mtp.py:117-122`). Here
 same sum and the end norm applies to it directly.
 """
 
+from collections.abc import Callable
+
 import mlx.core as mx
 import mlx.nn as nn
 
-from mlx_omnia.core.cache import KVCache, LayerCache
+from mlx_omnia.core.cache import FixedKVCache, KVCache, LayerCache
 from mlx_omnia.models.nemotron_h.config import ATTENTION, MAMBA, BlockKind, NemotronHConfig
 from mlx_omnia.models.nemotron_h.layers.block import NemotronHBlock
 
-DEFAULT_BLOCK = 3
+DEFAULT_BLOCK = 2
 """How many ids a round proposes when nobody says. Measured, not read off the config.
 
 `num_nextn_predict_layers` is 1, which says the head predicts one token and nothing about how
@@ -41,7 +43,20 @@ experts, so a 3-row verification reads about twice the MoE bytes of one row and 
 about 2.3x. Against that, measured acceptance falls 0.830, 0.621, 0.390 by depth.
 
 The product of the two, end to end on the bf16 30B-A3B over three prompts: 0.82-0.92x at 2,
-**0.95-1.07x at 3**, 0.88-1.06x at 4, 0.81-0.95x at 6. Three is where it stops losing."""
+**0.95-1.07x at 3**, 0.88-1.06x at 4, 0.81-0.95x at 6. Three is where it stops losing.
+
+Quantizing the trunk does not move the choice and does not make the head pay better. On the
+nvfp4 entry, interleaved over two prompts: 0.94-0.98x at 2, **0.97-1.09x at 3**, 0.86-1.02x at
+4, with the head's own acceptance at 0.809 / 0.564 / 0.327 by depth. A round of width 2 there
+costs 2.2-2.3 plain steps, so it pays from about 1.3 accepted of 2 — which prose does not
+always reach (1.25) and code does (1.41).
+
+Those block numbers belong to the replay verify. The compiled fixed-shape verify moved the
+optimum: a rejection is a slot pick instead of a replay, so depth 2's low acceptance (0.564)
+stops paying for its extra row. Interleaved on the nvfp4 entry with the compiled path, blocks
+2 / 3 / 4 read 214 / 211 / 183 tok/s cold and 198 / 192 / 171 warm against 176-183 plain —
+block 2 (one drafted id per round) wins every round, block 4 loses to no speculation at
+all."""
 
 
 class NemotronHMTPBlock(NemotronHBlock):
@@ -120,6 +135,72 @@ class NemotronHMTP(nn.Module):
             )
             for index, kind in enumerate(pattern)
         ]
+
+    def compile_chain(
+        self,
+        embed: Callable[[mx.array], mx.array],
+        head: Callable[[mx.array], mx.array],
+        width: int,
+    ) -> (
+        tuple[
+            Callable[[mx.array, mx.array], tuple[mx.array, mx.array]],
+            Callable[[], None],
+        ]
+        | None
+    ):
+        """One chained draft step, compiled: (token id [1], hidden [1,1,H]) -> (next id
+        [1], next hidden). The step's own KV lives in a fixed buffer of `width` rows
+        whose position the caller resets to zero each round — the same graph serves
+        every link of the chain, because the only thing that moves between links is
+        that position.
+
+        `embed` is the target's raw embedding table and `head` its raw logits
+        projection (`speculative.Speculable`); both bake into the trace as constants.
+        Returns None when the step holds an architecture the fixed-shape graph cannot
+        serve (none today: the pattern is attention plus stateless kinds by
+        construction)."""
+        config = self.config
+        kv_heads = config.num_key_value_heads
+        head_dim = config.attention_head_dim
+        first = self.layers[0]
+        assert isinstance(first, NemotronHMTPBlock)
+        dtype = first.norm.weight.dtype
+        caches: list[LayerCache] = []
+        for kind in self.pattern:
+            if kind == ATTENTION:
+                zeros = mx.zeros((1, kv_heads, width, head_dim), dtype=dtype)
+                caches.append(FixedKVCache(zeros, zeros, 0))
+            else:
+                caches.append(LayerCache())
+        fixed = [layer for layer in caches if isinstance(layer, FixedKVCache)]
+        state = [layer.state for layer in fixed]
+        columns = mx.arange(width)
+
+        def forward(token: mx.array, hidden: mx.array) -> tuple[mx.array, mx.array]:
+            anchor = fixed[0]
+            mask = (columns <= anchor.position).reshape(1, 1, 1, width)
+            first, *rest = self.layers
+            assert isinstance(first, NemotronHMTPBlock)
+            x = first(first.fuse(embed(token[None]), hidden), caches[0], mask)
+            for block, layer_cache in zip(rest, caches[1:], strict=True):
+                assert isinstance(block, NemotronHMTPBlock)
+                x = block(x, layer_cache, mask)
+            last = self.layers[-1]
+            assert isinstance(last, NemotronHMTPBlock)
+            out = last.finish(x)
+            logits = head(out)
+            return mx.argmax(logits[:, -1, :], axis=-1), out
+
+        compiled = mx.compile(forward, inputs=state, outputs=state)
+
+        def chain(token: mx.array, hidden: mx.array) -> tuple[mx.array, mx.array]:
+            return compiled(token, hidden)
+
+        def reset() -> None:
+            for layer in fixed:
+                layer.state[2] = mx.array([0], dtype=mx.int32)
+
+        return chain, reset
 
     def make_cache(self) -> list[LayerCache]:
         """One per block, as the trunk does. The attention block is the only one with state,

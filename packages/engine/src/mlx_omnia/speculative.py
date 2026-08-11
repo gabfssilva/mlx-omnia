@@ -226,6 +226,49 @@ class Verifiable[C: LayerCache](Protocol):
 
 
 @runtime_checkable
+class CompiledVerify[C: LayerCache](Protocol):
+    """A target whose verification forward compiles: every round feeds exactly
+    `width + 1` rows, so the shape is fixed and the graph is built once. The rewind
+    that comes with it costs no forward — per-row state checkpoints inside the
+    recurrent layers' own kernel, a moved position for the attention buffers.
+
+    `compile_verify` promotes the cache the way a compiled decode does, so it is taken
+    once, after the prefill, and the returned pair replaces both `Verifiable.verify`
+    and the round's replay for as long as the generation runs."""
+
+    def compile_verify(
+        self, cache: list[C], *, width: int, at: Sequence[int]
+    ) -> (
+        tuple[
+            Callable[[mx.array], tuple[mx.array, mx.array]],
+            Callable[[int], None],
+        ]
+        | None
+    ): ...
+
+
+@runtime_checkable
+class ChainCompilable(Protocol):
+    """A step that can compile its own chained drafting: one graph reused for every
+    link, a fixed KV buffer of `width` rows, and a reset that rewinds it between
+    rounds. `embed`/`head` are the target's raw vocabulary ends, baked in as
+    constants."""
+
+    def compile_chain(
+        self,
+        embed: Callable[[mx.array], mx.array],
+        head: Callable[[mx.array], mx.array],
+        width: int,
+    ) -> (
+        tuple[
+            Callable[[mx.array, mx.array], tuple[mx.array, mx.array]],
+            Callable[[], None],
+        ]
+        | None
+    ): ...
+
+
+@runtime_checkable
 class Step[S: LayerCache](Protocol):
     """One multi-token-prediction step: the pair *(what the trunk held at a position, the
     embedding of the token after it)* to a hidden row for the position after **that**.
@@ -293,6 +336,11 @@ class Chained[S: LayerCache]:
         self._width = block - 1
         self._tap = tap
         self._hidden: mx.array | None = None
+        self._chain = (
+            step.compile_chain(target.raw_embed, target.raw_logits, self._width)
+            if isinstance(step, ChainCompilable)
+            else None
+        )
 
     @property
     def taps(self) -> Sequence[int]:
@@ -317,6 +365,16 @@ class Chained[S: LayerCache]:
         """
         assert self._hidden is not None, "the round feeds the proposer before it asks"
         hidden = self._hidden
+        if self._chain is not None:
+            chain, reset = self._chain
+            reset()
+            token = mx.array([committed[-1]])
+            drafted: list[mx.array] = []
+            for _ in range(self._width):
+                token, hidden = chain(token, hidden)
+                mx.async_eval(token)
+                drafted.append(token)
+            return mx.concatenate(drafted)
         token = mx.array([committed[-1]])[None]
         cache = self._step.make_cache()
         proposals: list[mx.array] = []
@@ -398,10 +456,22 @@ def stream_speculative_ids[C: LayerCache, D: LayerCache](
     pending = _ints(mx.argmax(feed(ids[window][None])[:, -1, :], axis=-1))
     committed += pending
 
+    compiled: tuple[Callable[[mx.array], tuple[mx.array, mx.array]], Callable[[int], None]] | None
+    compiled = (
+        target.compile_verify(target_cache, width=proposer.width, at=taps)
+        if taps and isinstance(target, CompiledVerify)
+        else None
+    )
+
     emitted = 0
     while emitted < max_tokens:
         if not pending:
-            pending, accepted = _round(verify, forward, proposer, target_cache, committed, replays)
+            if compiled is not None and target_cache[0].offset == len(committed) - 1:
+                pending, accepted = _compiled_round(compiled, proposer, committed)
+            else:
+                pending, accepted = _round(
+                    verify, forward, proposer, target_cache, committed, replays
+                )
             committed += pending
             if acceptance is not None:
                 acceptance.rounds += 1
@@ -414,6 +484,35 @@ def stream_speculative_ids[C: LayerCache, D: LayerCache](
             meter.token()
         yield token
         emitted += 1
+
+
+def _compiled_round(
+    compiled: tuple[
+        Callable[[mx.array], tuple[mx.array, mx.array]], Callable[[int], None]
+    ],
+    proposer: Proposer,
+    committed: list[int],
+) -> tuple[list[int], int]:
+    """One round through the compiled fixed-shape verify: the gap is always the one
+    committed token the cache has not seen, so every round feeds `width + 1` rows, and
+    a rejection is a slot pick instead of a replay."""
+    verify_fn, rewind_fn = compiled
+    drafted = proposer.propose(committed)
+    width = drafted.size
+    verified = mx.concatenate([mx.array([committed[-1]], dtype=drafted.dtype), drafted])
+    logits, features = verify_fn(verified)
+    judged = mx.argmax(logits, axis=-1)
+    mx.eval(judged, drafted)
+
+    proposed, predicted = _ints(drafted), _ints(judged)
+    accepted = 0
+    while accepted < width and proposed[accepted] == predicted[accepted]:
+        accepted += 1
+    if accepted < width:
+        rewind_fn(1 + accepted)
+    proposer.absorb(features[:, : 1 + accepted])
+    proposer.settle(len(committed) + accepted)
+    return [*proposed[:accepted], predicted[accepted]], accepted
 
 
 def _round[C: LayerCache](

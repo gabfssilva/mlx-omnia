@@ -354,6 +354,49 @@ class FixedKVCache(LayerCache):
         raise NotImplementedError("a compiled cache cannot be rewound")
 
 
+class FixedDeltaCache(DeltaCache):
+    """A `DeltaCache` whose window and state live in a graph-visible container.
+
+    The growing cache holds both as plain attributes, which `mx.compile` cannot see: an
+    attribute rebound inside a traced function is rebound at trace time and never again.
+    Here they sit in `graph`, the list a compiled decode passes as `inputs`/`outputs`, and
+    the mixer's reads and writes go through properties over its slots — so the mamba layer
+    runs unchanged over either cache.
+    """
+
+    def __init__(self, window: mx.array, state: mx.array, position: int) -> None:
+        LayerCache.__init__(self)
+        self.offset = position
+        self.graph = [window, state]
+
+    @classmethod
+    def promote(cls, cache: DeltaCache) -> "FixedDeltaCache":
+        """Copy a completed prefill cache into the compile-friendly form. Both tensors are
+        set by then: a prefill that never ran has nothing worth compiling over."""
+        window, state = cache.window, cache.state
+        if window is None or state is None:
+            raise ValueError("promoting a delta cache before its prefill filled it")
+        return cls(window, state, cache.offset)
+
+    @property
+    def window(self) -> mx.array | None:
+        return self.graph[0]
+
+    @window.setter
+    def window(self, value: mx.array | None) -> None:
+        assert value is not None, "a fixed delta cache never clears its window"
+        self.graph[0] = value
+
+    @property
+    def state(self) -> mx.array | None:
+        return self.graph[1]
+
+    @state.setter
+    def state(self, value: mx.array | None) -> None:
+        assert value is not None, "a fixed delta cache never clears its state"
+        self.graph[1] = value
+
+
 _BLOCK = 256
 
 
