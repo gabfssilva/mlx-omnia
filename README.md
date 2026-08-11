@@ -26,7 +26,7 @@ uv run sideros-server        # OpenAI-compatible API on 127.0.0.1:8642
 
 Then point any OpenAI SDK at `http://127.0.0.1:8642/api/openai/v1`.
 
-There is also a desktop app in `app/`: a native chat and model-management UI that talks to the local server — download, quantize, and chat with models without touching a terminal.
+There is also a desktop window — `mise run app`, or `uv run sideros-app`: chat and model management over the same HTTP API, which it starts itself when nothing answers on the port. Download, quantize and chat without touching a terminal.
 
 ## What it does to be fast
 
@@ -39,19 +39,19 @@ There is also a desktop app in `app/`: a native chat and model-management UI tha
 
 ## Contributing
 
-uv workspace with three packages, plus the desktop app:
+uv workspace, one directory per package:
 
 | path | what it is |
 | --- | --- |
-| `packages/sideros` | the engine: model packages, checkpoint loading, generation pipeline, Metal kernels, quantization |
-| `packages/sideros-server` | FastAPI server speaking the OpenAI API (streaming included), global FCFS queue |
-| `packages/sideros-cli` | HTTP client for the server; depends only on httpx |
-| `app/` | desktop app (React renderer in an Electron shell), talks to the server over HTTP only |
+| `packages/engine` | the engine: model packages, checkpoint loading, generation pipeline, Metal kernels, quantization |
+| `packages/server` | FastAPI server speaking the OpenAI API (streaming included), global FCFS queue |
+| `packages/cli` | HTTP client for the server; depends only on httpx |
+| `packages/application` | the desktop window (Flet), talks to the server over HTTP only and starts it when nothing answers |
 
 Inside the engine:
 
 ```
-packages/sideros/src/sideros/
+packages/engine/src/sideros/
   models/<family>/      one self-contained package per architecture family
   checkpoint.py         the load spine; each architecture declares a CHECKPOINT
   task.py               `load` — the only entry point; dispatches model_type
@@ -78,7 +78,7 @@ uv run pytest -q                                             # suite
 uv run ruff check && uv run pyright && uv run lint-imports   # rest of the gate
 ```
 
-Fixtures are generated from reference implementations (`packages/sideros/tests/fixtures/generate_*.py`) and are not checked in; `SHA256SUMS` is. Parity tests compare full logits against them with tolerances derived from measured noise floors.
+Fixtures are generated from reference implementations (`packages/engine/tests/fixtures/generate_*.py`) and are not checked in; `SHA256SUMS` is. Parity tests compare full logits against them with tolerances derived from measured noise floors.
 
 Benchmarks are interleaved A/B in the same process, behind a thermal gate: `bench/interleaved.py` (against a baseline engine) and `bench/selfpair.py` (working tree against a git ref).
 

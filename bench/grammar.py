@@ -43,7 +43,7 @@ import numpy as np
 from numpy.typing import NDArray
 from transformers import AutoTokenizer
 
-FIXTURE = Path(__file__).parent.parent / "packages/sideros/tests/fixtures/grammar_schemas.json"
+FIXTURE = Path(__file__).parent.parent / "packages/engine/tests/fixtures/grammar_schemas.json"
 HUB = Path.home() / ".cache/huggingface/hub"
 DEFAULT_MODEL = "mlx-community/Qwen3-30B-A3B-4bit"
 

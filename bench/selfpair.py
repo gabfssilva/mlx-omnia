@@ -152,7 +152,7 @@ def run_side(
                 }
             )
         )
-        env = os.environ | {"PYTHONPATH": str(tree / "packages/sideros/src")}
+        env = os.environ | {"PYTHONPATH": str(tree / "packages/engine/src")}
         done = subprocess.run([sys.executable, __file__, "--worker", str(payload)], env=env)
         if done.returncode != 0:
             raise SystemExit(f"{label} side failed (see the worker's message above)")

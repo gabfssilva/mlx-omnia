@@ -2,7 +2,7 @@
 name = "sideros-workspace"
 version = "0.0.0"
 requires-python = ">=3.13"
-dependencies = ["sideros", "sideros-server", "sideros-cli"]
+dependencies = ["sideros", "sideros-server", "sideros-cli", "sideros-application"]
 
 [tool.uv]
 package = false
@@ -30,10 +30,11 @@ members = ["packages/*"]
 sideros = { workspace = true }
 sideros-server = { workspace = true }
 sideros-cli = { workspace = true }
+sideros-application = { workspace = true }
 
 [tool.ruff]
 line-length = 100
-src = ["packages/sideros/src", "packages/sideros-server/src", "packages/sideros-cli/src"]
+src = ["packages/engine/src", "packages/server/src", "packages/cli/src"]
 
 [tool.ruff.lint]
 select = [
@@ -47,7 +48,7 @@ select = [
 ]
 
 [tool.importlinter]
-root_packages = ["sideros"]
+root_packages = ["sideros", "sideros_application"]
 
 [[tool.importlinter.contracts]]
 name = "core and bpe never reach up"
@@ -73,6 +74,21 @@ forbidden_modules = [
 ]
 allow_indirect_imports = true
 
+[[tool.importlinter.contracts]]
+name = "the window stacks one way"
+type = "layers"
+layers = [
+    "sideros_application.main",
+    "sideros_application.views",
+    "sideros_application.ui",
+    "sideros_application.api",
+]
+
+[[tool.importlinter.contracts]]
+name = "screens do not know each other"
+type = "independence"
+modules = ["sideros_application.views.*"]
+
 [tool.pyright]
 typeCheckingMode = "off"
 #typeCheckingMode = "strict"
@@ -92,23 +108,23 @@ reportUnknownVariableType = false
 
 # huggingface_hub expõe Unknown nos overloads de download (tqdm genérico).
 [[tool.pyright.executionEnvironments]]
-root = "packages/sideros-server/src"
+root = "packages/server/src"
 reportUnknownVariableType = false
 
 # transformers/huggingface_hub (dev-deps de fixture) expõem Unknown; só nos testes.
 [[tool.pyright.executionEnvironments]]
-root = "packages/sideros-server/tests"
+root = "packages/server/tests"
 reportUnknownMemberType = false
 reportUnknownVariableType = false
 reportUnknownArgumentType = false
 reportPrivateUsage = false
 
 [[tool.pyright.executionEnvironments]]
-root = "packages/sideros/tests"
+root = "packages/engine/tests"
 reportUnknownMemberType = false
 reportUnknownVariableType = false
 reportUnknownArgumentType = false
 reportPrivateUsage = false
 
 [tool.pytest.ini_options]
-testpaths = ["packages/sideros/tests", "packages/sideros-server/tests", "packages/sideros-cli/tests"]
+testpaths = ["packages/engine/tests", "packages/server/tests", "packages/cli/tests"]

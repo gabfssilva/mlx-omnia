@@ -50,26 +50,10 @@ run = "uv run python bench/grammar.py"
 description = "run the FastAPI server"
 run = "uv run sideros-server"
 
+[tasks.app]
+description = "run the Flet window (it starts the engine when nothing answers on 8642)"
+run = "uv run sideros-app"
+
 [tasks.cli]
 description = "run the HTTP-only CLI"
 run = "uv run sideros"
-
-[tasks."app:dev"]
-description = "electron app in dev mode"
-dir = "app"
-run = "npm run dev"
-
-[tasks."app:build"]
-description = "build renderer + main"
-dir = "app"
-run = "npm run build"
-
-[tasks."app:typecheck"]
-description = "tsc --noEmit for renderer and desktop"
-dir = "app"
-run = "npm run typecheck"
-
-[tasks."app:package"]
-description = "electron-builder --mac (produces app/release)"
-dir = "app"
-run = "npm run package"
