@@ -280,12 +280,11 @@ class NemotronH(nn.Module):
         if ATTENTION not in pattern:
             return None
         offset = cache[0].offset
-        fit = _fit(offset)
         promoted: list[LayerCache] = []
         for layer, kind in zip(cache, pattern, strict=True):
             if kind == ATTENTION:
                 assert isinstance(layer, KVCache)
-                promoted.append(FixedKVCache.promote(layer, fit))
+                promoted.append(FixedKVCache.promote(layer, _fit(offset)))
             elif kind == MAMBA:
                 assert isinstance(layer, DeltaCache)
                 fixed = FixedDeltaCache.promote(layer)
@@ -301,55 +300,74 @@ class NemotronH(nn.Module):
             else:
                 promoted.append(layer)
         cache[:] = promoted
-        state_containers = [
-            layer.state if isinstance(layer, FixedKVCache) else layer.graph
-            for layer in promoted
-            if isinstance(layer, FixedKVCache | FixedDeltaCache)
-        ]
-        anchor = next(layer for layer in promoted if isinstance(layer, FixedKVCache))
-        columns = mx.arange(fit)
         blocks = self.backbone.layers
         steps = mx.arange(rows)
 
         joins = _joins(blocks, self.backbone.norm_f)
 
-        def forward(ids: mx.array) -> tuple[mx.array, mx.array]:
-            mask = (columns[None, :] <= anchor.position + steps[:, None]).reshape(
-                1, 1, rows, fit
-            )
-            x = self.backbone.embeddings(ids[None])
-            outputs: list[mx.array] = []
-            first = blocks[0]
-            assert isinstance(first, NemotronHBlock)
-            normed = first.norm(x) if joins is not None else x
-            for index, (block, layer_cache, kind) in enumerate(
-                zip(blocks, promoted, pattern, strict=True)
-            ):
-                assert isinstance(block, NemotronHBlock)
-                if joins is None:
-                    normed = block.norm(x)
-                if kind == MAMBA:
-                    mixer = block.mixer
-                    assert isinstance(mixer, NemotronHMamba)
-                    mixed = mixer.verify_rows(normed, layer_cache)
-                else:
-                    mixed = block.mix(normed, layer_cache, mask)
-                if joins is None:
-                    x = x + mixed
-                else:
-                    x, normed = joins[index](x, mixed)
-                outputs.append(x)
-            final = self.backbone.norm_f(x) if joins is None else normed
-            logits = self.lm_head(final)
-            features = mx.concatenate([outputs[index] for index in at], -1)
-            return logits[0], features
+        def build(fitting: int) -> tuple[Callable[[mx.array], tuple[mx.array, mx.array]], int]:
+            # A generation that outgrows the fixed attention buffers promotes again into
+            # larger ones and recompiles — the mamba containers are size-free and stay.
+            for index, kind in enumerate(pattern):
+                if kind != ATTENTION:
+                    continue
+                layer = promoted[index]
+                assert isinstance(layer, FixedKVCache)
+                if layer.state[0].shape[2] < fitting:
+                    promoted[index] = FixedKVCache(*_regrow(layer, fitting))
+            cache[:] = promoted
+            state_containers = [
+                layer.state if isinstance(layer, FixedKVCache) else layer.graph
+                for layer in promoted
+                if isinstance(layer, FixedKVCache | FixedDeltaCache)
+            ]
+            anchor = next(layer for layer in promoted if isinstance(layer, FixedKVCache))
+            columns = mx.arange(fitting)
 
-        compiled = mx.compile(forward, inputs=state_containers, outputs=state_containers)
+            def forward(ids: mx.array) -> tuple[mx.array, mx.array]:
+                mask = (columns[None, :] <= anchor.position + steps[:, None]).reshape(
+                    1, 1, rows, fitting
+                )
+                x = self.backbone.embeddings(ids[None])
+                outputs: list[mx.array] = []
+                first = blocks[0]
+                assert isinstance(first, NemotronHBlock)
+                normed = first.norm(x) if joins is not None else x
+                for index, (block, layer_cache, kind) in enumerate(
+                    zip(blocks, promoted, pattern, strict=True)
+                ):
+                    assert isinstance(block, NemotronHBlock)
+                    if joins is None:
+                        normed = block.norm(x)
+                    if kind == MAMBA:
+                        mixer = block.mixer
+                        assert isinstance(mixer, NemotronHMamba)
+                        mixed = mixer.verify_rows(normed, layer_cache)
+                    else:
+                        mixed = block.mix(normed, layer_cache, mask)
+                    if joins is None:
+                        x = x + mixed
+                    else:
+                        x, normed = joins[index](x, mixed)
+                    outputs.append(x)
+                final = self.backbone.norm_f(x) if joins is None else normed
+                logits = self.lm_head(final)
+                features = mx.concatenate([outputs[index] for index in at], -1)
+                return logits[0], features
+
+            return (
+                mx.compile(forward, inputs=state_containers, outputs=state_containers),
+                fitting,
+            )
+
+        compiled, fit = build(_fit(offset))
         current = offset
         before = offset
 
         def verify(ids: mx.array) -> tuple[mx.array, mx.array]:
-            nonlocal current, before
+            nonlocal current, before, compiled, fit
+            if current + rows > fit:
+                compiled, fit = build(_fit(current))
             before = current
             logits, features = compiled(ids)
             current = before + rows
