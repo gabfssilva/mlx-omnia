@@ -23,8 +23,16 @@ Authoritative semantics: transformers' modeling_nemotron_h.py.
 MTP leaves (`mtp.*`) are dropped at load.
 """
 
-from sideros.models.nemotron_h.checkpoint import CHECKPOINT
+from sideros.models.nemotron_h.checkpoint import CHECKPOINT, MTP, load_mtp
 from sideros.models.nemotron_h.config import NemotronHConfig
 from sideros.models.nemotron_h.model import NemotronH
+from sideros.models.nemotron_h.mtp import NemotronHMTP
 
-__all__ = ["CHECKPOINT", "NemotronH", "NemotronHConfig"]
+__all__ = [
+    "CHECKPOINT",
+    "MTP",
+    "NemotronH",
+    "NemotronHConfig",
+    "NemotronHMTP",
+    "load_mtp",
+]

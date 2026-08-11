@@ -989,7 +989,11 @@ async def count_tokens(request: CountRequest, engine: EngineDep, store: StoreDep
         # become, and the client is the only one who can change it — the same 400 the
         # generation route answers when the render fails on the far side of the queue.
         return encode_error(400, "invalid_request_error", str(refusal))
-    ids = await asyncio.to_thread(tokenizer.encode, prompt)
+    # Read out in the thread, not after it: `encode` hands the ids over as it makes them.
+    def encode() -> list[int]:
+        return list(tokenizer.encode(prompt))
+
+    ids = await asyncio.to_thread(encode)
     return JSONResponse(content={"input_tokens": len(ids)})
 
 

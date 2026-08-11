@@ -87,13 +87,19 @@ def _header(path: Path) -> dict[str, _TensorEntry]:
     return {name: entry for name, entry in raw.items() if name != "__metadata__"}
 
 
-def checkpoint_bytes(directory: Path) -> int:
+def checkpoint_bytes(directory: Path, prefix: str = "") -> int:
     """The weights a checkpoint holds, summed from the headers of its shards with no
     tensor mapped. A tied checkpoint that still serializes `lm_head` is counted with it —
-    the loader drops that copy, so this is an upper bound on what ends up resident."""
+    the loader drops that copy, so this is an upper bound on what ends up resident.
+
+    `prefix` narrows it to one part of the file, which is what an MTP head is: `mtp.*` in the
+    same shards as the trunk, loaded as a tree of its own or not at all. Admission has to
+    weigh it before the load and cannot open the tree to ask."""
     total = 0
     for shard in sorted(directory.glob("model*.safetensors")):
-        for entry in _header(shard).values():
+        for name, entry in _header(shard).items():
+            if not name.startswith(prefix):
+                continue
             begin, end = entry["data_offsets"]
             total += end - begin
     return total

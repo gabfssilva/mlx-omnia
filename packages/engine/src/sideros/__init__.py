@@ -1,6 +1,7 @@
 from sideros.bpe import ByteLevelBPE
 from sideros.chat import (
     CHAT,
+    DESCRIBE,
     Chat,
     ChatCapability,
     ChatMessage,
@@ -8,9 +9,11 @@ from sideros.chat import (
     ImageMarkerMismatch,
     ImagePart,
     MultimodalChatCapability,
+    SeeingChat,
     TextPart,
     chat_capabilities,
     chat_template,
+    composite,
 )
 from sideros.core.cache import KVCache
 from sideros.generate import (
@@ -114,6 +117,7 @@ from sideros.vision import RGB_IMAGE, Image
 
 __all__ = [
     "CHAT",
+    "DESCRIBE",
     "GPT2",
     "GPTOSS",
     "LFM2",
@@ -244,6 +248,7 @@ __all__ = [
     "Sampler",
     "SeedOss",
     "SeedOssConfig",
+    "SeeingChat",
     "Step3p7",
     "Step3p7Config",
     "Text",
@@ -253,6 +258,7 @@ __all__ = [
     "UnsupportedInput",
     "chat_capabilities",
     "chat_template",
+    "composite",
     "decode_clock",
     "greedy",
     "load",

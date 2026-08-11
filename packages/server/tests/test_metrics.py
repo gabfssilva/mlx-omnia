@@ -104,8 +104,9 @@ class CountingTokenizer:
     """One id per character, so two prompts of different lengths are two different prompt
     counts — which is the difference the register has to keep."""
 
-    def encode(self, text: str) -> list[int]:
-        return [0] * len(text)
+    def encode(self, text: str | Iterator[str]) -> Iterator[int]:
+        whole = text if isinstance(text, str) else "".join(text)
+        return iter([0] * len(whole))
 
     def decode_bytes(self, ids: list[int]) -> bytes:
         return b"."

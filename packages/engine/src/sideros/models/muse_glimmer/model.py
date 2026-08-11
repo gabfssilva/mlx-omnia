@@ -61,6 +61,11 @@ class MuseGlimmer(nn.Module):
     def embed(self, ids: mx.array) -> mx.array:
         return mx.fast.rms_norm(self.model.embed_tokens(ids), None, self.config.rms_norm_eps)
 
+    def raw_embed(self, ids: mx.array) -> mx.array:
+        """The lookup without the scaleless RMS above — `speculative.Speculable`. The two
+        differ here, and the drafter was trained against this one."""
+        return self.model.embed_tokens(ids)
+
     def image_features(self, patches: mx.array, grid: Grid) -> mx.array:
         """One row per trunk token: tower, adapter, projection, then the same weightless
         RMS the text embeddings get (`perception_emb_norm`)."""
@@ -74,6 +79,11 @@ class MuseGlimmer(nn.Module):
         cap = self.config.final_logit_softcapping
         logits = self.lm_head(normed) * self.config.output_multiplier
         return mx.tanh(logits / cap) * cap
+
+    def raw_logits(self, hidden: mx.array) -> mx.array:
+        """`lm_head` without the multiplier and the softcap above — `speculative.Speculable`.
+        Both are monotone, so under greedy the substitution would never show."""
+        return self.lm_head(hidden)
 
     def activations(
         self,

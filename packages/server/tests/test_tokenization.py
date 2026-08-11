@@ -56,8 +56,9 @@ class CharTokenizer:
     def __init__(self, offset: int = 0) -> None:
         self.offset = offset
 
-    def encode(self, text: str) -> list[int]:
-        return [self.offset + ord(character) for character in text]
+    def encode(self, text: str | Iterator[str]) -> Iterator[int]:
+        whole = text if isinstance(text, str) else "".join(text)
+        return iter([self.offset + ord(character) for character in whole])
 
     def decode_bytes(self, ids: list[int]) -> bytes:
         return bytes(identifier - self.offset for identifier in ids)
@@ -68,9 +69,10 @@ class RecordingTokenizer(CharTokenizer):
         super().__init__()
         self.thread: threading.Thread | None = None
 
-    def encode(self, text: str) -> list[int]:
+    def encode(self, text: str | Iterator[str]) -> Iterator[int]:
+        whole = text if isinstance(text, str) else "".join(text)
         self.thread = threading.current_thread()
-        return super().encode(text)
+        return iter(super().encode(whole))
 
 
 class Tokenizerless:

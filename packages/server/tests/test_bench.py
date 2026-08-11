@@ -85,8 +85,9 @@ class TinyLM(nn.Module):
 
 
 class CountingTokenizer:
-    def encode(self, text: str) -> list[int]:
-        return [0] * len(text)
+    def encode(self, text: str | Iterator[str]) -> Iterator[int]:
+        whole = text if isinstance(text, str) else "".join(text)
+        return iter([0] * len(whole))
 
     def decode_bytes(self, ids: list[int]) -> bytes:
         return b"."

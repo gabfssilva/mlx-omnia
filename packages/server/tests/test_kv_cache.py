@@ -1,7 +1,7 @@
 """A compressed KV cache, switched on per model.
 
 The policy is a `Features` field like any other, so where it is stored and how a profile
-overrides it is the same two-level resolution `dflash` already answers to. What is new is the
+overrides it is the same two-level resolution `speculation` already answers to. What is new is the
 gate in front of it: a trunk either decodes under the policy or the request is refused by name,
 and there is no third outcome — a model that generated densely under a policy the screen says
 is on would be a fidelity number about a compression nobody applied.
@@ -42,7 +42,7 @@ from sideros.quant.quantization import Affine
 from sideros.quantizing import Quantizing
 from sideros_server import Engine, catalog, create_app
 from sideros_server.engine import Job, NotQuantizable
-from sideros_server.features import DFlash, Features, KvCache, resolve
+from sideros_server.features import Features, KvCache, Speculation, resolve
 from sideros_server.store import ModelSettings, Store
 
 MODEL = "meta-models/Muse-Glimmer-30B"
@@ -204,10 +204,11 @@ def test_a_profile_that_only_speculates_leaves_the_kv_policy_alone() -> None:
     """The two switches are independent fields, which is what the two-level fill is for: a
     preset written about speculation must not silently uncompress the cache."""
     model = Features(kv_cache=KvCache(k="affine/4/64", v="affine/4/64"))
-    resolved = resolve(model, Features(dflash=DFlash(drafter="some/drafter")))
+    drafting = Speculation(kind="dflash", drafter="some/drafter")
+    resolved = resolve(model, Features(speculation=drafting))
 
     assert resolved.kv_cache == model.kv_cache
-    assert resolved.dflash == DFlash(drafter="some/drafter")
+    assert resolved.speculation == Speculation(kind="dflash", drafter="some/drafter")
 
 
 def test_a_row_naming_a_format_this_daemon_cannot_spell_fails_at_the_column() -> None:

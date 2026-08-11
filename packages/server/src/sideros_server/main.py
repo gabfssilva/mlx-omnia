@@ -31,7 +31,7 @@ def _resident(store: Store) -> Callable[[str], LanguageModel[ModelInput]]:
     def loader(model_id: str) -> LanguageModel[ModelInput]:
         model = load(model_id, local_files_only=True)
         settings = features.parse(store.model_settings(model_id).features)
-        features.pair(model_id, model, settings.dflash)
+        features.pair(model_id, model, settings.speculation)
         return model
 
     return loader

@@ -168,15 +168,24 @@ def _checkpoint_size(model_id: str) -> int:
     """What the model about to be loaded weighs, off the safetensors headers — the only
     figure that exists before the load. A model the catalog does not list weighs zero here:
     the two caches are what the daemon's own loader can open, and an id outside them has no
-    header to sum and nothing for admission to decide against."""
+    header to sum and nothing for admission to decide against.
+
+    The MTP head comes off, because the trunk's loader drops it (`_drop_mtp`, in nine
+    families): what a checkpoint carrying one weighs *as a model* is the file minus `mtp.*`.
+    `drafter_bytes` puts it back when the settings turn speculation on, which is the only
+    time it is resident — counting it here as well would charge it twice.
+    """
+    from sideros.task import MTP_PREFIX
     from sideros_server.catalog import scan
 
     entry = next((entry for entry in scan() if entry.id == model_id), None)
-    return 0 if entry is None else checkpoint_bytes(entry.directory)
+    if entry is None:
+        return 0
+    return checkpoint_bytes(entry.directory) - checkpoint_bytes(entry.directory, MTP_PREFIX)
 
 
 def _incoming_size(model_id: str, store: Store) -> int:
-    """Everything the load is about to put in memory: the checkpoint, plus the drafter that
+    """Everything the load is about to put in memory: the checkpoint, plus the draft that
     lands with it when the model's settings name one."""
     from sideros_server.features import drafter_bytes
 

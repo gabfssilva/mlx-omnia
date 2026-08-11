@@ -54,20 +54,20 @@ def reference() -> Encodes:
 
 @pytest.mark.parametrize("text", CORPUS)
 def test_ids_match_transformers(tokenizer: ByteLevelBPE, reference: Encodes, text: str) -> None:
-    assert tokenizer.encode(text) == reference.encode(text)
+    assert list(tokenizer.encode(text)) == list(reference.encode(text))
 
 
 @pytest.mark.parametrize("text", CORPUS)
 def test_round_trip(tokenizer: ByteLevelBPE, text: str) -> None:
-    assert tokenizer.decode(tokenizer.encode(text)) == text
+    assert tokenizer.decode(list(tokenizer.encode(text))) == text
 
 
 @given(st.text())
 def test_round_trip_any_text(tokenizer: ByteLevelBPE, text: str) -> None:
-    assert tokenizer.decode(tokenizer.encode(text)) == text
+    assert tokenizer.decode(list(tokenizer.encode(text))) == text
 
 
 def test_round_trip_without_added_tokens(tokenizer: ByteLevelBPE) -> None:
     # `"|".join([])` is the empty pattern, which matches at every position.
     bare = replace(tokenizer, added={}, _added_pattern=regex.compile(""))
-    assert bare.decode(bare.encode("hello")) == "hello"
+    assert bare.decode(list(bare.encode("hello"))) == "hello"

@@ -7,19 +7,21 @@ sampled, and nothing in a checkpoint has an opinion about whether this daemon sh
 a second one in memory.
 
 `None` is unset and not off, at both levels, which is what lets a profile inherit. Off is
-the feature present with nothing named — `{"dflash": {"drafter": null}}` — which a profile
+the feature present with nothing named — `{"speculation": {"kind": null}}` — which a profile
 written to turn speculation off for one preset says, and goes on saying when the model's
 default changes.
 
-There is no boolean anywhere: what turns DFlash on is naming the checkpoint to draft with,
-because that is the thing the daemon has to load and there is no useful "on" without it.
+There is no boolean anywhere: what turns speculation on is naming the *technique*, because
+naming it is naming the thing the daemon has to load — a second checkpoint for `dflash`, this
+model's own MTP head for `mtp`. The field was `dflash` before there were two, and a row
+written under that name still reads (`Features._from_dflash`).
 
 A feature is not a sampling knob: what it changes is what the daemon loads and which loop
-runs. Whether the text may move is each feature's own contract — DFlash cannot change an
+runs. Whether the text may move is each feature's own contract — speculation cannot change an
 answer (the verification rule accepts only the target's own argmax) and a request that
 cannot speculate simply does not; a compressed KV cache rounds what attention reads and is
 allowed to. What no feature may be is on without this table saying so, or quietly replaced
-by something weaker when it cannot hold — DFlash skips, a KV policy refuses
+by something weaker when it cannot hold — speculation skips, a KV policy refuses
 (`NotQuantizable`), and neither pretends.
 """
 
@@ -27,16 +29,17 @@ import asyncio
 import json
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Annotated
+from typing import Annotated, Literal
 
 from fastapi import APIRouter, Depends, HTTPException, Request
-from pydantic import BaseModel, ConfigDict, Field, field_validator
+from pydantic import BaseModel, ConfigDict, Field, field_validator, model_validator
 
 from sideros import load_drafter
 from sideros.footprint import checkpoint_bytes
 from sideros.model import Wrapping
 from sideros.quant.quantization import MXFP, NVFP, Affine, Quantization
 from sideros.speculative import Drafting
+from sideros.task import MTP_PREFIX, has_mtp, mtp_head
 from sideros_server import catalog
 from sideros_server.engine import Compression, Engine
 from sideros_server.store import ModelSettings, Store
@@ -48,18 +51,46 @@ what the daemon accepts: an id this table has never heard of still loads if it i
 because a drafter quantized locally or trained by hand is a checkpoint like any other."""
 
 
-class DFlash(BaseModel):
-    """Block speculative decoding with a DFlash drafter. `drafter` names the checkpoint to
-    load, and naming it is what turns the feature on — `None` is off at this level."""
+class Speculation(BaseModel):
+    """Speculative decoding, by whichever technique this model has one for.
+
+    `kind` is what turns it on, and there is still no boolean: naming the technique is naming
+    the thing the daemon has to load. `None` is off — the feature present with nothing named,
+    which is what a profile written to turn speculation off for one preset says.
+
+    The two differ in where the draft comes from, and that is the whole reason `kind` exists:
+
+    - `dflash` is a **second checkpoint**, so `drafter` names it and is required. It proposes
+      a whole block in one non-causal forward against layers its own config names.
+    - `mtp` is a head **inside this model's own checkpoint** — `mtp.*` in the same shards the
+      trunk loads from — so there is no id to name and `drafter` must stay empty. Nine ported
+      families ship one; `sideros.has_mtp` says whether this engine can build it.
+    """
 
     model_config = ConfigDict(extra="forbid")
 
+    kind: Literal["dflash", "mtp"] | None = None
     drafter: str | None = None
     block_size: int | None = Field(default=None, ge=1)
-    """How many ids to propose a round, `None` for the drafter's own. It cannot exceed
-    what the checkpoint was trained to write in one forward, but it may fall short of it:
-    a shorter block pays less for a round that gets rejected, and which length wins is a
-    property of the prompt that only measurement answers."""
+    """How many ids to propose a round, `None` for the pair's own default. It cannot exceed
+    what a DFlash checkpoint was trained to write in one forward, but it may fall short of it;
+    for an MTP head it is how many times the step is chained. Which length wins is a property
+    of the prompt and the trunk that only measurement answers — on the Nemotron-3.5 30B-A3B
+    the sweep says 3, and 2 and 6 both lose."""
+
+    @model_validator(mode="after")
+    def _named(self) -> "Speculation":
+        """The two kinds disagree about `drafter`, and storing the wrong shape is a switch the
+        screen draws as on and the daemon cannot honour."""
+        if self.kind == "dflash" and not self.drafter:
+            raise ValueError("dflash speculation needs a drafter checkpoint to load")
+        if self.kind == "mtp" and self.drafter:
+            raise ValueError(
+                f"mtp speculation drafts with the model's own head, not with {self.drafter!r}"
+            )
+        if self.kind is None and self.drafter:
+            raise ValueError(f"{self.drafter!r} is named with no kind: speculation is off")
+        return self
 
 
 def format_of(spelled: str) -> Quantization:
@@ -132,8 +163,36 @@ class Features(BaseModel):
 
     model_config = ConfigDict(extra="forbid")
 
-    dflash: DFlash | None = None
+    speculation: Speculation | None = None
     kv_cache: KvCache | None = None
+
+    @model_validator(mode="before")
+    @classmethod
+    def _from_dflash(cls, data: object) -> object:
+        """`speculation` used to be `dflash`, and the rows already on users' disks say so.
+
+        Migrated on read rather than by a pass over the store: what a settings blob has to
+        survive is a release, and a daemon that rewrote every row at startup would be a
+        daemon that has to get it right once, with no second chance and nothing to compare
+        against. Read here, the old spelling keeps working and the next write puts the new
+        one down.
+        """
+        if not isinstance(data, dict) or "dflash" not in data:
+            return data
+        moved = dict(data)
+        old = moved.pop("dflash")
+        if "speculation" in moved:
+            raise ValueError("features carry both `dflash` and `speculation`")
+        if old is None:
+            moved["speculation"] = None
+        elif isinstance(old, dict):
+            # A row that named a drafter was on; one that named none was off, and off has no
+            # kind. Nothing written under the old name could have been MTP.
+            named = old.get("drafter")
+            moved["speculation"] = {**old, "kind": "dflash" if named else None}
+        else:
+            raise ValueError(f"`dflash` is not an object: {old!r}")
+        return moved
 
 
 def resolve(model: Features, profile: Features | None) -> Features:
@@ -166,38 +225,60 @@ def drafting(model: object) -> Drafting | None:
     return model
 
 
-def pair(model_id: str, model: object, dflash: DFlash | None) -> None:
-    """Give a freshly loaded model the drafter its settings name, or leave it alone.
+def _entry(model_id: str) -> object:
+    return next((found for found in catalog.scan() if found.id == model_id), None)
 
-    It happens at load and not per request because what it does is put a second checkpoint
-    in memory: a request that turns the feature off decodes without it (`speculate` on the
-    options), and one that wants a *different* drafter is a different residency, which is
-    why a profile may not name one (`profiles.save`).
+
+def pair(model_id: str, model: object, speculation: Speculation | None) -> None:
+    """Give a freshly loaded model the draft its settings name, or leave it alone.
+
+    It happens at load and not per request because what it does is put a second tree in
+    memory: a request that turns the feature off decodes without it (`speculate` on the
+    options), and one that wants a *different* draft is a different residency, which is why
+    a profile may not name one (`profiles.save`).
 
     Every failure here is a load that fails. A model paired with a drafter that is not on
     disk, or with a tree it cannot use, would otherwise be a model that quietly answers at
     the speed the switch says it does not have.
     """
-    if dflash is None or dflash.drafter is None:
+    if speculation is None or speculation.kind is None:
         return
     facade = drafting(model)
     if facade is None:
         raise ValueError(f"nothing under {model_id!r} takes a drafter")
-    entry = next((found for found in catalog.scan() if found.id == dflash.drafter), None)
-    if entry is None:
-        raise ValueError(f"the drafter {dflash.drafter!r} is not in the catalog")
-    facade.speculate_with(load_drafter(entry.directory), block_size=dflash.block_size)
+    if speculation.kind == "mtp":
+        entry = _entry(model_id)
+        if entry is None:
+            raise ValueError(f"no model {model_id!r} in the catalog")
+        directory = entry.directory
+        if not has_mtp(directory):
+            raise ValueError(f"{model_id!r} carries no MTP head this engine can build")
+        facade.speculate_with(mtp_head(directory), block_size=speculation.block_size)
+        return
+    found = _entry(speculation.drafter or "")
+    if found is None:
+        raise ValueError(f"the drafter {speculation.drafter!r} is not in the catalog")
+    facade.speculate_with(
+        load_drafter(found.directory), block_size=speculation.block_size
+    )
 
 
 def drafter_bytes(model_id: str, store: Store) -> int:
-    """What this model's drafter weighs on disk, 0 for a model with none. Admission needs
-    it before the load: the drafter lands with the model and its bytes are as resident as
-    the model's."""
-    dflash = parse(store.model_settings(model_id).features).dflash
-    if dflash is None or dflash.drafter is None:
+    """What this model's draft weighs on disk, 0 for a model with none. Admission needs it
+    before the load: the draft lands with the model and its bytes are as resident as the
+    model's.
+
+    An MTP head weighs even though it downloads nothing — it is `mtp.*` in shards already
+    counted by `_checkpoint_size`, which the trunk's loader drops. Counting it twice would be
+    wrong and counting it not at all would let a model in that does not fit."""
+    speculation = parse(store.model_settings(model_id).features).speculation
+    if speculation is None or speculation.kind is None:
         return 0
-    entry = next((found for found in catalog.scan() if found.id == dflash.drafter), None)
-    return 0 if entry is None else checkpoint_bytes(entry.directory)
+    if speculation.kind == "mtp":
+        entry = _entry(model_id)
+        return 0 if entry is None else checkpoint_bytes(entry.directory, MTP_PREFIX)
+    found = _entry(speculation.drafter or "")
+    return 0 if found is None else checkpoint_bytes(found.directory)
 
 
 def compression(kv_cache: KvCache | None) -> Compression | None:
@@ -225,28 +306,38 @@ def compressing(store: Store, model_id: str) -> Compression | None:
 @dataclass(frozen=True)
 class Availability:
     """What the UI needs to draw the switch: the drafters this model is known to pair with,
-    and why the list is empty when it is. An empty list is not a closed door — any installed
-    checkpoint can be named — it is the screen having nothing to suggest."""
+    whether it carries a head of its own, and why there is nothing to offer when there is
+    not. An empty list is not a closed door — any installed checkpoint can be named — it is
+    the screen having nothing to suggest."""
 
     drafters: list[str]
+    mtp: bool = False
     reason: str | None = None
 
 
 def availability(model_id: str) -> Availability:
     """One scan, not one per question. Pricing the whole catalog is ~500 ms of headers on
     a disk with eighty checkpoints, and this route is drawn on every card: asking twice —
-    once for this model's architecture, once for the drafters — doubled it."""
+    once for this model's architecture, once for the drafters — doubled it.
+
+    The MTP half asks the checkpoint and not a table: whether the head is *there* is a fact
+    about the file, and a `nemotron_h` entry quantized before the head was kept has the
+    architecture and none of the tensors. `has_mtp` reads the shard headers, which the scan
+    has already paid for."""
     entries = catalog.scan()
-    architecture = next((entry.architecture for entry in entries if entry.id == model_id), None)
-    if architecture is None:
+    entry = next((found for found in entries if found.id == model_id), None)
+    if entry is None:
         raise HTTPException(status_code=404, detail=f"no model {model_id!r}")
-    if architecture not in DRAFTERS.values():
-        return Availability([], f"no drafter architecture is declared for {architecture!r}")
-    kinds = {drafter for drafter, target in DRAFTERS.items() if target == architecture}
-    drafters = [entry.id for entry in entries if entry.architecture in kinds]
-    if not drafters:
-        return Availability([], "no drafter for this model is installed")
-    return Availability(drafters)
+    mtp = has_mtp(entry.directory)
+    kinds = {drafter for drafter, target in DRAFTERS.items() if target == entry.architecture}
+    drafters = [found.id for found in entries if found.architecture in kinds]
+    if drafters or mtp:
+        return Availability(drafters, mtp)
+    if entry.architecture not in DRAFTERS.values():
+        return Availability(
+            [], False, f"no draft this engine can build for {entry.architecture!r}"
+        )
+    return Availability([], False, "no drafter for this model is installed")
 
 
 class SettingsView(BaseModel):
@@ -257,6 +348,10 @@ class SettingsView(BaseModel):
     model: str
     features: Features
     available: list[str]
+    mtp_available: bool = False
+    """Whether this checkpoint carries an MTP head this engine can build. Read from the
+    shards on every read, like `available`: a model requantized without the head turns the
+    switch unavailable without anything having to rewrite the row that named it."""
     unavailable_reason: str | None = None
 
 
@@ -290,6 +385,7 @@ def _view(model_id: str, features: Features) -> SettingsView:
         model=model_id,
         features=features,
         available=found.drafters,
+        mtp_available=found.mtp,
         unavailable_reason=found.reason,
     )
 
@@ -345,18 +441,30 @@ def _save(model_id: str, body: SettingsBody, store: Store) -> SettingsView:
             status_code=409,
             detail="a compressed KV cache takes a format for k and one for v, not one of the two",
         )
-    dflash = body.features.dflash
-    if dflash is not None and dflash.drafter is not None:
-        entry = next((found for found in catalog.scan() if found.id == dflash.drafter), None)
+    speculation = body.features.speculation
+    if speculation is not None and speculation.kind == "mtp":
+        # The head is not an id to look up: it is either in this checkpoint's shards or it is
+        # not, and a switch stored against a checkpoint that has none is one the next load
+        # fails on.
+        entry = next((found for found in catalog.scan() if found.id == model_id), None)
         if entry is None:
-            raise HTTPException(
-                status_code=409, detail=f"{dflash.drafter!r} is not in the catalog"
-            )
-        block = declared_block_size(entry.directory)
-        if dflash.block_size is not None and block is not None and dflash.block_size > block:
+            raise HTTPException(status_code=409, detail=f"{model_id!r} is not in the catalog")
+        if not has_mtp(entry.directory):
             raise HTTPException(
                 status_code=409,
-                detail=f"{dflash.drafter!r} writes {block} ids a round, not {dflash.block_size}",
+                detail=f"{model_id!r} carries no MTP head this engine can build",
+            )
+    elif speculation is not None and speculation.drafter is not None:
+        named = speculation.drafter
+        entry = next((found for found in catalog.scan() if found.id == named), None)
+        if entry is None:
+            raise HTTPException(status_code=409, detail=f"{named!r} is not in the catalog")
+        block = declared_block_size(entry.directory)
+        asked = speculation.block_size
+        if asked is not None and block is not None and asked > block:
+            raise HTTPException(
+                status_code=409,
+                detail=f"{named!r} writes {block} ids a round, not {speculation.block_size}",
             )
     store.save_model_settings(
         ModelSettings(model_id, body.features.model_dump_json(exclude_none=True))

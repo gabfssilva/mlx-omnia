@@ -17,7 +17,7 @@ from fastapi.testclient import TestClient
 
 from sideros_server import Engine, catalog, create_app, features
 from sideros_server.engine import Residency
-from sideros_server.features import DFlash, Features, resolve
+from sideros_server.features import Features, Speculation, resolve
 from sideros_server.profiles import ProfileView, Sampling, speculating, switches
 from sideros_server.store import ModelSettings, Store
 
@@ -47,7 +47,14 @@ def hub(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> Path:
     return root
 
 
-def installed(hub: Path, model_id: str, model_type: str, block_size: int | None = None) -> None:
+def installed(
+    hub: Path,
+    model_id: str,
+    model_type: str,
+    block_size: int | None = None,
+    *,
+    mtp: bool = False,
+) -> None:
     repository = hub / f"models--{model_id.replace('/', '--')}"
     snapshot = repository / "snapshots" / "head"
     snapshot.mkdir(parents=True)
@@ -58,10 +65,21 @@ def installed(hub: Path, model_id: str, model_type: str, block_size: int | None 
     }
     (snapshot / "config.json").write_text(json.dumps(config))
     # A real one-tensor shard rather than 64 zero bytes: what a checkpoint weighs is read
-    # off the header, and admission has to be able to weigh a drafter.
-    header = json.dumps({"w": {"dtype": "F32", "shape": [16], "data_offsets": [0, 64]}}).encode()
+    # off the header, and admission has to be able to weigh a drafter. `mtp` adds a second
+    # tensor under the prefix the head lives at, which is the only thing that tells a
+    # checkpoint carrying one from a checkpoint that does not.
+    tensors: dict[str, object] = {"w": {"dtype": "F32", "shape": [16], "data_offsets": [0, 64]}}
+    payload = 64
+    if mtp:
+        tensors["mtp.layers.0.eh_proj.weight"] = {
+            "dtype": "F32",
+            "shape": [8],
+            "data_offsets": [64, 96],
+        }
+        payload = 96
+    header = json.dumps(tensors).encode()
     (snapshot / "model.safetensors").write_bytes(
-        len(header).to_bytes(8, "little") + header + b"\0" * 64
+        len(header).to_bytes(8, "little") + header + b"\0" * payload
     )
     (repository / "refs").mkdir(parents=True)
     (repository / "refs" / "main").write_text("head")
@@ -71,13 +89,14 @@ def test_a_model_nobody_configured_has_no_switches_set(client: TestClient, hub: 
     installed(hub, TARGET, "muse_glimmer")
     response = client.get(f"/admin/models/{TARGET}/settings")
     assert response.status_code == 200, response.text
-    assert response.json()["features"] == {"dflash": None, "kv_cache": None}
+    assert response.json()["features"] == {"speculation": None, "kv_cache": None}
 
 
 def test_a_drafter_that_is_not_on_disk_cannot_be_named(client: TestClient, hub: Path) -> None:
     installed(hub, TARGET, "muse_glimmer")
     response = client.put(
-        f"/admin/models/{TARGET}/settings", json={"features": {"dflash": {"drafter": DRAFTER}}}
+        f"/admin/models/{TARGET}/settings",
+        json={"features": {"speculation": {"kind": "dflash", "drafter": DRAFTER}}},
     )
     assert response.status_code == 409
     assert "catalog" in response.json()["detail"]
@@ -97,11 +116,15 @@ def test_naming_an_installed_drafter_is_what_turns_it_on(client: TestClient, hub
 
     response = client.put(
         f"/admin/models/{TARGET}/settings",
-        json={"features": {"dflash": {"drafter": DRAFTER}}},
+        json={"features": {"speculation": {"kind": "dflash", "drafter": DRAFTER}}},
     )
     assert response.status_code == 200, response.text
     stored = client.get(f"/admin/models/{TARGET}/settings").json()
-    assert stored["features"]["dflash"] == {"drafter": DRAFTER, "block_size": None}
+    assert stored["features"]["speculation"] == {
+        "kind": "dflash",
+        "drafter": DRAFTER,
+        "block_size": None,
+    }
 
 
 def test_a_drafter_nobody_declared_a_pairing_for_is_still_accepted(
@@ -113,16 +136,17 @@ def test_a_drafter_nobody_declared_a_pairing_for_is_still_accepted(
     installed(hub, TARGET, "muse_glimmer")
     installed(hub, OTHER, "qwen3")
     response = client.put(
-        f"/admin/models/{TARGET}/settings", json={"features": {"dflash": {"drafter": OTHER}}}
+        f"/admin/models/{TARGET}/settings",
+        json={"features": {"speculation": {"kind": "dflash", "drafter": OTHER}}},
     )
     assert response.status_code == 200, response.text
-    assert response.json()["features"]["dflash"]["drafter"] == OTHER
+    assert response.json()["features"]["speculation"]["drafter"] == OTHER
 
 
 def test_a_block_longer_than_the_drafter_writes_is_refused(client: TestClient, hub: Path) -> None:
     installed(hub, TARGET, "muse_glimmer")
     installed(hub, DRAFTER, "muse_glimmer_assistant", block_size=16)
-    body = {"features": {"dflash": {"drafter": DRAFTER, "block_size": 32}}}
+    body = {"features": {"speculation": {"kind": "dflash", "drafter": DRAFTER, "block_size": 32}}}
     response = client.put(f"/admin/models/{TARGET}/settings", json=body)
     assert response.status_code == 409
     assert "16" in response.json()["detail"]
@@ -133,10 +157,10 @@ def test_a_shorter_block_is_stored(client: TestClient, hub: Path) -> None:
     eight costs less than one of sixteen, and which wins is measured, not declared."""
     installed(hub, TARGET, "muse_glimmer")
     installed(hub, DRAFTER, "muse_glimmer_assistant", block_size=16)
-    body = {"features": {"dflash": {"drafter": DRAFTER, "block_size": 8}}}
+    body = {"features": {"speculation": {"kind": "dflash", "drafter": DRAFTER, "block_size": 8}}}
     assert client.put(f"/admin/models/{TARGET}/settings", json=body).status_code == 200
     stored = client.get(f"/admin/models/{TARGET}/settings").json()
-    assert stored["features"]["dflash"]["block_size"] == 8
+    assert stored["features"]["speculation"]["block_size"] == 8
 
 
 def test_the_switch_survives_the_settings_route_sharing_admin_models(
@@ -149,14 +173,16 @@ def test_the_switch_survives_the_settings_route_sharing_admin_models(
 
 
 def on(block_size: int | None = None) -> str:
-    return Features(dflash=DFlash(drafter=DRAFTER, block_size=block_size)).model_dump_json()
+    paired = Speculation(kind="dflash", drafter=DRAFTER, block_size=block_size)
+    return Features(speculation=paired).model_dump_json()
 
 
 def test_a_profile_overrides_the_models_setting(store: Store) -> None:
     store.save_model_settings(ModelSettings(TARGET, on()))
-    careful = ProfileView(TARGET, "careful", Sampling(), features=Features(dflash=DFlash()))
+    off = Features(speculation=Speculation())
+    careful = ProfileView(TARGET, "careful", Sampling(), features=off)
     resolved = switches(store, TARGET, careful)
-    assert resolved.dflash is not None and resolved.dflash.drafter is None
+    assert resolved.speculation is not None and resolved.speculation.drafter is None
 
 
 def test_a_profile_may_override_only_the_block_length(store: Store) -> None:
@@ -164,30 +190,30 @@ def test_a_profile_may_override_only_the_block_length(store: Store) -> None:
     the drafter again, because half a feature resolved from two levels is a setting nobody
     can read off the screen."""
     store.save_model_settings(ModelSettings(TARGET, on()))
-    short = Features(dflash=DFlash(drafter=DRAFTER, block_size=8))
+    short = Features(speculation=Speculation(kind="dflash", drafter=DRAFTER, block_size=8))
     resolved = switches(store, TARGET, ProfileView(TARGET, "short", Sampling(), features=short))
-    assert resolved.dflash == DFlash(drafter=DRAFTER, block_size=8)
+    assert resolved.speculation == Speculation(kind="dflash", drafter=DRAFTER, block_size=8)
 
 
 def test_a_profile_that_says_nothing_inherits(store: Store) -> None:
     store.save_model_settings(ModelSettings(TARGET, on()))
     quiet = ProfileView(TARGET, "quiet", Sampling())
     resolved = switches(store, TARGET, quiet)
-    assert resolved.dflash is not None and resolved.dflash.drafter == DRAFTER
+    assert resolved.speculation is not None and resolved.speculation.drafter == DRAFTER
 
 
 def test_no_profile_is_the_models_own_setting(store: Store) -> None:
     store.save_model_settings(ModelSettings(TARGET, on(block_size=8)))
     resolved = switches(store, TARGET, None)
-    assert resolved.dflash == DFlash(drafter=DRAFTER, block_size=8)
+    assert resolved.speculation == Speculation(kind="dflash", drafter=DRAFTER, block_size=8)
 
 
 def test_unset_is_not_off() -> None:
     """The distinction the whole two-level shape rests on: a profile that leaves a feature
     unset inherits it, and one that turns it off keeps it off when the model changes."""
-    enabled = Features(dflash=DFlash(drafter=DRAFTER))
-    assert resolve(enabled, Features()).dflash == DFlash(drafter=DRAFTER)
-    assert resolve(enabled, Features(dflash=DFlash())).dflash == DFlash()
+    enabled = Features(speculation=Speculation(kind="dflash", drafter=DRAFTER))
+    assert resolve(enabled, Features()).speculation == Speculation(kind="dflash", drafter=DRAFTER)
+    assert resolve(enabled, Features(speculation=Speculation())).speculation == Speculation()
 
 
 class Facade:
@@ -218,7 +244,8 @@ def test_a_model_whose_settings_name_a_drafter_is_paired_at_load(
     monkeypatch.setattr(features, "load_drafter", lambda directory: loaded.append(directory))
     facade = Facade()
 
-    features.pair(TARGET, Wrapper(facade), DFlash(drafter=DRAFTER, block_size=4))
+    paired = Speculation(kind="dflash", drafter=DRAFTER, block_size=4)
+    features.pair(TARGET, Wrapper(facade), paired)
 
     assert len(loaded) == 1 and loaded[0].name == "head"
     assert facade.block == 4
@@ -229,7 +256,7 @@ def test_a_model_with_the_feature_off_is_left_alone(monkeypatch: pytest.MonkeyPa
     facade = Facade()
 
     features.pair(TARGET, Wrapper(facade), None)
-    features.pair(TARGET, Wrapper(facade), DFlash())
+    features.pair(TARGET, Wrapper(facade), Speculation())
 
     assert facade.drafter is None
 
@@ -240,13 +267,13 @@ def test_pairing_a_drafter_that_left_the_disk_fails_the_load(hub: Path) -> None:
     setting into a load that stops."""
     del hub
     with pytest.raises(ValueError, match="not in the catalog"):
-        features.pair(TARGET, Wrapper(Facade()), DFlash(drafter=DRAFTER))
+        features.pair(TARGET, Wrapper(Facade()), Speculation(kind="dflash", drafter=DRAFTER))
 
 
 def test_a_model_that_takes_no_drafter_fails_the_load(hub: Path) -> None:
     installed(hub, DRAFTER, "muse_glimmer_assistant")
     with pytest.raises(ValueError, match="takes a drafter"):
-        features.pair(TARGET, object(), DFlash(drafter=DRAFTER))
+        features.pair(TARGET, object(), Speculation(kind="dflash", drafter=DRAFTER))
 
 
 def test_the_drafter_counts_towards_what_the_load_is_admitted_for(hub: Path, store: Store) -> None:
@@ -255,7 +282,10 @@ def test_the_drafter_counts_towards_what_the_load_is_admitted_for(hub: Path, sto
     assert features.drafter_bytes(TARGET, store) == 0
 
     store.save_model_settings(
-        ModelSettings(TARGET, Features(dflash=DFlash(drafter=DRAFTER)).model_dump_json())
+        ModelSettings(
+            TARGET,
+            Features(speculation=Speculation(kind="dflash", drafter=DRAFTER)).model_dump_json(),
+        )
     )
 
     assert features.drafter_bytes(TARGET, store) > 0
@@ -270,18 +300,19 @@ def test_a_profile_may_turn_dflash_off_but_not_name_another_drafter(
     installed(hub, DRAFTER, "muse_glimmer_assistant")
     installed(hub, OTHER, "qwen3")
     client.put(
-        f"/admin/models/{TARGET}/settings", json={"features": {"dflash": {"drafter": DRAFTER}}}
+        f"/admin/models/{TARGET}/settings",
+        json={"features": {"speculation": {"kind": "dflash", "drafter": DRAFTER}}},
     )
 
     off = client.put(
         f"/admin/models/{TARGET}/profiles/careful",
-        json={"sampling": {}, "features": {"dflash": {"drafter": None}}},
+        json={"sampling": {}, "features": {"speculation": {"kind": None}}},
     )
     assert off.status_code == 200, off.text
 
     other = client.put(
         f"/admin/models/{TARGET}/profiles/fast",
-        json={"sampling": {}, "features": {"dflash": {"drafter": OTHER}}},
+        json={"sampling": {}, "features": {"speculation": {"kind": "dflash", "drafter": OTHER}}},
     )
     assert other.status_code == 409
     assert DRAFTER in other.json()["detail"]
@@ -289,7 +320,7 @@ def test_a_profile_may_turn_dflash_off_but_not_name_another_drafter(
 
 def test_speculating_reads_the_two_levels(store: Store) -> None:
     store.save_model_settings(ModelSettings(TARGET, on()))
-    off = ProfileView(TARGET, "careful", Sampling(), features=Features(dflash=DFlash()))
+    off = ProfileView(TARGET, "careful", Sampling(), features=Features(speculation=Speculation()))
 
     assert speculating(store, TARGET, None) is True
     assert speculating(store, TARGET, ProfileView(TARGET, "quiet", Sampling())) is True
@@ -312,8 +343,116 @@ def test_changing_the_switch_lets_go_of_the_model_holding_the_old_one(
 
         response = client.put(
             f"/admin/models/{TARGET}/settings",
-            json={"features": {"dflash": {"drafter": DRAFTER}}},
+            json={"features": {"speculation": {"kind": "dflash", "drafter": DRAFTER}}},
         )
 
         assert response.status_code == 200, response.text
         assert engine.resident == []
+
+
+NEMOTRON = "nvidia/NVIDIA-Nemotron-3.5-Lightning-30B-A3B-BF16"
+
+
+def test_a_row_written_as_dflash_still_reads(client: TestClient, hub: Path) -> None:
+    """The field was `dflash` before there were two techniques, and settings blobs on disk
+    say so. Migrated on read, so a daemon that never rewrote a row keeps honouring it — and
+    the literal old JSON is what this asserts, not a shape reconstructed from the new one."""
+    old = '{"dflash": {"drafter": "meta-models/Muse-Glimmer-30B-assistant", "block_size": 4}}'
+    parsed = features.parse(old)
+
+    assert parsed.speculation is not None
+    assert parsed.speculation.kind == "dflash"
+    assert parsed.speculation.drafter == DRAFTER
+    assert parsed.speculation.block_size == 4
+
+    # And off stays off: a row that named nothing was off, and off has no kind.
+    assert features.parse('{"dflash": {"drafter": null}}').speculation == Speculation()
+    assert features.parse('{"dflash": null}').speculation is None
+    with pytest.raises(ValueError, match="both"):
+        features.parse('{"dflash": {}, "speculation": {}}')
+
+
+def test_mtp_is_offered_by_the_checkpoint_and_not_by_a_table(client: TestClient, hub: Path) -> None:
+    """A drafter is offered because a table pairs two architectures; an MTP head is offered
+    because the tensors are *in the file*. The same architecture without them offers nothing,
+    which is the case a `nemotron_h` entry quantized before the head was kept lands in."""
+    installed(hub, NEMOTRON, "nemotron_h", mtp=True)
+    assert client.get(f"/admin/models/{NEMOTRON}/settings").json()["mtp_available"] is True
+
+    installed(hub, "local/nemotron-no-head", "nemotron_h")
+    view = client.get("/admin/models/local/nemotron-no-head/settings").json()
+    assert view["mtp_available"] is False
+    assert "nemotron_h" in (view["unavailable_reason"] or "")
+
+
+def test_turning_mtp_on_names_no_drafter(client: TestClient, hub: Path) -> None:
+    installed(hub, NEMOTRON, "nemotron_h", mtp=True)
+    response = client.put(
+        f"/admin/models/{NEMOTRON}/settings",
+        json={"features": {"speculation": {"kind": "mtp", "block_size": 3}}},
+    )
+    assert response.status_code == 200, response.text
+    assert response.json()["features"]["speculation"] == {
+        "kind": "mtp",
+        "drafter": None,
+        "block_size": 3,
+    }
+
+
+def test_mtp_on_a_checkpoint_without_a_head_is_refused(client: TestClient, hub: Path) -> None:
+    """Refused at the switch and not at the next load: the row would otherwise be a model
+    that fails to come back the first time somebody talks to it."""
+    installed(hub, "local/nemotron-no-head", "nemotron_h")
+    response = client.put(
+        "/admin/models/local/nemotron-no-head/settings",
+        json={"features": {"speculation": {"kind": "mtp"}}},
+    )
+    assert response.status_code == 409
+    assert "no MTP head" in response.json()["detail"]
+
+
+def test_naming_a_drafter_for_mtp_is_refused_by_the_shape(client: TestClient, hub: Path) -> None:
+    """The two kinds disagree about `drafter`, and the model says so before the route does."""
+    installed(hub, NEMOTRON, "nemotron_h", mtp=True)
+    response = client.put(
+        f"/admin/models/{NEMOTRON}/settings",
+        json={"features": {"speculation": {"kind": "mtp", "drafter": DRAFTER}}},
+    )
+    assert response.status_code == 400, response.text
+    assert "own head" in response.text
+
+
+def test_the_mtp_head_counts_towards_what_the_load_is_admitted_for(
+    hub: Path, store: Store
+) -> None:
+    """It downloads nothing and it is still resident. `_checkpoint_size` takes `mtp.*` off
+    the trunk — the loader drops it — so this is what puts it back, and only when on."""
+    installed(hub, NEMOTRON, "nemotron_h", mtp=True)
+    store.save_model_settings(ModelSettings(NEMOTRON, Features().model_dump_json()))
+    assert features.drafter_bytes(NEMOTRON, store) == 0
+
+    store.save_model_settings(
+        ModelSettings(NEMOTRON, Features(speculation=Speculation(kind="mtp")).model_dump_json())
+    )
+    assert features.drafter_bytes(NEMOTRON, store) == 32
+
+
+def test_pairing_mtp_loads_the_head_out_of_the_model_itself(
+    hub: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """No id is looked up: the directory the head comes from is the model's own."""
+    installed(hub, NEMOTRON, "nemotron_h", mtp=True)
+    loaded: list[Path] = []
+    monkeypatch.setattr(features, "mtp_head", lambda directory: loaded.append(directory))
+    facade = Facade()
+
+    features.pair(NEMOTRON, Wrapper(facade), Speculation(kind="mtp", block_size=3))
+
+    assert len(loaded) == 1 and loaded[0].name == "head"
+    assert facade.block == 3
+
+
+def test_pairing_mtp_on_a_checkpoint_without_a_head_fails_the_load(hub: Path) -> None:
+    installed(hub, "local/nemotron-no-head", "nemotron_h")
+    with pytest.raises(ValueError, match="no MTP head"):
+        features.pair("local/nemotron-no-head", Wrapper(Facade()), Speculation(kind="mtp"))

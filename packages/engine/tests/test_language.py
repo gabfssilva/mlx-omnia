@@ -1,3 +1,4 @@
+from collections.abc import Iterator
 from dataclasses import dataclass
 
 import mlx.core as mx
@@ -250,3 +251,81 @@ def test_two_models_do_not_share_a_prefix_for_the_same_prompt() -> None:
 
     assert first.prefix is not second.prefix
     assert two.step == one.step, "the second trunk read its own prompt instead of a cache"
+
+
+class _Clock:
+    """A monotonic tick, so an ordering can be asserted without a wall clock."""
+
+    def __init__(self) -> None:
+        self.now = 0
+
+    def tick(self) -> int:
+        self.now += 1
+        return self.now
+
+
+class _Watched(ScriptedLM):
+    """A trunk that records the tick of every forward it is given."""
+
+    def __init__(self, ids: list[int], clock: _Clock, vocab: int = 256) -> None:
+        super().__init__(ids, vocab)
+        self.clock = clock
+        self.forwards: list[int] = []
+        self.rows: list[int] = []
+
+    def __call__(self, ids: mx.array, cache: list[KVCache] | None = None) -> mx.array:
+        self.forwards.append(self.clock.tick())
+        self.rows.append(int(ids.shape[1]))
+        return super().__call__(ids, cache)
+
+
+class _Pieces:
+    """A tokenizer whose ids are one per character, cut wherever the text is cut: what is
+    under test here is when the forwards happen, not where a real BPE may break."""
+
+    def encode(self, text: str | Iterator[str]) -> Iterator[int]:
+        chunks = (text,) if isinstance(text, str) else text
+        for chunk in chunks:
+            yield from (ord(character) % 200 + 1 for character in chunk)
+
+    def decode_bytes(self, ids: list[int]) -> bytes:
+        return b"x" * len(ids)
+
+
+def test_the_prompt_is_prefilled_while_it_is_still_being_written() -> None:
+    """The whole point of a prompt that arrives: the decoder's forwards are interleaved with
+    the pieces, not queued behind the last one.
+
+    Each piece stamps the clock as it is produced and each forward stamps it as it runs. If
+    the prefill waited for the prompt, every forward would carry a tick past every piece.
+    """
+    clock = _Clock()
+    written: list[int] = []
+
+    def writing() -> Iterator[str]:
+        for _ in range(8):
+            written.append(clock.tick())
+            yield "x" * 64
+
+    trunk = _Watched([2], clock)
+    model = TextLanguageModel(trunk, _Pieces())
+    list(model.stream(Text(writing()), GenerationOptions(max_tokens=1)))
+
+    assert len(written) == 8
+    assert trunk.forwards, "the trunk was never run"
+    overlapped = [at for at in trunk.forwards if at < written[-1]]
+    assert overlapped, f"every forward waited for the whole prompt: {trunk.forwards} vs {written}"
+    # And the prompt reached the trunk in pieces rather than as one row of 512.
+    assert max(trunk.rows) < 512
+
+
+def test_a_whole_prompt_still_prefills_in_one_block() -> None:
+    """The other side of the same loop: nothing arriving means nothing to interleave, and a
+    prompt of this size is one block, so the trunk is run once for it."""
+    clock = _Clock()
+    trunk = _Watched([2], clock)
+    model = TextLanguageModel(trunk, _Pieces())
+    list(model.stream(Text("x" * 512), GenerationOptions(max_tokens=1)))
+    # 512 rows in one forward, then the single decode step the loop queues ahead of the id
+    # it is about to read. Cut into the blocks a producer needs, this would be nine.
+    assert trunk.rows == [512, 1]

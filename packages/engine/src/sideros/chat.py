@@ -20,7 +20,7 @@ fluent, wrong text.
 """
 
 import json
-from collections.abc import Callable, Mapping, Sequence
+from collections.abc import Callable, Iterator, Mapping, Sequence
 from dataclasses import dataclass
 from datetime import datetime
 from pathlib import Path
@@ -33,13 +33,21 @@ import jinja2.parser
 import jinja2.runtime
 from jinja2.sandbox import ImmutableSandboxedEnvironment
 
-from sideros.language import TEXT, LanguagePrompt, Text
-from sideros.model import AtomicInput, ContentType, Modality, ModelInput, Wrapping
-from sideros.parsers import Parser, parser_for
+from sideros.language import TEXT, GenerationOptions, LanguageModel, LanguagePrompt, Text
+from sideros.model import (
+    AtomicInput,
+    CompositeModel,
+    ContentType,
+    Modality,
+    ModelInput,
+    Wrapping,
+)
+from sideros.parsers import Parser, Segment, parser_for
 from sideros.vision import RGB_IMAGE, Image
 
 __all__ = [
     "CHAT",
+    "DESCRIBE",
     "Chat",
     "ChatCapability",
     "ChatMessage",
@@ -48,9 +56,11 @@ __all__ = [
     "ImageMarkerMismatch",
     "ImagePart",
     "MultimodalChatCapability",
+    "SeeingChat",
     "TextPart",
     "chat_capabilities",
     "chat_template",
+    "composite",
     "parser_of",
     "template_of",
 ]
@@ -387,6 +397,141 @@ class MultimodalChatCapability:
         return LanguagePrompt(tuple(parts))
 
 
+DESCRIBE = (
+    "Describe what is visible in this image in one or two sentences."
+    " Describe only, do not comment."
+)
+"""What a vision model is asked for when it stands in for eyes the text model has not got.
+
+It forbids commentary because the caption is read by a decoder that cannot check it: asked
+to describe an image "so that questions can be answered about it", the models in
+circulation write out the questions too, and a small decoder answers the ones it was handed
+instead of the one that was asked."""
+
+
+_MARKER = "\x00sideros:image\x00"
+"""Where a picture stands in the conversation handed to the template, and therefore where its
+caption is cut back into the rendered prompt. A control character because the cut has to be
+unambiguous: anything spellable is something a user can type, and a marker found in a message
+would splice a caption into the middle of someone's sentence. The count is checked after the
+render either way."""
+
+
+@dataclass(frozen=True)
+class SeeingChat:
+    """A conversation carrying images as the input of a text model that takes none. Every
+    image is replaced by what `vision` says about it, and the conversation is then rendered
+    by the text model's own template.
+
+    What the two other capabilities do with the checkpoint's own tower, this does with a
+    second model: the images never reach the decoder, only prose about them. Nothing here
+    is that decoder's semantics — it is prompted with text a user could have typed."""
+
+    vision: LanguageModel[ModelInput]
+    main_template: ChatTemplate
+    """The chat template of the model that answers, which is what the conversation is
+    rendered by once the captions are in it."""
+    vision_template: str = DESCRIBE
+    """What the model that looks is asked for, which is a prompt and not a template of the
+    kind above: a checkpoint being asked to describe a picture is having a conversation, and
+    its own template renders that one on the far side of `stream`."""
+    vision_max_tokens: int = 128
+    """The caption's own budget, which is not the request's: what the decoder is told about
+    a picture is this capability's business, and a request asking for one word of answer
+    still needs the whole description."""
+
+    @property
+    def input_type(self) -> ContentType:
+        return CHAT
+
+    @property
+    def target_types(self) -> frozenset[ContentType]:
+        return frozenset({TEXT})
+
+    def accepts(self, input: ModelInput) -> bool:
+        return isinstance(input, Chat)
+
+    def prepare(self, input: ModelInput) -> Text:
+        """The prompt as something still being written, not as a string.
+
+        The render happens first and once, over a conversation whose pictures are a marker:
+        the template has to see the whole thing to produce a prompt, and only text can pass
+        through jinja. Cutting the result on the marker gives back what is already written on
+        either side of each caption, so the pieces before the first picture reach the
+        decoder's prefill while the model that looks is still writing.
+        """
+        assert isinstance(input, Chat)
+        marked = Chat(
+            tuple(self._marked(message) for message in input.messages),
+            input.tools,
+            input.reasoning_effort,
+        )
+        rendered = self.main_template.render(marked)
+        images = _images(input)
+        chunks = rendered.split(_MARKER)
+        if len(chunks) != len(images) + 1:
+            raise ImageMarkerMismatch(len(images), len(chunks) - 1)
+        if not images:
+            return Text(rendered, self.main_template.parser)
+        return Text(self._arriving(chunks, images), self.main_template.parser)
+
+    def _marked(self, message: ChatMessage) -> ChatMessage:
+        """Flat text and not parts: a text-only checkpoint's template reads `content` as a
+        string — Qwen3's calls `startswith` on it — and raises on the list a multimodal one
+        expects. Each picture goes in as `_MARKER`, which is where its caption will be cut
+        back in."""
+        content = message["content"]
+        if isinstance(content, str):
+            return message
+        return {
+            "role": message["role"],
+            "content": "\n".join(
+                part["text"] if part["type"] == "text" else _MARKER for part in content
+            ),
+        }
+
+    def _arriving(self, chunks: list[str], images: tuple[Image, ...]) -> Iterator[str]:
+        for chunk, image in zip(chunks, images, strict=False):
+            if chunk:
+                yield chunk
+            yield "[image: "
+            yield from self._caption(image)
+            yield "]"
+        if chunks[-1]:
+            yield chunks[-1]
+
+    def _caption(self, image: Image) -> Iterator[str]:
+        """The description as the model writes it, piece by piece — which is the whole of what
+        the decoder downstream is waiting on, and the reason it does not wait for all of it.
+
+        Content alone: what the vision model thought on the way to the description is not the
+        description, and read into the prompt it is a decoder answering someone's
+        deliberation about the picture. Thinking is off for the reason the budget is small —
+        a caption is a lookup, and a model reasoning its way to one spends the budget before
+        reaching the text.
+        """
+        question: ChatMessage = {
+            "role": "user",
+            "content": (
+                {"type": "image", "image": image},
+                {"type": "text", "text": self.vision_template},
+            ),
+        }
+        ask = Chat((question,), reasoning_effort="off")
+        started = False
+        for piece in self.vision.stream(ask, GenerationOptions(max_tokens=self.vision_max_tokens)):
+            if piece.channel != "content":
+                continue
+            # Only the leading run is stripped, and it is stripped by holding the pieces that
+            # are all space: the trailing end cannot be found without keeping the last piece
+            # back, which is one caption's worth of latency for a space before a `]`.
+            text = piece.text if started else piece.text.lstrip()
+            if not text:
+                continue
+            started = True
+            yield text
+
+
 @runtime_checkable
 class _Composed(Protocol):
     """A model that answers for inputs it does not take natively — `CompositeModel`, whose
@@ -412,6 +557,46 @@ def template_of(model: object) -> ChatTemplate | None:
         if not isinstance(model, Wrapping):
             return None
         model = model.model
+
+
+def composite(
+    model: LanguageModel[ModelInput],
+    vision: LanguageModel[ModelInput],
+    vision_template: str | None = None,
+) -> CompositeModel[ModelInput, Segment, GenerationOptions]:
+    """`model` with `vision` behind it: a text-only decoder answering conversations that
+    carry images, by being told what is in them.
+
+    Both are what `load` hands back. A conversation without images never reaches the vision
+    model — the composite offers the input to `model` first, and a text checkpoint already
+    takes those through its own `ChatCapability`; only what that one refuses falls through
+    to here.
+
+    Parameters
+    ----------
+    model : LanguageModel[ModelInput]
+        The model that answers. Its chat template is what the conversation is rendered by.
+    vision : LanguageModel[ModelInput]
+        The model that looks. Any model taking images and writing text.
+    vision_template : str | None, optional
+        What `vision` is asked for. `DESCRIBE` when omitted.
+
+    Returns
+    -------
+    CompositeModel[ModelInput, Segment, GenerationOptions]
+        `model`, with a conversation carrying images among its inputs.
+
+    Raises
+    ------
+    ValueError
+        If `model` ships no chat template, which leaves nothing to render the conversation
+        the captions were written into.
+    """
+    main_template = template_of(model)
+    if main_template is None:
+        raise ValueError("the model ships no chat template")
+    asked = DESCRIBE if vision_template is None else vision_template
+    return CompositeModel(model, [SeeingChat(vision, main_template, asked)])
 
 
 def parser_of(model: object) -> Parser | None:

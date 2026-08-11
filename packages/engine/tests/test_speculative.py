@@ -16,7 +16,7 @@ import pytest
 from huggingface_hub import hf_hub_download, snapshot_download
 
 from sideros import GPT2, GPT2Tokenizer, KVCache, repetition_penalty, sampler, stream_ids, top_k
-from sideros.core.cache import DeltaCache
+from sideros.core.cache import DeltaCache, RingKVCache
 from sideros.generate import Meter
 from sideros.models.gpt2 import CHECKPOINT
 from sideros.speculative import Acceptance, SpeculationRefused, stream_speculative_ids
@@ -60,13 +60,59 @@ class ScriptedLM:
 
 
 class RecurrentLM:
-    """A DeltaNet-shaped cache: the recurrent state a trim would cut cannot be rebuilt."""
+    """A DeltaNet-shaped cache: the state a trim would cut cannot be rebuilt. As a *draft* it
+    is still refused — the round holds no forward of the draft to replay through."""
 
     def make_cache(self) -> list[DeltaCache]:
         return [DeltaCache()]
 
     def __call__(self, ids: mx.array, cache: list[DeltaCache] | None = None) -> mx.array:
         raise AssertionError("the refusal must land before any forward")
+
+
+class RotatingLM:
+    """A ring, which can neither trim nor restore: slot `j` holds absolute position
+    `j % window`, so a rejected row is written over one the ring still needs."""
+
+    def make_cache(self) -> list[RingKVCache]:
+        return [RingKVCache(8)]
+
+    def __call__(self, ids: mx.array, cache: list[RingKVCache] | None = None) -> mx.array:
+        raise AssertionError("the refusal must land before any forward")
+
+
+class ReplayingLM(ScriptedLM):
+    """The same script over a cache that cannot trim, only start over.
+
+    `state` is the running sum of every id the cache has taken, which is the cheapest thing
+    that is *wrong* if a rewind keeps a row the target rejected: a trim would leave the sum
+    with the rejected id still in it, and a restore that forgot to replay would leave it
+    short. The script keeps the logits a pure function of position, so the ids alone would
+    not catch either — the sum is what does.
+    """
+
+    def __init__(self, script: list[int], vocab: int) -> None:
+        super().__init__(script, vocab)
+        self.handed: list[list[DeltaCache]] = []
+        """Every cache this model made, so a test can read the one the loop kept — the
+        speculative stream builds its own and hands it to nobody."""
+
+    def make_cache(self) -> list[DeltaCache]:  # type: ignore[override]
+        self.handed.append([DeltaCache()])
+        return self.handed[-1]
+
+    def __call__(self, ids: mx.array, cache: list[DeltaCache] | None = None) -> mx.array:  # type: ignore[override]
+        assert cache is not None, "the speculative loop always carries a cache"
+        layer = cache[0]
+        offset = layer.offset
+        length = ids.shape[-1]
+        running = layer.state if layer.state is not None else mx.zeros((1,))
+        # Reassigned, never mutated: that is what makes `checkpoint()` a restore point.
+        layer.state = running + mx.sum(ids.astype(mx.float32))
+        layer.offset = offset + length
+        rows = mx.array([self.script[min(offset + i, len(self.script) - 1)] for i in range(length)])
+        distance = mx.abs(mx.arange(self.vocab)[None] - rows[:, None]).astype(mx.float32)
+        return (-distance)[None]
 
 
 @pytest.fixture
@@ -215,13 +261,48 @@ def test_an_explicit_acceptance_still_wins(target: ScriptedLM) -> None:
     assert meter.speculation.rounds == 0
 
 
-def test_a_recurrent_cache_refuses_the_draft(target: ScriptedLM) -> None:
-    """Qwen3.6's DeltaNet state cannot be rewound to the accepted prefix. Refused by name at
-    either end, before a single forward runs — the double asserts as much."""
+def test_a_cache_that_can_neither_trim_nor_replay_refuses_the_draft(target: ScriptedLM) -> None:
+    """Refused by name at either end, before a single forward runs — the doubles assert as
+    much. A ring is the target's case: it cannot drop the rejected rows and it cannot be
+    restored either, because it wrote over rows it still needs. A recurrent *draft* is the
+    other: replay is a forward, and the round holds the target's and not the draft's."""
     with pytest.raises(SpeculationRefused, match="target's cache keeps recurrent state"):
-        list(stream_ids(RecurrentLM(), PROMPT, max_tokens=4, draft=ScriptedLM(TARGET, VOCAB)))
+        list(stream_ids(RotatingLM(), PROMPT, max_tokens=4, draft=ScriptedLM(TARGET, VOCAB)))
     with pytest.raises(SpeculationRefused, match="draft's cache keeps recurrent state"):
         list(stream_ids(target, PROMPT, max_tokens=4, draft=RecurrentLM()))
+
+
+@pytest.mark.parametrize("script", [TARGET, HOSTILE, ALTERNATING])
+def test_a_recurrent_target_speculates_by_replay(script: list[int]) -> None:
+    """The rewind a state cannot do by trimming, done by starting over.
+
+    Two claims, and the second is the one a trim would pass: the ids are the greedy ids, and
+    the cache lands on the state a run that never speculated would hold. `HOSTILE` is the
+    discriminating script — every round rejects, so every round restores and replays.
+    """
+    draft = ScriptedLM(script, VOCAB)
+    speculated = list(
+        stream_ids(ReplayingLM(TARGET, VOCAB), PROMPT, max_tokens=8, draft=draft)
+    )
+    plain = list(stream_ids(ReplayingLM(TARGET, VOCAB), PROMPT, max_tokens=8))
+    assert speculated == plain
+
+    model = ReplayingLM(TARGET, VOCAB)
+    list(stream_ids(model, PROMPT, max_tokens=8, draft=ScriptedLM(script, VOCAB)))
+    (kept,) = model.handed
+    # A round settles what it accepted plus one, so the loop stops holding ids it never
+    # emitted: the cache is longer than the stream and the reference has to be read from the
+    # true continuation, cut to exactly what the cache took.
+    reference = ReplayingLM(TARGET, VOCAB)
+    truth = [*PROMPT, *stream_ids(ReplayingLM(TARGET, VOCAB), PROMPT, max_tokens=16)]
+    # Both ends of the offset, and the floor is the one that bites: a rewind that restores
+    # and forgets to replay leaves a cache that is *consistent* and short, which the state
+    # comparison below would happily confirm against its own smaller prefix.
+    assert len(PROMPT) + 8 - 1 <= kept[0].offset <= len(truth)
+    straight = reference.make_cache()
+    reference(mx.array(truth[: kept[0].offset])[None], straight)
+    assert kept[0].state is not None and straight[0].state is not None
+    assert mx.array_equal(kept[0].state, straight[0].state)
 
 
 def test_what_cannot_be_verified_is_refused_instead_of_approximated(target: ScriptedLM) -> None:
@@ -270,7 +351,7 @@ def test_speculation_reproduces_greedy_on_a_real_model(
     """The scripted double keeps its own positions; a real trunk keeps keys, and a rejected
     proposal leaves rows in twelve caches that describe a sequence that never happened. The
     draft proposes one word forever, so most rounds reject and every round rewinds."""
-    prompt = tokenizer.encode("Hello, my name is")
+    prompt = list(tokenizer.encode("Hello, my name is"))
     plain = list(stream_ids(gpt2, prompt, max_tokens=16))
     counts = Acceptance()
     drafted = list(
@@ -278,7 +359,7 @@ def test_speculation_reproduces_greedy_on_a_real_model(
             gpt2,
             prompt,
             max_tokens=16,
-            draft=ScriptedLM(tokenizer.encode(" the"), len(tokenizer.encoder)),
+            draft=ScriptedLM(list(tokenizer.encode(" the")), len(tokenizer.encoder)),
             acceptance=counts,
         )
     )
@@ -294,7 +375,7 @@ def test_a_draft_that_is_the_target_is_almost_always_accepted(
     draft the two only disagree where a batched row rounds away from a single one (fp32 here,
     ~1e-6 by `test_stepwise_matches_prefill`), so a rate at half is a misfeed and not
     arithmetic."""
-    prompt = tokenizer.encode("Hello, my name is")
+    prompt = list(tokenizer.encode("Hello, my name is"))
     counts = Acceptance()
     drafted = list(stream_ids(gpt2, prompt, max_tokens=16, draft=gpt2, acceptance=counts))
     assert drafted == list(stream_ids(gpt2, prompt, max_tokens=16))

@@ -1,4 +1,5 @@
 import json
+from collections.abc import Iterator
 from dataclasses import dataclass
 from pathlib import Path
 
@@ -34,12 +35,33 @@ class GPT2Tokenizer:
             ranks[(left, right)] = len(ranks)
         return cls(encoder, {identifier: token for token, identifier in encoder.items()}, ranks)
 
-    def encode(self, text: str) -> list[int]:
+    def encode(self, text: str | Iterator[str]) -> Iterator[int]:
+        if isinstance(text, str):
+            yield from self._encode_whole(text)
+            return
+        yield from self._encode_arriving(text)
+
+    def _encode_whole(self, text: str) -> list[int]:
         ids: list[int] = []
         for match in _PRETOKEN.finditer(text):
             mapped = "".join(BYTE_CHAR[byte] for byte in match.group().encode("utf-8"))
             ids.extend(self.encoder[part] for part in bpe(mapped, self.ranks))
         return ids
+
+    def _encode_arriving(self, chunks: Iterator[str]) -> Iterator[int]:
+        """Cut on the pre-token `_PRETOKEN` already found: `bpe` merges inside one and never
+        across two, so every match but the last is decided. The last one waits, because the
+        text that has not arrived may still belong to it."""
+        pending = ""
+        for chunk in chunks:
+            pending += chunk
+            matches = list(_PRETOKEN.finditer(pending))
+            if len(matches) < 2:
+                continue
+            cut = matches[-1].start()
+            yield from self._encode_whole(pending[:cut])
+            pending = pending[cut:]
+        yield from self._encode_whole(pending)
 
     def decode_bytes(self, ids: list[int]) -> bytes:
         return bytes(

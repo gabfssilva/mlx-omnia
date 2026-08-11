@@ -47,14 +47,14 @@ def reference() -> Encodes:
 
 @pytest.mark.parametrize("text", CORPUS)
 def test_ids_match_transformers(tokenizer: GPT2Tokenizer, reference: Encodes, text: str) -> None:
-    assert tokenizer.encode(text) == reference.encode(text)
+    assert list(tokenizer.encode(text)) == list(reference.encode(text))
 
 
 @pytest.mark.parametrize("text", CORPUS)
 def test_round_trip(tokenizer: GPT2Tokenizer, text: str) -> None:
-    assert tokenizer.decode(tokenizer.encode(text)) == text
+    assert tokenizer.decode(list(tokenizer.encode(text))) == text
 
 
 @given(st.text())
 def test_round_trip_any_text(tokenizer: GPT2Tokenizer, text: str) -> None:
-    assert tokenizer.decode(tokenizer.encode(text)) == text
+    assert tokenizer.decode(list(tokenizer.encode(text))) == text

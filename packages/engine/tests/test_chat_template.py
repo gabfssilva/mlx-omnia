@@ -19,6 +19,7 @@ from conftest import local_snapshot
 from sideros.bpe import ByteLevelBPE
 from sideros.chat import (
     CHAT,
+    DESCRIBE,
     Chat,
     ChatCapability,
     ChatMessage,
@@ -26,8 +27,10 @@ from sideros.chat import (
     Effort,
     ImageMarkerMismatch,
     MultimodalChatCapability,
+    SeeingChat,
     chat_capabilities,
     chat_template,
+    composite,
     parser_of,
 )
 from sideros.language import TEXT, GenerationOptions, LanguagePrompt, Text
@@ -35,7 +38,7 @@ from sideros.model import CompositeModel, ModelInput, ModelSignature, Unsupporte
 from sideros.parsers import Parser, Segment
 from sideros.parsers.qwen import PARSER as QWEN
 from sideros.parsers.qwen_xml import PARSER as QWEN_XML
-from sideros.vision import Image
+from sideros.vision import RGB_IMAGE, Image
 
 FIXTURE = Path(__file__).parent / "fixtures" / "chat_template.json"
 GOLDEN: dict[str, Any] = json.loads(FIXTURE.read_text(encoding="utf-8"))
@@ -100,7 +103,7 @@ def test_ids_match_transformers(case: dict[str, Any]) -> None:
     """The rendered text encoded back with the checkpoint's tokenizer: this is where the
     added tokens (`<|im_start|>`, `<|image_pad|>`) have to come out as one id, not bytes."""
     tokenizer = ByteLevelBPE.from_file(checkpoint_of(case["repo"]) / "tokenizer.json")
-    assert tokenizer.encode(template_of(case).render(chat_of(case))) == case["ids"]
+    assert list(tokenizer.encode(template_of(case).render(chat_of(case)))) == case["ids"]
 
 
 @pytest.mark.parametrize("repo", REPOS)
@@ -242,7 +245,7 @@ class _Echo:
         return isinstance(input, Text)
 
     def stream(self, input: Text, options: GenerationOptions) -> Iterator[Segment]:
-        yield Segment("content", input.value)
+        yield Segment("content", input.read())
 
 
 def test_composite_model_routes_a_chat_through_the_capability() -> None:
@@ -255,6 +258,113 @@ def test_composite_model_routes_a_chat_through_the_capability() -> None:
     chat, _ = with_images(FIRST_IMAGE_CASE)
     with pytest.raises(UnsupportedInput):
         list(model.stream(chat, GenerationOptions(max_tokens=1)))
+
+
+class _Eyes:
+    """A vision model that answers one caption, and records what it was asked."""
+
+    def __init__(self, *pieces: Segment) -> None:
+        self.pieces = pieces or (Segment("content", "a cat"),)
+        self.asked: list[tuple[Chat, GenerationOptions]] = []
+
+    @property
+    def native_signature(self) -> ModelSignature:
+        return ModelSignature(frozenset({TEXT, RGB_IMAGE}), frozenset({TEXT}))
+
+    def accepts(self, input: ModelInput) -> TypeIs[Chat]:
+        return isinstance(input, Chat)
+
+    def stream(self, input: Chat, options: GenerationOptions) -> Iterator[Segment]:
+        self.asked.append((input, options))
+        yield from self.pieces
+
+
+def test_seeing_chat_puts_the_caption_where_the_image_was() -> None:
+    chat, images = with_images(FIRST_IMAGE_CASE)
+    eyes = _Eyes()
+    prepared = SeeingChat(eyes, template_of(FIRST_IMAGE_CASE)).prepare(chat)
+
+    assert isinstance(prepared, Text)
+    assert prepared.read().count("[image: a cat]") == len(images)
+    # The conversation the eyes were handed is the picture and the instruction, and nothing
+    # of the conversation it came from: what the decoder is asking is not what is being
+    # described.
+    asked, options = eyes.asked[0]
+    assert asked.messages == (
+        {
+            "role": "user",
+            "content": ({"type": "image", "image": images[0]}, {"type": "text", "text": DESCRIBE}),
+        },
+    )
+    assert asked.reasoning_effort == "off"
+    assert options.max_tokens == 128
+    assert len(eyes.asked) == len(images)
+
+
+def test_seeing_chat_asks_nothing_until_the_prompt_is_read() -> None:
+    """The point of the whole arrangement. `prepare` hands back a prompt that is still being
+    written, so the model that looks runs while whoever holds it is already prefilling —
+    a caption produced eagerly here would be the wait it exists to remove."""
+    chat, _ = with_images(FIRST_IMAGE_CASE)
+    eyes = _Eyes()
+    prepared = SeeingChat(eyes, template_of(FIRST_IMAGE_CASE)).prepare(chat)
+    assert eyes.asked == []
+
+    assert not isinstance(prepared.value, str)
+    pieces = prepared.value
+    # Everything the template wrote before the picture is there to be prefilled first, and
+    # the eyes have still not been asked for anything.
+    assert next(pieces)
+    assert eyes.asked == []
+
+
+def test_seeing_chat_keeps_only_what_the_eyes_said() -> None:
+    """The reasoning the vision model spends on its way to a description is not the
+    description — read into the prompt as one, it is a decoder answering someone's
+    deliberation about the picture."""
+    chat, _ = with_images(FIRST_IMAGE_CASE)
+    eyes = _Eyes(
+        Segment("reasoning", "the user wants a colour"),
+        Segment("content", " a cat "),
+        Segment("tool", '{"name": "zoom"}'),
+    )
+    rendered = SeeingChat(eyes, template_of(FIRST_IMAGE_CASE)).prepare(chat).read()
+    assert "[image: a cat " in rendered
+    assert "the user wants a colour" not in rendered
+    assert "zoom" not in rendered
+
+
+def test_seeing_chat_asks_for_the_description_it_was_given() -> None:
+    chat, _ = with_images(FIRST_IMAGE_CASE)
+    eyes = _Eyes()
+    SeeingChat(eyes, template_of(FIRST_IMAGE_CASE), "Name the colours.").prepare(chat).read()
+    asked, _ = eyes.asked[0]
+    assert asked.messages[0]["content"][1] == {"type": "text", "text": "Name the colours."}
+
+
+def test_composite_sends_only_a_conversation_with_images_to_the_eyes() -> None:
+    """The text model is offered the input first, so a conversation it already takes never
+    pays for a second model."""
+    case = next(c for c in GOLDEN["cases"] if c["name"] == "user")
+    eyes = _Eyes()
+    model = composite(CompositeModel(_Echo(), [ChatCapability(template_of(case))]), eyes)
+
+    assert list(model.stream(chat_of(case), GenerationOptions(max_tokens=1))) == [
+        Segment("content", case["rendered"])
+    ]
+    assert eyes.asked == []
+
+    chat, images = with_images(FIRST_IMAGE_CASE)
+    generated = list(model.stream(chat, GenerationOptions(max_tokens=1)))
+    assert len(eyes.asked) == len(images)
+    assert "[image: a cat]" in generated[0].text
+
+
+def test_composite_refuses_a_model_that_ships_no_template() -> None:
+    """Nothing renders the conversation the captions were written into, and a guessed
+    template produces fluent, wrong text."""
+    with pytest.raises(ValueError, match="chat template"):
+        composite(CompositeModel(_Echo(), []), _Eyes())
 
 
 @pytest.mark.parametrize(("repo", "family"), FAMILIES)

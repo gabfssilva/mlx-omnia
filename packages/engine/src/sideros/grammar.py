@@ -15,7 +15,7 @@ request, which is where all the state of a walk lives.
 """
 
 import json
-from collections.abc import Callable, Collection, Mapping, Sequence
+from collections.abc import Callable, Collection, Iterator, Mapping, Sequence
 from dataclasses import dataclass
 from typing import Final, Protocol, runtime_checkable
 
@@ -86,10 +86,11 @@ class _Table:
     bos_token_id: int | None
     tokens: Sequence[bytes]
     special_token_ids: Sequence[int]
-    encode: Callable[[str], list[int]]
+    encode: Callable[[str], Iterator[int]]
 
     def __call__(self, text: bytes) -> list[int]:
-        return self.encode(text.decode("utf-8"))
+        # llguidance wants the ids in hand; the tokenizer hands them over as they are made.
+        return list(self.encode(text.decode("utf-8")))
 
 
 def _pieces(tokenizer: Tokenizer, size: int) -> list[bytes]:

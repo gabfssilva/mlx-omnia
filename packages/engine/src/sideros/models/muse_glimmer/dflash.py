@@ -24,7 +24,6 @@ the head is the target's raw `lm_head` — no `output_multiplier`, no softcap.
 """
 
 from collections.abc import Sequence
-from typing import TYPE_CHECKING
 
 import mlx.core as mx
 import mlx.nn as nn
@@ -33,11 +32,7 @@ from sideros.core.cache import KVCache
 from sideros.core.layers import SwiGLU
 from sideros.core.masks import SLIDING
 from sideros.models.muse_glimmer.config import MuseGlimmerAssistantConfig
-
-if TYPE_CHECKING:
-    # The facade in `model` reaches this module to build the pair; the target is an
-    # annotation here, so the import stays out of the runtime cycle.
-    from sideros.models.muse_glimmer.model import MuseGlimmer
+from sideros.speculative import Speculable, SpeculationRefused
 
 
 def sliding_mask(queries: int, keys: int, window: int) -> mx.array | None:
@@ -216,11 +211,17 @@ class MuseGlimmerDFlash:
 
     def __init__(
         self,
-        target: "MuseGlimmer",
+        target: Speculable,
         drafter: MuseGlimmerAssistant,
         *,
         block_size: int | None = None,
     ) -> None:
+        if not isinstance(target, Speculable):
+            raise SpeculationRefused(
+                f"{type(target).__name__} does not lend its embedding table and its head "
+                "(`speculative.Speculable`), and a DFlash block is nothing but rows through "
+                "the two"
+            )
         config = drafter.config
         if block_size is not None and not 2 <= block_size <= config.block_size:
             raise ValueError(
@@ -256,18 +257,16 @@ class MuseGlimmerDFlash:
         has not seen — and the rest of the block is the mask token; what comes back is the
         argmax of the target's own head over every row but the anchor's.
 
-        Both borrowed pieces are the raw ones: the embedding lookup without the trunk's
-        scaleless norm, and `lm_head` without the multiplier and the softcap `head()`
-        applies. That is what the drafter was trained against, and under greedy the two
-        missing transforms are monotone anyway.
+        Both borrowed pieces are the raw ones — `Speculable` is where the difference is
+        named, and it is what the drafter was trained against.
         """
         anchor = mx.array([committed[-1]])
         ids = mx.concatenate([anchor, self._noise])
-        embeds = self._target.model.embed_tokens(ids)[None]
+        embeds = self._target.raw_embed(ids)[None]
         hidden = self._drafter.propose(embeds.astype(self._drafter.norm.weight.dtype), self._cache)
         # Sliced before the head and not after: the anchor's row is dropped either way, and
         # the head is the widest matmul in the round — 201k columns of it.
-        return mx.argmax(self._target.lm_head(hidden[:, 1:])[0], axis=-1)
+        return mx.argmax(self._target.raw_logits(hidden[:, 1:])[0], axis=-1)
 
     def settle(self, length: int) -> None:
         """Nothing to do: the block never entered the cache, and what did — the context —

@@ -592,6 +592,10 @@ def _quantize(source: str, repo: str, selection: ByPath, request: QuantizeReques
                 {**checkpoint.config, **calibrated.config, "sideros": recorded},
                 weights,
                 plan,
+                # The MTP head rides along, packed round-to-nearest whatever the trunk's
+                # method was — `write_entry` says why, and it is what keeps a quantized
+                # entry able to speculate.
+                selection=selection,
             )
             # The last report before the entry takes the name the catalog reads: a
             # cancellation that arrived while the file was being written lands here.

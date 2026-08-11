@@ -88,8 +88,9 @@ class TinyLM(nn.Module):
 
 
 class TinyTokenizer:
-    def encode(self, text: str) -> list[int]:
-        return [sum(text.encode()) % VOCAB]
+    def encode(self, text: str | Iterator[str]) -> Iterator[int]:
+        whole = text if isinstance(text, str) else "".join(text)
+        return iter([sum(whole.encode()) % VOCAB])
 
     def decode_bytes(self, ids: list[int]) -> bytes:
         return bytes(ord("a") + token for token in ids)
@@ -257,7 +258,7 @@ def test_a_profile_is_written_read_replaced_and_deleted_under_its_model(
             "reasoning_budget": None,
         },
         "system_prompt": "be terse",
-        "features": {"dflash": None},
+        "features": {"speculation": None, "kv_cache": None},
     }
     assert client.get(url).json() == created.json()
 

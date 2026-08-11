@@ -289,8 +289,8 @@ class Qwen35LanguageModel:
         images: list[tuple[mx.array, Grid]] = []
         for part in parts:
             match part:
-                case Text(value=value):
-                    ids.extend(self.tokenizer.encode(value))
+                case Text():
+                    ids.extend(self.tokenizer.encode(part.read()))
                 case Image(pixels=pixels):
                     processed = process_image(pixels, processor)
                     _, grid = processed
@@ -307,7 +307,8 @@ class Qwen35LanguageModel:
         stop = self.stop if options.stop is None else options.stop
         parser = _parser(input)
         match input:
-            case Text(value=rendered):
+            case Text():
+                rendered = input.read()
                 self.prefix = prefix_cache(self.prefix, options.prefix_budget)
                 ids = stream_ids(
                     self.model,
@@ -322,7 +323,7 @@ class Qwen35LanguageModel:
                 )
             case Image() | LanguagePrompt():
                 parts = input.parts if isinstance(input, LanguagePrompt) else ()
-                rendered = "".join(part.value for part in parts if isinstance(part, Text))
+                rendered = "".join(part.read() for part in parts if isinstance(part, Text))
                 prompt = self.prepare(input)
                 # No prefix here, and it is not an omission: an image is one id repeated per
                 # patch, so two different pictures on the same grid produce the same ids — a

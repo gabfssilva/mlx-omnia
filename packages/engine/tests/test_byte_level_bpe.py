@@ -63,24 +63,24 @@ def _pair(repo: str) -> tuple[ByteLevelBPE, Encodes]:
 @pytest.mark.parametrize("text", CORPUS)
 def test_qwen2_ids_match_transformers(text: str) -> None:
     ours, reference = _pair(QWEN2)
-    assert ours.encode(text) == reference.encode(text, add_special_tokens=False)
-    assert ours.decode(ours.encode(text)) == text
+    assert list(ours.encode(text)) == list(reference.encode(text, add_special_tokens=False))
+    assert ours.decode(list(ours.encode(text))) == text
 
 
 @requires_checkpoint(QWEN3)
 @pytest.mark.parametrize("text", CORPUS)
 def test_qwen3_ids_match_transformers(text: str) -> None:
     ours, reference = _pair(QWEN3)
-    assert ours.encode(text) == reference.encode(text, add_special_tokens=False)
-    assert ours.decode(ours.encode(text)) == text
+    assert list(ours.encode(text)) == list(reference.encode(text, add_special_tokens=False))
+    assert ours.decode(list(ours.encode(text))) == text
 
 
 @requires_checkpoint(QWEN3_MOE)
 @pytest.mark.parametrize("text", CORPUS)
 def test_qwen3_moe_ids_match_transformers(text: str) -> None:
     ours, reference = _pair(QWEN3_MOE)
-    assert ours.encode(text) == reference.encode(text, add_special_tokens=False)
-    assert ours.decode(ours.encode(text)) == text
+    assert list(ours.encode(text)) == list(reference.encode(text, add_special_tokens=False))
+    assert ours.decode(list(ours.encode(text))) == text
 
 
 @requires_checkpoint(GPT_OSS)
@@ -88,8 +88,8 @@ def test_qwen3_moe_ids_match_transformers(text: str) -> None:
 def test_gpt_oss_ids_match_transformers(text: str) -> None:
     ours, reference = _pair(GPT_OSS)
     assert ours.ignore_merges
-    assert ours.encode(text) == reference.encode(text, add_special_tokens=False)
-    assert ours.decode(ours.encode(text)) == text
+    assert list(ours.encode(text)) == list(reference.encode(text, add_special_tokens=False))
+    assert ours.decode(list(ours.encode(text))) == text
 
 
 @requires_checkpoint(LAGUNA)
@@ -99,8 +99,8 @@ def test_laguna_ids_match_transformers(text: str) -> None:
     # mutação: tratar o primeiro estágio como `Isolated` quebra em qualquer texto com
     # quebra de linha — a corrida de `\n` deixa de colar no pedaço seguinte.
     assert len(ours.splits) == 2
-    assert ours.encode(text) == reference.encode(text, add_special_tokens=False)
-    assert ours.decode(ours.encode(text)) == text
+    assert list(ours.encode(text)) == list(reference.encode(text, add_special_tokens=False))
+    assert ours.decode(list(ours.encode(text))) == text
 
 
 @requires_checkpoint(LAGUNA)

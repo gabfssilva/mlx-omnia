@@ -1,5 +1,6 @@
-from collections.abc import Collection, Iterator
+from collections.abc import Collection, Iterable, Iterator
 from dataclasses import dataclass, field
+from itertools import chain
 from typing import Any, Protocol, TypeIs, runtime_checkable
 
 import mlx.core as mx
@@ -8,6 +9,7 @@ import mlx.nn as nn
 from sideros.core.cache import LayerCache
 from sideros.core.prompt_cache import Budget, PromptCache, Spill
 from sideros.generate import (
+    BlockOutputs,
     CausalLM,
     Constraint,
     Meter,
@@ -29,13 +31,27 @@ from sideros.model import (
     Wrapping,
 )
 from sideros.parsers import REASONING, Parser, Segment, opened
+from sideros.speculative import Chained, Speculable, Step
 
 TEXT = ContentType(Modality.TEXT, "text/plain")
+
+type TextContent = str | Iterator[str]
+"""A prompt, whole or arriving in pieces.
+
+An `Iterator` and not an `Iterable`, because `str` *is* an `Iterable[str]`: the union would
+be equal to its second arm, and code that iterated the field without asking first would take
+a whole prompt apart one character at a time — no error, just a different prompt. Iterating
+is the distinction, so the type is what carries it.
+
+One `ContentType` for both. What arrives in pieces is the same text as what arrives whole,
+and a model that takes one takes the other; making the streamed form its own content type
+would put a question in every `native_signature` that no checkpoint has a different answer
+to."""
 
 
 @dataclass(frozen=True)
 class Text:
-    value: str
+    value: TextContent
     parser: Parser | None = None
     """Which dialect the checkpoint speaks, as the source of the chat template that rendered
     this prompt says. It travels with the prompt because the prompt is all the streamer is
@@ -45,6 +61,14 @@ class Text:
     @property
     def content_type(self) -> ContentType:
         return TEXT
+
+    def read(self) -> str:
+        """The whole prompt, which for one that arrives in pieces means waiting for the last.
+
+        A method and not a property because it spends something: a `Text` built over a
+        generator has one read in it, and the second comes back empty. The eager form is a
+        `str` and re-reads freely, which is what every caller that came before this had."""
+        return self.value if isinstance(self.value, str) else "".join(self.value)
 
 
 @dataclass(frozen=True)
@@ -122,9 +146,30 @@ class GenerationOptions:
 
 
 class Tokenizer(Protocol):
-    def encode(self, text: str) -> list[int]: ...
+    """Where a prompt may be cut is a fact of the tokenizer — its pre-tokenizer, its added
+    tokens, whether it writes a BOS — so a prompt still arriving is handed over whole and each
+    implementation answers for itself. One that can name no safe offset gathers the pieces and
+    encodes once, which costs the overlap and never a different prompt."""
+
+    def encode(self, text: TextContent) -> Iterator[int]: ...
 
     def decode_bytes(self, ids: list[int]) -> bytes: ...
+
+
+def kept(content: TextContent, seen: list[str]) -> TextContent:
+    """The same text with a copy taken, because the tokenizer spends it on the way to ids and
+    the segmenter downstream still needs the prompt's tail to know which channel the
+    generation starts in."""
+    if isinstance(content, str):
+        seen.append(content)
+        return content
+
+    def watched() -> Iterator[str]:
+        for chunk in content:
+            seen.append(chunk)
+            yield chunk
+
+    return watched()
 
 
 def reasoning_budget(
@@ -265,6 +310,11 @@ class TextLanguageModel[C: LayerCache]:
         the engine because its element type is this trunk's own cache, which nothing holding
         a `LanguageModel[ModelInput]` can name — and because dying with the model is exactly
         the invariant "one prompt in two resident models does not cross caches"."""
+        self.drafter: nn.Module | None = None
+        """`speculative.Drafting`. Out of the trunk's tree so whoever accounts for memory can
+        weigh it: with an MTP head the two are one checkpoint on disk and still two trees
+        here, and only one of them is under `self.model`."""
+        self._block: int | None = None
 
     @property
     def native_signature(self) -> ModelSignature:
@@ -273,29 +323,123 @@ class TextLanguageModel[C: LayerCache]:
     def accepts(self, input: ModelInput) -> TypeIs[Text]:
         return isinstance(input, Text)
 
+    def speculate_with(self, drafter: nn.Module, *, block_size: int | None = None) -> None:
+        """Take an MTP step for this trunk — `speculative.Drafting`.
+
+        Here and not on a family's facade because nothing in it is a family's: the step is a
+        `Step`, the trunk lends the two ends of its vocabulary through `Speculable`, and the
+        rows the step conditions on come out of `BlockOutputs`. A family that implements the
+        three speculates through this; one that does not is refused by the name of what it is
+        missing, which is the only way a checkpoint id can be wrong here.
+
+        A DFlash drafter does not come through this door. Its proposal is one forward over a
+        block of mask tokens against layers the *drafter's* own config names, so the pair
+        needs that config to build — `models/muse_glimmer` owns it and its own facade.
+        """
+        if not isinstance(drafter, Step):
+            raise TypeError(f"{type(drafter).__name__} is not an MTP step for this engine")
+        if not isinstance(self.model, Speculable):
+            raise TypeError(
+                f"{type(self.model).__name__} does not lend its embedding table and its head "
+                "(`speculative.Speculable`), which is the whole of an MTP step's vocabulary"
+            )
+        if not isinstance(self.model, BlockOutputs):
+            raise TypeError(
+                f"{type(self.model).__name__} has no `block_outputs`, so there is nothing for "
+                "the step to condition on"
+            )
+        block = drafter.block if block_size is None else block_size
+        if block < 2:
+            raise ValueError(f"a block of {block} proposes nothing")
+        self.drafter = drafter
+        self._block = block
+
+    def _proposer(self, options: GenerationOptions) -> "Chained[LayerCache] | None":
+        """The proposer for this request, or `None` for every request that cannot be verified
+        against the target's own argmax.
+
+        Not a refusal: a request that samples, penalizes or decodes under a grammar is
+        answered the way it would have been with no head loaded at all. What the switch buys
+        is speed, so the case where it buys nothing is a case where it does nothing.
+
+        One per generation — the chain's state is this request's accepted prefix.
+        """
+        drafter = self.drafter
+        if drafter is None or self._block is None or not options.speculate:
+            return None
+        if options.sampler is not greedy or options.penalty is not None:
+            return None
+        if options.constraint is not None or options.reasoning_budget is not None:
+            return None
+        assert isinstance(drafter, Step)
+        assert isinstance(self.model, Speculable)
+        # `-1`: the step conditions on the trunk's last block, and `block_outputs` indexes the
+        # list Python's way. A trunk that grows a layer still taps the right one.
+        return Chained(self.model, drafter, block=self._block, tap=-1)
+
     def stream(self, input: Text, options: GenerationOptions) -> Iterator[Segment]:
         self.prefix = prefix_cache(self.prefix, options.prefix_budget, options.prefix_spill)
-        prompt = self.tokenizer.encode(input.value)
+        draft = self._proposer(options)
+        # Three options are answers about the whole prompt and are read before its first
+        # forward: how much window is left, which reasoning block the template left open, and
+        # the trie's match. A prompt still being written is waited for when one of them is
+        # asked for — it costs the overlap and never a row — and pulled when none is.
+        whole = (
+            input.read()
+            if options.context_limit is not None
+            or options.reasoning_budget is not None
+            or self.prefix is not None
+            or draft is not None
+            else None
+        )
+        seen: list[str] = []
+        prompt = kept(whole if whole is not None else input.value, seen)
+        # A prompt that is all here has its ids read out now. The tokenizer hands them over
+        # lazily whatever it was given, and a lazy prompt is what makes `stream_ids` prefill
+        # in the small blocks that overlap a producer — spending those on a prompt with no
+        # producer behind it would be paying the latency knob for nothing.
+        encoded: Iterable[int] = (
+            list(self.tokenizer.encode(prompt))
+            if isinstance(prompt, str)
+            else self.tokenizer.encode(prompt)
+        )
         # The clamp lives here because this is where the prompt's cost in ids first
         # exists: the budget is what the window has left, and a prompt that already
         # spent it generates nothing rather than pushing positions past the config's.
         budget = options.max_tokens
-        if options.context_limit is not None:
-            budget = min(budget, max(0, options.context_limit - len(prompt)))
+        if options.context_limit is not None and isinstance(encoded, list):
+            budget = min(budget, max(0, options.context_limit - len(encoded)))
         ids = stream_ids(
             self.model,
-            prompt,
+            encoded,
             max_tokens=budget,
             sampler=options.sampler,
             stop=self.stop if options.stop is None else options.stop,
             penalty=options.penalty,
             meter=options.meter,
-            prefix=self.prefix,
+            # The two do not compose (`stream_ids` says why), and a round is worth more than
+            # a prefix: the trie saves the prefill of a turn, the head saves a read of the
+            # weights per token of every turn.
+            prefix=None if draft is not None else self.prefix,
             constraint=options.constraint,
             reasoning_budget=reasoning_budget(
-                options.reasoning_budget, input.value, self.tokenizer
+                options.reasoning_budget, whole if whole is not None else "", self.tokenizer
             ),
+            draft=draft,
         )
+        # Drawn here rather than inside `stream_text`, and that is what makes the prompt's
+        # own text available to it: pulling the first id runs the prefill, which is what
+        # consumes the prompt, which is what fills `seen`. The segmenter reads the prompt's
+        # tail to know which channel the generation starts in, and a tail read before this
+        # would be the tail of a prompt that had not finished arriving.
+        first = next(ids, None)
+        if first is None:
+            return
         # No dialect — unknown, or a prompt no template rendered — still holds the reasoning
         # block back: that one is the model's own spelling and not the dialect's.
-        yield from stream_text(ids, self.tokenizer, parser=input.parser, prompt=input.value)
+        yield from stream_text(
+            chain((first,), ids),
+            self.tokenizer,
+            parser=input.parser,
+            prompt="".join(seen),
+        )

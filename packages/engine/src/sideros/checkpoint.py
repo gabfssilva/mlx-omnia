@@ -608,6 +608,19 @@ class Drafter[M: nn.Module]:
     quantize: Callable[[Path, mx.Dtype | None], Pending[M]]
 
 
+MTP_PREFIX = "mtp."
+"""Where a multi-token-prediction head sits in a checkpoint that carries one, and where the
+entry this engine writes puts it back.
+
+A fact about the *file* and not about any architecture, which is why the spine owns it: nine
+ported families ship a head under this prefix and every one of them drops it from the trunk's
+tree, so the trunk's loader must not be handed those tensors — before quantization it never
+was, because the family's own `weights` dropped them; after it, the entry holds both trees in
+one file and `prepared` is where the second one gets out of the first one's way.
+
+`task.mtp_head` is what builds it, `task.write_entry` is what packs it, and neither would be
+enough on its own: an entry the trunk cannot load is not an entry."""
+
 _CARRIED = ("generation_config.json",)
 """What every architecture reads and none has to declare. `stop_tokens` and
 `sampling_defaults` both come off this file, and both of them *widen* what `config.json`
@@ -656,7 +669,11 @@ def checkpoint[M: nn.Module, C](
     ) -> dict[str, mx.array]:
         if declared is None:
             return weights(directory, parsed, dtype)
-        tensors = load_shards(directory)
+        tensors = {
+            key: value
+            for key, value in load_shards(directory).items()
+            if not key.startswith(MTP_PREFIX)
+        }
         reject_dtype_cast(dtype, tensors)
         return tensors
 

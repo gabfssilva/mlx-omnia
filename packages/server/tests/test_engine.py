@@ -254,8 +254,9 @@ class ByteTokenizer:
     """One id per byte plus one that ends a turn. Small enough to build a table over in a
     test and real enough for a grammar: JSON is bytes, and llguidance walks these."""
 
-    def encode(self, text: str) -> list[int]:
-        return list(text.encode("utf-8"))
+    def encode(self, text: str | Iterator[str]) -> Iterator[int]:
+        whole = text if isinstance(text, str) else "".join(text)
+        return iter(list(whole.encode("utf-8")))
 
     def decode_bytes(self, ids: list[int]) -> bytes:
         # `KeyError` and not an empty piece: it is what an id past the tokenizer's own count

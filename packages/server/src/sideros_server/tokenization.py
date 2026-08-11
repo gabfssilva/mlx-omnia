@@ -64,4 +64,10 @@ async def tokenize(model_id: str, body: TokenizeRequest, engine: EngineDep) -> T
     tokenizer = tokenizer_of(await engine.resolve(model_id))
     if tokenizer is None:
         raise HTTPException(status_code=500, detail=f"{model_id!r} exposes no tokenizer")
-    return Tokens(ids=await asyncio.to_thread(tokenizer.encode, body.text))
+    # Read out in the thread and not after it: the tokenizer hands the ids over as it
+    # makes them, so `to_thread` on `encode` alone would move a generator and leave the
+    # work on the loop.
+    def encode() -> list[int]:
+        return list(tokenizer.encode(body.text))
+
+    return Tokens(ids=await asyncio.to_thread(encode))

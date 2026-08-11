@@ -544,7 +544,7 @@ def test_usage_counts_the_rendered_prompt_and_the_ids_emitted(client: OpenAI) ->
     assert template is not None
     rendered = template.render(Chat(({"role": "user", "content": prompt},)))
     tokenizer = ByteLevelBPE.from_file(directory / "tokenizer.json")
-    assert usage.prompt_tokens == len(tokenizer.encode(rendered))
+    assert usage.prompt_tokens == len(list(tokenizer.encode(rendered)))
     assert 0 < usage.completion_tokens <= 16
     assert usage.total_tokens == usage.prompt_tokens + usage.completion_tokens
     assert usage.prompt_tokens_details is not None, "the field is written even at zero"

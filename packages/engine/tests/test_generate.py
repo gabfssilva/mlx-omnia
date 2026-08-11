@@ -112,7 +112,7 @@ def test_trim_rewinds(model: GPT2, golden: dict[str, mx.array]) -> None:
 
 def test_streaming_detokenizer_holds_partial_utf8(tokenizer: GPT2Tokenizer) -> None:
     text = "emoji 🤖🔥 ok"
-    ids = tokenizer.encode(text)
+    ids = list(tokenizer.encode(text))
     import codecs
 
     decoder = codecs.getincrementaldecoder("utf-8")("replace")
@@ -186,7 +186,7 @@ def test_stream_ids_uses_greedy_compiled_decode_only_for_plain_greedy() -> None:
 
 
 def test_stream_generate_flushes_partial_utf8(tokenizer: GPT2Tokenizer) -> None:
-    ids = tokenizer.encode("ok 🤖🔥 done")
+    ids = list(tokenizer.encode("ok 🤖🔥 done"))
     split = next((k for k in range(1, len(ids)) if "�" in tokenizer.decode(ids[:k])), None)
     assert split is not None, "no token boundary lands inside a multibyte sequence"
     truncated = ids[:split]
@@ -234,8 +234,8 @@ def test_ttft_grows_with_the_prompt(model: GPT2, tokenizer: GPT2Tokenizer) -> No
     """The first token's mark is what separates prefill from decode: same model and the
     same two tokens generated, so the only thing left to move the number is how much
     prompt the first step reads."""
-    short = tokenizer.encode("Hello")
-    long = tokenizer.encode("Hello there, this is a longer prompt. " * 60)
+    short = list(tokenizer.encode("Hello"))
+    long = list(tokenizer.encode("Hello there, this is a longer prompt. " * 60))
     list(stream_ids(model, short, max_tokens=2))
     brief, wordy = Meter(), Meter()
     list(stream_ids(model, short, max_tokens=2, meter=brief))
@@ -250,7 +250,7 @@ def test_stream_generate_text(model: GPT2, tokenizer: GPT2Tokenizer) -> None:
     assert len(pieces) > 0
     text = "".join(piece.text for piece in pieces)
     assert text == tokenizer.decode(
-        list(stream_ids(model, tokenizer.encode("Hello, my name is"), max_tokens=8))
+        list(stream_ids(model, list(tokenizer.encode("Hello, my name is")), max_tokens=8))
     )
 
 
@@ -336,9 +336,9 @@ def primed(model: GPT2, tokenizer: GPT2Tokenizer) -> tuple[PromptCache[KVCache],
     agent's shape: the second request repeats the first prompt, the ids the model wrote, and
     a new tail."""
     trie = PromptCache[KVCache](budget=1 << 30)
-    first = tokenizer.encode(CONVERSATION)
+    first = list(tokenizer.encode(CONVERSATION))
     grown = list(stream_ids(model, first, max_tokens=4, prefix=trie))
-    return trie, [*first, *grown, *tokenizer.encode(NEXT_TURN)]
+    return trie, [*first, *grown, *list(tokenizer.encode(NEXT_TURN))]
 
 
 def test_the_second_turn_prefills_only_what_the_stored_cache_does_not_cover(
@@ -351,7 +351,7 @@ def test_the_second_turn_prefills_only_what_the_stored_cache_does_not_cover(
 
     list(stream_ids(warm, second, max_tokens=2, prefix=trie))
 
-    assert warm.fed == [len(tokenizer.encode(NEXT_TURN)), 1, 1]
+    assert warm.fed == [len(list(tokenizer.encode(NEXT_TURN))), 1, 1]
 
 
 def test_the_reused_prefix_reproduces_the_logits_of_a_cold_prefill(
@@ -378,7 +378,10 @@ def test_a_stored_cache_longer_than_the_match_is_rewound_and_still_matches(
     and the run over the rewound cache has to be the cold run, row for row."""
     trie, _ = primed(model, tokenizer)
     shared = 20
-    edited = [*tokenizer.encode(CONVERSATION)[:shared], *tokenizer.encode(" but the dog moved.")]
+    edited = [
+        *list(tokenizer.encode(CONVERSATION))[:shared],
+        *tokenizer.encode(" but the dog moved."),
+    ]
     rewound, fresh = Recording(model), Recording(model)
 
     resumed = list(stream_ids(rewound, edited, max_tokens=3, prefix=trie))
@@ -419,7 +422,7 @@ def test_the_meter_counts_what_the_stored_prefix_covered(
     is what the caller sent.
     """
     trie, second = primed(model, tokenizer)
-    stored = len(tokenizer.encode(CONVERSATION)) + 4
+    stored = len(list(tokenizer.encode(CONVERSATION))) + 4
     warm, cold = Meter(), Meter()
 
     list(stream_ids(model, second, max_tokens=2, prefix=trie, meter=warm))
@@ -436,7 +439,7 @@ def test_a_cancelled_run_stores_exactly_the_ids_that_entered_the_cache(
     records has to be the rows the layers hold: the ids the loop fed, which are the prompt
     plus everything it emitted, and not the `max_tokens` it was asked for."""
     trie = PromptCache[KVCache](budget=1 << 30)
-    prompt = tokenizer.encode(CONVERSATION)
+    prompt = list(tokenizer.encode(CONVERSATION))
     stream = stream_ids(model, prompt, max_tokens=16, prefix=trie)
     taken = list(islice(stream, 3))
 
@@ -551,7 +554,7 @@ def test_the_trie_charges_what_the_run_reserved(model: GPT2, tokenizer: GPT2Toke
     256-row block, `n_embd` wide, in fp32."""
     trie = PromptCache[KVCache](budget=1 << 30)
 
-    list(stream_ids(model, tokenizer.encode(CONVERSATION), max_tokens=2, prefix=trie))
+    list(stream_ids(model, list(tokenizer.encode(CONVERSATION)), max_tokens=2, prefix=trie))
 
     width = model.wte.weight.shape[1]
     assert trie.nbytes == len(model.h) * 2 * 768 * width * 4
@@ -564,7 +567,7 @@ def test_a_cache_that_does_not_fit_the_budget_is_not_kept(
     would be a trie that grows for ever with a budget that only counts."""
     trie = PromptCache[KVCache](budget=1)
 
-    list(stream_ids(model, tokenizer.encode(CONVERSATION), max_tokens=2, prefix=trie))
+    list(stream_ids(model, list(tokenizer.encode(CONVERSATION)), max_tokens=2, prefix=trie))
 
     assert (len(trie), trie.nbytes) == (0, 0)
 

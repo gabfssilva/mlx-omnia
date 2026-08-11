@@ -97,8 +97,8 @@ def test_a_schema_is_either_enforced_or_refused_in_the_compilers_own_words(
     except GrammarRefused as refusal:
         assert any(part in str(refusal) for part in entry["keyword"].split("/"))
         return
-    assert walks(grammar, tokenizer.encode(compact(entry["valid"])), stop)
-    assert not walks(grammar, tokenizer.encode(compact(entry["invalid"])), stop)
+    assert walks(grammar, list(tokenizer.encode(compact(entry["valid"]))), stop)
+    assert not walks(grammar, list(tokenizer.encode(compact(entry["invalid"]))), stop)
 
 
 @pytest.mark.parametrize("entry", SCHEMAS, ids=[entry["name"] for entry in SCHEMAS])

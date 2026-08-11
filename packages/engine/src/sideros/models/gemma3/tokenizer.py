@@ -2,6 +2,7 @@
 
 import heapq
 import json
+from collections.abc import Iterator
 from dataclasses import dataclass
 from pathlib import Path
 
@@ -152,7 +153,13 @@ class Gemma3Tokenizer:
                 symbols.append(identifier)
         return self._merge(symbols)
 
-    def encode(self, text: str) -> list[int]:
+    def encode(self, text: str | Iterator[str]) -> Iterator[int]:
+        if isinstance(text, str):
+            yield from self._encode_whole(text)
+            return
+        yield from self._encode_arriving(text)
+
+    def _encode_whole(self, text: str) -> list[int]:
         ids = [self.bos]
         for piece in self.added.split(text):
             if isinstance(piece, int):
@@ -160,6 +167,15 @@ class Gemma3Tokenizer:
             else:
                 ids.extend(self._encode_text(piece))
         return ids
+
+    def _encode_arriving(self, chunks: Iterator[str]) -> Iterator[int]:
+        """Gathered and encoded once, which is this tokenizer's honest answer rather than an
+        omission: `_merge` is BPE over the whole span between two added tokens with no
+        pre-tokenizer breaking it up, so there is no offset inside a span that a later
+        character cannot still change the merges of. A prompt cut on a guess would be ids
+        the prompt does not encode to, which costs more than the overlap is worth.
+        """
+        yield from self._encode_whole("".join(chunks))
 
     def decode_bytes(self, ids: list[int]) -> bytes:
         output = bytearray()

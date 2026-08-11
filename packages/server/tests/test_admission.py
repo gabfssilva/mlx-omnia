@@ -96,8 +96,8 @@ class Weights(nn.Module):
 
 
 class Tokenizer:
-    def encode(self, text: str) -> list[int]:
-        return [0]
+    def encode(self, text: str | Iterator[str]) -> Iterator[int]:
+        return iter([0])
 
     def decode_bytes(self, ids: list[int]) -> bytes:
         return b"."

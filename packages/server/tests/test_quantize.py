@@ -230,8 +230,9 @@ class _Encoder:
     """The corpus is sampled with the model's own tokenizer, so the test model needs one.
     Bytes modulo the vocabulary: every id the pass draws indexes a row that exists."""
 
-    def encode(self, text: str) -> list[int]:
-        return [byte % _VOCAB for byte in text.encode()]
+    def encode(self, text: str | Iterator[str]) -> Iterator[int]:
+        whole = text if isinstance(text, str) else "".join(text)
+        return iter([byte % _VOCAB for byte in whole.encode()])
 
     def decode_bytes(self, ids: list[int]) -> bytes:
         return bytes(id % 256 for id in ids)

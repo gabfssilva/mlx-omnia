@@ -37,6 +37,23 @@ class LayerCache:
         layer holding only its offset has nothing to evaluate."""
         return ()
 
+    @property
+    def is_replayable(self) -> bool:
+        """Whether `checkpoint()` is a *true* restore point — whether running the layer again
+        over the same rows lands on the state it would have had.
+
+        The default is yes, because that is what `checkpoint()` below promises and what every
+        layer honours whose writes only land past the offset or which reassigns its tensors
+        rather than mutating them. A layer that rotates its buffer, or whose position lives
+        somewhere the base does not capture, answers `False` — and it is a property and not a
+        docstring because a caller that rewinds by replay has to be able to ask.
+
+        Read over the whole list the way `is_trimmable` is: one layer that cannot restore
+        makes the trunk's rewind a lie, and a lie here is a decode running off state that
+        describes a sequence that never happened.
+        """
+        return True
+
     def checkpoint(self) -> Callable[[], None]:
         """A restore point at a call boundary, for a replay that runs the layer again over
         the same input. Unlike `trim`, this needs no kept history: the base restores the
@@ -138,8 +155,14 @@ class ConvCache(LayerCache):
 
 
 class DeltaCache(ConvCache):
-    """The DeltaNet's conv window plus its recurrent state; a trimmed state cannot be
-    reconstructed, so speculative decoding is off for this architecture."""
+    """The DeltaNet's conv window plus its recurrent state.
+
+    `is_trimmable` stays `False` and always will: a state trimmed to an earlier length cannot
+    be reconstructed from itself, because the recurrence kept no history to subtract. What it
+    can do is start over — `checkpoint()` captures the state and the window by reference, and
+    both this and `ConvCache` reassign rather than mutate, so restoring the references is
+    exact. That is what makes speculation possible here, by replay and not by trim.
+    """
 
     def __init__(self) -> None:
         super().__init__()
@@ -277,6 +300,13 @@ class FixedKVCache(LayerCache):
 
     @property
     def is_trimmable(self) -> bool:
+        return False
+
+    @property
+    def is_replayable(self) -> bool:
+        """No: the position that moves is `state[2]`, inside the graph, and the base's
+        `checkpoint()` captures `offset` — which the compiled decode never touches. A restore
+        would report the old position over a buffer that already advanced."""
         return False
 
     @property
@@ -478,6 +508,13 @@ class RingKVCache(LayerCache):
 
     @property
     def is_trimmable(self) -> bool:
+        return False
+
+    @property
+    def is_replayable(self) -> bool:
+        """No, and for a reason `trim` shares: slot `j` holds absolute position `j % window`,
+        so a write wraps onto a row the ring still needs. The un-promoted path assigns into
+        the buffer in place, which no restore of a reference can undo."""
         return False
 
     @property

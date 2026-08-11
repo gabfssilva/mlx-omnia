@@ -133,7 +133,7 @@ def test_gemma3_answers_with_the_ids_of_its_own_tokenizer() -> None:
     found = tokenizer_of(load(directory))
     assert isinstance(found, Gemma3Tokenizer)
     reference = Gemma3Tokenizer.from_file(directory / "tokenizer.json")
-    assert found.encode(text) == reference.encode(text)
+    assert list(found.encode(text)) == list(reference.encode(text))
     # The signature no byte-level BPE over the same file produces: Gemma's own template
     # processor is what puts `<bos>` in front.
-    assert found.encode(text)[0] == reference.bos == 2
+    assert next(iter(found.encode(text))) == reference.bos == 2

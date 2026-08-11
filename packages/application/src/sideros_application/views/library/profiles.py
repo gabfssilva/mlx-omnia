@@ -1,4 +1,4 @@
-"""A model's saved profiles and its own DFlash setting.
+"""A model's saved profiles and its own speculation setting.
 
 A profile is sampling plus a system prompt, saved on the model and served as `model:name`;
 a knob left blank is not part of the profile, which is what `—` means on screen and `null`
@@ -14,14 +14,22 @@ from dataclasses import dataclass, field
 import flet as ft
 
 from sideros_application.api import catalog as hub
-from sideros_application.api.catalog import EFFORTS, DFlash, ProfileView, SettingsView
+from sideros_application.api.catalog import (
+    EFFORTS,
+    ProfileView,
+    SettingsView,
+)
+from sideros_application.api.catalog import Speculation as Speculating
 from sideros_application.ui import forms, parts, theme
 from sideros_application.ui.hooks import act
 from sideros_application.ui.theme import t
 
-# The value the picker uses for "an id the list does not offer". Not a valid model id — a
-# `/` is mandatory in one — so it can never collide with something selectable.
+# The two values the picker uses that are not ids. Neither is a valid model id — a `/` is
+# mandatory in one — so they can never collide with something selectable.
 OTHER = "?other"
+MTP = "?mtp"
+"""This model's own head, which has no id to name: it is `mtp.*` inside the checkpoint the
+model already loads from."""
 
 KNOBS = [
     ("temperature", "Temperature"),
@@ -361,10 +369,19 @@ class Profiles:
 
 
 class Speculation:
-    """There is no on/off here: what turns speculation on is naming the checkpoint to
-    draft with, since that is the thing the daemon loads beside the model. It never
-    changes what the model writes — verification accepts only the target's own argmax —
-    so the setting buys speed or it buys nothing."""
+    """There is no on/off here: what turns speculation on is naming the *technique*, since
+    naming it is naming the thing the daemon loads beside the model. It never changes what
+    the model writes — verification accepts only the target's own argmax — so the setting
+    buys speed or it buys nothing.
+
+    Two techniques, drawn by one picker because on screen it is one choice:
+
+    - a **DFlash drafter**, a second checkpoint, picked by id out of what is installed;
+    - this model's **own MTP head**, which is inside its checkpoint and has no id to pick.
+
+    Which of the two a model can do is the daemon's answer, read on every load: `available`
+    lists the drafters, `mtp_available` says whether the head is in the shards.
+    """
 
     def __init__(self, redraw: Callable[[], None]) -> None:
         self.redraw = redraw
@@ -372,7 +389,9 @@ class Speculation:
         self.view: SettingsView | None = None
         self.failure: str | None = None
         self.saving = False
-        self.drafter = ""
+        self.choice = ""
+        """What the picker holds: `""` off, `MTP` this model's own head, anything else the
+        id of a drafter checkpoint."""
         self.typing = False
         self.block = ""
         self._task: asyncio.Task[None] | None = None
@@ -388,12 +407,20 @@ class Speculation:
             self._task.cancel()
         self._task = asyncio.get_running_loop().create_task(self._read(model))
 
+    @staticmethod
+    def _chosen(stored: Speculating | None) -> str:
+        """The stored row as the picker's one value. An MTP head names no drafter, so the
+        kind is the only thing that tells it from off."""
+        if stored is None or stored.get("kind") is None:
+            return ""
+        return MTP if stored["kind"] == "mtp" else (stored.get("drafter") or "")
+
     def _take(self, view: SettingsView) -> None:
         self.view = view
-        dflash = view["features"]["dflash"]
-        self.drafter = (dflash or {}).get("drafter") or ""
+        stored = view["features"]["speculation"]
+        self.choice = self._chosen(stored)
         self.typing = False
-        size = (dflash or {}).get("block_size")
+        size = (stored or {}).get("block_size")
         self.block = "" if size is None else str(size)
 
     async def _read(self, model: str) -> None:
@@ -403,26 +430,23 @@ class Speculation:
             self.failure = str(error)
         self.redraw()
 
-    def _commit(self, named: str) -> None:
+    def _commit(self, choice: str) -> None:
         view = self.view
         if view is None:
             return
-        stored = view["features"]["dflash"]
+        stored = view["features"]["speculation"]
         length = None if self.block.strip() == "" else int(float(self.block))
-        if named == ((stored or {}).get("drafter") or "") and length == (
-            (stored or {}).get("block_size")
-        ):
+        if choice == self._chosen(stored) and length == (stored or {}).get("block_size"):
             return
-        act(
-            self._write(
-                {
-                    "drafter": named or None,
-                    "block_size": None if named == "" else length,
-                }
-            )
-        )
+        if choice == "":
+            asked: Speculating = {"kind": None, "drafter": None, "block_size": None}
+        elif choice == MTP:
+            asked = {"kind": "mtp", "drafter": None, "block_size": length}
+        else:
+            asked = {"kind": "dflash", "drafter": choice, "block_size": length}
+        act(self._write(asked))
 
-    async def _write(self, next_: DFlash) -> None:
+    async def _write(self, next_: Speculating) -> None:
         model = self.model
         if model is None:
             return
@@ -430,7 +454,7 @@ class Speculation:
         self.failure = None
         self.redraw()
         try:
-            self._take(await hub.save_settings(model, {"dflash": next_}))
+            self._take(await hub.save_settings(model, {"speculation": next_}))
         except Exception as error:  # noqa: BLE001
             self.failure = str(error)
             # The daemon refused, so what is on screen is not what is stored.
@@ -441,44 +465,45 @@ class Speculation:
 
     def _pick(self, value: str) -> None:
         if value == OTHER:
-            self.drafter = ""
+            self.choice = ""
             self.typing = True
             self.redraw()
             return
-        self.drafter = value
+        self.choice = value
         self._commit(value)
 
     def draw(self) -> list[ft.Control]:
         view = self.view
         if view is None:
             return []
-        # What the picker offers: off, everything installed, and — when the stored id is
-        # not among them — the stored one, so opening the list never proposes to forget it.
-        offered = (
-            view["available"]
-            if self.drafter in view["available"] or self.drafter == ""
-            else [self.drafter, *view["available"]]
-        )
-        if self.typing or not offered:
+        # What the picker offers: off, this model's own head when it has one, everything
+        # installed, and — when the stored id is not among them — the stored one, so opening
+        # the list never proposes to forget it.
+        installed = view["available"]
+        named = "" if self.choice == MTP else self.choice
+        offered = installed if named in installed or named == "" else [named, *installed]
+        options = [("", "off")]
+        if view["mtp_available"]:
+            options.append((MTP, "This model's own MTP head"))
+        options += [(one, one) for one in offered]
+        options.append((OTHER, "Another checkpoint…"))
+
+        if self.typing or (not offered and not view["mtp_available"]):
             chooser: ft.Control = parts.field(
-                self.drafter,
+                named,
                 lambda value: self._commit(value.strip()),
                 mono=True,
                 hint="off",
             )
         else:
-            chooser = parts.pick(
-                [("", "off"), *((one, one) for one in offered), (OTHER, "Another checkpoint…")],
-                self.drafter,
-                self._pick,
-            )
+            chooser = parts.pick(options, self.choice, self._pick)
         drawn: list[ft.Control] = [
             # First on the Features tab, which it has to itself until there is a second one.
             parts.group("Speculation", first=True),
-            forms.labelled("DFlash drafter", chooser),
+            forms.labelled("Draft with", chooser),
         ]
-        stored = view["features"]["dflash"]
-        if stored is not None and stored["drafter"] is not None:
+        stored = view["features"]["speculation"]
+        if stored is not None and stored["kind"] is not None:
             drawn.append(
                 ft.Container(
                     padding=ft.Padding.only(top=11),
@@ -489,6 +514,20 @@ class Speculation:
                             lambda value: self._set_block(value),
                             hint="the engine's default",
                         ),
+                    ),
+                )
+            )
+            # Said before the click and not as a 409 after it. The engine refuses to compose
+            # speculation with prefix reuse (`generate.stream_ids` says why), and prefix
+            # reuse is on by default — on a 21k conversation it is the difference between
+            # 0.14 s and 15.78 s to the first token of the third turn.
+            drawn.append(
+                ft.Container(
+                    padding=ft.Padding.only(top=9),
+                    content=parts.note(
+                        "While this is on, requests that speculate do not reuse the "
+                        "conversation prefix, and a sampled, penalized or grammar-constrained "
+                        "request decodes without the draft."
                     ),
                 )
             )
@@ -507,4 +546,4 @@ class Speculation:
 
     def _set_block(self, value: str) -> None:
         self.block = value
-        self._commit(self.drafter.strip())
+        self._commit(self.choice)

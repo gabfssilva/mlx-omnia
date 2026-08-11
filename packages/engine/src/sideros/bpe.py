@@ -8,6 +8,7 @@ implement raises instead of tokenizing differently from the checkpoint's own.
 
 import itertools
 import json
+from collections.abc import Iterator
 from dataclasses import dataclass
 from pathlib import Path
 from typing import NotRequired, TypedDict
@@ -211,7 +212,20 @@ class ByteLevelBPE:
             regex.compile("|".join(regex.escape(token) for token in longest_first)),
         )
 
-    def encode(self, text: str) -> list[int]:
+    def encode(self, text: "str | Iterator[str]") -> Iterator[int]:
+        """The ids of a prompt, whole or arriving in pieces.
+
+        Where a prompt may be cut is a fact of this tokenizer: `self.splits` is the
+        pre-tokenizer this checkpoint declared, and BPE never merges across one of its
+        breaks. A caller that cut on its own idea of a boundary would feed the model ids the
+        whole prompt does not encode to.
+        """
+        if isinstance(text, str):
+            yield from self._encode_whole(text)
+            return
+        yield from self._encode_arriving(text)
+
+    def _encode_whole(self, text: str) -> list[int]:
         if not self.added:
             return self._encode_text(text)
         ids: list[int] = []
@@ -222,6 +236,43 @@ class ByteLevelBPE:
             position = match.end()
         ids.extend(self._encode_text(text[position:]))
         return ids
+
+    def _encode_arriving(self, chunks: Iterator[str]) -> Iterator[int]:
+        """Ids for everything a later piece can no longer change, as each piece lands.
+
+        Two things can still change: the pre-token the text ends inside — `MergedWithNext`
+        glues a match to what follows it, so the last one is never final — and an added token
+        straddling the cut, which is why the tail keeps the longest one's worth of characters.
+        `<|im_` encoded as ordinary text is bytes where the checkpoint has one id.
+        """
+        margin = max((len(token) for token in self.added), default=0)
+        pending = ""
+        for chunk in chunks:
+            pending += chunk
+            settled = self._settled(pending, margin)
+            if settled > 0:
+                yield from self._encode_whole(pending[:settled])
+                pending = pending[settled:]
+        yield from self._encode_whole(pending)
+
+    def _settled(self, pending: str, margin: int) -> int:
+        """How much of `pending` this tokenizer's own pre-tokenizer has already decided.
+
+        The end of the last added token is settled whatever the splits say, and nothing
+        before it may be cut: the pre-tokenizer parts `<|im_start|>` into pieces that are
+        each a legal boundary and together are not the token — cutting on one of them hands
+        the model six ids where the checkpoint has one.
+        """
+        anchor = 0
+        for match in self._added_pattern.finditer(pending):
+            anchor = match.end()
+        limit = len(pending) - margin
+        if limit <= anchor:
+            return anchor
+        pieces = [pending[anchor:limit]]
+        for split in self.splits:
+            pieces = [part for piece in pieces for part in split.apply(piece)]
+        return anchor if len(pieces) < 2 else limit - len(pieces[-1])
 
     def _encode_text(self, text: str) -> list[int]:
         pieces = [text]

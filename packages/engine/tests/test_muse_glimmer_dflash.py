@@ -29,14 +29,20 @@ from sideros import (
     top_k,
 )
 from sideros.bpe import ByteLevelBPE
+from sideros.core.masks import FULL
 from sideros.models.muse_glimmer import CHECKPOINT, MuseGlimmer, load_assistant
+from sideros.models.muse_glimmer.config import (
+    MuseGlimmerConfig,
+    MuseGlimmerRoPE,
+    MuseGlimmerTextConfig,
+)
 from sideros.models.muse_glimmer.dflash import (
     DEFAULT_BLOCK,
     MuseGlimmerAssistant,
     MuseGlimmerDFlash,
 )
 from sideros.models.muse_glimmer.model import MuseGlimmerLanguageModel
-from sideros.speculative import Acceptance, Proposer
+from sideros.speculative import Acceptance, Proposer, Speculable, SpeculationRefused
 
 REPO = "local/Muse-Glimmer-30B-4bit"
 """The quantized target, not the bf16 one: this is the shape the pair actually decodes in
@@ -60,6 +66,41 @@ def drafter() -> MuseGlimmerAssistant:
 @pytest.fixture(scope="module")
 def tokenizer() -> ByteLevelBPE:
     return ByteLevelBPE.from_file(checkpoint_dir(REPO) / "tokenizer.json")
+
+
+VOCAB, HIDDEN = 12, 8
+
+
+@pytest.fixture
+def lender() -> MuseGlimmer:
+    """A trunk of the right shape and the wrong size, with both ends of its vocabulary set
+    by hand. What the tests below read off it is the pair of transforms the *config* turns
+    on — the scaleless RMS over the lookup, the multiplier and the softcap over the head —
+    so the 17 GB of real weights would only make them slower, and they run on a machine that
+    has no checkpoint at all."""
+    text = MuseGlimmerTextConfig(
+        hidden_size=HIDDEN,
+        intermediate_size=2 * HIDDEN,
+        num_hidden_layers=1,
+        num_attention_heads=2,
+        num_key_value_heads=1,
+        head_dim=HIDDEN // 2,
+        vocab_size=VOCAB,
+        rms_norm_eps=1e-6,
+        post_norm_eps=1e-6,
+        sliding_window=8,
+        qk_scale_factor=1.0,
+        output_multiplier=2.0,
+        final_logit_softcapping=30.0,
+        layer_types=(FULL,),
+        layer_rope_theta=(10000.0,),
+        rope_parameters=MuseGlimmerRoPE(rope_theta=10000.0),
+    )
+    model = MuseGlimmer(MuseGlimmerConfig(text))
+    ramp = mx.arange(1, VOCAB * HIDDEN + 1, dtype=mx.float32).reshape(VOCAB, HIDDEN)
+    model.model.embed_tokens.weight = ramp / 8
+    model.lm_head.weight = ramp / 32
+    return model
 
 
 def _ulp(magnitude: float, dtype: mx.Dtype) -> float:
@@ -115,14 +156,16 @@ def test_dflash_reproduces_the_greedy_stream(
 
 
 @requires_checkpoint(DRAFTER)
-def test_the_drafter_is_a_proposer_and_says_what_it_reads(drafter: MuseGlimmerAssistant) -> None:
+def test_the_drafter_is_a_proposer_and_says_what_it_reads(
+    lender: MuseGlimmer, drafter: MuseGlimmerAssistant
+) -> None:
     """The contract the loop is written against, and the two numbers a round is shaped by.
 
     The taps are the checkpoint's; the block is *not*. What the checkpoint declares is what
     the drafter was trained to write in one forward (16), and what a round is worth
     proposing is where the target's rows are still free — four here, measured. Reading the
     trained length as the default is what made the feature a loss out of the box."""
-    proposer = MuseGlimmerDFlash(None, drafter)  # pyright: ignore[reportArgumentType]
+    proposer = MuseGlimmerDFlash(lender, drafter)
 
     assert isinstance(proposer, Proposer)
     assert proposer.width == DEFAULT_BLOCK - 1
@@ -131,14 +174,45 @@ def test_the_drafter_is_a_proposer_and_says_what_it_reads(drafter: MuseGlimmerAs
 
 
 @requires_checkpoint(DRAFTER)
-def test_a_shorter_block_is_a_shorter_proposal(drafter: MuseGlimmerAssistant) -> None:
+def test_a_shorter_block_is_a_shorter_proposal(
+    lender: MuseGlimmer, drafter: MuseGlimmerAssistant
+) -> None:
     """The knob the settings expose. Below the checkpoint's own length it is a choice; above
     it there is nothing to write with, and asking is a `ValueError` rather than a block of
     mask rows the drafter never saw in training."""
-    shorter = MuseGlimmerDFlash(None, drafter, block_size=8)  # pyright: ignore[reportArgumentType]
+    shorter = MuseGlimmerDFlash(lender, drafter, block_size=8)
     assert shorter.width == 7
     with pytest.raises(ValueError, match="writes"):
-        MuseGlimmerDFlash(None, drafter, block_size=32)  # pyright: ignore[reportArgumentType]
+        MuseGlimmerDFlash(lender, drafter, block_size=32)
+
+
+def test_the_target_lends_the_raw_pair_and_not_the_cooked_one(lender: MuseGlimmer) -> None:
+    """What `Speculable` is named for. Neither end of this facade's vocabulary is the bare
+    tensor — `embed` puts a scaleless RMS over the lookup, `head` puts `output_multiplier`
+    and a softcap over `lm_head` — and the drafter was trained against the bare ones.
+
+    Both differences are **monotone**, so a pair that reached for the cooked pair by mistake
+    would agree token for token with this one under greedy and pass every other test in this
+    file. That is the whole reason the protocol names them apart instead of trusting a type.
+    """
+    ids = mx.array([3, 1, 4, 1, 5])
+
+    assert isinstance(lender, Speculable)
+    rows = lender.raw_embed(ids)
+    assert not mx.allclose(rows, lender.embed(ids))
+
+    raw, cooked = lender.raw_logits(rows), lender.head(rows)
+    assert not mx.allclose(raw, cooked)
+    assert mx.array_equal(mx.argmax(raw, axis=-1), mx.argmax(cooked, axis=-1))
+
+
+@requires_checkpoint(DRAFTER)
+def test_a_target_that_lends_nothing_is_refused_by_name(drafter: MuseGlimmerAssistant) -> None:
+    """The pair is no longer typed to one model, so what a wrong target costs has to be an
+    exception and not a signature. Before the first token, by name, and not an
+    `AttributeError` three rounds into a generation."""
+    with pytest.raises(SpeculationRefused, match="Speculable"):
+        MuseGlimmerDFlash(object(), drafter)  # pyright: ignore[reportArgumentType]
 
 
 @requires_checkpoint(REPO)

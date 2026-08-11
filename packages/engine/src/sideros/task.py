@@ -13,8 +13,9 @@ import huggingface_hub
 import mlx.core as mx
 import mlx.nn as nn
 
-from sideros.checkpoint import Drafter, Pending, save_quantized
+from sideros.checkpoint import MTP_PREFIX, Drafter, Pending, save_quantized
 from sideros.core.cache import LayerCache
+from sideros.footprint import checkpoint_bytes
 from sideros.generate import CausalLM
 from sideros.language import LanguageModel
 from sideros.model import ModelInput
@@ -210,7 +211,10 @@ _MODEL_SPECS: dict[str, _Registered] = {
 _CACHE = Path.home() / ".cache" / "sideros" / "quantized"
 
 # Bumped whenever the same plan over the same checkpoint would produce different bits.
-_FORMAT_VERSION = 1
+_FORMAT_VERSION = 2
+"""2: an entry now carries the source's MTP head under `MTP_PREFIX`. Same source, same plan,
+different bits — and the difference is exactly the thing an old entry cannot be asked for,
+since a head that was never written cannot be read back out."""
 
 
 def _fingerprint(directory: Path, repository: str | None) -> tuple[str, dict[str, object]]:
@@ -272,15 +276,31 @@ def write_entry(
     config: Mapping[str, object],
     weights: Mapping[str, mx.array],
     plan: QuantizationPlan,
+    *,
+    selection: ByPath | Quantization | None = None,
 ) -> None:
     """Staged next to the entry and renamed at the end: a process killed halfway leaves a
-    `.tmp-*` that no lookup can take for an entry."""
+    `.tmp-*` that no lookup can take for an entry.
+
+    An MTP head the source carries is packed and written here, under `MTP_PREFIX`, and that
+    is deliberately *here* and not in either caller. There are two — `load(quantize=…)` and
+    the daemon's own quantization job — and the first version of this put the merge in one of
+    them, which produced entries that quantized fine and could not speculate. A caller cannot
+    forget what it does not do.
+
+    `selection` is what the head is packed under. `None` leaves it out, which is what a
+    caller writing an entry for something that is not a model wants. The head is always
+    round-to-nearest, even when the trunk was calibrated: the statistics a calibration
+    gathers are the trunk's, and running the head through them would be a number derived
+    from the wrong activations. It is 3.7% of the bytes it rides with.
+    """
     entry.parent.mkdir(parents=True, exist_ok=True)
     staging = Path(tempfile.mkdtemp(prefix=".tmp-", dir=entry.parent))
     try:
         for name in _auxiliary(checkpoint, patterns):
             shutil.copy2(checkpoint / name, staging / name)
-        save_quantized(staging, config, weights, plan)
+        head, head_plan = _packed_head(checkpoint, selection)
+        save_quantized(staging, config, {**weights, **head}, plan | head_plan)
     except BaseException:
         shutil.rmtree(staging, ignore_errors=True)
         raise
@@ -290,6 +310,32 @@ def write_entry(
         shutil.rmtree(staging, ignore_errors=True)
         if not entry.is_dir():
             raise
+
+
+def _packed_head(
+    checkpoint: Path, selection: ByPath | Quantization | None
+) -> tuple[dict[str, mx.array], QuantizationPlan]:
+    """The source's MTP head, packed, with its leaves named as the entry spells them.
+
+    Empty for a checkpoint with no head and for a caller that named no selection. The plan is
+    the head's own — `expand_plan` over the head's tree — because the trunk's is a map of
+    leaves the head does not have.
+    """
+    spec = None if selection is None else _MTP_SPECS.get(_architecture(checkpoint))
+    if spec is None or not has_mtp(checkpoint):
+        return {}, {}
+    pending = spec.quantize(checkpoint, None)
+    plan = expand_plan(pending.model, selection)
+    packed = _quantized(pending.model, pending.weights(), plan)
+    return (
+        {f"{MTP_PREFIX}{leaf}": value for leaf, value in packed.items()},
+        {f"{MTP_PREFIX}{leaf}": format for leaf, format in plan.items()},
+    )
+
+
+def _architecture(directory: Path) -> str:
+    config: _Config = json.loads((directory / "config.json").read_text())
+    return config["model_type"]
 
 
 def _quantized(
@@ -476,6 +522,7 @@ def load(
             {**config, "sideros": recorded},
             _quantized(pending.model, pending.weights(), plan),
             plan,
+            selection=quantize,
         )
     return spec.task(entry, None)
 
@@ -519,6 +566,55 @@ def load_drafter(directory: Path, dtype: mx.Dtype | None = None) -> nn.Module:
     if spec is None:
         raise ValueError(f"{architecture!r} is not a drafter architecture this engine loads")
     return spec.load(directory, dtype)
+
+
+_MTP_SPECS: dict[str, Drafter[nn.Module]] = {
+    "nemotron_h": nemotron_h.MTP,
+}
+"""Architectures whose *own* checkpoint carries a multi-token-prediction head.
+
+A second table and not an entry in `_DRAFTER_SPECS`, because the question is different. That
+one asks "is this directory a drafter and nothing else" — it has no tokenizer, serves no
+task, answers to no `load`. Here the directory is the model; the head is a prefix inside its
+shards that the trunk's loader drops (`_drop_mtp`, in nine families). Keyed the same way and
+answering separately is what keeps `drafts()` from having to say two things at once about one
+folder, which is the collision `64.3` names from the other side.
+
+`prepare_weights` still drops `mtp.*` from the trunk's tree: the head is a second tree, out of
+the model's own, so whoever accounts for memory can weigh it — `speculative.Drafting` says
+why."""
+
+
+def mtp_head(directory: Path, dtype: mx.Dtype | None = None) -> nn.Module:
+    """The MTP head this checkpoint carries, as a tree of its own.
+
+    Raises rather than returning `None` for a checkpoint without one: naming a head is what
+    turns speculation on, and a switch that silently did nothing is a model answering at a
+    speed the screen says it does not have.
+    """
+    config: _Config = json.loads((directory / "config.json").read_text())
+    architecture = config["model_type"]
+    spec = _MTP_SPECS.get(architecture)
+    if spec is None:
+        raise ValueError(f"{architecture!r} has no MTP head this engine loads")
+    return spec.load(directory, dtype)
+
+
+def has_mtp(directory: Path) -> bool:
+    """Whether this checkpoint carries a head *and* this engine can build it.
+
+    Both halves are needed and neither implies the other: a `nemotron_h` entry quantized
+    before the head was kept has the architecture and none of the tensors, and a family whose
+    checkpoints ship `mtp.*` has the tensors and no tree until somebody writes one. Read off
+    the shard headers, so it costs no load — which is what the catalog and the screen need.
+    """
+    try:
+        config: _Config = json.loads((directory / "config.json").read_text())
+    except (OSError, ValueError):
+        return False
+    if config.get("model_type") not in _MTP_SPECS:
+        return False
+    return checkpoint_bytes(directory, MTP_PREFIX) > 0
 
 
 def tree(

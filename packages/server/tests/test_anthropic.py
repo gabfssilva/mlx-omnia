@@ -267,8 +267,9 @@ class Letters:
     """One id per character. `count_tokens` is about which text was rendered and encoded, not
     about a vocabulary: with this, the count a test asserts is a length it can write down."""
 
-    def encode(self, text: str) -> list[int]:
-        return [ord(character) for character in text]
+    def encode(self, text: str | Iterator[str]) -> Iterator[int]:
+        whole = text if isinstance(text, str) else "".join(text)
+        return iter([ord(character) for character in whole])
 
     def decode_bytes(self, ids: list[int]) -> bytes:
         return bytes(ids)

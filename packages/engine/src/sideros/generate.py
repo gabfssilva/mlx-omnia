@@ -9,6 +9,7 @@ import codecs
 import time
 from collections.abc import Callable, Collection, Generator, Iterable, Iterator, Sequence
 from dataclasses import dataclass, field
+from itertools import islice
 from typing import Protocol, runtime_checkable
 
 import mlx.core as mx
@@ -16,7 +17,7 @@ import mlx.core as mx
 from sideros.core.cache import LayerCache
 from sideros.core.cache_file import policy
 from sideros.core.mxcompat import softmax
-from sideros.core.prefill import prefill
+from sideros.core.prefill import ARRIVING, BLOCK, pulled
 from sideros.core.prompt_cache import PromptCache
 from sideros.parsers import FALLBACK, Parser, Segment, Segmenter
 from sideros.speculative import Acceptance, SpeculationRefused, stream_speculative_ids
@@ -389,7 +390,7 @@ def _boundary[C: LayerCache](model: CausalLM[C], cache: list[C]) -> list[C] | No
 
 def stream_ids[C: LayerCache, D: LayerCache](
     model: CausalLM[C],
-    prompt: list[int],
+    prompt: Iterable[int],
     *,
     max_tokens: int,
     sampler: Sampler = greedy,
@@ -436,7 +437,14 @@ def stream_ids[C: LayerCache, D: LayerCache](
 
     A `draft` moves the whole run onto the speculative loop, which emits this same greedy
     stream token for token — `lookahead` and `acceptance` are read only there. Without one
-    nothing below changes."""
+    nothing below changes.
+
+    `prompt` may still be arriving. A sequence is prefilled the way it always was; anything
+    else is pulled block by block, so a caller whose prompt is being written by something
+    slower — a caption coming out of a second model — has this one's forwards running against
+    that production instead of after it. Two things want the whole list and therefore wait for
+    it: `prefix`, whose trie matches ids it has to have, and `draft`. What a lazy prompt pays
+    them is the overlap, never a row."""
     if draft is not None:
         if sampler is not greedy:
             raise SpeculationRefused(
@@ -483,6 +491,12 @@ def stream_ids[C: LayerCache, D: LayerCache](
         return
 
     cache = model.make_cache()
+    if prefix is not None and not isinstance(prompt, Sequence):
+        # The trie descends the ids one by one and `take` sizes its match against the whole
+        # list, so a prompt still being produced is waited for here rather than matched
+        # against a piece of itself — a match cut short at a block boundary would be reuse
+        # silently lost on exactly the long conversations the trie exists for.
+        prompt = list(prompt)
     # The fresh cache goes in as well as out: a trie backed by disk fills *this* list rather
     # than handing one back, because a file has no cache in it — only the rows one would
     # hold, and which class holds them is the trunk's answer and nobody else's.
@@ -490,11 +504,17 @@ def stream_ids[C: LayerCache, D: LayerCache](
     if reuse is not None:
         cache = reuse.caches
     # What the cache holds, row for row, for the insert at the end: the prompt, whether its
-    # head was reused or prefilled, plus every id the loop feeds back in.
-    covered = list(prompt)
-    history = mx.array(prompt)
+    # head was reused or prefilled, plus every id the loop feeds back in. It is filled as the
+    # prompt arrives, which for a sequence is all at once.
+    covered: list[int] = []
+    prompt_length = 0
+    history = mx.array([], dtype=mx.int32)
     if meter is not None:
-        meter.prefill(len(prompt), 0 if reuse is None else reuse.length)
+        # The clock starts here whatever shape the prompt is in: for one still arriving, the
+        # wait for its producer is part of the TTFT this measures. The count is set below,
+        # where it exists.
+        known = len(prompt) if isinstance(prompt, Sequence) else 0
+        meter.prefill(known, 0 if reuse is None else reuse.length)
 
     decode: Callable[[mx.array], mx.array] | None = None
 
@@ -505,7 +525,7 @@ def stream_ids[C: LayerCache, D: LayerCache](
         if constraint is not None:
             # Last, so nothing downstream can put a forbidden id back: a filter divides and
             # compares, and -inf survives both.
-            logits = constraint.mask(logits, max_tokens - (len(covered) - len(prompt)))
+            logits = constraint.mask(logits, max_tokens - (len(covered) - prompt_length))
         return sampler(logits)[0]
 
     def advance(drawn: mx.array) -> mx.array:
@@ -535,9 +555,26 @@ def stream_ids[C: LayerCache, D: LayerCache](
     try:
         # What the reuse did not already cover, fed in blocks: only the last block's logits
         # are read, and the blocks before it never compute the head at all.
-        fresh = history if reuse is None else mx.array(prompt[reuse.length :])
-        window = prefill(lambda block: model(fresh[block][None], cache), fresh.size, cache)
-        y = step(fresh[window], history)
+        arriving = iter(prompt)
+        if reuse is not None:
+            covered.extend(islice(arriving, reuse.length))
+
+        def feed(ids: list[int]) -> object:
+            covered.extend(ids)
+            return model(mx.array(ids)[None], cache)
+
+        head = pulled(
+            feed, arriving, cache, block=BLOCK if isinstance(prompt, Sequence) else ARRIVING
+        )
+        covered.extend(head)
+        prompt_length = len(covered)
+        history = mx.array(covered)
+        if meter is not None:
+            # The count only exists now for a prompt that was arriving; `prefill` above
+            # started the clock, and the wait for the producer belongs inside the TTFT it
+            # measures.
+            meter.prompt_tokens = prompt_length
+        y = step(mx.array(head), history)
         mx.async_eval(y)
         # The cut the next turn will actually match, on a trunk that cannot be rewound to it
         # later. The entry this loop leaves behind ends in the ids the model wrote, and a

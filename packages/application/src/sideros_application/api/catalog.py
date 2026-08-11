@@ -118,15 +118,21 @@ class Sampling(TypedDict):
     reasoning_budget: int | None
 
 
-class DFlash(TypedDict):
-    """Naming the drafter is what turns it on, and null is off."""
+class Speculation(TypedDict):
+    """Naming the *technique* is what turns it on, and a null `kind` is off.
 
+    `dflash` drafts with a second checkpoint, so `drafter` names it. `mtp` drafts with a head
+    inside the model's own checkpoint, so there is nothing to name and `drafter` stays null —
+    which is why the screen draws the two differently: a picker for one, a switch for the
+    other."""
+
+    kind: str | None
     drafter: str | None
     block_size: int | None
 
 
 class Features(TypedDict):
-    dflash: DFlash | None
+    speculation: Speculation | None
 
 
 class ProfileView(TypedDict):
@@ -144,6 +150,10 @@ class SettingsView(TypedDict):
     model: str
     features: Features
     available: list[str]
+    mtp_available: bool
+    """Whether this checkpoint carries an MTP head the daemon can build. Read off the shards
+    on every read, like `available`: a model requantized without the head turns the switch
+    unavailable without anything having to rewrite the row that named it."""
     unavailable_reason: str | None
 
 

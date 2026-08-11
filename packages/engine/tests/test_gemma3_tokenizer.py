@@ -57,18 +57,18 @@ def reference() -> Encodes:
 
 @pytest.mark.parametrize("text", CORPUS)
 def test_ids_match_transformers(tokenizer: Gemma3Tokenizer, reference: Encodes, text: str) -> None:
-    assert tokenizer.encode(text) == reference.encode(text)
+    assert list(tokenizer.encode(text)) == list(reference.encode(text))
 
 
 @pytest.mark.parametrize("text", [text for text in CORPUS if "▁" not in text])
 def test_round_trip(tokenizer: Gemma3Tokenizer, text: str) -> None:
-    assert tokenizer.decode(tokenizer.encode(text)[1:]) == text
+    assert tokenizer.decode(list(tokenizer.encode(text))[1:]) == text
 
 
 @given(st.text().filter(lambda text: "▁" not in text))
 def test_round_trip_any_text(tokenizer: Gemma3Tokenizer, text: str) -> None:
-    assert tokenizer.decode(tokenizer.encode(text)[1:]) == text
+    assert tokenizer.decode(list(tokenizer.encode(text))[1:]) == text
 
 
 def test_bos_is_prepended(tokenizer: Gemma3Tokenizer) -> None:
-    assert tokenizer.encode("hello")[0] == tokenizer.bos == 2
+    assert next(iter(tokenizer.encode("hello"))) == tokenizer.bos == 2

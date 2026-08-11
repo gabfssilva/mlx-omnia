@@ -137,12 +137,21 @@ def preset(model_id: str, profile: ProfileView | None) -> Sampling:
 assert set(vars(SamplingDefaults())) <= set(Sampling.model_fields)
 
 
+def _named(loaded: features.Speculation | None) -> str:
+    """What the model is holding, for a refusal a reader can act on. The drafter's id when
+    there is one to name, and what the head *is* when there is not — an MTP head has no id,
+    which is the whole reason `kind` exists."""
+    if loaded is None or loaded.kind is None:
+        return "no draft"
+    return repr(loaded.drafter) if loaded.drafter else "its own MTP head"
+
+
 def speculating(store: Store, model_id: str, profile: ProfileView | None) -> bool:
-    """Whether this request may use the drafter the model was loaded with. A profile that
-    names no feature inherits; one that turned DFlash off decodes without it, on a model
-    that is holding the drafter for everybody else."""
-    dflash = switches(store, model_id, profile).dflash
-    return dflash is not None and dflash.drafter is not None
+    """Whether this request may use the draft the model was loaded with. A profile that
+    names no feature inherits; one that turned speculation off decodes without it, on a model
+    that is holding the draft for everybody else."""
+    speculation = switches(store, model_id, profile).speculation
+    return speculation is not None and speculation.kind is not None
 
 
 def switches(store: Store, model_id: str, profile: ProfileView | None) -> Features:
@@ -202,18 +211,20 @@ def save(model_id: str, name: str, body: ProfileBody, store: StoreDep) -> Profil
     """
     if ":" in name:
         raise HTTPException(status_code=400, detail=f"profile name {name!r} may not contain ':'")
-    asked = body.features.dflash
-    if asked is not None and asked.drafter is not None:
-        # A profile may turn a feature off; a drafter is a second checkpoint in memory, and
-        # which one is loaded is decided once for the model. Refused rather than stored and
-        # ignored, which is a preset that says it drafts with something it never touches.
-        loaded = features.parse(store.model_settings(model_id).features).dflash
-        if loaded is None or loaded.drafter != asked.drafter:
-            named = "no drafter" if loaded is None else repr(loaded.drafter)
+    asked = body.features.speculation
+    if asked is not None and asked.kind is not None:
+        # A profile may turn a feature off; a draft is a second tree in memory, and which one
+        # is loaded is decided once for the model. Refused rather than stored and ignored,
+        # which is a preset that says it drafts with something it never touches.
+        #
+        # The pair and not the id: `mtp` names no drafter, so comparing `drafter` alone would
+        # let a profile switch a model from DFlash to the head it never loaded.
+        loaded = features.parse(store.model_settings(model_id).features).speculation
+        if loaded is None or (loaded.kind, loaded.drafter) != (asked.kind, asked.drafter):
             raise HTTPException(
                 status_code=409,
-                detail=f"{model_id!r} loads {named}: a profile may turn DFlash off, not "
-                "name another drafter",
+                detail=f"{model_id!r} loads {_named(loaded)}: a profile may turn speculation "
+                "off, not name another draft",
             )
     store.save_profile(
         Profile(
