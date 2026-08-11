@@ -18,9 +18,9 @@ import pytest
 from conftest import floor, load_golden, relative_diff
 from huggingface_hub import snapshot_download
 
-from sideros.bpe import ByteLevelBPE
-from sideros.language import TEXT, GenerationOptions, LanguagePrompt, Text
-from sideros.models.qwen3_5 import (
+from mlx_omnia.bpe import ByteLevelBPE
+from mlx_omnia.language import TEXT, GenerationOptions, LanguagePrompt, Text
+from mlx_omnia.models.qwen3_5 import (
     CHECKPOINT,
     MultimodalPrompt,
     Qwen35,
@@ -30,8 +30,8 @@ from sideros.models.qwen3_5 import (
     multimodal_prompt,
     stream_multimodal_ids,
 )
-from sideros.models.qwen3_5.layers.attention import _mrope_sources
-from sideros.models.qwen3_5.vision import (
+from mlx_omnia.models.qwen3_5.layers.attention import _mrope_sources
+from mlx_omnia.models.qwen3_5.vision import (
     Grid,
     Qwen35Vision,
     Qwen35VisionActivations,
@@ -43,7 +43,7 @@ from sideros.models.qwen3_5.vision import (
     resample,
     smart_resize,
 )
-from sideros.vision import RGB_IMAGE, Image
+from mlx_omnia.vision import RGB_IMAGE, Image
 
 FIXTURE = Path(__file__).parent / "fixtures" / "qwen3_5_vision.safetensors"
 N_LAYER = 24

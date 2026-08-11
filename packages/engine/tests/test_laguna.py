@@ -18,9 +18,9 @@ from conftest import (
     requires_checkpoint,
 )
 
-from sideros import KVCache, stream_ids
-from sideros.models.laguna import CHECKPOINT, Laguna
-from sideros.models.laguna.layers.moe import LagunaSparseMoe
+from mlx_omnia import KVCache, stream_ids
+from mlx_omnia.models.laguna import CHECKPOINT, Laguna
+from mlx_omnia.models.laguna.layers.moe import LagunaSparseMoe
 
 FIXTURE = Path(__file__).parent / "fixtures" / "laguna_mlxlm.safetensors"
 REPO = "local/Laguna-S-2.1-mlx-oQ3e-fast-gs128"

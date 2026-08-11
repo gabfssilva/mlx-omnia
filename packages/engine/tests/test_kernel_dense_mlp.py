@@ -15,15 +15,15 @@ only when they straddle a tie.
 import mlx.core as mx
 from conftest import relative_diff
 
-from sideros.core.kernels.mlp import DefaultMlp, Mlp
-from sideros.core.kernels.mlp.dense import (
+from mlx_omnia.core.kernels.mlp import DefaultMlp, Mlp
+from mlx_omnia.core.kernels.mlp.dense import (
     DenseMlp,
     dense_down_residual,
     dense_down_residual_applies,
     dense_gate_up_swiglu,
     dense_gate_up_swiglu_applies,
 )
-from sideros.core.layers import SwiGLU
+from mlx_omnia.core.layers import SwiGLU
 
 HIDDEN = 256
 INNER = 512

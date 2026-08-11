@@ -15,11 +15,11 @@ from pathlib import Path
 import pytest
 from fastapi.testclient import TestClient
 
-from sideros_server import Engine, catalog, create_app, features
-from sideros_server.engine import Residency
-from sideros_server.features import Features, Speculation, resolve
-from sideros_server.profiles import ProfileView, Sampling, speculating, switches
-from sideros_server.store import ModelSettings, Store
+from mlx_omnia_server import Engine, catalog, create_app, features
+from mlx_omnia_server.engine import Residency
+from mlx_omnia_server.features import Features, Speculation, resolve
+from mlx_omnia_server.profiles import ProfileView, Sampling, speculating, switches
+from mlx_omnia_server.store import ModelSettings, Store
 
 TARGET = "meta-models/Muse-Glimmer-30B"
 DRAFTER = "meta-models/Muse-Glimmer-30B-assistant"
@@ -238,7 +238,7 @@ def test_a_model_whose_settings_name_a_drafter_is_paired_at_load(
     hub: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
     """What the loader does with the row. The tree is whatever `load_drafter` returns —
-    which architecture answers to a directory is `sideros.task`'s to say, not this one's."""
+    which architecture answers to a directory is `mlx_omnia.task`'s to say, not this one's."""
     installed(hub, DRAFTER, "muse_glimmer_assistant", block_size=16)
     loaded: list[Path] = []
     monkeypatch.setattr(features, "load_drafter", lambda directory: loaded.append(directory))

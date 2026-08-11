@@ -9,11 +9,11 @@ import pytest
 from conftest import relative_diff
 from huggingface_hub import snapshot_download
 
-import sideros.task  # noqa: F401  — imports every family, so LayerCache has every subclass
-from sideros import GPT2, KVCache
-from sideros.core.cache import LayerCache
-from sideros.core.prefill import prefill
-from sideros.models.gpt2 import CHECKPOINT
+import mlx_omnia.task  # noqa: F401  — imports every family, so LayerCache has every subclass
+from mlx_omnia import GPT2, KVCache
+from mlx_omnia.core.cache import LayerCache
+from mlx_omnia.core.prefill import prefill
+from mlx_omnia.models.gpt2 import CHECKPOINT
 
 LENGTH = 512
 BLOCK = 64

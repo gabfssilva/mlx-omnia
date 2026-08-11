@@ -11,7 +11,7 @@ import math
 import mlx.core as mx
 import pytest
 
-from sideros import (
+from mlx_omnia import (
     KVCache,
     greedy,
     min_p,

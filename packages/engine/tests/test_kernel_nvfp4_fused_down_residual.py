@@ -14,9 +14,9 @@ import mlx.core as mx
 import mlx.nn as nn
 from conftest import relative_diff
 
-from sideros.core.kernels.down_combine import DownCombine, Nvfp4PackedDownCombine
-from sideros.core.kernels.down_combine.nvfp4_packed import applies, halve_down_scales
-from sideros.core.layers import QuantizedSwitchLinear, SwitchLinear
+from mlx_omnia.core.kernels.down_combine import DownCombine, Nvfp4PackedDownCombine
+from mlx_omnia.core.kernels.down_combine.nvfp4_packed import applies, halve_down_scales
+from mlx_omnia.core.layers import QuantizedSwitchLinear, SwitchLinear
 
 HIDDEN = 64
 INNER = 512

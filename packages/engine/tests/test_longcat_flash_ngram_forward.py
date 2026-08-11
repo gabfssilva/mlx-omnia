@@ -26,8 +26,8 @@ from conftest import (
     requires_checkpoint,
 )
 
-from sideros import stream_ids
-from sideros.models.longcat_flash_ngram import (
+from mlx_omnia import stream_ids
+from mlx_omnia.models.longcat_flash_ngram import (
     CHECKPOINT,
     LongcatFlashNgram,
 )
@@ -90,8 +90,8 @@ def test_moe_internals_within_floor(
 ) -> None:
     """A failure here names the culprit: the router, the expert sum, or the
     identity pass-through."""
-    from sideros.core.mxcompat import softmax
-    from sideros.models.longcat_flash_ngram.layers.cache import MLACache, NgramCache
+    from mlx_omnia.core.mxcompat import softmax
+    from mlx_omnia.models.longcat_flash_ngram.layers.cache import MLACache, NgramCache
 
     ngram_cache = NgramCache(model.config.emb_neighbor_num)
     embeddings = model.model.ngram_embeddings(golden["input_ids"][None], ngram_cache)

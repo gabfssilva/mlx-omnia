@@ -30,7 +30,7 @@ import pytest
 from fastapi import FastAPI
 from fastapi.testclient import TestClient
 
-from sideros import (
+from mlx_omnia import (
     TEXT,
     CompositeModel,
     GenerationOptions,
@@ -41,10 +41,10 @@ from sideros import (
     Text,
     TextLanguageModel,
 )
-from sideros.parsers import Segment
-from sideros_server import bench, jobs
-from sideros_server.engine import Engine, Loader
-from sideros_server.store import Store
+from mlx_omnia.parsers import Segment
+from mlx_omnia_server import bench, jobs
+from mlx_omnia_server.engine import Engine, Loader
+from mlx_omnia_server.store import Store
 
 _DEADLINE = 30.0
 """Every wait here is bounded by it: a job that never arrives fails this suite instead of
@@ -310,14 +310,14 @@ def test_the_history_outlives_the_process_and_carries_the_engine_version(
 
     assert len(after) == 1
     assert after == before
-    assert after[0]["engine_version"] == version("sideros")
+    assert after[0]["engine_version"] == version("mlx_omnia")
     assert number(after[0], "tokens_per_second") == pytest.approx(300.0)
 
 
 def test_the_history_says_in_the_body_that_it_is_not_interleaved_against_mlx_lm(
     tmp_path: Path,
 ) -> None:
-    """The one thing a reader of these numbers must not conclude is that sideros got faster
+    """The one thing a reader of these numbers must not conclude is that mlx_omnia got faster
     or slower than mlx-lm. Interleaved A/B against mlx-lm git main is what counts a
     regression and it does not fit behind an endpoint, so the response says so itself: a
     docstring does not travel with the JSON someone pastes into a table.

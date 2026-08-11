@@ -16,9 +16,9 @@ import numpy as np
 import pytest
 from conftest import checkpoint_dir, load_golden, relative_diff, requires_checkpoint
 
-from sideros.core.kernels.conv_mix import ConvMix, DefaultConvMix, FusedConvMix
-from sideros.core.kernels.conv_mix import fused as cm
-from sideros.core.mxcompat import metal_kernel
+from mlx_omnia.core.kernels.conv_mix import ConvMix, DefaultConvMix, FusedConvMix
+from mlx_omnia.core.kernels.conv_mix import fused as cm
+from mlx_omnia.core.mxcompat import metal_kernel
 
 HIDDEN = 2048
 KERNEL = 3

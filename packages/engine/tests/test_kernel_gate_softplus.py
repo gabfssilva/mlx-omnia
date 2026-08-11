@@ -16,8 +16,8 @@ import mlx.nn as nn
 import pytest
 from conftest import relative_diff
 
-from sideros.core.kernels.qmv.softplus import gate_softplus, gate_softplus_applies
-from sideros.core.patch import original
+from mlx_omnia.core.kernels.qmv.softplus import gate_softplus, gate_softplus_applies
+from mlx_omnia.core.patch import original
 
 KDIM = 2048
 ROWS = 64
@@ -37,7 +37,7 @@ def packed(rows: int, kdim: int, seed: int) -> tuple[mx.array, mx.array, mx.arra
 def logits(
     x: mx.array, weight: mx.array, scales: mx.array, biases: mx.array
 ) -> mx.array:
-    """`original`, not `mx.quantized_matmul`: importing sideros installs a replacement
+    """`original`, not `mx.quantized_matmul`: importing mlx_omnia installs a replacement
     over that name, and comparing against it would compare a kernel with itself."""
     projected = original(mx, "quantized_matmul")(
         x, weight, scales=scales, biases=biases, transpose=True, group_size=GROUP, bits=BITS

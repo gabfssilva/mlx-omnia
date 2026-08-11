@@ -23,8 +23,8 @@ from collections.abc import Callable
 import mlx.core as mx
 import pytest
 
-from sideros.core.kernels.lm_head import ArgmaxGreedyHead, DefaultGreedyHead, GreedyHead
-from sideros.core.kernels.lm_head.argmax import (
+from mlx_omnia.core.kernels.lm_head import ArgmaxGreedyHead, DefaultGreedyHead, GreedyHead
+from mlx_omnia.core.kernels.lm_head.argmax import (
     Int5Planes,
     int5_planes,
     lm_head_argmax_applies,

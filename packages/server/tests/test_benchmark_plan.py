@@ -7,7 +7,7 @@ from pathlib import Path
 from benchmark_stand import HUGE, SMALL, SPEED_BODY, WINDOWED, stand, wait_for
 from fastapi.testclient import TestClient
 
-from sideros_server import benchmarks
+from mlx_omnia_server import benchmarks
 
 MODEL = "house/small"
 BIG = "house/huge"

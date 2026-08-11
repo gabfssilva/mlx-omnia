@@ -7,7 +7,7 @@ from collections.abc import Mapping
 import mlx.core as mx
 import mlx.nn as nn
 
-from sideros.quant.calibration import (
+from mlx_omnia.quant.calibration import (
     BlockedForward,
     ImportanceMatrix,
     _perturbed,
@@ -15,8 +15,8 @@ from sideros.quant.calibration import (
     collect,
     quantize_dequantize,
 )
-from sideros.quant.oq import OqSensitivity
-from sideros.quant.quantization import Affine
+from mlx_omnia.quant.oq import OqSensitivity
+from mlx_omnia.quant.quantization import Affine
 
 _HIDDEN = 64
 _VOCAB = 128

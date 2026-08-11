@@ -1,5 +1,5 @@
 {
-  "note": "The schemas an OpenAI-compatible server actually receives, written to sit on the line where a grammar compiler either covers a keyword, refuses it, or ignores it in silence. The first four stay inside the subset sideros/schema.py validates; the rest are exactly the keywords 42.1 declared outside it (pattern, string and number bounds, local $ref, oneOf, type as a list), plus the ones Pydantic emits on its own (anyOf for an optional, const for a Literal, format for a datetime, title everywhere). Each entry carries a conforming document and one that violates only the keyword under test: a compiler that accepts both compiled the schema without enforcing it, which no error message reports. Property order in every document follows the schema's declared order, because a compiler is free to fix it (xgrammar's any_order defaults to false).",
+  "note": "The schemas an OpenAI-compatible server actually receives, written to sit on the line where a grammar compiler either covers a keyword, refuses it, or ignores it in silence. The first four stay inside the subset mlx_omnia/schema.py validates; the rest are exactly the keywords 42.1 declared outside it (pattern, string and number bounds, local $ref, oneOf, type as a list), plus the ones Pydantic emits on its own (anyOf for an optional, const for a Literal, format for a datetime, title everywhere). Each entry carries a conforming document and one that violates only the keyword under test: a compiler that accepts both compiled the schema without enforcing it, which no error message reports. Property order in every document follows the schema's declared order, because a compiler is free to fix it (xgrammar's any_order defaults to false).",
   "serialization": "compact: json.dumps(document, separators=[\",\", \":\"])",
   "schemas": [
     {
@@ -44,11 +44,11 @@
         "additionalProperties": false
       },
       "valid": {
-        "path": "packages/engine/src/sideros/generate.py",
+        "path": "packages/engine/src/mlx_omnia/generate.py",
         "edits": [{"old": "max_tokens=128", "new": "max_tokens=256"}],
         "dry_run": false
       },
-      "invalid": {"path": "packages/engine/src/sideros/generate.py", "dry_run": false}
+      "invalid": {"path": "packages/engine/src/mlx_omnia/generate.py", "dry_run": false}
     },
     {
       "name": "classification_enum",

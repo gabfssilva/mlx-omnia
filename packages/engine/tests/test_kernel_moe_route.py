@@ -32,7 +32,7 @@ import numpy as np
 import pytest
 from conftest import relative_diff
 
-from sideros.core.kernels.route import (
+from mlx_omnia.core.kernels.route import (
     BiasTopkRoute,
     DefaultRoute,
     OrdinalRoute,
@@ -41,7 +41,7 @@ from sideros.core.kernels.route import (
     SigmoidTopkRoute,
     SoftmaxTopkRoute,
 )
-from sideros.core.kernels.route.softmax_topk import (
+from mlx_omnia.core.kernels.route.softmax_topk import (
     _SIGMOID_SOURCE,
     _SOFTPLUS_GATHER_SOURCE,
     _SOFTPLUS_HEADER,
@@ -53,7 +53,7 @@ from sideros.core.kernels.route.softmax_topk import (
     softplus_gather,
     softplus_topk,
 )
-from sideros.core.mxcompat import metal_kernel, softmax
+from mlx_omnia.core.mxcompat import metal_kernel, softmax
 
 SHAPES = [(32, 4), (128, 8), (256, 8)]
 SHARED_LOGIT = 1.5

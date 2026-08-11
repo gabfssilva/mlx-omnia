@@ -15,13 +15,13 @@ import mlx.core as mx
 import pytest
 from conftest import relative_diff
 
-from sideros.core.kernels.qmv.nvfp4 import nvfp4_qmv, nvfp4_qmv_applies
-from sideros.core.kernels.shared.nvfp4 import (
+from mlx_omnia.core.kernels.qmv.nvfp4 import nvfp4_qmv, nvfp4_qmv_applies
+from mlx_omnia.core.kernels.shared.nvfp4 import (
     LaneMajorScales,
     expand,
     lane_major_scales,
 )
-from sideros.core.patch import original
+from mlx_omnia.core.patch import original
 
 KDIM = 2048
 ROWS = 64
@@ -64,7 +64,7 @@ def escaped(bank: LaneMajorScales) -> int:
 
 
 def reference(x: mx.array, weight: mx.array, scales: mx.array) -> mx.array:
-    """`original`, not `mx.quantized_matmul`: importing sideros installs a replacement
+    """`original`, not `mx.quantized_matmul`: importing mlx_omnia installs a replacement
     over that name, and comparing against it would compare a kernel with itself."""
     projected = original(mx, "quantized_matmul")(
         x, weight, scales=scales, transpose=True, group_size=GROUP, bits=BITS, mode="nvfp4"

@@ -11,7 +11,7 @@ from hypothesis import given
 from hypothesis import strategies as st
 from transformers import AutoTokenizer
 
-from sideros.bpe import ByteLevelBPE
+from mlx_omnia.bpe import ByteLevelBPE
 
 REPO = "LiquidAI/LFM2.5-8B-A1B"
 

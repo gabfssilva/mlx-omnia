@@ -19,10 +19,10 @@ import mlx.core as mx
 import pytest
 from conftest import relative_diff
 
-import sideros.core.kernels.attention.sink as sa
-from sideros.core.cache import KVCache
-from sideros.core.kernels.attention.sink import sink_attention, sink_attention_applies
-from sideros.models.gpt_oss import (
+import mlx_omnia.core.kernels.attention.sink as sa
+from mlx_omnia.core.cache import KVCache
+from mlx_omnia.core.kernels.attention.sink import sink_attention, sink_attention_applies
+from mlx_omnia.models.gpt_oss import (
     GPTOSSAttention,
     GPTOSSConfig,
     GPTOSSRoPEScaling,

@@ -1,4 +1,4 @@
-# Sideros
+# Omnia
 
 LLM inference engine for Apple Silicon, written in Python on raw [MLX](https://github.com/ml-explore/mlx).
 
@@ -6,27 +6,27 @@ LLM inference engine for Apple Silicon, written in Python on raw [MLX](https://g
 
 ## What it is
 
-Sideros is an LLM inference engine built from scratch: model implementations, checkpoint loading, KV cache, tokenizer, quantization, and Metal kernels are all in-house, with no third-party inference or tokenization libraries at runtime. It ships as a Python library, an OpenAI-compatible server, a CLI, and a desktop app. Around 45 architecture families are supported, from GPT-2 to current MoE, hybrid, and vision models (Qwen, Gemma, Llama, gpt-oss, LFM2, Mamba2, Falcon-H1, …).
+Omnia is an LLM inference engine built from scratch: model implementations, checkpoint loading, KV cache, tokenizer, quantization, and Metal kernels are all in-house, with no third-party inference or tokenization libraries at runtime. It ships as a Python library, an OpenAI-compatible server, a CLI, and a desktop app. Around 45 architecture families are supported, from GPT-2 to current MoE, hybrid, and vision models (Qwen, Gemma, Llama, gpt-oss, LFM2, Mamba2, Falcon-H1, …).
 
 ## Motivation
 
-Model inference has two basic challenges: prefill, which is compute-bound, and decode, which is memory-bandwidth-bound. Sideros tries to maximize both axes, and the work is per model: each architecture is investigated for how close it can get to the physical limit of the hardware — for decode that ceiling is computed from the checkpoint's own active bytes per token, and every result is reported as a percentage of it. All of that under one founding rule: speed never buys numerical loss. An improvement only lands if it stays within the measured tolerance for that model.
+Model inference has two basic challenges: prefill, which is compute-bound, and decode, which is memory-bandwidth-bound. Omnia tries to maximize both axes, and the work is per model: each architecture is investigated for how close it can get to the physical limit of the hardware — for decode that ceiling is computed from the checkpoint's own active bytes per token, and every result is reported as a percentage of it. All of that under one founding rule: speed never buys numerical loss. An improvement only lands if it stays within the measured tolerance for that model.
 
-The other motivation is engineering quality, end to end. Inference engines tend to treat code quality as secondary to shipping the next model; Sideros doesn't. Strict typing with no escape hatches, no patches, enforced architectural boundaries, protocols instead of coupling, and tests that prove they can catch the bugs they claim to — these are goals of the project, not overhead on the way to it.
+The other motivation is engineering quality, end to end. Inference engines tend to treat code quality as secondary to shipping the next model; Omnia doesn't. Strict typing with no escape hatches, no patches, enforced architectural boundaries, protocols instead of coupling, and tests that prove they can catch the bugs they claim to — these are goals of the project, not overhead on the way to it.
 
 ## Installation
 
 Requires an Apple Silicon Mac and [uv](https://docs.astral.sh/uv/).
 
 ```sh
-git clone https://github.com/gabfssilva/sideros
-cd sideros
-uv run sideros-server        # OpenAI-compatible API on 127.0.0.1:8642
+git clone https://github.com/gabfssilva/mlx-omnia
+cd mlx-omnia
+uv run omnia-server        # OpenAI-compatible API on 127.0.0.1:8642
 ```
 
 Then point any OpenAI SDK at `http://127.0.0.1:8642/api/openai/v1`.
 
-There is also a desktop window — `mise run app`, or `uv run sideros-app`: chat and model management over the same HTTP API, which it starts itself when nothing answers on the port. Download, quantize and chat without touching a terminal.
+There is also a desktop window — `mise run app`, or `uv run omnia-app`: chat and model management over the same HTTP API, which it starts itself when nothing answers on the port. Download, quantize and chat without touching a terminal.
 
 ## What it does to be fast
 
@@ -51,7 +51,7 @@ uv workspace, one directory per package:
 Inside the engine:
 
 ```
-packages/engine/src/sideros/
+packages/engine/src/mlx_omnia/
   models/<family>/      one self-contained package per architecture family
   checkpoint.py         the load spine; each architecture declares a CHECKPOINT
   task.py               `load` — the only entry point; dispatches model_type
@@ -65,7 +65,7 @@ Design rules that keep it this shape:
 
 - **One package per architecture family, self-contained, checkpoint-shaped.** Property names *are* the checkpoint's: the module tree is the shape table, and strict loading is the totality contract. There is no renaming layer.
 - **No shared modeling layer between families.** Two families repeating an attention shape is fine; a shared abstraction couples architectures that will diverge. Code moves to `core/` only on the second byte-identical use.
-- **One door for loading.** `sideros.load` reads `model_type` and dispatches to that architecture's `CHECKPOINT`. There is no public per-architecture loader.
+- **One door for loading.** `mlx_omnia.load` reads `model_type` and dispatches to that architecture's `CHECKPOINT`. There is no public per-architecture loader.
 - **Protocols at the boundary.** Model-agnostic code depends on a `Protocol` sized to what it actually calls, defined where it is consumed. Models satisfy it structurally and never import the consumer.
 - **Strict one-directional layering**, enforced by import-linter contracts and `uv tree`: the server knows only the engine's public API; the CLI and the app speak HTTP only.
 - **Kernels are operation-named, never model-named**, live in `core/kernels/`, and export a cheap `*_applies(...)` predicate. The model decides when a kernel applies to *it*; the kernel never knows the model exists.

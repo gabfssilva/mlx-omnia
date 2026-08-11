@@ -24,15 +24,15 @@ import mlx.nn as nn
 import pytest
 from mlx.utils import tree_flatten, tree_unflatten
 
-import sideros.task as task
-from sideros import CompositeModel, load
-from sideros.core.cache import DeltaCache, KVCache, LayerCache
-from sideros.generate import stream_ids
-from sideros.models.nemotron_h.config import NemotronHConfig
-from sideros.models.nemotron_h.model import NemotronH
-from sideros.models.nemotron_h.mtp import NemotronHMTP
-from sideros.quant.quantization import Affine
-from sideros.speculative import Acceptance, Chained, SpeculationRefused, stream_speculative_ids
+import mlx_omnia.task as task
+from mlx_omnia import CompositeModel, load
+from mlx_omnia.core.cache import DeltaCache, KVCache, LayerCache
+from mlx_omnia.generate import stream_ids
+from mlx_omnia.models.nemotron_h.config import NemotronHConfig
+from mlx_omnia.models.nemotron_h.model import NemotronH
+from mlx_omnia.models.nemotron_h.mtp import NemotronHMTP
+from mlx_omnia.quant.quantization import Affine
+from mlx_omnia.speculative import Acceptance, Chained, SpeculationRefused, stream_speculative_ids
 
 PROMPT = [3, 1, 2, 1, 0, 3, 2, 1]
 

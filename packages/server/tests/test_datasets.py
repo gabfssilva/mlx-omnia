@@ -16,8 +16,8 @@ import pytest
 from fastapi import FastAPI
 from fastapi.testclient import TestClient
 
-from sideros_server import datasets
-from sideros_server.store import Store
+from mlx_omnia_server import datasets
+from mlx_omnia_server.store import Store
 
 FILES = [
     "README.md",

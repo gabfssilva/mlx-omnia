@@ -20,10 +20,10 @@ from fastapi import FastAPI
 from fastapi.exceptions import RequestValidationError
 from fastapi.testclient import TestClient
 
-from sideros_server import store as store_module
-from sideros_server.app import _invalid_request
-from sideros_server.sessions import router
-from sideros_server.store import SCHEMA_VERSION, Profile, Store
+from mlx_omnia_server import store as store_module
+from mlx_omnia_server.app import _invalid_request
+from mlx_omnia_server.sessions import router
+from mlx_omnia_server.store import SCHEMA_VERSION, Profile, Store
 
 CONVERSATION: list[dict[str, object]] = [
     {"role": "system", "content": "Answer with code and nothing else."},

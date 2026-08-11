@@ -26,20 +26,20 @@ from pathlib import Path
 import mlx.core as mx
 import pytest
 
-from sideros.chat import Chat, ChatCapability, ChatTemplate
-from sideros.core.cache import KVCache
-from sideros.generate import Sampler, stream_generate
-from sideros.language import GenerationOptions, Text, TextLanguageModel
-from sideros.models.qwen3_5 import (
+from mlx_omnia.chat import Chat, ChatCapability, ChatTemplate
+from mlx_omnia.core.cache import KVCache
+from mlx_omnia.generate import Sampler, stream_generate
+from mlx_omnia.language import GenerationOptions, Text, TextLanguageModel
+from mlx_omnia.models.qwen3_5 import (
     Qwen35,
     Qwen35Config,
     Qwen35LanguageModel,
     Qwen35RoPEParameters,
     Qwen35TextConfig,
 )
-from sideros.parsers import FALLBACK, Parser, Segment, Segmenter, ToolCall
-from sideros.parsers.harmony import PARSER as HARMONY
-from sideros.parsers.qwen import PARSER as QWEN
+from mlx_omnia.parsers import FALLBACK, Parser, Segment, Segmenter, ToolCall
+from mlx_omnia.parsers.harmony import PARSER as HARMONY
+from mlx_omnia.parsers.qwen import PARSER as QWEN
 
 CALL = '<tool_call>{"name": "f", "arguments": {"x": 1}}</tool_call>'
 HARMONY_CALL = (
@@ -532,7 +532,7 @@ def test_a_reasoning_tag_the_user_typed_does_not_open_the_block() -> None:
 
 
 def atem_parser() -> Parser:
-    from sideros.parsers.atem import PARSER
+    from mlx_omnia.parsers.atem import PARSER
 
     return PARSER
 

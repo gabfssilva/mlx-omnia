@@ -10,8 +10,8 @@ from pathlib import Path
 import mlx.core as mx
 import pytest
 
-from sideros.core import cache_file
-from sideros.core.cache import (
+from mlx_omnia.core import cache_file
+from mlx_omnia.core.cache import (
     ConvCache,
     DeltaCache,
     FixedKVCache,

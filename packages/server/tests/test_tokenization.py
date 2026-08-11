@@ -18,7 +18,7 @@ import httpx
 import mlx.core as mx
 from fastapi import FastAPI
 
-from sideros import (
+from mlx_omnia import (
     TEXT,
     ChatCapability,
     ChatTemplate,
@@ -31,10 +31,10 @@ from sideros import (
     TextLanguageModel,
     Tokenizer,
 )
-from sideros.parsers import Segment
-from sideros_server import catalog
-from sideros_server.engine import Engine
-from sideros_server.tokenization import router
+from mlx_omnia.parsers import Segment
+from mlx_omnia_server import catalog
+from mlx_omnia_server.engine import Engine
+from mlx_omnia_server.tokenization import router
 
 TEMPLATE = "{% for message in messages %}{{ message['content'] }}{% endfor %}"
 
@@ -218,7 +218,7 @@ def test_the_encode_does_not_run_on_the_event_loop() -> None:
 
 
 def test_a_resident_model_that_holds_no_tokenizer_says_so() -> None:
-    """Not reachable through `sideros.load` — every architecture builds one — but the engine
+    """Not reachable through `mlx_omnia.load` — every architecture builds one — but the engine
     takes any loader, and a `None` that reached `encode` would be a 500 with no name in it."""
 
     async def run() -> httpx.Response:

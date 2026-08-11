@@ -1,8 +1,8 @@
 import mlx.core as mx
 import pytest
 
-from sideros.quant.oqe import ImportanceMatrixAffine
-from sideros.quant.quantization import (
+from mlx_omnia.quant.oqe import ImportanceMatrixAffine
+from mlx_omnia.quant.quantization import (
     Affine,
     AffineRTN,
     AffineWeight,

@@ -1,6 +1,6 @@
 import numpy as np
 
-from sideros import Chat, ChatMessage, GenerationOptions, Image, composite, load
+from mlx_omnia import Chat, ChatMessage, GenerationOptions, Image, composite, load
 
 
 def main() -> None:

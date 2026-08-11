@@ -25,8 +25,8 @@ import pytest
 from conftest import floor, load_golden, relative_diff
 from huggingface_hub import snapshot_download
 
-from sideros import stream_ids
-from sideros.models.gemma4 import CHECKPOINT, Gemma4, Gemma4Activations
+from mlx_omnia import stream_ids
+from mlx_omnia.models.gemma4 import CHECKPOINT, Gemma4, Gemma4Activations
 
 FIXTURE = Path(__file__).parent / "fixtures" / "gemma4_forward.safetensors"
 N_LAYER = 35
@@ -127,7 +127,7 @@ def test_block_internals_within_floor(
 
     check(block.input_layernorm(x), "input_layernorm")
     if not block.self_attn.kv_shared:
-        from sideros.core.cache import KVCache
+        from mlx_omnia.core.cache import KVCache
 
         check(
             block.self_attn(golden[f"b{index}_input_layernorm"], KVCache()),

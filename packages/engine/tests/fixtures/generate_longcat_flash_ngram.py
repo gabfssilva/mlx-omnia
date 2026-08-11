@@ -18,7 +18,7 @@ Three floors, all measured:
 
 The ngram EOS-aware shift: transformers resets at EOS, mlx-lm does NOT. This
 fixture uses mlx-lm as the reference, so the floors are measured against the
-mlx-lm shift. Sideros implements the EOS-aware shift (matching transformers);
+mlx-lm shift. Omnia implements the EOS-aware shift (matching transformers);
 the divergence at EOS boundaries is a documented floor, not a bug.
 
 Run: MLX_ENABLE_TF32=0 uv run --with git+https://github.com/ml-explore/mlx-lm \

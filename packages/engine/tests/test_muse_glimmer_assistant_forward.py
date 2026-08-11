@@ -23,8 +23,8 @@ import mlx.core as mx
 import pytest
 from conftest import checkpoint_dir, floor, load_golden, relative_diff, requires_checkpoint
 
-from sideros.models.muse_glimmer.checkpoint import load_assistant
-from sideros.models.muse_glimmer.dflash import MuseGlimmerAssistant
+from mlx_omnia.models.muse_glimmer.checkpoint import load_assistant
+from mlx_omnia.models.muse_glimmer.dflash import MuseGlimmerAssistant
 
 FIXTURE = Path(__file__).parent / "fixtures" / "muse_glimmer_assistant_forward.safetensors"
 REPO = "meta-models/Muse-Glimmer-30B-assistant"

@@ -15,7 +15,13 @@ from collections.abc import Mapping
 
 import pytest
 
-from sideros.schema import MalformedJSON, SchemaViolation, extract_json, json_instruction, validate
+from mlx_omnia.schema import (
+    MalformedJSON,
+    SchemaViolation,
+    extract_json,
+    json_instruction,
+    validate,
+)
 
 RECIPE: Mapping[str, object] = {
     "type": "object",

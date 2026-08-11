@@ -3,7 +3,7 @@ from typing import NamedTuple, assert_type
 import mlx.core as mx
 import mlx.nn as nn
 
-from sideros.core.kernels import MetalDispatch, MetalKernel
+from mlx_omnia.core.kernels import MetalDispatch, MetalKernel
 
 
 class ArithmeticInputs(NamedTuple):

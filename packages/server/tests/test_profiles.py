@@ -1,7 +1,7 @@
 """Profiles: `model:profile` as a served id, and what naming one changes in a request.
 
 No checkpoint is loaded here. What a profile has to reach is the sampler and the chat
-template, and both run for real — `sideros.sampler` over a model whose logits are a fixed
+template, and both run for real — `mlx_omnia.sampler` over a model whose logits are a fixed
 table, and the checkpoint-side `ChatCapability` over a ChatML template — which is what
 makes these assertions statements about the wiring rather than about a small model's
 willingness to obey an instruction.
@@ -24,7 +24,7 @@ import mlx.nn as nn
 import pytest
 from fastapi.testclient import TestClient
 
-from sideros import (
+from mlx_omnia import (
     TEXT,
     Chat,
     ChatCapability,
@@ -38,9 +38,9 @@ from sideros import (
     Text,
     TextLanguageModel,
 )
-from sideros.parsers import Segment
-from sideros_server import Engine, catalog, create_app
-from sideros_server.store import Store
+from mlx_omnia.parsers import Segment
+from mlx_omnia_server import Engine, catalog, create_app
+from mlx_omnia_server.store import Store
 
 MODEL = "mlx-community/Qwen3-0.6B-4bit"
 DENSE = "Qwen/Qwen3-0.6B"

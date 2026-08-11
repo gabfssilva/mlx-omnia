@@ -23,7 +23,7 @@ from openai.types.chat import ChatCompletionMessageParam, ChatCompletionToolPara
 from openai.types.shared_params import ResponseFormatJSONSchema
 from pydantic import BaseModel
 
-from sideros import (
+from mlx_omnia import (
     TEXT,
     ByteLevelBPE,
     Chat,
@@ -38,12 +38,12 @@ from sideros import (
     chat_template,
     load,
 )
-from sideros.parsers import FALLBACK, Segment, Segmenter
-from sideros.schema import json_instruction
-from sideros_server import Engine, create_app, prefixes
-from sideros_server import engine as engine_module
-from sideros_server.engine import Job, Loader
-from sideros_server.store import Store
+from mlx_omnia.parsers import FALLBACK, Segment, Segmenter
+from mlx_omnia.schema import json_instruction
+from mlx_omnia_server import Engine, create_app, prefixes
+from mlx_omnia_server import engine as engine_module
+from mlx_omnia_server.engine import Job, Loader
+from mlx_omnia_server.store import Store
 
 # A checkpoint with a chat template: /chat/completions takes a conversation, and what
 # turns it into a prompt is the template. A base model has none and is refused (see
@@ -255,7 +255,7 @@ def template() -> ChatTemplate:
     return found
 
 
-FIXTURE = Path(__file__).parents[3] / "packages" / "sideros" / "tests" / "fixtures"
+FIXTURE = Path(__file__).parents[3] / "packages" / "mlx_omnia" / "tests" / "fixtures"
 QWEN36 = "mlx-community/Qwen3.6-35B-A3B-6bit"
 
 
@@ -381,7 +381,7 @@ def test_health_says_who_is_answering_and_for_how_long(base_url: str) -> None:
     assert payload["pid"] == os.getpid(), "the stand runs the server in this process"
     uptime = payload["uptime"]
     assert isinstance(uptime, float) and uptime > 0
-    assert payload["version"] == version("sideros")
+    assert payload["version"] == version("mlx_omnia")
 
 
 def test_the_admin_routes_are_mounted_on_the_real_app(base_url: str) -> None:
@@ -729,7 +729,7 @@ def test_the_usage_frame_carries_what_the_turn_cost_in_seconds(base_url: str) ->
             for line in response.iter_lines()
             if line.startswith("data: ")
         ]
-    timings = json.loads(frames[-2])["x_sideros"]
+    timings = json.loads(frames[-2])["x_mlx_omnia"]
     assert "load_seconds" in timings
     assert timings["ttft_seconds"] > 0
     assert timings["prefill_tokens_per_second"] > 0

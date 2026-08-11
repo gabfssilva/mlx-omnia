@@ -11,8 +11,8 @@ from pathlib import Path
 import mlx.core as mx
 import mlx.nn as nn
 
-from sideros.core.layers import QuantizedSwitchLinear, SegmentedLinear
-from sideros.models.qwen3_5 import CHECKPOINT, Qwen35MoE
+from mlx_omnia.core.layers import QuantizedSwitchLinear, SegmentedLinear
+from mlx_omnia.models.qwen3_5 import CHECKPOINT, Qwen35MoE
 
 HIDDEN = 64
 INNER = 32

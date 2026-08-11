@@ -6,9 +6,9 @@ import mlx.nn as nn
 import pytest
 from conftest import relative_diff
 
-from sideros.checkpoint import load_checkpoint, save_quantized
-from sideros.quant.calibration import BlockedForward, SecondMoment, collect
-from sideros.quant.gptq import (
+from mlx_omnia.checkpoint import load_checkpoint, save_quantized
+from mlx_omnia.quant.calibration import BlockedForward, SecondMoment, collect
+from mlx_omnia.quant.gptq import (
     GPTQConfig,
     PermutedAffineWeight,
     gptq,
@@ -16,7 +16,7 @@ from sideros.quant.gptq import (
     solve,
     to_affine,
 )
-from sideros.quant.quantization import Affine, AffineRTN, AffineWeight, QuantizationPlan
+from mlx_omnia.quant.quantization import Affine, AffineRTN, AffineWeight, QuantizationPlan
 
 _CPU = mx.Device(mx.cpu)
 

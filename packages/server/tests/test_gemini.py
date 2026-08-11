@@ -30,7 +30,7 @@ from fastapi import FastAPI
 from google import genai
 from google.genai import errors, types
 
-from sideros import (
+from mlx_omnia import (
     TEXT,
     Chat,
     ChatCapability,
@@ -44,14 +44,14 @@ from sideros import (
     Text,
     greedy,
 )
-from sideros.generate import Constraint
-from sideros.parsers import FALLBACK, Segment, Segmenter
-from sideros.schema import json_instruction
-from sideros_server import catalog, gemini
-from sideros_server.engine import Engine, Job, Loader
-from sideros_server.profiles import Sampling
-from sideros_server.responses import ToolTurn
-from sideros_server.store import Profile, Store
+from mlx_omnia.generate import Constraint
+from mlx_omnia.parsers import FALLBACK, Segment, Segmenter
+from mlx_omnia.schema import json_instruction
+from mlx_omnia_server import catalog, gemini
+from mlx_omnia_server.engine import Engine, Job, Loader
+from mlx_omnia_server.profiles import Sampling
+from mlx_omnia_server.responses import ToolTurn
+from mlx_omnia_server.store import Profile, Store
 
 MODEL = "stand/echo"
 """A `/` in the id, like every Hub repository: the name travels in the path, so the route has

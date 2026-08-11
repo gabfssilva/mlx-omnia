@@ -15,9 +15,9 @@ import mlx.nn as nn
 import pytest
 from conftest import checkpoint_dir, relative_diff, requires_checkpoint
 
-from sideros import stream_ids
-from sideros.models.laguna import CHECKPOINT, Laguna
-from sideros.models.laguna.layers.moe import LagunaSparseMoe
+from mlx_omnia import stream_ids
+from mlx_omnia.models.laguna import CHECKPOINT, Laguna
+from mlx_omnia.models.laguna.layers.moe import LagunaSparseMoe
 
 FIXTURE = Path(__file__).parent / "fixtures" / "laguna_xs_mlxfast_golden.json"
 REPO = "poolside/Laguna-XS-2.1-NVFP4-mlx"

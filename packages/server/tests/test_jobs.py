@@ -27,8 +27,8 @@ import uvicorn
 from fastapi import FastAPI
 from fastapi.responses import JSONResponse
 
-from sideros_server.jobs import _WORKERS, Job, Jobs, Load, Progress, accepted, router
-from sideros_server.store import JobRecord, Store
+from mlx_omnia_server.jobs import _WORKERS, Job, Jobs, Load, Progress, accepted, router
+from mlx_omnia_server.store import JobRecord, Store
 
 
 @dataclass

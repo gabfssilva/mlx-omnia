@@ -13,9 +13,9 @@ import numpy as np
 import pytest
 from conftest import relative_diff
 
-from sideros.core.kernels.down_combine.mxfp4 import Mxfp4DownCombine
-from sideros.core.kernels.gate_up.mxfp4 import Mxfp4GateUp
-from sideros.core.kernels.gate_up.mxfp4 import applies as mxfp4_moe_applies
+from mlx_omnia.core.kernels.down_combine.mxfp4 import Mxfp4DownCombine
+from mlx_omnia.core.kernels.gate_up.mxfp4 import Mxfp4GateUp
+from mlx_omnia.core.kernels.gate_up.mxfp4 import applies as mxfp4_moe_applies
 
 EXPERTS, HIDDEN, INNER, TOPK, LIMIT = 32, 2880, 2880, 4, 7.0
 GROUP = 32

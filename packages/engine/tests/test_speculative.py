@@ -15,11 +15,11 @@ import mlx.core as mx
 import pytest
 from huggingface_hub import hf_hub_download, snapshot_download
 
-from sideros import GPT2, GPT2Tokenizer, KVCache, repetition_penalty, sampler, stream_ids, top_k
-from sideros.core.cache import DeltaCache, RingKVCache
-from sideros.generate import Meter
-from sideros.models.gpt2 import CHECKPOINT
-from sideros.speculative import Acceptance, SpeculationRefused, stream_speculative_ids
+from mlx_omnia import GPT2, GPT2Tokenizer, KVCache, repetition_penalty, sampler, stream_ids, top_k
+from mlx_omnia.core.cache import DeltaCache, RingKVCache
+from mlx_omnia.generate import Meter
+from mlx_omnia.models.gpt2 import CHECKPOINT
+from mlx_omnia.speculative import Acceptance, SpeculationRefused, stream_speculative_ids
 
 VOCAB = 64
 PROMPT = [0]

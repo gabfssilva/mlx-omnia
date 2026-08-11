@@ -21,8 +21,8 @@ from conftest import (
     requires_checkpoint,
 )
 
-from sideros import stream_ids
-from sideros.models.qwen3_5 import CHECKPOINT, Qwen35
+from mlx_omnia import stream_ids
+from mlx_omnia.models.qwen3_5 import CHECKPOINT, Qwen35
 
 FIXTURE = Path(__file__).parent / "fixtures" / "qwen3_5_27b_mlxlm.safetensors"
 REPO = "mlx-community/Qwen3.6-27B-6bit"

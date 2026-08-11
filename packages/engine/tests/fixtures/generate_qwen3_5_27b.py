@@ -3,7 +3,7 @@
 Qwen3.6-27B checkpoint.
 
 No transformers fixture exists at this size (fp32 of 27B is ~110GB). Same weights, same
-kernels, a different implementation of the same graph — the gap is the bound the sideros
+kernels, a different implementation of the same graph — the gap is the bound the mlx_omnia
 forward is held to, and the two floors the fixture carries are measured, never invented:
 
 - `noise.logits`: the bf16 graph against itself with scales/biases/norms in fp32.

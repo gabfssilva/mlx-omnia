@@ -14,11 +14,11 @@ import pytest
 from conftest import floor, load_golden, relative_diff
 from huggingface_hub import snapshot_download
 
-from sideros import stream_ids
-from sideros.core.cache import DeltaCache
-from sideros.core.kernels.ssm.step import ssm_step
-from sideros.models.mamba2 import CHECKPOINT, Mamba2, Mamba2Activations
-from sideros.models.mamba2.layers import flags, ssd
+from mlx_omnia import stream_ids
+from mlx_omnia.core.cache import DeltaCache
+from mlx_omnia.core.kernels.ssm.step import ssm_step
+from mlx_omnia.models.mamba2 import CHECKPOINT, Mamba2, Mamba2Activations
+from mlx_omnia.models.mamba2.layers import flags, ssd
 
 FIXTURE = Path(__file__).parent / "fixtures" / "mamba2_forward.safetensors"
 N_LAYER = 64

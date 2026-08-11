@@ -17,7 +17,7 @@ from typing import TypeIs
 from fastapi import FastAPI
 from fastapi.testclient import TestClient
 
-from sideros import (
+from mlx_omnia import (
     TEXT,
     CompositeModel,
     GenerationOptions,
@@ -26,10 +26,10 @@ from sideros import (
     ModelSignature,
     Text,
 )
-from sideros.parsers import Segment
-from sideros_server import benchmarks, catalog, jobs
-from sideros_server.engine import Engine
-from sideros_server.store import Store
+from mlx_omnia.parsers import Segment
+from mlx_omnia_server import benchmarks, catalog, jobs
+from mlx_omnia_server.engine import Engine
+from mlx_omnia_server.store import Store
 
 DEADLINE = 30.0
 """Every wait here is bounded by it: a job that never arrives fails the suite instead of

@@ -1,8 +1,8 @@
 [project]
-name = "sideros-workspace"
+name = "mlx-omnia-workspace"
 version = "0.0.0"
 requires-python = ">=3.13"
-dependencies = ["sideros", "sideros-server", "sideros-cli", "sideros-application"]
+dependencies = ["mlx-omnia", "mlx-omnia-server", "mlx-omnia-cli", "mlx-omnia-application"]
 
 [tool.uv]
 package = false
@@ -27,10 +27,10 @@ dev = [
 members = ["packages/*"]
 
 [tool.uv.sources]
-sideros = { workspace = true }
-sideros-server = { workspace = true }
-sideros-cli = { workspace = true }
-sideros-application = { workspace = true }
+mlx-omnia = { workspace = true }
+mlx-omnia-server = { workspace = true }
+mlx-omnia-cli = { workspace = true }
+mlx-omnia-application = { workspace = true }
 
 [tool.ruff]
 line-length = 100
@@ -48,29 +48,29 @@ select = [
 ]
 
 [tool.importlinter]
-root_packages = ["sideros", "sideros_application"]
+root_packages = ["mlx_omnia", "mlx_omnia_application"]
 
 [[tool.importlinter.contracts]]
 name = "core and bpe never reach up"
 type = "forbidden"
-source_modules = ["sideros.core", "sideros.bpe", "sideros.parsers", "sideros.quant"]
-forbidden_modules = ["sideros.models"]
+source_modules = ["mlx_omnia.core", "mlx_omnia.bpe", "mlx_omnia.parsers", "mlx_omnia.quant"]
+forbidden_modules = ["mlx_omnia.models"]
 
 [[tool.importlinter.contracts]]
 name = "model families are independent, except tokenizers"
 type = "independence"
-modules = ["sideros.models.*"]
-ignore_imports = ["sideros.models.** -> sideros.models.*.tokenizer"]
+modules = ["mlx_omnia.models.*"]
+ignore_imports = ["mlx_omnia.models.** -> mlx_omnia.models.*.tokenizer"]
 
 [[tool.importlinter.contracts]]
 name = "models never name a dialect"
 type = "forbidden"
-source_modules = ["sideros.models"]
+source_modules = ["mlx_omnia.models"]
 forbidden_modules = [
-    "sideros.parsers.qwen",
-    "sideros.parsers.qwen_xml",
-    "sideros.parsers.harmony",
-    "sideros.parsers.atem",
+    "mlx_omnia.parsers.qwen",
+    "mlx_omnia.parsers.qwen_xml",
+    "mlx_omnia.parsers.harmony",
+    "mlx_omnia.parsers.atem",
 ]
 allow_indirect_imports = true
 
@@ -78,16 +78,16 @@ allow_indirect_imports = true
 name = "the window stacks one way"
 type = "layers"
 layers = [
-    "sideros_application.main",
-    "sideros_application.views",
-    "sideros_application.ui",
-    "sideros_application.api",
+    "mlx_omnia_application.main",
+    "mlx_omnia_application.views",
+    "mlx_omnia_application.ui",
+    "mlx_omnia_application.api",
 ]
 
 [[tool.importlinter.contracts]]
 name = "screens do not know each other"
 type = "independence"
-modules = ["sideros_application.views.*"]
+modules = ["mlx_omnia_application.views.*"]
 
 [tool.pyright]
 typeCheckingMode = "off"

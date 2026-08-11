@@ -7,8 +7,8 @@ from pathlib import Path
 
 import pytest
 
-from sideros_cli import daemon
-from sideros_cli.client import ServerError
+from mlx_omnia_cli import daemon
+from mlx_omnia_cli.client import ServerError
 
 
 @pytest.mark.parametrize(
@@ -31,7 +31,7 @@ def test_only_a_loopback_address_can_be_started_here(
 def test_an_address_this_machine_does_not_own_is_refused_before_anything_is_spawned(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    """`sideros --url http://engine.local:8642 run` must not answer a remote outage by
+    """`mlx_omnia --url http://engine.local:8642 run` must not answer a remote outage by
     starting a local engine that answers nothing the user asked for."""
 
     def refuse(host: str, port: int, log: Path) -> subprocess.Popen[bytes]:
@@ -49,8 +49,8 @@ def test_the_daemon_log_and_lock_sit_where_the_app_keeps_its_settings(
     """One daemon, one address, one log: the app's Settings card names this exact file, and
     a CLI writing somewhere else leaves the user reading the wrong one."""
     monkeypatch.setenv("XDG_CONFIG_HOME", str(tmp_path))
-    assert daemon.log_path() == tmp_path / "sideros" / "daemon.log"
-    assert daemon.lock_path() == tmp_path / "sideros" / "daemon.lock"
+    assert daemon.log_path() == tmp_path / "mlx_omnia" / "daemon.log"
+    assert daemon.lock_path() == tmp_path / "mlx_omnia" / "daemon.lock"
 
 
 def test_the_reason_survives_the_shutdown_chatter() -> None:
@@ -93,6 +93,6 @@ def test_the_daemon_it_starts_does_not_share_the_ctrl_c_that_cancels_a_generatio
 
     command, detached = seen[0]
     assert detached, "the daemon shares this process's signals"
-    assert command == [sys.executable, "-m", "sideros_server.main",
+    assert command == [sys.executable, "-m", "mlx_omnia_server.main",
                        "--host", "127.0.0.1", "--port", "8642"]
     assert log.is_file(), "the detached daemon has nowhere to write"

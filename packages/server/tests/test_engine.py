@@ -9,7 +9,7 @@ from typing import TypeIs
 
 import pytest
 
-from sideros import (
+from mlx_omnia import (
     TEXT,
     Chat,
     CompositeModel,
@@ -20,12 +20,12 @@ from sideros import (
     Text,
     UnsupportedInput,
 )
-from sideros.core.prompt_cache import Budget
-from sideros.grammar import GrammarRefused
-from sideros.parsers import Segment
-from sideros_server import Engine, catalog
-from sideros_server.engine import Job, NotConstrainable, NotResident
-from sideros_server.store import Store
+from mlx_omnia.core.prompt_cache import Budget
+from mlx_omnia.grammar import GrammarRefused
+from mlx_omnia.parsers import Segment
+from mlx_omnia_server import Engine, catalog
+from mlx_omnia_server.engine import Job, NotConstrainable, NotResident
+from mlx_omnia_server.store import Store
 
 
 class FakeLanguageModel:

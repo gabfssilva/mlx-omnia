@@ -4,7 +4,7 @@ import mlx.core as mx
 import mlx.nn as nn
 import pytest
 
-from sideros.quant.oq import (
+from mlx_omnia.quant.oq import (
     RECIPE_OQ4_V1,
     Allocation,
     BlockScore,
@@ -15,7 +15,7 @@ from sideros.quant.oq import (
     allocate,
     widen,
 )
-from sideros.quant.quantization import (
+from mlx_omnia.quant.quantization import (
     Affine,
     Leaf,
     Quantization,
@@ -354,8 +354,8 @@ def test_the_oq_plan_beats_uniform_rtn_at_the_same_effective_size() -> None:
     """The point of the sensitivity-guided budget: against uniform 6-bit RTN of the same
     physical size, spending the same bytes as 8 bits on the gaussian blocks and 4 on the
     nearly-constant ones ends closer to the float output."""
-    from sideros.quant.calibration import BlockedForward
-    from sideros.quant.oq import measure_sensitivity
+    from mlx_omnia.quant.calibration import BlockedForward
+    from mlx_omnia.quant.oq import measure_sensitivity
 
     model = _Trunk(_trunk_weights())
     mx.eval(model.parameters())

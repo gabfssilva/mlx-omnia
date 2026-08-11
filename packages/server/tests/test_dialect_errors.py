@@ -29,7 +29,7 @@ from google import genai
 from google.genai import errors, types
 from openai import AuthenticationError, BadRequestError, NotFoundError, OpenAI
 
-from sideros import (
+from mlx_omnia import (
     TEXT,
     ChatCapability,
     ChatTemplate,
@@ -40,15 +40,15 @@ from sideros import (
     ModelSignature,
     Text,
 )
-from sideros.parsers import Segment
-from sideros_server import Engine, catalog, create_app
-from sideros_server.store import Store
+from mlx_omnia.parsers import Segment
+from mlx_omnia_server import Engine, catalog, create_app
+from mlx_omnia_server.store import Store
 
 MODEL = "stand/echo"
 """A `/` in the id like every Hub repository: the Gemini route matches a tail that carries
 slashes, and the error tests below name a model that resolves."""
 
-KEY = "sk-sideros-37-1"
+KEY = "sk-mlx_omnia-37-1"
 
 SOURCE = "{% for message in messages %}<{{ message['role'] }}>{{ message['content'] }}{% endfor %}"
 

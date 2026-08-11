@@ -28,7 +28,7 @@ import mlx.core as mx
 import mlx.nn as nn
 import pytest
 
-from sideros import (
+from mlx_omnia import (
     TEXT,
     CompositeModel,
     GenerationOptions,
@@ -38,11 +38,11 @@ from sideros import (
     Text,
     TextLanguageModel,
 )
-from sideros.parsers import Segment
-from sideros_server import Engine, catalog, create_app
-from sideros_server.engine import Job, ModelTooLarge
-from sideros_server.state import footprint_bytes
-from sideros_server.store import Store
+from mlx_omnia.parsers import Segment
+from mlx_omnia_server import Engine, catalog, create_app
+from mlx_omnia_server.engine import Job, ModelTooLarge
+from mlx_omnia_server.state import footprint_bytes
+from mlx_omnia_server.store import Store
 
 FIRST, SECOND, THIRD = "test/first", "test/second", "test/third"
 """Three ids carrying a `/`, as every Hub id does, and named for the order they are loaded

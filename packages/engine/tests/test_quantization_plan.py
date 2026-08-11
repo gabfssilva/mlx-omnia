@@ -5,7 +5,7 @@ import mlx.core as mx
 import mlx.nn as nn
 import pytest
 
-from sideros.quant.quantization import (
+from mlx_omnia.quant.quantization import (
     Affine,
     ByPath,
     expand_plan,

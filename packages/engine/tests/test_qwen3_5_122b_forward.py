@@ -22,11 +22,11 @@ from conftest import (
     requires_checkpoint,
 )
 
-from sideros import stream_ids
-from sideros.core.cache import DeltaCache
-from sideros.core.kernels.route import SoftmaxTopkRoute
-from sideros.core.layers import QuantizedSwitchLinear
-from sideros.models.qwen3_5 import CHECKPOINT, Qwen35, Qwen35MoE
+from mlx_omnia import stream_ids
+from mlx_omnia.core.cache import DeltaCache
+from mlx_omnia.core.kernels.route import SoftmaxTopkRoute
+from mlx_omnia.core.layers import QuantizedSwitchLinear
+from mlx_omnia.models.qwen3_5 import CHECKPOINT, Qwen35, Qwen35MoE
 
 FIXTURE = Path(__file__).parent / "fixtures" / "qwen3_5_122b_mlxlm.safetensors"
 REPO = "mlx-community/Qwen3.5-122B-A10B-4bit"

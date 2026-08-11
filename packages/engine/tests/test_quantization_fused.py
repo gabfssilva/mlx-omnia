@@ -4,9 +4,9 @@ from pathlib import Path
 import mlx.core as mx
 import pytest
 
-from sideros.checkpoint import fuse_qkv, interleave_gate_up, load_shards, stack_experts
-from sideros.models.gpt2.checkpoint import _transpose_conv1d
-from sideros.quant.quantization import NVFP, Affine, QuantizationPlan, quantize_weights
+from mlx_omnia.checkpoint import fuse_qkv, interleave_gate_up, load_shards, stack_experts
+from mlx_omnia.models.gpt2.checkpoint import _transpose_conv1d
+from mlx_omnia.quant.quantization import NVFP, Affine, QuantizationPlan, quantize_weights
 
 _FORMAT = Affine(group_size=64, bits=4)
 _SUFFIXES = ("weight", "scales", "biases")

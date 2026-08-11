@@ -13,7 +13,7 @@ from hypothesis import given
 from hypothesis import strategies as st
 from transformers import AutoTokenizer
 
-from sideros.models.gemma3 import Gemma3Tokenizer
+from mlx_omnia.models.gemma3 import Gemma3Tokenizer
 
 MODEL = "google/gemma-3-270m"
 

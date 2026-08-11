@@ -16,21 +16,21 @@ from conftest import checkpoint_dir, requires_checkpoint
 from huggingface_hub import snapshot_download
 from mlx.utils import tree_flatten
 
-from sideros.footprint import (
+from mlx_omnia.footprint import (
     active_bytes_per_token,
     ceiling,
     checkpoint_bytes,
     expert_slots,
     resident_bytes,
 )
-from sideros.models.deepseek_v4.config import LOCAL, DeepseekV4Config
-from sideros.models.deepseek_v4.layers.attention import DeepseekV4Attention
-from sideros.models.gpt2 import CHECKPOINT as GPT2
-from sideros.models.qwen3.dense import CHECKPOINT as QWEN3
-from sideros.models.qwen3.moe import CHECKPOINT as QWEN3_MOE
-from sideros.models.qwen3.moe import Qwen3MoE
-from sideros.models.qwen3_5 import CHECKPOINT as QWEN3_5
-from sideros.models.qwen3_5 import Qwen35MoE, Qwen35RoPEParameters, Qwen35TextConfig
+from mlx_omnia.models.deepseek_v4.config import LOCAL, DeepseekV4Config
+from mlx_omnia.models.deepseek_v4.layers.attention import DeepseekV4Attention
+from mlx_omnia.models.gpt2 import CHECKPOINT as GPT2
+from mlx_omnia.models.qwen3.dense import CHECKPOINT as QWEN3
+from mlx_omnia.models.qwen3.moe import CHECKPOINT as QWEN3_MOE
+from mlx_omnia.models.qwen3.moe import Qwen3MoE
+from mlx_omnia.models.qwen3_5 import CHECKPOINT as QWEN3_5
+from mlx_omnia.models.qwen3_5 import Qwen35MoE, Qwen35RoPEParameters, Qwen35TextConfig
 
 MOE_REPO = "mlx-community/Qwen3-30B-A3B-4bit"
 SHARED_REPO = "mlx-community/Qwen3.6-35B-A3B-4bit"

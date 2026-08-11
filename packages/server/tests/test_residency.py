@@ -27,7 +27,7 @@ import mlx.core as mx
 import mlx.nn as nn
 import pytest
 
-from sideros import (
+from mlx_omnia import (
     TEXT,
     CompositeModel,
     GenerationOptions,
@@ -37,11 +37,11 @@ from sideros import (
     Text,
     TextLanguageModel,
 )
-from sideros.parsers import Segment
-from sideros_server import Engine, catalog, create_app
-from sideros_server.engine import Job
-from sideros_server.jobs import _WORKERS
-from sideros_server.store import Store
+from mlx_omnia.parsers import Segment
+from mlx_omnia_server import Engine, catalog, create_app
+from mlx_omnia_server.engine import Job
+from mlx_omnia_server.jobs import _WORKERS
+from mlx_omnia_server.store import Store
 
 MODEL = "test/held"
 """The id carries a `/`, as every Hub id does: the `{model_id:path}` of these routes is what

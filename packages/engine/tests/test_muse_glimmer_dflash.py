@@ -20,7 +20,7 @@ import mlx.nn as nn
 import pytest
 from conftest import checkpoint_dir, requires_checkpoint
 
-from sideros import (
+from mlx_omnia import (
     GenerationOptions,
     load,
     repetition_penalty,
@@ -28,21 +28,21 @@ from sideros import (
     stream_ids,
     top_k,
 )
-from sideros.bpe import ByteLevelBPE
-from sideros.core.masks import FULL
-from sideros.models.muse_glimmer import CHECKPOINT, MuseGlimmer, load_assistant
-from sideros.models.muse_glimmer.config import (
+from mlx_omnia.bpe import ByteLevelBPE
+from mlx_omnia.core.masks import FULL
+from mlx_omnia.models.muse_glimmer import CHECKPOINT, MuseGlimmer, load_assistant
+from mlx_omnia.models.muse_glimmer.config import (
     MuseGlimmerConfig,
     MuseGlimmerRoPE,
     MuseGlimmerTextConfig,
 )
-from sideros.models.muse_glimmer.dflash import (
+from mlx_omnia.models.muse_glimmer.dflash import (
     DEFAULT_BLOCK,
     MuseGlimmerAssistant,
     MuseGlimmerDFlash,
 )
-from sideros.models.muse_glimmer.model import MuseGlimmerLanguageModel
-from sideros.speculative import Acceptance, Proposer, Speculable, SpeculationRefused
+from mlx_omnia.models.muse_glimmer.model import MuseGlimmerLanguageModel
+from mlx_omnia.speculative import Acceptance, Proposer, Speculable, SpeculationRefused
 
 REPO = "local/Muse-Glimmer-30B-4bit"
 """The quantized target, not the bf16 one: this is the shape the pair actually decodes in

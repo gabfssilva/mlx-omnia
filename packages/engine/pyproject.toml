@@ -1,5 +1,5 @@
 [project]
-name = "sideros"
+name = "mlx-omnia"
 version = "0.1.0"
 description = "Inference engine for Apple Silicon on MLX"
 requires-python = ">=3.13"

@@ -8,7 +8,7 @@ the default strategy, which is those three lookups.
 
 import mlx.core as mx
 
-from sideros.core.kernels.embed import AtlasEmbed, DefaultEmbed, Embed
+from mlx_omnia.core.kernels.embed import AtlasEmbed, DefaultEmbed, Embed
 
 VOCAB = 128
 HIDDEN = 256

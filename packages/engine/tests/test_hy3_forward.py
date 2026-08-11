@@ -1,7 +1,7 @@
 # pyright: basic
 """Parity gate for Hunyuan 3 (Hy3): logits vs transformers, prefill vs stepwise, mutation.
 
-Sideros is the first MLX implementation. The reference is
+Omnia is the first MLX implementation. The reference is
 transformers (CUDA-generated fixture). Floors are measured, never invented; argmax
 compares modulo ties.
 
@@ -23,9 +23,9 @@ from conftest import (
     requires_checkpoint,
 )
 
-from sideros import KVCache, stream_ids
-from sideros.models.hy3 import CHECKPOINT, Hy3
-from sideros.models.hy3.layers.moe import Hy3SparseMoe
+from mlx_omnia import KVCache, stream_ids
+from mlx_omnia.models.hy3 import CHECKPOINT, Hy3
+from mlx_omnia.models.hy3.layers.moe import Hy3SparseMoe
 
 FIXTURE = Path(__file__).parent / "fixtures" / "hy3_transformers.safetensors"
 REPO = "tencent/Hy3"

@@ -5,7 +5,7 @@ import mlx.core as mx
 import mlx.nn as nn
 import pytest
 
-from sideros.quant.calibration import (
+from mlx_omnia.quant.calibration import (
     CORPUS_V1,
     BlockedForward,
     BlockSensitivity,
@@ -20,7 +20,7 @@ from sideros.quant.calibration import (
     load_corpus,
     sample_sequences,
 )
-from sideros.quant.quantization import Affine
+from mlx_omnia.quant.quantization import Affine
 
 _HIDDEN = 64
 _VOCAB = 128

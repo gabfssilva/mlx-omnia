@@ -1,4 +1,4 @@
-from sideros import Chat, ChatMessage, GenerationOptions, load
+from mlx_omnia import Chat, ChatMessage, GenerationOptions, load
 
 
 def main() -> None:

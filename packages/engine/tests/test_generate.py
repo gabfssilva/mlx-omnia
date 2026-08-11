@@ -7,12 +7,12 @@ import pytest
 from conftest import load_golden, relative_diff
 from huggingface_hub import hf_hub_download, snapshot_download
 
-from sideros import GPT2, GPT2Tokenizer, KVCache, sampler, stream_generate, stream_ids, top_k
-from sideros.core.cache import DeltaCache, LayerCache, RingKVCache
-from sideros.core.prompt_cache import PromptCache
-from sideros.generate import Meter, _boundary
-from sideros.models.gpt2 import CHECKPOINT
-from sideros.speculative import SpeculationRefused
+from mlx_omnia import GPT2, GPT2Tokenizer, KVCache, sampler, stream_generate, stream_ids, top_k
+from mlx_omnia.core.cache import DeltaCache, LayerCache, RingKVCache
+from mlx_omnia.core.prompt_cache import PromptCache
+from mlx_omnia.generate import Meter, _boundary
+from mlx_omnia.models.gpt2 import CHECKPOINT
+from mlx_omnia.speculative import SpeculationRefused
 
 FIXTURE = Path(__file__).parent / "fixtures" / "gpt2_forward.safetensors"
 

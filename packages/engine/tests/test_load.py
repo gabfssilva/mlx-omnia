@@ -7,9 +7,9 @@ import mlx.core as mx
 import mlx.nn as nn
 import pytest
 
-import sideros
-import sideros.task as task
-from sideros import (
+import mlx_omnia
+import mlx_omnia.task as task
+from mlx_omnia import (
     TEXT,
     CompositeModel,
     GenerationOptions,
@@ -17,8 +17,8 @@ from sideros import (
     ModelSignature,
     Text,
 )
-from sideros.checkpoint import Checkpoint
-from sideros.parsers import Segment
+from mlx_omnia.checkpoint import Checkpoint
+from mlx_omnia.parsers import Segment
 
 
 class TextBackend:
@@ -39,7 +39,7 @@ def _no_tree(directory: Path, dtype: mx.Dtype | None) -> nn.Module:
 
 
 def test_load_is_public() -> None:
-    assert callable(getattr(sideros, "load", None))
+    assert callable(getattr(mlx_omnia, "load", None))
 
 
 def test_load_dispatches_from_the_model_registry(
@@ -49,14 +49,14 @@ def test_load_dispatches_from_the_model_registry(
     (tmp_path / "config.json").write_text(json.dumps({"model_type": "custom"}))
     backend = TextBackend()
 
-    def load_custom(directory: Path, dtype: mx.Dtype | None) -> sideros.LanguageModel[ModelInput]:
+    def load_custom(directory: Path, dtype: mx.Dtype | None) -> mlx_omnia.LanguageModel[ModelInput]:
         assert directory == tmp_path
         assert dtype is None
         return CompositeModel(backend, [])
 
     monkeypatch.setitem(task._MODEL_SPECS, "custom", Checkpoint((), _no_tree, load_custom))
 
-    loaded = sideros.load(tmp_path)
+    loaded = mlx_omnia.load(tmp_path)
 
     assert isinstance(loaded, CompositeModel)
     assert loaded.model is backend
@@ -70,7 +70,7 @@ def test_load_uses_a_local_directory_without_the_hub(
     backend = TextBackend()
     calls: list[tuple[Path, mx.Dtype | None]] = []
 
-    def load_gpt2(directory: Path, dtype: mx.Dtype | None) -> sideros.LanguageModel[ModelInput]:
+    def load_gpt2(directory: Path, dtype: mx.Dtype | None) -> mlx_omnia.LanguageModel[ModelInput]:
         calls.append((directory, dtype))
         return CompositeModel(backend, [])
 
@@ -80,7 +80,7 @@ def test_load_uses_a_local_directory_without_the_hub(
     monkeypatch.setitem(task._MODEL_SPECS, "gpt2", Checkpoint((), _no_tree, load_gpt2))
     monkeypatch.setattr(task, "_download_config", unexpected_hub_call)
 
-    loaded = sideros.load(tmp_path, dtype=mx.float16)
+    loaded = mlx_omnia.load(tmp_path, dtype=mx.float16)
 
     assert isinstance(loaded, CompositeModel)
     assert loaded.model is backend
@@ -108,7 +108,7 @@ def test_load_resolves_a_repository_in_the_default_hugging_face_cache(
         snapshot_calls.append((repository, options))
         return tmp_path
 
-    def load_qwen(directory: Path, dtype: mx.Dtype | None) -> sideros.LanguageModel[ModelInput]:
+    def load_qwen(directory: Path, dtype: mx.Dtype | None) -> mlx_omnia.LanguageModel[ModelInput]:
         assert directory == tmp_path
         assert dtype is None
         return CompositeModel(backend, [])
@@ -117,7 +117,7 @@ def test_load_resolves_a_repository_in_the_default_hugging_face_cache(
     monkeypatch.setattr(task, "_download_snapshot", download_snapshot)
     monkeypatch.setitem(task._MODEL_SPECS, "qwen3_5", Checkpoint((), _no_tree, load_qwen))
 
-    loaded = sideros.load(
+    loaded = mlx_omnia.load(
         "Qwen/Qwen3.5-0.8B",
         revision="main",
         local_files_only=True,
@@ -142,4 +142,4 @@ def test_load_rejects_an_unsupported_architecture(tmp_path: Path) -> None:
     (tmp_path / "config.json").write_text(json.dumps({"model_type": "bert"}))
 
     with pytest.raises(ValueError, match="unsupported model_type 'bert'"):
-        sideros.load(tmp_path)
+        mlx_omnia.load(tmp_path)

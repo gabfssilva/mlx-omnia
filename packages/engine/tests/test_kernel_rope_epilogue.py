@@ -14,13 +14,13 @@ import mlx.core as mx
 import numpy as np
 from conftest import relative_diff
 
-from sideros.core.kernels.qkv_rope.epilogue import _KERNEL, _SOURCE, rope_epilogue
-from sideros.core.mxcompat import metal_kernel
-from sideros.models.qwen3.config import Qwen3MoEConfig
-from sideros.models.qwen3.layers.attention import Qwen3Attention
+from mlx_omnia.core.kernels.qkv_rope.epilogue import _KERNEL, _SOURCE, rope_epilogue
+from mlx_omnia.core.mxcompat import metal_kernel
+from mlx_omnia.models.qwen3.config import Qwen3MoEConfig
+from mlx_omnia.models.qwen3.layers.attention import Qwen3Attention
 
 if TYPE_CHECKING:
-    from sideros.core.mxcompat import MetalKernel
+    from mlx_omnia.core.mxcompat import MetalKernel
 
 CONFIG = Qwen3MoEConfig(
     hidden_size=2048,

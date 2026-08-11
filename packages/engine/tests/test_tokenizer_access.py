@@ -14,7 +14,7 @@ import mlx.core as mx
 import mlx.nn as nn
 from conftest import checkpoint_dir, requires_checkpoint
 
-from sideros import (
+from mlx_omnia import (
     TEXT,
     ChatCapability,
     ChatTemplate,
@@ -28,8 +28,8 @@ from sideros import (
     TextLanguageModel,
     load,
 )
-from sideros.language import Prefill, tokenizer_of, trunk_of
-from sideros.parsers import Segment
+from mlx_omnia.language import Prefill, tokenizer_of, trunk_of
+from mlx_omnia.parsers import Segment
 
 GEMMA = "google/gemma-3-270m"
 

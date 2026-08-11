@@ -48,12 +48,12 @@ run = "uv run python bench/grammar.py"
 
 [tasks.server]
 description = "run the FastAPI server"
-run = "uv run sideros-server"
+run = "uv run omnia-server"
 
 [tasks.app]
 description = "run the Flet window (it starts the engine when nothing answers on 8642)"
-run = "uv run sideros-app"
+run = "uv run omnia-app"
 
 [tasks.cli]
 description = "run the HTTP-only CLI"
-run = "uv run sideros"
+run = "uv run omnia"

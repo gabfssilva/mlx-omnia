@@ -14,8 +14,8 @@ import pytest
 from huggingface_hub import hf_hub_download
 from test_generate import ScriptedLM
 
-from sideros import GPT2Tokenizer, stream_ids
-from sideros.grammar import Grammar, GrammarRefused, GrammarStalled, SchemaConstraint, Vocabulary
+from mlx_omnia import GPT2Tokenizer, stream_ids
+from mlx_omnia.grammar import Grammar, GrammarRefused, GrammarStalled, SchemaConstraint, Vocabulary
 
 
 class Entry(TypedDict):

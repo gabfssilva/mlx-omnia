@@ -8,8 +8,8 @@ import mlx.core as mx
 import mlx.nn as nn
 from conftest import relative_diff
 
-from sideros.checkpoint import fuse_qkv, load_checkpoint
-from sideros.core.layers import SegmentedQKV
+from mlx_omnia.checkpoint import fuse_qkv, load_checkpoint
+from mlx_omnia.core.layers import SegmentedQKV
 
 _ATTENTION = "model.layers.0.self_attn."
 _HIDDEN = 128

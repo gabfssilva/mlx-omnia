@@ -5,7 +5,7 @@ import threading
 
 import pytest
 
-from sideros_cli.client import Event, ServerError, health, read_events
+from mlx_omnia_cli.client import Event, ServerError, health, read_events
 
 DOWN = "http://127.0.0.1:9"
 """The discard port: nothing listens there, which is the daemon being down."""

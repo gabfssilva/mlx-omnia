@@ -1,9 +1,9 @@
 import mlx.core as mx
 import mlx.nn as nn
 
-from sideros.quant.calibration import BlockedForward, collect
-from sideros.quant.oq import BlockScore, OqSensitivity, measure_sensitivity
-from sideros.quant.quantization import Affine, Quantization
+from mlx_omnia.quant.calibration import BlockedForward, collect
+from mlx_omnia.quant.oq import BlockScore, OqSensitivity, measure_sensitivity
+from mlx_omnia.quant.quantization import Affine, Quantization
 
 _HIDDEN = 64
 _VOCAB = 128

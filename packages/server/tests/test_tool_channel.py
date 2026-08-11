@@ -12,9 +12,9 @@ leaves as content, and a request whose generation writes no envelope gets back e
 text it always did.
 """
 
-from sideros.parsers import Segment, ToolCall
-from sideros.parsers.qwen import PARSER
-from sideros_server.responses import Calls
+from mlx_omnia.parsers import Segment, ToolCall
+from mlx_omnia.parsers.qwen import PARSER
+from mlx_omnia_server.responses import Calls
 
 assert PARSER.tools is not None
 QWEN = PARSER.tools

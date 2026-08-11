@@ -14,10 +14,10 @@ The floor is the bf16 epilogue -- see `test_kernel_nvfp4_qmv` for the derivation
 import mlx.core as mx
 from conftest import relative_diff
 
-from sideros.core.kernels.qmv.gated_nvfp4 import gated_nvfp4_qmv, gated_nvfp4_qmv_applies
-from sideros.core.kernels.qmv.nvfp4 import nvfp4_qmv
-from sideros.core.kernels.shared.nvfp4 import LaneMajorScales, lane_major_scales
-from sideros.core.patch import original
+from mlx_omnia.core.kernels.qmv.gated_nvfp4 import gated_nvfp4_qmv, gated_nvfp4_qmv_applies
+from mlx_omnia.core.kernels.qmv.nvfp4 import nvfp4_qmv
+from mlx_omnia.core.kernels.shared.nvfp4 import LaneMajorScales, lane_major_scales
+from mlx_omnia.core.patch import original
 
 KDIM = 2048
 ROWS = 512
@@ -68,7 +68,7 @@ def pre_gated(x: mx.array, gate: mx.array) -> mx.array:
 def reference(
     x: mx.array, gate: mx.array, weight: mx.array, scales: mx.array
 ) -> mx.array:
-    """`original`, not `mx.quantized_matmul`: importing sideros installs a replacement
+    """`original`, not `mx.quantized_matmul`: importing mlx_omnia installs a replacement
     over that name."""
     projected = original(mx, "quantized_matmul")(
         pre_gated(x, gate),

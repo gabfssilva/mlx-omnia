@@ -9,8 +9,8 @@ import pytest
 from fastapi import FastAPI
 from fastapi.testclient import TestClient
 
-from sideros_server import fidelity
-from sideros_server.store import Store
+from mlx_omnia_server import fidelity
+from mlx_omnia_server.store import Store
 
 
 @pytest.fixture

@@ -15,9 +15,9 @@ from benchmark_stand import (
 )
 from fastapi.testclient import TestClient
 
-from sideros import GenerationOptions, Text
-from sideros_server import benchmarks
-from sideros_server.engine import Engine
+from mlx_omnia import GenerationOptions, Text
+from mlx_omnia_server import benchmarks
+from mlx_omnia_server.engine import Engine
 
 MODEL = "house/small"
 OTHER = "house/other"

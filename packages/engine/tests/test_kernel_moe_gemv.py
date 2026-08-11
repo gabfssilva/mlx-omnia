@@ -32,14 +32,14 @@ import numpy as np
 import pytest
 from conftest import relative_diff
 
-from sideros.core.kernels.down_combine.affine import _SOURCE as _DOWN_SOURCE
-from sideros.core.kernels.down_combine.affine import AffineDownCombine
-from sideros.core.kernels.down_combine.affine import applies as down_applies
-from sideros.core.kernels.gate_up.affine import _SOURCE as _GATE_UP_SOURCE
-from sideros.core.kernels.gate_up.affine import HEADER as _HEADER
-from sideros.core.kernels.gate_up.affine import AffineGateUp
-from sideros.core.kernels.gate_up.affine import applies as gate_up_applies
-from sideros.core.mxcompat import metal_kernel
+from mlx_omnia.core.kernels.down_combine.affine import _SOURCE as _DOWN_SOURCE
+from mlx_omnia.core.kernels.down_combine.affine import AffineDownCombine
+from mlx_omnia.core.kernels.down_combine.affine import applies as down_applies
+from mlx_omnia.core.kernels.gate_up.affine import _SOURCE as _GATE_UP_SOURCE
+from mlx_omnia.core.kernels.gate_up.affine import HEADER as _HEADER
+from mlx_omnia.core.kernels.gate_up.affine import AffineGateUp
+from mlx_omnia.core.kernels.gate_up.affine import applies as gate_up_applies
+from mlx_omnia.core.mxcompat import metal_kernel
 
 
 def moe_gemv_applies(hidden: int, inner: int, gate_group: int, down_group: int) -> bool:

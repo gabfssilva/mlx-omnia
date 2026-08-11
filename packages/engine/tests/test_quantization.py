@@ -7,11 +7,11 @@ import pytest
 from conftest import relative_diff
 from mlx.utils import tree_flatten
 
-import sideros.quant.quantization as quantization
-from sideros.checkpoint import _quantization, fuse_qkv, load_checkpoint, save_quantized
-from sideros.core.layers import QuantizedSwitchLinear, QuantizeMode, SwitchLinear
-from sideros.core.mxcompat import gather_mm
-from sideros.quant.quantization import (
+import mlx_omnia.quant.quantization as quantization
+from mlx_omnia.checkpoint import _quantization, fuse_qkv, load_checkpoint, save_quantized
+from mlx_omnia.core.layers import QuantizedSwitchLinear, QuantizeMode, SwitchLinear
+from mlx_omnia.core.mxcompat import gather_mm
+from mlx_omnia.quant.quantization import (
     MXFP,
     MXFPRTN,
     NVFP,

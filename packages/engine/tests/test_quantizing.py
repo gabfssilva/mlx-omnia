@@ -9,12 +9,12 @@ consistent with itself and an unwrapped layer of a hybrid is left exactly as it 
 import mlx.core as mx
 import pytest
 
-from sideros.core.attend import Attending, attend
-from sideros.core.cache import DeltaCache, KVCache, LayerCache
-from sideros.core.quantized_cache import QuantizedKVCache
-from sideros.generate import BlockOutputs, CausalLM, CompiledDecode, _boundary
-from sideros.quant.quantization import Affine
-from sideros.quantizing import Quantizing, admits
+from mlx_omnia.core.attend import Attending, attend
+from mlx_omnia.core.cache import DeltaCache, KVCache, LayerCache
+from mlx_omnia.core.quantized_cache import QuantizedKVCache
+from mlx_omnia.generate import BlockOutputs, CausalLM, CompiledDecode, _boundary
+from mlx_omnia.quant.quantization import Affine
+from mlx_omnia.quantizing import Quantizing, admits
 
 K_FORMAT = Affine(group_size=64, bits=4)
 V_FORMAT = Affine(group_size=64, bits=8)

@@ -9,8 +9,8 @@ from pathlib import Path
 
 import pytest
 
-from sideros_server import store
-from sideros_server.store import (
+from mlx_omnia_server import store
+from mlx_omnia_server.store import (
     SCHEMA_VERSION,
     Bench,
     JobRecord,
@@ -68,7 +68,7 @@ def test_the_migration_creates_the_whole_schema_over_an_empty_file(tmp_path: Pat
 
 
 def test_the_first_boot_creates_the_directory(tmp_path: Path) -> None:
-    path = tmp_path / "sideros" / "server.db"
+    path = tmp_path / "mlx_omnia" / "server.db"
 
     Store(path)
 
@@ -275,7 +275,7 @@ def test_the_database_sits_beside_the_app_config(
     """`XDG_CONFIG_HOME` overrides the `~/.config` base."""
     monkeypatch.setenv("XDG_CONFIG_HOME", str(tmp_path))
 
-    assert default_path() == tmp_path / "sideros" / "server.db"
+    assert default_path() == tmp_path / "mlx_omnia" / "server.db"
 
 
 def speed_run(

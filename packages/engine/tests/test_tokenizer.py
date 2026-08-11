@@ -7,7 +7,7 @@ from hypothesis import given
 from hypothesis import strategies as st
 from transformers import AutoTokenizer
 
-from sideros import GPT2Tokenizer
+from mlx_omnia import GPT2Tokenizer
 
 CORPUS = [
     "",

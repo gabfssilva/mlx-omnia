@@ -21,10 +21,10 @@ import random
 import mlx.core as mx
 from conftest import relative_diff
 
-from sideros.core.kernels.gate_up import GateUp, Nvfp4PackedGateUp, OrdinalRouting
-from sideros.core.kernels.gate_up.nvfp4_packed import applies
-from sideros.core.kernels.shared.nvfp4 import halved_group32_scales
-from sideros.core.layers import QuantizedSwitchLinear, SwitchLinear
+from mlx_omnia.core.kernels.gate_up import GateUp, Nvfp4PackedGateUp, OrdinalRouting
+from mlx_omnia.core.kernels.gate_up.nvfp4_packed import applies
+from mlx_omnia.core.kernels.shared.nvfp4 import halved_group32_scales
+from mlx_omnia.core.layers import QuantizedSwitchLinear, SwitchLinear
 
 HIDDEN = 512
 INNER = 32

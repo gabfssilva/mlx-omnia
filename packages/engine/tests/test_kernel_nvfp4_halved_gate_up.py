@@ -12,14 +12,14 @@ import mlx.nn as nn
 import pytest
 from conftest import relative_diff
 
-from sideros.core.kernels.mlp import DefaultMlp, Mlp
-from sideros.core.kernels.mlp.nvfp4 import (
+from mlx_omnia.core.kernels.mlp import DefaultMlp, Mlp
+from mlx_omnia.core.kernels.mlp.nvfp4 import (
     Nvfp4Mlp,
     halve_gate_up_scales,
     nvfp4_halved_gate_up,
     nvfp4_halved_gate_up_applies,
 )
-from sideros.core.layers import SwiGLU
+from mlx_omnia.core.layers import SwiGLU
 
 HIDDEN = 512
 INNER = 32

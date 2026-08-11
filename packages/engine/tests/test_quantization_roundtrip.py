@@ -6,8 +6,8 @@ import mlx.core as mx
 import mlx.nn as nn
 from conftest import relative_diff
 
-from sideros.checkpoint import load_checkpoint, save_quantized
-from sideros.quant.quantization import (
+from mlx_omnia.checkpoint import load_checkpoint, save_quantized
+from mlx_omnia.quant.quantization import (
     Affine,
     ByPath,
     QuantizationPlan,

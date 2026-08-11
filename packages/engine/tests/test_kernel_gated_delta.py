@@ -19,7 +19,7 @@ import numpy as np
 import pytest
 from conftest import relative_diff
 
-from sideros.core.kernels.gated_delta import (
+from mlx_omnia.core.kernels.gated_delta import (
     DefaultGatedDelta,
     FusedGatedDelta,
     GatedDelta,
@@ -27,12 +27,12 @@ from sideros.core.kernels.gated_delta import (
     gated_delta,
     gated_delta_applies,
 )
-from sideros.core.kernels.gated_delta.fused import _KERNEL, _SOURCE
-from sideros.core.layers import l2norm
-from sideros.core.mxcompat import metal_kernel
+from mlx_omnia.core.kernels.gated_delta.fused import _KERNEL, _SOURCE
+from mlx_omnia.core.layers import l2norm
+from mlx_omnia.core.mxcompat import metal_kernel
 
 if TYPE_CHECKING:
-    from sideros.core.mxcompat import MetalKernel
+    from mlx_omnia.core.mxcompat import MetalKernel
 
 SMALL = (16, 16, 128, 128)  # 0.8B: Hk, Hv, Dk, Dv
 BROADCAST = (16, 48, 128, 128)  # 27B

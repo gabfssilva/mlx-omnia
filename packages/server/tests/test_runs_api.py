@@ -7,7 +7,7 @@ from pathlib import Path
 
 from benchmark_stand import SMALL, stand
 
-from sideros_server.store import Run, SpeedResult, Store
+from mlx_omnia_server.store import Run, SpeedResult, Store
 
 MODEL = "house/small"
 OTHER = "house/other"

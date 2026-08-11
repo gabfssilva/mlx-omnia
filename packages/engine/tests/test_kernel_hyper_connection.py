@@ -20,13 +20,13 @@ import mlx.core as mx
 import pytest
 from conftest import relative_diff
 
-from sideros.core.kernels.hyper_connection import (
+from mlx_omnia.core.kernels.hyper_connection import (
     DefaultHyperConnection,
     FusedHyperConnection,
     HyperConnection,
 )
-from sideros.core.kernels.hyper_connection.fused import _EXPAND_EMIT_SOURCE, _SOURCE
-from sideros.core.mxcompat import metal_kernel, softmax
+from mlx_omnia.core.kernels.hyper_connection.fused import _EXPAND_EMIT_SOURCE, _SOURCE
+from mlx_omnia.core.mxcompat import metal_kernel, softmax
 
 HC, D = 4, 4096
 ITERS, EPS, NEPS = 20, 1e-6, 1e-6

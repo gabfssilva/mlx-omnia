@@ -25,8 +25,8 @@ import mlx.core as mx
 import pytest
 from conftest import relative_diff
 
-import sideros.core.kernels.attention.full as ffa
-from sideros.core.kernels.attention.full import (
+import mlx_omnia.core.kernels.attention.full as ffa
+from mlx_omnia.core.kernels.attention.full import (
     full_fused_attention,
     full_fused_attention_applies,
 )

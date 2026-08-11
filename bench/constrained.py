@@ -30,11 +30,11 @@ from pathlib import Path
 import mlx.core as mx
 from huggingface_hub import snapshot_download
 
-from sideros import stream_ids
-from sideros.bpe import ByteLevelBPE
-from sideros.grammar import Grammar, Vocabulary
-from sideros.models.qwen3.dense import CHECKPOINT as QWEN3
-from sideros.models.qwen3.moe import CHECKPOINT as QWEN3_MOE
+from mlx_omnia import stream_ids
+from mlx_omnia.bpe import ByteLevelBPE
+from mlx_omnia.grammar import Grammar, Vocabulary
+from mlx_omnia.models.qwen3.dense import CHECKPOINT as QWEN3
+from mlx_omnia.models.qwen3.moe import CHECKPOINT as QWEN3_MOE
 
 TOKENS = 128
 RUNS = 5

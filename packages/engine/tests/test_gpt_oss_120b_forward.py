@@ -26,14 +26,14 @@ from conftest import (
     relative_diff,
 )
 
-from sideros import KVCache, stream_ids
-from sideros.checkpoint import stop_tokens
-from sideros.core.config import load_config
-from sideros.core.kernels.attention import SinkAttentionStep
-from sideros.core.kernels.down_combine import DownCombine
-from sideros.core.layers import QuantizedSwitchLinear
-from sideros.models.gpt_oss import CHECKPOINT, GPTOSS, GPTOSSConfig
-from sideros.models.gpt_oss.layers import flags
+from mlx_omnia import KVCache, stream_ids
+from mlx_omnia.checkpoint import stop_tokens
+from mlx_omnia.core.config import load_config
+from mlx_omnia.core.kernels.attention import SinkAttentionStep
+from mlx_omnia.core.kernels.down_combine import DownCombine
+from mlx_omnia.core.layers import QuantizedSwitchLinear
+from mlx_omnia.models.gpt_oss import CHECKPOINT, GPTOSS, GPTOSSConfig
+from mlx_omnia.models.gpt_oss.layers import flags
 
 FIXTURE = Path(__file__).parent / "fixtures" / "gpt_oss_120b_mlxlm.safetensors"
 REPO = "openai/gpt-oss-120b"

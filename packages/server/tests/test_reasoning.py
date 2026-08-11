@@ -11,13 +11,13 @@ is where the two halves meet. The Anthropic half is tested next to that dialect,
 import pytest
 from pydantic import ValidationError
 
-from sideros_server import gemini
-from sideros_server.app import ChatRequest
-from sideros_server.app import _options as chat_options
-from sideros_server.app import _preset as chat_preset
-from sideros_server.gemini import GenerationConfig
-from sideros_server.profiles import Sampling
-from sideros_server.responses import PROFILE_ONLY, ResponsesRequest, effort_of
+from mlx_omnia_server import gemini
+from mlx_omnia_server.app import ChatRequest
+from mlx_omnia_server.app import _options as chat_options
+from mlx_omnia_server.app import _preset as chat_preset
+from mlx_omnia_server.gemini import GenerationConfig
+from mlx_omnia_server.profiles import Sampling
+from mlx_omnia_server.responses import PROFILE_ONLY, ResponsesRequest, effort_of
 
 
 def chat(**fields: object) -> ChatRequest:

@@ -17,11 +17,11 @@ from pathlib import Path
 import mlx.core as mx
 import mlx.nn as nn
 
-from sideros import load_drafter
-from sideros.models.muse_glimmer import ASSISTANT, MuseGlimmerAssistant
-from sideros.models.muse_glimmer.checkpoint import assistant_config
-from sideros.quant.quantization import Affine, expand_plan, inventory, quantize_weights
-from sideros.task import source, write_entry
+from mlx_omnia import load_drafter
+from mlx_omnia.models.muse_glimmer import ASSISTANT, MuseGlimmerAssistant
+from mlx_omnia.models.muse_glimmer.checkpoint import assistant_config
+from mlx_omnia.quant.quantization import Affine, expand_plan, inventory, quantize_weights
+from mlx_omnia.task import source, write_entry
 
 _HIDDEN = 64
 _HEAD_DIM = 16

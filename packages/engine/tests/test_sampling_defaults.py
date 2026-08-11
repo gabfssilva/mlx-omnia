@@ -8,7 +8,7 @@ means for a file that also carries a temperature.
 import json
 from pathlib import Path
 
-from sideros.checkpoint import SamplingDefaults, sampling_defaults
+from mlx_omnia.checkpoint import SamplingDefaults, sampling_defaults
 
 
 def written(directory: Path, **fields: object) -> Path:

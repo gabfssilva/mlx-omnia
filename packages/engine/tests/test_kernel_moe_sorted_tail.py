@@ -10,7 +10,7 @@ different row.
 import mlx.core as mx
 from conftest import relative_diff
 
-from sideros.core.kernels.moe_tail import DefaultMoeTail, MoeTail, SortedMoeTail
+from mlx_omnia.core.kernels.moe_tail import DefaultMoeTail, MoeTail, SortedMoeTail
 
 TOKENS = 3
 TOPK = 4

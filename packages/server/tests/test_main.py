@@ -19,7 +19,7 @@ from pathlib import Path
 import httpx
 import pytest
 
-from sideros_server.main import watch_parent
+from mlx_omnia_server.main import watch_parent
 
 
 def free_port() -> int:
@@ -72,7 +72,7 @@ def test_a_daemon_started_with_parent_pid_stops_when_that_pid_is_killed(
         [
             sys.executable,
             "-m",
-            "sideros_server.main",
+            "mlx_omnia_server.main",
             "--port",
             str(port),
             "--parent-pid",

@@ -4,9 +4,9 @@ import mlx.core as mx
 import mlx.nn as nn
 from conftest import relative_diff
 
-from sideros.models.gpt2 import GPT2, GPT2Config
-from sideros.models.qwen3 import Qwen3, Qwen3Config
-from sideros.quant.awq import (
+from mlx_omnia.models.gpt2 import GPT2, GPT2Config
+from mlx_omnia.models.qwen3 import Qwen3, Qwen3Config
+from mlx_omnia.quant.awq import (
     Applied,
     Pair,
     Refused,
@@ -14,8 +14,8 @@ from sideros.quant.awq import (
     channel_scale,
     derive_pairs,
 )
-from sideros.quant.calibration import quantize_dequantize
-from sideros.quant.quantization import (
+from mlx_omnia.quant.calibration import quantize_dequantize
+from mlx_omnia.quant.quantization import (
     Affine,
     QuantizationPlan,
     infer_quantization,

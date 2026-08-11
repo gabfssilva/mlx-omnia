@@ -10,8 +10,8 @@ original comes back on exit.
 import mlx.core as mx
 from conftest import relative_diff
 
-from sideros.core.kernels.qmv.int8 import QUANTIZED_MATMUL
-from sideros.core.patch import Patch, patched, uses
+from mlx_omnia.core.kernels.qmv.int8 import QUANTIZED_MATMUL
+from mlx_omnia.core.patch import Patch, patched, uses
 
 
 def packed(rows: int, kdim: int, bits: int = 8, group_size: int = 32):

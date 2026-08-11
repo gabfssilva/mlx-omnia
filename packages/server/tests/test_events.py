@@ -26,11 +26,11 @@ from fastapi import FastAPI
 from fastapi.responses import StreamingResponse
 from fastapi.testclient import TestClient
 
-from sideros import CompositeModel, GenerationOptions, Text
-from sideros.parsers import Segment
-from sideros_server import catalog, create_app, events
-from sideros_server.engine import Engine
-from sideros_server.store import Store
+from mlx_omnia import CompositeModel, GenerationOptions, Text
+from mlx_omnia.parsers import Segment
+from mlx_omnia_server import catalog, create_app, events
+from mlx_omnia_server.engine import Engine
+from mlx_omnia_server.store import Store
 
 _DEADLINE_SECONDS = 20.0
 """How long any one frame is waited for. Generous on purpose: FSEvents runs on a clock of

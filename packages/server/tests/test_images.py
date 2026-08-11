@@ -40,7 +40,7 @@ from openai import BadRequestError, OpenAI
 from openai.types.chat import ChatCompletionMessageParam
 from openai.types.responses import ResponseInputParam
 
-from sideros import (
+from mlx_omnia import (
     RGB_IMAGE,
     TEXT,
     Chat,
@@ -56,11 +56,11 @@ from sideros import (
     MultimodalChatCapability,
     Text,
 )
-from sideros.parsers import Segment
-from sideros_server import Engine, catalog, create_app
-from sideros_server.engine import Job, Loader
-from sideros_server.responses import UnreadableImage, image_part
-from sideros_server.store import Store
+from mlx_omnia.parsers import Segment
+from mlx_omnia_server import Engine, catalog, create_app
+from mlx_omnia_server.engine import Job, Loader
+from mlx_omnia_server.responses import UnreadableImage, image_part
+from mlx_omnia_server.store import Store
 
 MODEL = "stand/eyes"
 TEXT_ONLY = "stand/deaf"

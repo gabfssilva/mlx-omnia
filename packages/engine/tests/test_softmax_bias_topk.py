@@ -20,12 +20,12 @@ import numpy as np
 import pytest
 from conftest import relative_diff
 
-from sideros.core.kernels.route.bias_topk import (
+from mlx_omnia.core.kernels.route.bias_topk import (
     _SOURCE,
     softmax_bias_topk,
     softmax_bias_topk_applies,
 )
-from sideros.core.mxcompat import metal_kernel, softmax
+from mlx_omnia.core.mxcompat import metal_kernel, softmax
 
 SHAPES = [(32, 4), (128, 8), (256, 8), (384, 12)]
 SCALE = 6.0

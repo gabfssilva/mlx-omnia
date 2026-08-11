@@ -1,5 +1,5 @@
 # pyright: basic
-"""Self-paired A/B: the same sideros benched at two git refs, mlxfast-style.
+"""Self-paired A/B: the same mlx_omnia benched at two git refs, mlxfast-style.
 
 The measure-job design ported from the Poolside mlxfast-challenge harness — no round
 interleaving between the sides: the baseline ref runs first as a whole gated battery,
@@ -9,11 +9,11 @@ each timed round rejects a measurement that throttled mid-run: a loaded sample
 (gpu_active_ratio ≥ 0.5) below the clock floor fails the round, with one gated retry.
 
 Each side is a subprocess with PYTHONPATH pointing at its tree — two versions of the
-same package never share an interpreter — and the worker asserts the sideros it
-imported came from the tree it was told to bench. Only the sideros *source* is
+same package never share an interpreter — and the worker asserts the mlx_omnia it
+imported came from the tree it was told to bench. Only the mlx_omnia *source* is
 swapped; both sides run in the current uv environment, so the baseline ref must be
 source-compatible with it (same mlx pin, core generate/footprint API present, and
-`sideros.tree` — the door `load_ours` goes through).
+`mlx_omnia.tree` — the door `load_ours` goes through).
 
 Decode is teacher-forced to the baseline's greedy stream on both sides. A candidate
 whose own greedy stream diverges is reported with the position — ties or a real
@@ -42,10 +42,10 @@ import threading
 import time
 from pathlib import Path
 
-FLOOR_MHZ = int(os.environ.get("SIDEROS_GPU_MIN_MHZ", "1300"))
+FLOOR_MHZ = int(os.environ.get("OMNIA_GPU_MIN_MHZ", "1300"))
 LOADED_RATIO = 0.5
 TELEMETRY_MS = 100
-CALIBRATION = Path.home() / ".cache/sideros/selfpair.json"
+CALIBRATION = Path.home() / ".cache/mlx_omnia/selfpair.json"
 CALIBRATION_BAND = 0.05
 FLOOR = 0.95
 
@@ -87,11 +87,11 @@ def worker(payload_path: str) -> None:
     write samples + telemetry to the output file."""
     payload = json.loads(Path(payload_path).read_text())
 
-    import sideros
+    import mlx_omnia
 
     tree = payload["tree"]
-    assert sideros.__file__ is not None and sideros.__file__.startswith(tree), (
-        f"worker imported sideros from {sideros.__file__}, not from {tree}"
+    assert mlx_omnia.__file__ is not None and mlx_omnia.__file__.startswith(tree), (
+        f"worker imported mlx_omnia from {mlx_omnia.__file__}, not from {tree}"
     )
 
     from interleaved import find_macmon, load_ours, run_ours, sample_ids, wait_cool
@@ -129,7 +129,9 @@ def worker(payload_path: str) -> None:
         telemetry.stop()
 
     Path(payload["out"]).write_text(
-        json.dumps({"own": own, "samples": samples, "clocks": clocks, "sideros": sideros.__file__})
+        json.dumps(
+            {"own": own, "samples": samples, "clocks": clocks, "mlx_omnia": mlx_omnia.__file__}
+        )
     )
 
 
@@ -233,7 +235,7 @@ def main() -> None:
 
     from interleaved import MLXLM_REPO, PROMPT_TOKENS, RUNS, TOKENS, prompt_ids
 
-    from sideros.bpe import ByteLevelBPE
+    from mlx_omnia.bpe import ByteLevelBPE
 
     model = sys.argv[1] if len(sys.argv) > 1 else "gpt2"
     ref = sys.argv[2] if len(sys.argv) > 2 else "main"

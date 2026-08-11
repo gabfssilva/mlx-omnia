@@ -10,9 +10,9 @@ import mlx.core as mx
 import pytest
 from conftest import relative_diff
 
-from sideros.core.kernels.down_combine.nvfp4 import Nvfp4DownCombine
-from sideros.core.kernels.gate_up.nvfp4 import Nvfp4GateUp
-from sideros.core.kernels.gate_up.nvfp4 import applies as nvfp4_moe_applies
+from mlx_omnia.core.kernels.down_combine.nvfp4 import Nvfp4DownCombine
+from mlx_omnia.core.kernels.gate_up.nvfp4 import Nvfp4GateUp
+from mlx_omnia.core.kernels.gate_up.nvfp4 import applies as nvfp4_moe_applies
 
 EXPERTS = 8
 ACTIVE = 4

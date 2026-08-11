@@ -77,7 +77,7 @@ def forward(ids: list[int], dtype: torch.dtype) -> dict[str, np.ndarray]:
 def batching_noise(ids: list[int]) -> float:
     """Prefill against step-by-step with cache, both transformers fp32: what the
     act-quant's round amplifies out of a mere change in matmul row count. This is the
-    floor for sideros' own stepwise-vs-prefill gate — a fixed fp32 tolerance is
+    floor for mlx_omnia' own stepwise-vs-prefill gate — a fixed fp32 tolerance is
     unachievable on this trunk (the fp32-vs-fp64 logits floor is already ~3e-2)."""
     model = BitNetForCausalLM.from_pretrained(MODEL, dtype=torch.float32)
     model.eval()

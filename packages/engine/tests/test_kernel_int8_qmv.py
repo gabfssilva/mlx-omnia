@@ -11,14 +11,14 @@ import mlx.core as mx
 import pytest
 from conftest import relative_diff
 
-from sideros.core.kernels.qmv.int8 import (
+from mlx_omnia.core.kernels.qmv.int8 import (
     gated_int8_qmv,
     gated_int8_qmv_applies,
     int8_qmv,
     int8_qmv_applies,
     norm_int8_qmv,
 )
-from sideros.core.patch import original
+from mlx_omnia.core.patch import original
 
 GROUP = 32
 BITS = 8

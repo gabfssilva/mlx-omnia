@@ -3,16 +3,16 @@ from dataclasses import dataclass
 
 import mlx.core as mx
 
-from sideros import GPT2Tokenizer, KVCache, greedy, stream_generate
-from sideros.language import (
+from mlx_omnia import GPT2Tokenizer, KVCache, greedy, stream_generate
+from mlx_omnia.language import (
     GenerationOptions,
     LanguageModel,
     LanguagePrompt,
     Text,
     TextLanguageModel,
 )
-from sideros.model import ContentType, Modality, ModelSignature
-from sideros.parsers import Segment
+from mlx_omnia.model import ContentType, Modality, ModelSignature
+from mlx_omnia.parsers import Segment
 
 TOKENS = {
     "prompt": [1],

@@ -18,7 +18,7 @@ import mlx.core as mx
 import mlx.nn as nn
 import pytest
 
-from sideros.core.kernels.ssm import (
+from mlx_omnia.core.kernels.ssm import (
     DefaultSsm,
     FusedSsm,
     Ssm,

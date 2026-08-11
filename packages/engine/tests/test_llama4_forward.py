@@ -24,10 +24,10 @@ from conftest import (
     requires_checkpoint,
 )
 
-from sideros import KVCache, stream_ids
-from sideros.models.llama4 import CHECKPOINT, Llama4
-from sideros.models.llama4.layers.attention import Llama4Attention
-from sideros.models.llama4.layers.block import Llama4Block
+from mlx_omnia import KVCache, stream_ids
+from mlx_omnia.models.llama4 import CHECKPOINT, Llama4
+from mlx_omnia.models.llama4.layers.attention import Llama4Attention
+from mlx_omnia.models.llama4.layers.block import Llama4Block
 
 FIXTURE = Path(__file__).parent / "fixtures" / "llama4_mlxlm.safetensors"
 REPO = "mlx-community/Llama-4-Scout-17B-16E-Instruct-4bit"

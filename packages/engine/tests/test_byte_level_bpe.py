@@ -17,7 +17,7 @@ import pytest
 from conftest import checkpoint_dir, requires_checkpoint
 from transformers import AutoTokenizer
 
-from sideros.bpe import ByteLevelBPE
+from mlx_omnia.bpe import ByteLevelBPE
 
 CORPUS = [
     "",

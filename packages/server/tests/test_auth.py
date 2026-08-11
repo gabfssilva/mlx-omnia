@@ -19,11 +19,11 @@ import pytest
 from fastapi import FastAPI
 from fastapi.testclient import TestClient
 
-from sideros import LanguageModel, ModelInput
-from sideros_server import Engine, auth, create_app
-from sideros_server.store import Store
+from mlx_omnia import LanguageModel, ModelInput
+from mlx_omnia_server import Engine, auth, create_app
+from mlx_omnia_server.store import Store
 
-KEY = "sk-sideros-test"
+KEY = "sk-mlx_omnia-test"
 
 PATHS = (
     "/admin/config",

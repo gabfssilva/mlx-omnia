@@ -24,7 +24,7 @@ import mlx.nn as nn
 import pytest
 from fastapi.testclient import TestClient
 
-from sideros import (
+from mlx_omnia import (
     TEXT,
     ChatCapability,
     ChatTemplate,
@@ -34,16 +34,16 @@ from sideros import (
     ModelSignature,
     Text,
 )
-from sideros.core.attend import attend
-from sideros.core.cache import KVCache, LayerCache
-from sideros.core.quantized_cache import QuantizedKVCache
-from sideros.parsers import Segment
-from sideros.quant.quantization import Affine
-from sideros.quantizing import Quantizing
-from sideros_server import Engine, catalog, create_app
-from sideros_server.engine import Job, NotQuantizable
-from sideros_server.features import Features, KvCache, Speculation, resolve
-from sideros_server.store import ModelSettings, Store
+from mlx_omnia.core.attend import attend
+from mlx_omnia.core.cache import KVCache, LayerCache
+from mlx_omnia.core.quantized_cache import QuantizedKVCache
+from mlx_omnia.parsers import Segment
+from mlx_omnia.quant.quantization import Affine
+from mlx_omnia.quantizing import Quantizing
+from mlx_omnia_server import Engine, catalog, create_app
+from mlx_omnia_server.engine import Job, NotQuantizable
+from mlx_omnia_server.features import Features, KvCache, Speculation, resolve
+from mlx_omnia_server.store import ModelSettings, Store
 
 MODEL = "meta-models/Muse-Glimmer-30B"
 HEAD_DIM = 64

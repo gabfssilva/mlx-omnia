@@ -1,10 +1,10 @@
 [project]
-name = "sideros-server"
+name = "mlx-omnia-server"
 version = "0.1.0"
-description = "HTTP API for the sideros inference engine"
+description = "HTTP API for the mlx-omnia inference engine"
 requires-python = ">=3.13"
 dependencies = [
-    "sideros",
+    "mlx-omnia",
     "fastapi>=0.115",
     "uvicorn>=0.30",
     "huggingface_hub>=0.30",
@@ -13,10 +13,10 @@ dependencies = [
 ]
 
 [project.scripts]
-sideros-server = "sideros_server.main:main"
+omnia-server = "mlx_omnia_server.main:main"
 
 [tool.uv.sources]
-sideros = { workspace = true }
+mlx-omnia = { workspace = true }
 
 [build-system]
 requires = ["uv_build>=0.11,<0.12"]

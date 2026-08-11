@@ -22,7 +22,7 @@ import mlx.core as mx
 import numpy as np
 from conftest import relative_diff
 
-from sideros.core.kernels.qkv_rope.qk_norm_rope import (
+from mlx_omnia.core.kernels.qkv_rope.qk_norm_rope import (
     _OUTPUTS,
     _PREFILL_SCALED_INPUTS,
     _PREFILL_SCALED_SOURCE,
@@ -33,10 +33,10 @@ from sideros.core.kernels.qkv_rope.qk_norm_rope import (
     qk_norm_rope_prefill_scaled,
     qk_norm_rope_prefill_scaled_applies,
 )
-from sideros.core.mxcompat import metal_kernel
+from mlx_omnia.core.mxcompat import metal_kernel
 
 if TYPE_CHECKING:
-    from sideros.core.mxcompat import MetalKernel
+    from mlx_omnia.core.mxcompat import MetalKernel
 
 QUERY_HEADS = 12
 KV_HEADS = 4

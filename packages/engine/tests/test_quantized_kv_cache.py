@@ -15,12 +15,12 @@ from pathlib import Path
 import mlx.core as mx
 import pytest
 
-from sideros.core import cache_file
-from sideros.core.attend import attend
-from sideros.core.cache import KVCache
-from sideros.core.prompt_cache import PromptCache
-from sideros.core.quantized_cache import FormatRefused, QuantizedKVCache, ShapeRefused
-from sideros.quant.quantization import MXFP, NVFP, Affine
+from mlx_omnia.core import cache_file
+from mlx_omnia.core.attend import attend
+from mlx_omnia.core.cache import KVCache
+from mlx_omnia.core.prompt_cache import PromptCache
+from mlx_omnia.core.quantized_cache import FormatRefused, QuantizedKVCache, ShapeRefused
+from mlx_omnia.quant.quantization import MXFP, NVFP, Affine
 
 HEADS = 4
 KV_HEADS = 2

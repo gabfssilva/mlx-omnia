@@ -11,14 +11,14 @@ import mlx.core as mx
 import mlx.nn as nn
 from conftest import relative_diff
 
-from sideros.core.kernels.down_combine import (
+from mlx_omnia.core.kernels.down_combine import (
     AffineDownCombine,
     DefaultDownCombine,
     DownCombine,
     Mxfp4DownCombine,
     Nvfp4DownCombine,
 )
-from sideros.core.layers import QuantizedSwitchLinear, SwitchLinear
+from mlx_omnia.core.layers import QuantizedSwitchLinear, SwitchLinear
 
 EXPERTS = 8
 ACTIVE = 4

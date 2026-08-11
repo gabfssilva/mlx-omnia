@@ -1,7 +1,7 @@
 """The commands against a daemon that is only its HTTP surface.
 
 The stub below is the whole point of the package: none of these tests import the engine, and
-the one that would — a real `sideros-server` child — is refused by the autouse fixture, so a
+the one that would — a real `omnia-server` child — is refused by the autouse fixture, so a
 regression that makes the CLI spawn while a daemon is already answering fails here instead of
 starting an interpreter that loads mlx.
 """
@@ -21,9 +21,9 @@ from urllib.parse import parse_qs, urlsplit
 
 import pytest
 
-from sideros_cli import daemon
-from sideros_cli.client import ServerError
-from sideros_cli.main import main
+from mlx_omnia_cli import daemon
+from mlx_omnia_cli.client import ServerError
+from mlx_omnia_cli.main import main
 
 ANSWER = ("Hello", " from", " the", " stub")
 
@@ -211,7 +211,7 @@ def test_run_puts_the_model_s_words_on_stdout_and_nothing_else(
     stub: Stub, capsys: pytest.CaptureFixture[str]
 ) -> None:
     """The line that separates this from a script: a single note on stdout and every
-    `sideros run -m X | jq` in the world reads the note as part of the answer."""
+    `mlx_omnia run -m X | jq` in the world reads the note as part of the answer."""
     assert main(["--url", stub.url, "run", "-m", QWEN, "who", "are", "you"]) == 0
     captured = capsys.readouterr()
     assert captured.out == "".join(ANSWER) + "\n"
@@ -225,10 +225,10 @@ def test_a_command_with_no_daemon_answering_starts_one_before_asking(
 ) -> None:
     """The other tests all run against a daemon that is already up, so none of them ever
     reaches the spawn — decision 1 of APP.md says every path goes through the daemon, and
-    `sideros run` on a cold machine is where that is either true or not.
+    `mlx_omnia run` on a cold machine is where that is either true or not.
 
     The note it prints on the way belongs to stderr for the same reason the answer belongs
-    to stdout: it lands in the first `sideros run -m X | jq` anyone ever types.
+    to stdout: it lands in the first `mlx_omnia run -m X | jq` anyone ever types.
     """
     started: list[str] = []
 
@@ -249,7 +249,7 @@ def test_a_command_with_no_daemon_answering_starts_one_before_asking(
 def test_run_takes_the_prompt_from_a_pipe_when_no_words_were_given(
     stub: Stub, monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
 ) -> None:
-    """`echo ... | sideros run -m X`, which is the shape the task asks for."""
+    """`echo ... | mlx_omnia run -m X`, which is the shape the task asks for."""
     monkeypatch.setattr(sys, "stdin", io.StringIO("what is a tensor?\n"))
     assert main(["--url", stub.url, "run", "-m", QWEN]) == 0
     assert capsys.readouterr().out == "".join(ANSWER) + "\n"

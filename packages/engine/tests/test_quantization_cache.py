@@ -9,9 +9,9 @@ import mlx.nn as nn
 import pytest
 from conftest import relative_diff
 
-import sideros
-import sideros.task as task
-from sideros import (
+import mlx_omnia
+import mlx_omnia.task as task
+from mlx_omnia import (
     TEXT,
     CompositeModel,
     GenerationOptions,
@@ -20,9 +20,9 @@ from sideros import (
     ModelSignature,
     Text,
 )
-from sideros.checkpoint import Checkpoint, checkpoint, load_checkpoint, save_quantized
-from sideros.parsers import Segment
-from sideros.quant.quantization import (
+from mlx_omnia.checkpoint import Checkpoint, checkpoint, load_checkpoint, save_quantized
+from mlx_omnia.parsers import Segment
+from mlx_omnia.quant.quantization import (
     Affine,
     ByPath,
     QuantizationPlan,
@@ -134,19 +134,19 @@ def _logits(loaded: LanguageModel[ModelInput]) -> mx.array:
 def test_a_second_load_reuses_the_entry_instead_of_quantizing_again(source: _Source) -> None:
     # mutação: forçar o miss (`if not entry.is_dir()` → `if True`) quebra — a origem passa
     # a ser lida duas vezes.
-    first = sideros.load(source.directory, quantize=_COARSE)
+    first = mlx_omnia.load(source.directory, quantize=_COARSE)
     (entry,) = _entries(source)
     written = (entry / "model.safetensors").stat().st_mtime_ns
 
-    second = sideros.load(source.directory, quantize=_COARSE)
+    second = mlx_omnia.load(source.directory, quantize=_COARSE)
 
     assert source.reads.count(source.directory) == 1
     assert (entry / "model.safetensors").stat().st_mtime_ns == written
     assert relative_diff(_logits(second), _logits(first)) == 0.0
 
     config = json.loads((entry / "config.json").read_text())
-    assert config["sideros"]["method"] == "rtn"
-    assert config["sideros"]["source"]["directory"] == str(source.directory.resolve())
+    assert config["mlx_omnia"]["method"] == "rtn"
+    assert config["mlx_omnia"]["source"]["directory"] == str(source.directory.resolve())
     assert config["quantization"]["leaves"]["head"] == {"group_size": 64, "bits": 4}
     assert (entry / "tokenizer.json").exists()
 
@@ -154,10 +154,10 @@ def test_a_second_load_reuses_the_entry_instead_of_quantizing_again(source: _Sou
 def test_selections_that_expand_to_the_same_plan_share_the_entry(source: _Source) -> None:
     # mutação: digerir `repr(quantize)` no lugar do plano expandido quebra — as quatro
     # seleções são objetos distintos e produziriam quatro entradas.
-    sideros.load(source.directory, quantize=_COARSE)
-    sideros.load(source.directory, quantize=ByPath(_COARSE, {}))
-    sideros.load(source.directory, quantize=ByPath(_COARSE, {"attn": _FINE, "head": _FINE}))
-    sideros.load(source.directory, quantize=ByPath(_COARSE, {"head": _FINE, "attn": _FINE}))
+    mlx_omnia.load(source.directory, quantize=_COARSE)
+    mlx_omnia.load(source.directory, quantize=ByPath(_COARSE, {}))
+    mlx_omnia.load(source.directory, quantize=ByPath(_COARSE, {"attn": _FINE, "head": _FINE}))
+    mlx_omnia.load(source.directory, quantize=ByPath(_COARSE, {"head": _FINE, "attn": _FINE}))
 
     assert len(_entries(source)) == 2
 
@@ -168,13 +168,13 @@ def test_a_different_plan_or_format_version_produces_a_new_entry(
 ) -> None:
     # mutação: tirar "format_version" do payload de `_digest` quebra — o bump volta a cair
     # na entrada gravada pela versão anterior.
-    sideros.load(source.directory, quantize=_COARSE)
-    sideros.load(source.directory, quantize=_FINE)
-    sideros.load(source.directory, quantize=ByPath(_COARSE, {"mlp": _FINE}))
+    mlx_omnia.load(source.directory, quantize=_COARSE)
+    mlx_omnia.load(source.directory, quantize=_FINE)
+    mlx_omnia.load(source.directory, quantize=ByPath(_COARSE, {"mlp": _FINE}))
     assert len(_entries(source)) == 3
 
     monkeypatch.setattr(task, "_FORMAT_VERSION", task._FORMAT_VERSION + 1)
-    sideros.load(source.directory, quantize=_COARSE)
+    mlx_omnia.load(source.directory, quantize=_COARSE)
 
     assert len(_entries(source)) == 4
 
@@ -186,7 +186,7 @@ def test_quantizing_an_already_quantized_checkpoint_raises(source: _Source) -> N
     mx.save_safetensors(str(source.directory / "model.safetensors"), packed)
 
     with pytest.raises(ValueError, match="quantize= cannot be applied to a quantized checkpoint"):
-        sideros.load(source.directory, quantize=_FINE)
+        mlx_omnia.load(source.directory, quantize=_FINE)
 
 
 def test_every_registered_architecture_has_a_quantizing_load() -> None:
@@ -208,7 +208,7 @@ def test_quantizing_an_architecture_without_a_quantizing_load_raises(
     (tmp_path / "config.json").write_text(json.dumps({"model_type": "bare"}))
 
     with pytest.raises(ValueError, match="quantize= is not supported for model_type 'bare'"):
-        sideros.load(tmp_path, quantize=_COARSE)
+        mlx_omnia.load(tmp_path, quantize=_COARSE)
 
 
 def test_a_dtype_cast_is_rejected_by_the_tensors_and_not_by_the_config_block() -> None:
@@ -223,10 +223,10 @@ def test_a_dtype_cast_is_rejected_by_the_tensors_and_not_by_the_config_block() -
 def test_cache_false_quantizes_without_writing_anything(source: _Source) -> None:
     # mutação: no ramo `cache=False`, passar `pending.weights()` direto ao attach (sem
     # `quantize_weights`) quebra — os logits passam a ser os do modelo denso.
-    memory = sideros.load(source.directory, quantize=_COARSE, cache=False)
+    memory = mlx_omnia.load(source.directory, quantize=_COARSE, cache=False)
     assert not source.cache.exists()
 
-    cached = sideros.load(source.directory, quantize=_COARSE)
+    cached = mlx_omnia.load(source.directory, quantize=_COARSE)
 
     assert relative_diff(_logits(memory), _logits(cached)) == 0.0
 
@@ -249,14 +249,14 @@ def test_an_interrupted_write_leaves_no_entry_the_next_load_would_accept(
         raise KeyboardInterrupt
 
     with pytest.MonkeyPatch.context() as patch:
-        patch.setattr("sideros.task.save_quantized", killed)
+        patch.setattr("mlx_omnia.task.save_quantized", killed)
         with pytest.raises(KeyboardInterrupt):
-            sideros.load(source.directory, quantize=_COARSE)
+            mlx_omnia.load(source.directory, quantize=_COARSE)
 
     assert written[0].name.startswith(".tmp-")
     assert _entries(source) == []
 
-    sideros.load(source.directory, quantize=_COARSE)
+    mlx_omnia.load(source.directory, quantize=_COARSE)
 
     assert len(_entries(source)) == 1
 
@@ -265,7 +265,7 @@ def test_the_entry_carries_what_the_loader_reads_besides_the_weights(source: _So
     """A quantized entry has to load on its own: a symlink into the hub's snapshot dangles
     the day it is collected, so everything in `patterns` that is not weights or config is
     copied — the chat template included."""
-    sideros.load(source.directory, quantize=_COARSE)
+    mlx_omnia.load(source.directory, quantize=_COARSE)
     (entry,) = _entries(source)
     assert (entry / "chat_template.jinja").read_text() == "{{ messages[0]['content'] }}"
     assert (entry / "tokenizer.json").exists()

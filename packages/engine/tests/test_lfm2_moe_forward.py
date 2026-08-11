@@ -11,19 +11,19 @@ import mlx.core as mx
 import numpy as np
 import pytest
 from conftest import checkpoint_dir, floor, load_golden, relative_diff, requires_checkpoint
-from sideros.core.kernels.moe_gemv_dense import moe_dense_down
+from mlx_omnia.core.kernels.moe_gemv_dense import moe_dense_down
 
-from sideros import KVCache, stream_ids
-from sideros.core.cache import ConvCache
-from sideros.core.kernels.conv_mix import conv_mix
-from sideros.models.lfm2.layers import conv as conv_layer
-from sideros.models.lfm2.layers import experts as experts_layer
-from sideros.models.lfm2.layers import flags
-from sideros.models.lfm2.layers.attention import LFM2Attention
-from sideros.models.lfm2.layers.conv import LFM2Conv
-from sideros.models.lfm2.layers.experts import LFM2SparseMLP
-from sideros.models.lfm2.moe import CHECKPOINT, LFM2MoE
-from sideros.models.lfm2.moe.model import LFM2MoEActivations
+from mlx_omnia import KVCache, stream_ids
+from mlx_omnia.core.cache import ConvCache
+from mlx_omnia.core.kernels.conv_mix import conv_mix
+from mlx_omnia.models.lfm2.layers import conv as conv_layer
+from mlx_omnia.models.lfm2.layers import experts as experts_layer
+from mlx_omnia.models.lfm2.layers import flags
+from mlx_omnia.models.lfm2.layers.attention import LFM2Attention
+from mlx_omnia.models.lfm2.layers.conv import LFM2Conv
+from mlx_omnia.models.lfm2.layers.experts import LFM2SparseMLP
+from mlx_omnia.models.lfm2.moe import CHECKPOINT, LFM2MoE
+from mlx_omnia.models.lfm2.moe.model import LFM2MoEActivations
 
 FIXTURE = Path(__file__).parent / "fixtures" / "lfm2_moe_forward.safetensors"
 REPO = "LiquidAI/LFM2.5-8B-A1B"

@@ -8,7 +8,7 @@ every declaration resolves, the default serving whatever no kernel does.
 import mlx.core as mx
 from conftest import relative_diff
 
-from sideros.core.kernels.gate_up import (
+from mlx_omnia.core.kernels.gate_up import (
     Activation,
     AffineGateUp,
     DefaultGateUp,
@@ -16,7 +16,7 @@ from sideros.core.kernels.gate_up import (
     Mxfp4GateUp,
     Nvfp4GateUp,
 )
-from sideros.core.layers import QuantizedSwitchLinear, SwitchLinear
+from mlx_omnia.core.layers import QuantizedSwitchLinear, SwitchLinear
 
 EXPERTS = 8
 ACTIVE = 4

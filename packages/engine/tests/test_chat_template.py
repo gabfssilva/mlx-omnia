@@ -16,8 +16,8 @@ import numpy as np
 import pytest
 from conftest import local_snapshot
 
-from sideros.bpe import ByteLevelBPE
-from sideros.chat import (
+from mlx_omnia.bpe import ByteLevelBPE
+from mlx_omnia.chat import (
     CHAT,
     DESCRIBE,
     Chat,
@@ -33,12 +33,12 @@ from sideros.chat import (
     composite,
     parser_of,
 )
-from sideros.language import TEXT, GenerationOptions, LanguagePrompt, Text
-from sideros.model import CompositeModel, ModelInput, ModelSignature, UnsupportedInput
-from sideros.parsers import Parser, Segment
-from sideros.parsers.qwen import PARSER as QWEN
-from sideros.parsers.qwen_xml import PARSER as QWEN_XML
-from sideros.vision import RGB_IMAGE, Image
+from mlx_omnia.language import TEXT, GenerationOptions, LanguagePrompt, Text
+from mlx_omnia.model import CompositeModel, ModelInput, ModelSignature, UnsupportedInput
+from mlx_omnia.parsers import Parser, Segment
+from mlx_omnia.parsers.qwen import PARSER as QWEN
+from mlx_omnia.parsers.qwen_xml import PARSER as QWEN_XML
+from mlx_omnia.vision import RGB_IMAGE, Image
 
 FIXTURE = Path(__file__).parent / "fixtures" / "chat_template.json"
 GOLDEN: dict[str, Any] = json.loads(FIXTURE.read_text(encoding="utf-8"))

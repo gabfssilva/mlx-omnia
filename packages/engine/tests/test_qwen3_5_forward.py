@@ -16,19 +16,19 @@ import pytest
 from conftest import floor, load_golden, relative_diff
 from huggingface_hub import snapshot_download
 
-from sideros import stream_ids
-from sideros.core.cache import DeltaCache, KVCache
-from sideros.core.kernels.add_norm import AddRmsNorm, FusedAddRmsNorm
-from sideros.core.kernels.gated_delta import (
+from mlx_omnia import stream_ids
+from mlx_omnia.core.cache import DeltaCache, KVCache
+from mlx_omnia.core.kernels.add_norm import AddRmsNorm, FusedAddRmsNorm
+from mlx_omnia.core.kernels.gated_delta import (
     DefaultGatedDelta,
     FusedGatedDelta,
     GatedDelta,
     delta_rule,
 )
-from sideros.models.qwen3_5 import CHECKPOINT, Qwen35, Qwen35Activations
-from sideros.models.qwen3_5.layers import block, deltanet, flags
-from sideros.models.qwen3_5.layers.block import Qwen35Block
-from sideros.models.qwen3_5.layers.deltanet import l2norm
+from mlx_omnia.models.qwen3_5 import CHECKPOINT, Qwen35, Qwen35Activations
+from mlx_omnia.models.qwen3_5.layers import block, deltanet, flags
+from mlx_omnia.models.qwen3_5.layers.block import Qwen35Block
+from mlx_omnia.models.qwen3_5.layers.deltanet import l2norm
 
 FIXTURE = Path(__file__).parent / "fixtures" / "qwen3_5_forward.safetensors"
 N_LAYER = 24

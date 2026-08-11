@@ -1,6 +1,6 @@
 import mlx.core as mx
 
-from sideros.core.cache import FixedKVCache, KVCache, RingKVCache
+from mlx_omnia.core.cache import FixedKVCache, KVCache, RingKVCache
 
 
 def _cache(length: int) -> KVCache:

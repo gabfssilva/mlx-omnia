@@ -15,13 +15,13 @@ import mlx.core as mx
 import numpy as np
 import pytest
 
-from sideros.core.kernels.route.sort import (
+from mlx_omnia.core.kernels.route.sort import (
     _SOURCE,
     _TILE,
     route_counting_sort,
     route_counting_sort_applies,
 )
-from sideros.core.mxcompat import metal_kernel
+from mlx_omnia.core.mxcompat import metal_kernel
 
 CASES = [(64, 8, 256), (64, 4, 64), (16, 8, 256)]
 

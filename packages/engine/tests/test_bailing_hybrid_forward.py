@@ -17,20 +17,20 @@ import numpy as np
 import pytest
 from conftest import floor, load_golden, relative_diff
 
-from sideros import stream_ids
-from sideros.core import cache_file
-from sideros.core.cache import DeltaCache, KVCache, LayerCache
-from sideros.core.kernels.gated_delta import GatedDelta, gated_delta
-from sideros.core.layers import MultiLinear, SharedMLP, SwitchGLU
-from sideros.core.prompt_cache import PromptCache, Reuse
-from sideros.models.bailing_hybrid import (
+from mlx_omnia import stream_ids
+from mlx_omnia.core import cache_file
+from mlx_omnia.core.cache import DeltaCache, KVCache, LayerCache
+from mlx_omnia.core.kernels.gated_delta import GatedDelta, gated_delta
+from mlx_omnia.core.layers import MultiLinear, SharedMLP, SwitchGLU
+from mlx_omnia.core.prompt_cache import PromptCache, Reuse
+from mlx_omnia.models.bailing_hybrid import (
     CHECKPOINT,
     BailingHybrid,
     BailingHybridActivations,
 )
-from sideros.models.bailing_hybrid.layers.attention import BailingHybridLatentAttention
-from sideros.models.bailing_hybrid.layers.kda import KimiDeltaAttention
-from sideros.models.bailing_hybrid.layers.moe import LimitedSharedMLP, LimitedSwitchGLU
+from mlx_omnia.models.bailing_hybrid.layers.attention import BailingHybridLatentAttention
+from mlx_omnia.models.bailing_hybrid.layers.kda import KimiDeltaAttention
+from mlx_omnia.models.bailing_hybrid.layers.moe import LimitedSharedMLP, LimitedSwitchGLU
 
 FIXTURES = Path(__file__).parent / "fixtures"
 FIXTURE = FIXTURES / "bailing_hybrid_forward.safetensors"

@@ -1,12 +1,12 @@
 """BitNet b1.58-2B fp32 parity against transformers, plus cache and mutation gates.
 
 The fixture is transformers in fp32 (the 2B ternary model fits fp32 in ~10 GB), so
-sideros loads in fp32 and the tolerance is ``3x`` the fixture's measured fp32-vs-fp64
+mlx_omnia loads in fp32 and the tolerance is ``3x`` the fixture's measured fp32-vs-fp64
 floor per tensor — the trunk is 30 layers, so a single number would be vacuous at one
 end and impossible at the other.
 
 Hypothesis flagged, not measured here: transformers' ``AutoBitLinear`` quantizes the
-activation with ``torch.round`` (round-half-to-even); sideros uses ``mx.round``. If
+activation with ``torch.round`` (round-half-to-even); mlx_omnia uses ``mx.round``. If
 the two round modes disagree on a half-value, an int8 level flips by 1 and the output
 drifts beyond the fp32-vs-fp64 floor. ``mx.round`` is expected to match (IEEE
 round-to-nearest-even); if the suite fails past the floor, the act-quant round-mode
@@ -23,9 +23,9 @@ import pytest
 from conftest import floor, load_golden, relative_diff
 from huggingface_hub import snapshot_download
 
-from sideros import KVCache, stream_ids
-from sideros.models.bitnet import CHECKPOINT, BitNet, BitNetActivations
-from sideros.models.bitnet.layers.mlp import _relu2
+from mlx_omnia import KVCache, stream_ids
+from mlx_omnia.models.bitnet import CHECKPOINT, BitNet, BitNetActivations
+from mlx_omnia.models.bitnet.layers.mlp import _relu2
 
 FIXTURE = Path(__file__).parent / "fixtures" / "bitnet_forward.safetensors"
 N_LAYER = 30

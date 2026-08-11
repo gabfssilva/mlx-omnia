@@ -14,9 +14,9 @@ import mlx.core as mx
 import mlx.nn as nn
 import pytest
 
-from sideros.checkpoint import declared_plan, load_checkpoint
-from sideros.quant.calibration import CalibrationConfig
-from sideros.quant.oq import (
+from mlx_omnia.checkpoint import declared_plan, load_checkpoint
+from mlx_omnia.quant.calibration import CalibrationConfig
+from mlx_omnia.quant.oq import (
     RECIPE_OQ4_V1,
     Allocation,
     BlockScore,
@@ -26,7 +26,7 @@ from sideros.quant.oq import (
     plan_provenance,
     save_allocated,
 )
-from sideros.quant.quantization import (
+from mlx_omnia.quant.quantization import (
     Affine,
     Leaf,
     QuantizationIntent,
@@ -212,7 +212,7 @@ def test_an_oq_checkpoint_loads_without_the_allocator(tmp_path: Path) -> None:
     config = json.loads((tmp_path / "config.json").read_text())
     assert "oq" in config
 
-    assert "sideros.quant.oq" not in _reachable("sideros.checkpoint")
+    assert "mlx_omnia.quant.oq" not in _reachable("mlx_omnia.checkpoint")
 
     expected = {
         leaf.path: saved.allocation.plan[leaf.path].bits
@@ -254,7 +254,7 @@ def test_a_checkpoint_without_the_block_still_loads(tmp_path: Path) -> None:
 
 
 def _reachable(module: str) -> set[str]:
-    """Every `sideros.*` module the given one pulls in, transitively, read off the source:
+    """Every `mlx_omnia.*` module the given one pulls in, transitively, read off the source:
     a runtime check cannot see it, because the test itself imports the allocator."""
     seen: set[str] = set()
     pending = [module]
@@ -263,7 +263,7 @@ def _reachable(module: str) -> set[str]:
         if name in seen:
             continue
         seen.add(name)
-        if not name.startswith("sideros"):
+        if not name.startswith("mlx_omnia"):
             continue
         spec = importlib.util.find_spec(name)
         if spec is None or spec.origin is None or not spec.origin.endswith(".py"):

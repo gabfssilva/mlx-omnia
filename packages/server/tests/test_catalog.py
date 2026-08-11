@@ -25,13 +25,13 @@ from fastapi import FastAPI
 from fastapi.testclient import TestClient
 from mlx.utils import tree_flatten
 
-from sideros.footprint import active_bytes_per_token, ceiling
-from sideros.models.glm4_moe import CHECKPOINT as GLM4_MOE
-from sideros.models.qwen3.moe import CHECKPOINT as QWEN3_MOE
-from sideros.models.qwen3.moe import Qwen3MoE, Qwen3MoEConfig
-from sideros.task import source
-from sideros_server import catalog
-from sideros_server.store import Store
+from mlx_omnia.footprint import active_bytes_per_token, ceiling
+from mlx_omnia.models.glm4_moe import CHECKPOINT as GLM4_MOE
+from mlx_omnia.models.qwen3.moe import CHECKPOINT as QWEN3_MOE
+from mlx_omnia.models.qwen3.moe import Qwen3MoE, Qwen3MoEConfig
+from mlx_omnia.task import source
+from mlx_omnia_server import catalog
+from mlx_omnia_server.store import Store
 
 QUANTIZED = "mlx-community/Qwen3-0.6B-4bit"
 DENSE = "Qwen/Qwen3-0.6B"

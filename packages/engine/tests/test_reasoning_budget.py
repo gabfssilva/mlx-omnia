@@ -3,9 +3,9 @@
 import mlx.core as mx
 import pytest
 
-from sideros import KVCache, stream_ids
-from sideros.generate import ConstraintConflict, ReasoningBlock, ReasoningBudget
-from sideros.language import GenerationOptions, Text, TextLanguageModel, reasoning_budget
+from mlx_omnia import KVCache, stream_ids
+from mlx_omnia.generate import ConstraintConflict, ReasoningBlock, ReasoningBudget
+from mlx_omnia.language import GenerationOptions, Text, TextLanguageModel, reasoning_budget
 
 OPEN, CLOSE = 10, 11
 """`<think>` and `</think>` as this vocabulary spells them: one id each, which is what an

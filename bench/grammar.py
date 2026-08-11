@@ -10,7 +10,7 @@ The four calls, the same shape on both sides: fill the next-token bitmask (**ret
 whether it has to be applied** — an all-legal step skips the whole elementwise op), accept a
 token, say whether it is done, and roll back n tokens for speculation.
 
-Neither library is a workspace dependency and this script imports nothing from `sideros`:
+Neither library is a workspace dependency and this script imports nothing from `mlx_omnia`:
 
   uv run --no-project --with xgrammar --with llguidance --with transformers bench/grammar.py
   uv run --no-project --with xgrammar --with llguidance --with transformers \\

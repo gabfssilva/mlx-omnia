@@ -2,10 +2,10 @@ import mlx.core as mx
 import mlx.nn as nn
 import pytest
 
-from sideros.core.cache import DeltaCache, KVCache
-from sideros.models.gpt2 import GPT2, GPT2Config
-from sideros.models.qwen3 import Qwen3, Qwen3Config
-from sideros.quant.calibration import (
+from mlx_omnia.core.cache import DeltaCache, KVCache
+from mlx_omnia.models.gpt2 import GPT2, GPT2Config
+from mlx_omnia.models.qwen3 import Qwen3, Qwen3Config
+from mlx_omnia.quant.calibration import (
     BlockedForward,
     BlockSensitivity,
     ChannelEnergy,
@@ -15,7 +15,7 @@ from sideros.quant.calibration import (
     discover_blocks,
     intercepted_collect,
 )
-from sideros.quant.quantization import Affine
+from mlx_omnia.quant.quantization import Affine
 
 _HIDDEN = 64
 _VOCAB = 128

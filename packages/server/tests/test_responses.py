@@ -36,7 +36,7 @@ from openai.types.responses import (
     ResponseTextConfigParam,
 )
 
-from sideros import (
+from mlx_omnia import (
     TEXT,
     Chat,
     ChatCapability,
@@ -49,15 +49,15 @@ from sideros import (
     ModelSignature,
     Text,
 )
-from sideros.generate import Constraint
-from sideros.parsers import FALLBACK, Segment, Segmenter
-from sideros.schema import json_instruction
-from sideros_server import catalog
-from sideros_server import responses as responses_module
-from sideros_server.engine import Engine, Loader
-from sideros_server.profiles import Sampling
-from sideros_server.responses import ToolTurn, router
-from sideros_server.store import Profile, Store
+from mlx_omnia.generate import Constraint
+from mlx_omnia.parsers import FALLBACK, Segment, Segmenter
+from mlx_omnia.schema import json_instruction
+from mlx_omnia_server import catalog
+from mlx_omnia_server import responses as responses_module
+from mlx_omnia_server.engine import Engine, Loader
+from mlx_omnia_server.profiles import Sampling
+from mlx_omnia_server.responses import ToolTurn, router
+from mlx_omnia_server.store import Profile, Store
 
 CACHED = "cached"
 """The scripted model, reporting a prefix reuse. What the dialect writes about a reuse is not
@@ -145,7 +145,7 @@ dialect builds, and a template that spells them back is what makes the prompt re
 is spelled Qwen's way because that spelling is also what says which family this checkpoint
 speaks — `parser_of` reads the source, not the generated text — so a stand whose template
 spells no envelope has no tool channel at all. The checkpoint's own template is what
-`sideros.load` brings, and that path is `test_api.py`'s."""
+`mlx_omnia.load` brings, and that path is `test_api.py`'s."""
 
 SCHEMA: dict[str, object] = {
     "type": "object",

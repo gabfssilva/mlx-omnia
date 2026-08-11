@@ -1,11 +1,11 @@
 import mlx.core as mx
 import mlx.nn as nn
 
-from sideros.core.cache import LayerCache
+from mlx_omnia.core.cache import LayerCache
 
 
 def test_dense_model_runs_rotary_and_nope_layers() -> None:
-    from sideros.core.attention import DenseConfig, DenseModel
+    from mlx_omnia.core.attention import DenseConfig, DenseModel
 
     config = DenseConfig(
         hidden_size=16,
@@ -31,7 +31,7 @@ def test_dense_model_runs_rotary_and_nope_layers() -> None:
 
 
 def test_dense_attention_composes_its_collaborators() -> None:
-    from sideros.core.attention import DenseAttention, Projected
+    from mlx_omnia.core.attention import DenseAttention, Projected
 
     class Projection(nn.Module):
         def __call__(self, x: mx.array) -> Projected[mx.array]:

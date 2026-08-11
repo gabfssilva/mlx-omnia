@@ -23,13 +23,13 @@ import numpy as np
 import pytest
 from conftest import relative_diff
 
-from sideros.core.kernels.route.ordinal import (
+from mlx_omnia.core.kernels.route.ordinal import (
     _SOURCE,
     ORDINAL_HEADER,
     router_tournament,
     router_tournament_applies,
 )
-from sideros.core.mxcompat import metal_kernel
+from mlx_omnia.core.mxcompat import metal_kernel
 
 EXPERTS = 256
 TOPK = 8

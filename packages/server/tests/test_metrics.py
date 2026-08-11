@@ -33,7 +33,7 @@ import pytest
 import uvicorn
 from fastapi import FastAPI
 
-from sideros import (
+from mlx_omnia import (
     TEXT,
     CompositeModel,
     GenerationOptions,
@@ -43,11 +43,11 @@ from sideros import (
     Text,
     TextLanguageModel,
 )
-from sideros.generate import Meter
-from sideros.parsers import Segment
-from sideros_server import metrics as metrics_module
-from sideros_server.engine import Engine
-from sideros_server.metrics import Metrics, router
+from mlx_omnia.generate import Meter
+from mlx_omnia.parsers import Segment
+from mlx_omnia_server import metrics as metrics_module
+from mlx_omnia_server.engine import Engine
+from mlx_omnia_server.metrics import Metrics, router
 
 _VOCAB = 8
 _WIDTH = 4

@@ -22,8 +22,8 @@ import pytest
 from conftest import floor, load_golden, relative_diff
 from huggingface_hub import snapshot_download
 
-from sideros.models.falcon_h1 import CHECKPOINT, FalconH1, FalconH1Activations
-from sideros.models.falcon_h1.layers.cache import FalconH1LayerCache
+from mlx_omnia.models.falcon_h1 import CHECKPOINT, FalconH1, FalconH1Activations
+from mlx_omnia.models.falcon_h1.layers.cache import FalconH1LayerCache
 
 FIXTURE = Path(__file__).parent / "fixtures" / "falcon_h1_forward.safetensors"
 
@@ -96,7 +96,7 @@ def test_stepwise_matches_prefill(model: FalconH1, golden: dict[str, mx.array]) 
 
 
 def test_cached_greedy_matches_fixture(model: FalconH1, golden: dict[str, mx.array]) -> None:
-    from sideros import stream_ids
+    from mlx_omnia import stream_ids
 
     prompt = [int(i) for i in np.array(golden["input_ids"])]
     expected = [int(i) for i in np.array(golden["greedy_ids"])]

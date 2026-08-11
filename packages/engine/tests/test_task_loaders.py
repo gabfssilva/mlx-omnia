@@ -7,8 +7,8 @@ import pytest
 from conftest import local_snapshot, relative_diff
 from huggingface_hub import snapshot_download
 
-import sideros.task as task
-from sideros import (
+import mlx_omnia.task as task
+from mlx_omnia import (
     RGB_IMAGE,
     TEXT,
     Chat,
@@ -19,10 +19,10 @@ from sideros import (
     UnsupportedInput,
     load,
 )
-from sideros.models import gpt2, qwen3_5
-from sideros.quant.quantization import Affine
-from sideros.task import _MODEL_SPECS
-from sideros.vision import Image
+from mlx_omnia.models import gpt2, qwen3_5
+from mlx_omnia.quant.quantization import Affine
+from mlx_omnia.task import _MODEL_SPECS
+from mlx_omnia.vision import Image
 
 HELLO: ChatMessage = {"role": "user", "content": "Capital of France?"}
 

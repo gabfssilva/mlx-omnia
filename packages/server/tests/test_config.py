@@ -27,10 +27,10 @@ from fastapi import FastAPI
 from fastapi.exceptions import RequestValidationError
 from fastapi.testclient import TestClient
 
-from sideros_server import catalog
-from sideros_server.app import _invalid_request
-from sideros_server.config import current, router
-from sideros_server.store import Store
+from mlx_omnia_server import catalog
+from mlx_omnia_server.app import _invalid_request
+from mlx_omnia_server.config import current, router
+from mlx_omnia_server.store import Store
 
 FIELDS = {
     "memory_limit_bytes",

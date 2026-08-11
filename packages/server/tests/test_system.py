@@ -18,7 +18,7 @@ from fastapi import FastAPI
 from fastapi.testclient import TestClient
 from huggingface_hub.constants import HF_HUB_CACHE
 
-from sideros_server.system import _free_bytes, router
+from mlx_omnia_server.system import _free_bytes, router
 
 
 @pytest.fixture(scope="module")
@@ -84,12 +84,12 @@ def test_the_bandwidth_pair_is_declared_constant_and_nothing_else_is(
 
 def test_the_version_is_the_engine_package_s(payload: dict[str, object]) -> None:
     """The engine's version, not the server's. This catches a hardcoded or stale string; it
-    cannot yet catch `version("sideros-server")` in its place, because both packages sit at
+    cannot yet catch `version("mlx-omnia-server")` in its place, because both packages sit at
     the same number — the day they diverge is the day this assertion starts discriminating.
     """
-    manifest = Path(__file__).parents[3] / "packages" / "sideros" / "pyproject.toml"
+    manifest = Path(__file__).parents[3] / "packages" / "engine" / "pyproject.toml"
     declared = tomllib.loads(manifest.read_text())["project"]["version"]
-    assert payload["version"] == version("sideros") == declared
+    assert payload["version"] == version("mlx_omnia") == declared
 
 
 def test_the_free_space_is_the_catalog_volume_s(client: TestClient) -> None:

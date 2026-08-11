@@ -13,7 +13,7 @@ from pathlib import Path
 
 import pytest
 
-from sideros.parsers import (
+from mlx_omnia.parsers import (
     MalformedToolCall,
     Parser,
     ToolCall,

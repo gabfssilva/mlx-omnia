@@ -19,7 +19,7 @@ from typing import TypeIs
 
 import pytest
 
-from sideros import (
+from mlx_omnia import (
     TEXT,
     CompositeModel,
     GenerationOptions,
@@ -28,12 +28,12 @@ from sideros import (
     ModelSignature,
     Text,
 )
-from sideros.parsers import Segment
-from sideros_server import speed
-from sideros_server.engine import Engine
-from sideros_server.jobs import Bench, Job, JobView, Progress
-from sideros_server.speed import ModelFacts, Sampling, SpeedShape, measure
-from sideros_server.store import Store
+from mlx_omnia.parsers import Segment
+from mlx_omnia_server import speed
+from mlx_omnia_server.engine import Engine
+from mlx_omnia_server.jobs import Bench, Job, JobView, Progress
+from mlx_omnia_server.speed import ModelFacts, Sampling, SpeedShape, measure
+from mlx_omnia_server.store import Store
 
 GIGABYTE = 1024**3
 

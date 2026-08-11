@@ -9,9 +9,9 @@ import mlx.nn as nn
 import pytest
 from conftest import relative_diff
 
-from sideros.core import layers
-from sideros.core.kernels.qkv_rope.segmented import qkv_step
-from sideros.core.layers import SegmentedQKV
+from mlx_omnia.core import layers
+from mlx_omnia.core.kernels.qkv_rope.segmented import qkv_step
+from mlx_omnia.core.layers import SegmentedQKV
 
 _HIDDEN = 256
 _QUERIES = 16

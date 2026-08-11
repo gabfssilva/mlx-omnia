@@ -4,8 +4,8 @@ from typing import TypeIs
 
 import pytest
 
-from sideros.language import TEXT, LanguagePrompt, Text
-from sideros.model import (
+from mlx_omnia.language import TEXT, LanguagePrompt, Text
+from mlx_omnia.model import (
     Capability,
     CompositeModel,
     ContentType,

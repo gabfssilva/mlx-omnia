@@ -13,12 +13,12 @@ from pathlib import Path
 import mlx.core as mx
 import pytest
 
-from sideros.core.cache import DeltaCache, KVCache, LayerCache
-from sideros.core.quantized_cache import QuantizedKVCache
-from sideros.quant.quantization import Affine
-from sideros_server import prefixes
-from sideros_server.prefixes import DiskSpill
-from sideros_server.store import Store
+from mlx_omnia.core.cache import DeltaCache, KVCache, LayerCache
+from mlx_omnia.core.quantized_cache import QuantizedKVCache
+from mlx_omnia.quant.quantization import Affine
+from mlx_omnia_server import prefixes
+from mlx_omnia_server.prefixes import DiskSpill
+from mlx_omnia_server.store import Store
 
 WIDTH = 64
 """Wide enough that one row is a kilobyte and a short cache clears the floor below without

@@ -5,7 +5,7 @@ import mlx.nn as nn
 import pytest
 from conftest import relative_diff
 
-from sideros.checkpoint import fuse_qkv, load_checkpoint
+from mlx_omnia.checkpoint import fuse_qkv, load_checkpoint
 
 _ATTENTION = "model.layers.0.self_attn."
 

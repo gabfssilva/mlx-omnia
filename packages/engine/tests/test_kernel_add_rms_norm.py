@@ -18,14 +18,14 @@ import mlx.nn as nn
 import pytest
 from conftest import relative_diff
 
-from sideros.core.kernels.add_norm import (
+from mlx_omnia.core.kernels.add_norm import (
     AddRmsNorm,
     DefaultAddRmsNorm,
     FusedAddRmsNorm,
     RowsAddRmsNorm,
 )
-from sideros.core.kernels.add_norm import fused as fused_module
-from sideros.core.kernels.add_norm import rows as rows_module
+from mlx_omnia.core.kernels.add_norm import fused as fused_module
+from mlx_omnia.core.kernels.add_norm import rows as rows_module
 
 EPS = 1e-6
 HIDDENS = [1024, 2048, 4096, 2880]

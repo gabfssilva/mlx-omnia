@@ -18,8 +18,8 @@ from conftest import (
     requires_checkpoint,
 )
 
-from sideros import KVCache, stream_ids
-from sideros.models.step3p7 import CHECKPOINT, Step3p7, Step3p7MoE
+from mlx_omnia import KVCache, stream_ids
+from mlx_omnia.models.step3p7 import CHECKPOINT, Step3p7, Step3p7MoE
 
 FIXTURE = Path(__file__).parent / "fixtures" / "step3p7_mlxlm.safetensors"
 REPO = "stepfun-ai/Step-3.7-Flash"

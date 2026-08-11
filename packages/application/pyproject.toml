@@ -1,7 +1,7 @@
 [project]
-name = "sideros-application"
+name = "mlx-omnia-application"
 version = "0.1.0"
-description = "Desktop window for the sideros daemon (HTTP only)"
+description = "Desktop window for the mlx-omnia daemon (HTTP only)"
 requires-python = ">=3.13"
 dependencies = [
     "flet[desktop]>=0.86",
@@ -9,7 +9,7 @@ dependencies = [
 ]
 
 [project.scripts]
-sideros-app = "sideros_application.main:run"
+omnia-app = "mlx_omnia_application.main:run"
 
 [build-system]
 requires = ["uv_build>=0.11,<0.12"]

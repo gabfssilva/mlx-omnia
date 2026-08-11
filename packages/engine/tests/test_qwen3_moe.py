@@ -19,15 +19,15 @@ from conftest import (
     requires_checkpoint,
 )
 
-from sideros import KVCache, stream_ids
-from sideros.core.kernels.add_norm import AddRmsNorm
-from sideros.core.kernels.down_combine.affine import AffineDownCombine
-from sideros.core.kernels.gate_up.affine import AffineGateUp
-from sideros.core.kernels.qkv_rope.epilogue import rope_epilogue
-from sideros.core.kernels.route.softmax_topk import softmax_topk, softmax_topk_applies
-from sideros.core.mxcompat import softmax
-from sideros.models.qwen3.model import Qwen3MoE
-from sideros.models.qwen3.moe import CHECKPOINT
+from mlx_omnia import KVCache, stream_ids
+from mlx_omnia.core.kernels.add_norm import AddRmsNorm
+from mlx_omnia.core.kernels.down_combine.affine import AffineDownCombine
+from mlx_omnia.core.kernels.gate_up.affine import AffineGateUp
+from mlx_omnia.core.kernels.qkv_rope.epilogue import rope_epilogue
+from mlx_omnia.core.kernels.route.softmax_topk import softmax_topk, softmax_topk_applies
+from mlx_omnia.core.mxcompat import softmax
+from mlx_omnia.models.qwen3.model import Qwen3MoE
+from mlx_omnia.models.qwen3.moe import CHECKPOINT
 
 FIXTURE = Path(__file__).parent / "fixtures" / "qwen3_moe_mlxlm.safetensors"
 REPO = "mlx-community/Qwen3-30B-A3B-4bit"
@@ -192,14 +192,14 @@ def test_step_kernels_match_op_path(
     """Both kernels on against both switched off. Same path, same
     inputs, only the rounding of the fused arithmetic differs — bounded by the
     fixture's own measured batching floor, which is the same kind of bf16 reordering."""
-    monkeypatch.setattr("sideros.models.qwen3.layers.flags.ROPE_EPILOGUE_KERNEL", True)
-    monkeypatch.setattr("sideros.models.qwen3.layers.flags.ADD_RMS_NORM_KERNEL", True)
+    monkeypatch.setattr("mlx_omnia.models.qwen3.layers.flags.ROPE_EPILOGUE_KERNEL", True)
+    monkeypatch.setattr("mlx_omnia.models.qwen3.layers.flags.ADD_RMS_NORM_KERNEL", True)
     ids = golden["greedy_ids"]
     fused = stepwise(model, ids)
     monkeypatch.setattr(
-        "sideros.models.qwen3.layers.attention.rope_epilogue_applies", never_head_dim
+        "mlx_omnia.models.qwen3.layers.attention.rope_epilogue_applies", never_head_dim
     )
-    monkeypatch.setattr("sideros.models.qwen3.layers.flags.ADD_RMS_NORM_KERNEL", False)
+    monkeypatch.setattr("mlx_omnia.models.qwen3.layers.flags.ADD_RMS_NORM_KERNEL", False)
     assert relative_diff(fused, stepwise(model, ids)) < 3 * golden["noise.batching"].item()
 
 
@@ -229,8 +229,8 @@ def test_rope_epilogue_mutation_breaks_stepwise(
             q_norm=k_norm, k_norm=q_norm, offset=offset, base=base, eps=eps,
         )
 
-    monkeypatch.setattr("sideros.models.qwen3.layers.flags.ROPE_EPILOGUE_KERNEL", True)
-    monkeypatch.setattr("sideros.models.qwen3.layers.attention.rope_epilogue", swapped)
+    monkeypatch.setattr("mlx_omnia.models.qwen3.layers.flags.ROPE_EPILOGUE_KERNEL", True)
+    monkeypatch.setattr("mlx_omnia.models.qwen3.layers.attention.rope_epilogue", swapped)
     ids = golden["greedy_ids"]
     gap = relative_diff(stepwise(model, ids), model(ids[None]))
     assert gap > 3 * golden["noise.batching"].item()
@@ -243,8 +243,8 @@ def test_add_rms_norm_mutation_breaks_stepwise(
     """The residual join is the kernel's first output; dropping `x` from it must break
     the step-vs-prefill agreement. The facade resolves lazily, so clearing the cached
     join is what makes the swapped class the one the block binds."""
-    monkeypatch.setattr("sideros.models.qwen3.layers.flags.ADD_RMS_NORM_KERNEL", True)
-    monkeypatch.setattr("sideros.models.qwen3.layers.block.AddRmsNorm", WithoutResidual)
+    monkeypatch.setattr("mlx_omnia.models.qwen3.layers.flags.ADD_RMS_NORM_KERNEL", True)
+    monkeypatch.setattr("mlx_omnia.models.qwen3.layers.block.AddRmsNorm", WithoutResidual)
     for layer in model.model.layers:
         monkeypatch.setattr(layer, "_add_norm", None)
     ids = golden["greedy_ids"]

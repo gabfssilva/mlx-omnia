@@ -4,8 +4,8 @@
 The model is built here — four leaves and a config — because what this covers is the job
 around the quantization and not the arithmetic inside it: the engine's own suite holds
 `quantize_weights` against the formats. The other half is exactly what no double could
-show, so it is real: the entry is written by `sideros.task`, listed by `catalog.scan` and
-opened by `sideros.load` under the repo id that was asked for.
+show, so it is real: the entry is written by `mlx_omnia.task`, listed by `catalog.scan` and
+opened by `mlx_omnia.load` under the repo id that was asked for.
 
 Both caches move to `tmp_path` — `catalog.HUB_CACHE` and `huggingface_hub`'s own — because
 the entry lands in the hub cache layout and the load by id resolves through it. Nothing
@@ -31,9 +31,9 @@ from fastapi import FastAPI
 from fastapi.testclient import TestClient
 from mlx.utils import tree_flatten
 
-import sideros
-import sideros.task as task
-from sideros import (
+import mlx_omnia
+import mlx_omnia.task as task
+from mlx_omnia import (
     TEXT,
     CompositeModel,
     GenerationOptions,
@@ -42,9 +42,9 @@ from sideros import (
     ModelSignature,
     Text,
 )
-from sideros.checkpoint import Checkpoint, Drafter, Pending, attach_weights, save_quantized
-from sideros.parsers import Segment
-from sideros.quant.quantization import (
+from mlx_omnia.checkpoint import Checkpoint, Drafter, Pending, attach_weights, save_quantized
+from mlx_omnia.parsers import Segment
+from mlx_omnia.quant.quantization import (
     MXFP,
     NVFP,
     Affine,
@@ -53,8 +53,8 @@ from sideros.quant.quantization import (
     inventory,
     quantize_weights,
 )
-from sideros_server import catalog, jobs, quantize
-from sideros_server.store import Store
+from mlx_omnia_server import catalog, jobs, quantize
+from mlx_omnia_server.store import Store
 
 REPO = "local/tiny-4bit"
 SOURCE_REPO = "tiny/dense"
@@ -372,7 +372,7 @@ def caches(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> Path:
     hub = tmp_path / "hub"
     monkeypatch.setattr(catalog, "HUB_CACHE", hub)
     monkeypatch.setattr(catalog, "QUANTIZED_CACHE", tmp_path / "quantized")
-    # What `sideros.load` resolves a repo id through, which is the same cache the entry is
+    # What `mlx_omnia.load` resolves a repo id through, which is the same cache the entry is
     # written into — and the reason no test of this module can touch the real one.
     monkeypatch.setattr(huggingface_hub.constants, "HF_HUB_CACHE", str(hub))
     monkeypatch.setitem(task._MODEL_SPECS, "tiny", CHECKPOINT)
@@ -384,7 +384,7 @@ def caches(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> Path:
 @pytest.fixture
 def source(tmp_path: Path, caches: Path) -> Path:
     """The dense checkpoint as a directory: what the catalog reports for a quantized entry,
-    and what `sideros.load` takes back."""
+    and what `mlx_omnia.load` takes back."""
     return _checkpoint(tmp_path / "checkpoint")
 
 
@@ -584,8 +584,8 @@ def test_a_job_writes_an_entry_the_catalog_offers_by_the_repo_id_that_was_asked_
     assert entries[0].quantization == "4-bit"
     assert (entries[0].directory / "tokenizer.json").is_file(), "the entry cannot load alone"
 
-    loaded = sideros.load(REPO, local_files_only=True)
-    memory = sideros.load(source, quantize=Affine(group_size=64, bits=4), cache=False)
+    loaded = mlx_omnia.load(REPO, local_files_only=True)
+    memory = mlx_omnia.load(source, quantize=Affine(group_size=64, bits=4), cache=False)
 
     assert _difference(_logits(loaded), _logits(memory)) == 0.0
     assert list((caches / quantize.STAGING).iterdir()) == [], "the staging outlived the job"
@@ -648,7 +648,7 @@ def test_the_entry_carries_the_width_the_plan_asked_for_leaf_by_leaf(
         "mlp": {"group_size": 64, "bits": 4},
     }
     assert entry.quantization == "mixed"
-    assert _logits(sideros.load(REPO, local_files_only=True)).shape == (1, 5, 32)
+    assert _logits(mlx_omnia.load(REPO, local_files_only=True)).shape == (1, 5, 32)
 
 
 def test_a_group_size_the_plan_does_not_share_travels_with_the_leaf_that_asked_for_it(
@@ -704,7 +704,7 @@ def test_an_exponent_scaled_mode_packs_its_own_shape_and_the_entry_loads_by_its_
         "mlp": format,
     }
     assert entry.quantization == mode
-    assert _logits(sideros.load(REPO, local_files_only=True)).shape == (1, 5, 32)
+    assert _logits(mlx_omnia.load(REPO, local_files_only=True)).shape == (1, 5, 32)
 
 
 def test_an_exponent_scaled_mode_refuses_what_it_does_not_decide(
@@ -751,7 +751,7 @@ def test_the_provenance_records_the_source_and_the_digest_the_path_stopped_carry
 
     assert [entry.id for entry in catalog.scan()] == [REPO, SOURCE_REPO]
     entry = catalog.scan()[0]
-    recorded = json.loads((entry.directory / "config.json").read_text())["sideros"]
+    recorded = json.loads((entry.directory / "config.json").read_text())["mlx_omnia"]
 
     assert recorded["source"] == {"repository": SOURCE_REPO, "commit": SOURCE_SHA}
     assert recorded["digest"] == entry.directory.name
@@ -762,7 +762,7 @@ def test_the_provenance_records_the_source_and_the_digest_the_path_stopped_carry
 
 def _recorded(entry_directory: Path) -> dict[str, object]:
     config = json.loads((entry_directory / "config.json").read_text())
-    block = config["sideros"]
+    block = config["mlx_omnia"]
     assert isinstance(block, dict)
     return block
 
@@ -806,7 +806,7 @@ def test_every_calibrated_method_records_the_pass_it_read_and_the_entry_still_lo
         assert calibration["corpus"] == "calibration-v1.txt"
         assert len(str(calibration["corpus_digest"])) == 64
         assert (calibration["sequences"], calibration["sequence_length"]) == (2, 64)
-        assert _logits_of(sideros.load(repo, local_files_only=True)).shape == (1, 5, _VOCAB)
+        assert _logits_of(mlx_omnia.load(repo, local_files_only=True)).shape == (1, 5, _VOCAB)
 
 
 def test_awq_takes_the_pairs_the_tree_admits_and_writes_no_trace_of_having_run(

@@ -22,7 +22,7 @@ import mlx.nn as nn
 import pytest
 from fastapi import FastAPI
 
-from sideros import (
+from mlx_omnia import (
     TEXT,
     CompositeModel,
     GenerationOptions,
@@ -32,13 +32,13 @@ from sideros import (
     Text,
     TextLanguageModel,
 )
-from sideros.footprint import resident_bytes
-from sideros.parsers import Segment
-from sideros_server import engine as engine_module
-from sideros_server import state
-from sideros_server.engine import Engine, Job, tree
-from sideros_server.state import router
-from sideros_server.store import Store
+from mlx_omnia.footprint import resident_bytes
+from mlx_omnia.parsers import Segment
+from mlx_omnia_server import engine as engine_module
+from mlx_omnia_server import state
+from mlx_omnia_server.engine import Engine, Job, tree
+from mlx_omnia_server.state import router
+from mlx_omnia_server.store import Store
 
 _KV_BYTES = 32 * 1024 * 1024
 

@@ -27,8 +27,8 @@ from fastapi import FastAPI, HTTPException
 from fastapi.testclient import TestClient
 from huggingface_hub import ModelInfo
 
-from sideros_server import catalog, download, jobs, quantize
-from sideros_server.store import Store
+from mlx_omnia_server import catalog, download, jobs, quantize
+from mlx_omnia_server.store import Store
 
 REPO = "mlx-community/Qwen3-0.6B-4bit"
 TINY = "hf-internal-testing/tiny-random-gpt2"
@@ -640,7 +640,7 @@ def test_a_repository_already_on_disk_is_refused_instead_of_downloaded_again(
 def test_a_repository_left_incomplete_in_the_hub_cache_is_refused_too(
     client: TestClient, caches: Path
 ) -> None:
-    """`load` downloads into the same hub cache (`sideros/task.py`), so a `load` killed
+    """`load` downloads into the same hub cache (`mlx_omnia/task.py`), so a `load` killed
     partway leaves a `models--*` that `catalog.scan` refuses to list for being incomplete.
     A check that reads the catalog lets it through, pays for the whole repository, and only
     then fails renaming staging onto a directory that is already there — every time."""

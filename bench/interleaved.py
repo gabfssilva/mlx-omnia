@@ -1,5 +1,5 @@
 # pyright: basic
-"""Interleaved A/B decode bench: sideros vs mlx-lm, same checkpoint, same prompt.
+"""Interleaved A/B decode bench: mlx_omnia vs mlx-lm, same checkpoint, same prompt.
 
 Only interleaved rounds count; median of 5, greedy, EOS ignored. MoE decode also
 reports % of the physical ceiling (active bytes/token ÷ 490 GB/s sustained).
@@ -10,14 +10,14 @@ Two measurement rules ported from the Poolside mlxfast-challenge harness:
   used to read as "~8% over a battery" is throttle spikes, not smooth decay: prefill
   throttles ~2x cool→hot, and sitting idle does not recover the cool state — only a
   gate does. Without macmon the bench warns and runs ungated.
-- The plain arms decode teacher-forced to one stream (sideros's own greedy ids): a
+- The plain arms decode teacher-forced to one stream (mlx_omnia's own greedy ids): a
   bf16 tie resolved differently by the two implementations can no longer hand them
   different tokens, so every round times the same computation. The draft arm stays
   free-running — acceptance needs the draft's own proposals.
 
-A draft name adds a third arm — the same sideros over the same prompt, speculating. The
+A draft name adds a third arm — the same mlx_omnia over the same prompt, speculating. The
 rounds rotate the order so no arm always sits where the drift lands, and before the battery
-the two sideros arms are compared token for token: speculation that changes the stream is a
+the two mlx_omnia arms are compared token for token: speculation that changes the stream is a
 bug by construction, and the tok/s of two different generations compare nothing.
 
 The ceiling that arm is reported against is not the dense one. A round runs `k` draft
@@ -63,9 +63,9 @@ import mlx.core as mx
 import mlx.nn as nn
 from huggingface_hub import snapshot_download
 
-from sideros import greedy, stream_ids, tree
-from sideros.footprint import Routed, active_bytes_per_token, ceiling
-from sideros.speculative import Acceptance
+from mlx_omnia import greedy, stream_ids, tree
+from mlx_omnia.footprint import Routed, active_bytes_per_token, ceiling
+from mlx_omnia.speculative import Acceptance
 
 TOKENS = 128
 RUNS = 5
@@ -84,7 +84,7 @@ type Arm = Callable[[list[int]], tuple[float, float]]
 
 
 def find_macmon() -> str | None:
-    if os.environ.get("SIDEROS_COOL_GATE") == "0":
+    if os.environ.get("OMNIA_COOL_GATE") == "0":
         return None
     found = shutil.which("macmon")
     if found:
@@ -143,7 +143,7 @@ def wait_cool(macmon: str | None) -> None:
             raise SystemExit(
                 f"cool gate: GPU hot and not cooling ({temp:.1f}°C, min {minimum:.1f}°C,"
                 f" waited {waited}s) — something else is loading it; free it up and rerun,"
-                " or SIDEROS_COOL_GATE=0 for an ungated debug run"
+                " or OMNIA_COOL_GATE=0 for an ungated debug run"
             )
         if waited >= COOL_MAX_S:
             raise SystemExit(
@@ -187,7 +187,7 @@ def _snapshot(repository: str, *patterns: str) -> Path:
     return Path(snapshot_download(repository, allow_patterns=list(patterns)))
 
 
-# `sideros.tree` dispatches on the checkpoint's own model_type, so the entries here keep
+# `mlx_omnia.tree` dispatches on the checkpoint's own model_type, so the entries here keep
 # only what the door doesn't decide: which repo, which download patterns, and gpt2's
 # fp16 pin.
 OURS = {
@@ -367,7 +367,7 @@ def report_speculation(
         physical = ceiling(spent)
         print(
             f"  {label}: {spent / 1e9:.3f} GB/token   ceiling {physical:7.1f} tok/s   "
-            f"sideros+draft at {100 * decode / physical:.1f}% of it"
+            f"mlx_omnia+draft at {100 * decode / physical:.1f}% of it"
         )
 
 
@@ -412,7 +412,7 @@ def main() -> None:
     def mlxlm_arm(prompt: list[int]) -> tuple[float, float]:
         return run_mlxlm(ref_model, prompt, script=plain)
 
-    arms: dict[str, Arm] = {"sideros": plain_arm}
+    arms: dict[str, Arm] = {"mlx_omnia": plain_arm}
     if draft_model is not None:
         drafted = sample_ids(ours_model, ids, draft=draft_model, lookahead=lookahead)
         if len(drafted) != len(plain):
@@ -432,20 +432,20 @@ def main() -> None:
             # one way by each path. What speculation guarantees is checked where it can be:
             # `test_speculative.py`, over fp32 and over scripted models with no floor at all.
             print(
-                f"note: the two sideros arms agree for {agreed} of {len(plain)} ids and then"
+                f"note: the two mlx_omnia arms agree for {agreed} of {len(plain)} ids and then"
                 " part at a bf16 tie — see test_speculative.py for the exactness claim",
                 file=sys.stderr,
             )
-        arms["sideros+draft"] = draft_arm
+        arms["mlx_omnia+draft"] = draft_arm
     arms["mlx-lm"] = mlxlm_arm
 
     samples = battery(arms, ids, find_macmon())
     medians = {arm: report(arm, samples[arm], len(ids)) for arm in arms}
-    ours_ttft, ours_decode = medians["sideros"]
+    ours_ttft, ours_decode = medians["mlx_omnia"]
     ref_ttft, ref_decode = medians["mlx-lm"]
     print(
         f"ratio: decode {ours_decode / ref_decode:.3f}x   prefill {ref_ttft / ours_ttft:.3f}x"
-        "   (sideros/mlx-lm; >1 = sideros faster)"
+        "   (mlx_omnia/mlx-lm; >1 = mlx_omnia faster)"
     )
 
     if name in WITH_CEILING:
@@ -453,11 +453,11 @@ def main() -> None:
         physical = ceiling(active)
         print(
             f"active bytes/token: {active / 1e9:.3f} GB   "
-            f"ceiling {physical:.1f} tok/s   sideros at {100 * ours_decode / physical:.1f}% "
+            f"ceiling {physical:.1f} tok/s   mlx_omnia at {100 * ours_decode / physical:.1f}% "
             "of ceiling"
         )
     if draft_model is not None:
-        _, speculated = medians["sideros+draft"]
+        _, speculated = medians["mlx_omnia+draft"]
         report_speculation(ours_model, draft_model, lookahead, acceptance, speculated)
         print(f"draft speedup: {speculated / ours_decode:.3f}x (same stream, same prompt)")
 

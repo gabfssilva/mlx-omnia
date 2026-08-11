@@ -7,8 +7,8 @@ search picks, whether it is allowed to rewind, and who leaves under pressure.
 
 import gc
 
-from sideros.core.cache import DeltaCache, KVCache, LayerCache
-from sideros.core.prompt_cache import Budget, PromptCache
+from mlx_omnia.core.cache import DeltaCache, KVCache, LayerCache
+from mlx_omnia.core.prompt_cache import Budget, PromptCache
 
 PROMPT = [11, 12, 13, 14, 15, 16, 17, 18, 19, 20, 21, 22]
 SYSTEM = PROMPT[:4]

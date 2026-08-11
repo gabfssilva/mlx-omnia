@@ -1,6 +1,6 @@
 import numpy as np
 
-from sideros import (
+from mlx_omnia import (
     GenerationOptions,
     Image,
     LanguagePrompt,

@@ -5,7 +5,7 @@ import pytest
 from conftest import floor, load_golden, relative_diff
 from huggingface_hub import snapshot_download
 
-from sideros.models.gpt2 import CHECKPOINT, GPT2, GPT2Activations
+from mlx_omnia.models.gpt2 import CHECKPOINT, GPT2, GPT2Activations
 
 FIXTURE = Path(__file__).parent / "fixtures" / "gpt2_forward.safetensors"
 
