@@ -1195,7 +1195,7 @@ def _metrics(metrics: Metrics | None, waiting: float | None) -> ft.Control:
             said.append(
                 ft.Row(
                     [
-                        ft.Text("dflash", style=theme.sans(11, t().fg3)),
+                        ft.Text("speculation", style=theme.sans(11, t().fg3)),
                         ft.Text(
                             f"{landed:.1f}",
                             style=theme.sans(11, t().mat(0), ft.FontWeight.W_600),
