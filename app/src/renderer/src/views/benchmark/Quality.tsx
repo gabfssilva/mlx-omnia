@@ -10,6 +10,7 @@
    as a zero. */
 
 import { type JSX, useState } from 'react'
+import { useEscape } from '../../keys'
 import type { Axis } from './Band'
 import { preview, saveDataset, type DatasetDefinition, type Preview, type Run } from './api'
 
@@ -267,6 +268,8 @@ export function DatasetForm({
   const [shown, setShown] = useState<Preview | null>(null)
   const [failure, setFailure] = useState<string | null>(null)
   const [busy, setBusy] = useState(false)
+
+  useEscape(onClose)
 
   const field = (key: keyof typeof EMPTY, value: string): void =>
     setDraft({ ...draft, [key]: value === '' && key === 'config' ? null : value })

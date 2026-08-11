@@ -39,7 +39,9 @@ export function readTheme(): Theme {
 }
 
 /* Nothing stamped is the system following itself, which is what the stylesheet's
-   prefers-color-scheme block is for. */
+   prefers-color-scheme block is for. The shell mirrors the choice into nativeTheme so
+   menus, sheets and dialogs open on the same side; without a shell the mirror is a
+   no-op. */
 export function writeTheme(theme: Theme): void {
   if (theme === 'system') {
     localStorage.removeItem(KEY)
@@ -48,6 +50,11 @@ export function writeTheme(theme: Theme): void {
     localStorage.setItem(KEY, theme)
     document.documentElement.setAttribute('data-theme', theme)
   }
+  void fetch('/desktop/theme', {
+    method: 'POST',
+    headers: { 'content-type': 'application/json' },
+    body: JSON.stringify({ theme })
+  }).catch(() => {})
 }
 
 /* The ring is one reading over every download at once — bytes, not jobs, so a 17 GB

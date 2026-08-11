@@ -33,14 +33,14 @@
 .leaf .pick {
   font-family: var(--mono); font-size: 10.5px; font-weight: 500; color: var(--fg);
   background-color: var(--surface2); border: 1px solid var(--hair2); border-radius: 7px;
-  width: 70px; flex: none; padding: 3px 16px 3px 8px; cursor: pointer; outline: none;
+  width: 70px; flex: none; padding: 3px 16px 3px 8px; outline: none;
   font-variant-numeric: tabular-nums; appearance: none; -webkit-appearance: none;
   background-image: linear-gradient(45deg, transparent 50%, var(--fg3) 50%), linear-gradient(135deg, var(--fg3) 50%, transparent 50%);
   background-position: calc(100% - 10px) 55%, calc(100% - 7px) 55%;
   background-size: 4px 4px; background-repeat: no-repeat;
 }
 .leaf .pick:hover { background-color: var(--sel); }
-.leaf .pick:focus-visible { border-color: var(--m); }
+.leaf .pick:focus-visible { border-color: var(--accent); }
 
 /* What the daemon refused, in its own words. */
 .qz .refusal { margin: 0; font-size: 11px; line-height: 1.55; color: var(--bad); }

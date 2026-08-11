@@ -10,7 +10,7 @@
 import { createServer, type IncomingMessage, type ServerResponse } from 'node:http'
 import { readFile } from 'node:fs/promises'
 import { join, normalize } from 'node:path'
-import { shell } from 'electron'
+import { app, BrowserWindow, dialog, nativeTheme, Notification, shell } from 'electron'
 
 export const SCHEME = 'sideros'
 export const ORIGIN = `${SCHEME}://app`
@@ -81,7 +81,71 @@ async function desktop(
   if (url.pathname === '/desktop/daemon/restart' && request.method === 'POST') {
     return await act(() => control.restart())
   }
+  if (url.pathname === '/desktop/theme' && request.method === 'POST') return await theme(request)
+  if (url.pathname === '/desktop/confirm' && request.method === 'POST') return await confirm(request)
+  if (url.pathname === '/desktop/notify' && request.method === 'POST') return await notify(request)
+  if (url.pathname === '/desktop/badge' && request.method === 'POST') return await badge(request)
   return undefined
+}
+
+/* The renderer's Appearance choice, mirrored into the process: native menus, sheets and
+   dialogs open on the side the app is drawn on, not the side the OS happens to be on. */
+async function theme(request: Request): Promise<Response> {
+  const { theme } = (await request.json()) as { theme?: unknown }
+  if (theme !== 'light' && theme !== 'dark' && theme !== 'system') {
+    return Response.json({ detail: 'theme is light, dark or system' }, { status: 400 })
+  }
+  nativeTheme.themeSource = theme
+  return Response.json({ ok: true })
+}
+
+/* A destructive action asks as a sheet off the title bar — the parent window is what
+   makes showMessageBox a sheet rather than a floating alert. */
+async function confirm(request: Request): Promise<Response> {
+  const { message, detail, action, danger } = (await request.json()) as {
+    message?: unknown
+    detail?: unknown
+    action?: unknown
+    danger?: unknown
+  }
+  if (typeof message !== 'string' || typeof action !== 'string') {
+    return Response.json({ detail: 'message and action are required' }, { status: 400 })
+  }
+  const [win] = BrowserWindow.getAllWindows()
+  const options = {
+    type: danger === true ? ('warning' as const) : ('question' as const),
+    buttons: [action, 'Cancel'],
+    defaultId: 0,
+    cancelId: 1,
+    message,
+    ...(typeof detail === 'string' ? { detail } : {})
+  }
+  const answer = win === undefined
+    ? await dialog.showMessageBox(options)
+    : await dialog.showMessageBox(win, options)
+  return Response.json({ ok: answer.response === 0 })
+}
+
+async function notify(request: Request): Promise<Response> {
+  const { title, body } = (await request.json()) as { title?: unknown; body?: unknown }
+  if (typeof title !== 'string') {
+    return Response.json({ detail: 'title is required' }, { status: 400 })
+  }
+  if (Notification.isSupported()) {
+    new Notification({ title, ...(typeof body === 'string' ? { body } : {}) }).show()
+  }
+  return Response.json({ ok: true })
+}
+
+/* How many downloads are running, worn on the dock icon — the app keeps working behind
+   other windows, and this is how it says so. */
+async function badge(request: Request): Promise<Response> {
+  const { count } = (await request.json()) as { count?: unknown }
+  if (typeof count !== 'number' || !Number.isInteger(count) || count < 0) {
+    return Response.json({ detail: 'count is a non-negative integer' }, { status: 400 })
+  }
+  app.dock?.setBadge(count === 0 ? '' : String(count))
+  return Response.json({ ok: true })
 }
 
 /* A refusal (foreign daemon, one that would not die) arrives as the house

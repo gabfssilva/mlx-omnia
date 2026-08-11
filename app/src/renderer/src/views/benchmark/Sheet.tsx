@@ -15,6 +15,7 @@
 
 import { type JSX, useCallback, useEffect, useState } from 'react'
 import { gb, type CatalogEntry } from '../../api/engine'
+import { useEscape } from '../../keys'
 import { getProfile, listProfileNames } from '../models/api'
 import {
   CONCURRENCIES,
@@ -86,7 +87,6 @@ export function Sheet({
   const [generates, setGenerates] = useState<number[]>([256])
   const [concurrencies, setConcurrencies] = useState<number[]>([1])
   const [rounds, setRounds] = useState(3)
-  const [warmup, setWarmup] = useState(1)
   const [sampling, setSampling] = useState<Sampling>(GREEDY)
   const [profiles, setProfiles] = useState<string[]>([])
   const [profile, setProfile] = useState('')
@@ -102,6 +102,8 @@ export function Sheet({
   const [failure, setFailure] = useState<string | null>(null)
   const [busy, setBusy] = useState(false)
 
+  useEscape(onClose)
+
   const body = useCallback((): Request | null => {
     if (view === 'speed') {
       if (models.length === 0) return null
@@ -112,7 +114,6 @@ export function Sheet({
         generates,
         concurrencies,
         rounds,
-        warmup,
         sampling,
         page_cache: page,
         thermal_gate_c: gate,
@@ -148,7 +149,6 @@ export function Sheet({
     generates,
     concurrencies,
     rounds,
-    warmup,
     sampling,
     page,
     gate,
@@ -454,14 +454,6 @@ export function Sheet({
                       />
                     </div>
                     <div className="field">
-                      <label>Warm-up</label>
-                      <input
-                        className="input mono"
-                        value={warmup}
-                        onChange={(event) => setWarmup(Number(event.target.value) || 0)}
-                      />
-                    </div>
-                    <div className="field">
                       <label>Page cache on load</label>
                       <select
                         className="input"
@@ -501,7 +493,6 @@ export function Sheet({
                         generates[0] ?? 256,
                         concurrencies[0] ?? 1,
                         rounds,
-                        warmup,
                         sampling,
                         page
                       )}

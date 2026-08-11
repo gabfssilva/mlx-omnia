@@ -16,7 +16,15 @@ import * as api from './api'
    a `/` is mandatory in one — so it can never collide with something selectable. */
 const OTHER = '?other'
 
-export function Speculation({ model }: { model: string }): JSX.Element | null {
+export function Speculation({
+  model,
+  onReady
+}: {
+  model: string
+  /** Fired once the setting is read, however it went. A caller that reveals several blocks
+      together needs to know this one has stopped being blank. */
+  onReady?: () => void
+}): JSX.Element | null {
   const [view, setView] = useState<api.SettingsView | null>(null)
   const [error, setError] = useState<string | null>(null)
   const [saving, setSaving] = useState(false)
@@ -40,9 +48,14 @@ export function Speculation({ model }: { model: string }): JSX.Element | null {
   }, [model, take])
 
   useEffect(() => {
+    let live = true
     setView(null)
     setError(null)
-    void read()
+    // `onReady` stays out of the deps: it is a notification, not a source.
+    void read().then(() => live && onReady?.())
+    return () => {
+      live = false
+    }
   }, [read])
 
   if (view === null) return null

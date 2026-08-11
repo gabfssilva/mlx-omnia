@@ -26,6 +26,7 @@ import type {
 } from './api'
 import { group } from './leaves'
 import type { LeafGroup } from './leaves'
+import { useEscape } from '../../keys'
 import './quantize.css'
 
 const GIB = 1024 ** 3
@@ -82,6 +83,8 @@ export function Quantize({
 
   const [plan, setPlan] = useState<PricedPlan | null>(null)
   const [refusal, setRefusal] = useState<string | null>(null)
+
+  useEscape(onClose)
   const [pricing, setPricing] = useState(false)
 
   const [job, setJob] = useState<JobView | null>(null)

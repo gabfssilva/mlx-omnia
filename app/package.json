@@ -9,7 +9,7 @@
     "dev:mock": "npm run build:main && SIDEROS_DEV=1 SIDEROS_MOCK=1 electron .",
     "dev:web": "vite",
     "mock": "node src/mock/daemon.ts",
-    "build:main": "esbuild src/desktop/main.ts --bundle --platform=node --format=esm --target=node22 --external:electron --outfile=dist/desktop/main.mjs",
+    "build:main": "esbuild src/desktop/main.ts --bundle --platform=node --format=esm --target=node22 --external:electron --banner:js=\"import{createRequire}from'node:module';const require=createRequire(import.meta.url);\" --outfile=dist/desktop/main.mjs",
     "build:renderer": "vite build",
     "build": "npm run build:renderer && npm run build:main",
     "app": "npm run build && electron .",
@@ -32,9 +32,19 @@
     ],
     "mac": {
       "category": "public.app-category.developer-tools",
-      "target": "dmg",
+      "target": [
+        "dmg",
+        "zip"
+      ],
       "icon": "build/icon.icns"
-    }
+    },
+    "publish": [
+      {
+        "provider": "github",
+        "owner": "gabfssilva",
+        "repo": "sideros"
+      }
+    ]
   },
   "devDependencies": {
     "@types/node": "^26.1.2",
@@ -53,5 +63,8 @@
     "remark-gfm": "^4.0.1",
     "typescript": "^5.9.3",
     "vite": "^7.3.0"
+  },
+  "dependencies": {
+    "electron-updater": "^6.8.9"
   }
 }

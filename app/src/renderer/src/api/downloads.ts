@@ -6,7 +6,13 @@
    downloads are running, and each one's `subject.model` says which tile it belongs under. */
 
 import { createContext, useCallback, useContext, useEffect, useRef, useState } from 'react'
-import { cancelJob, jobEvents, listJobs, type JobState, type JobView } from './http'
+import { cancelJob, jobEvents, listJobs, send, type JobState, type JobView } from './http'
+
+/* Dock badge and Notification Center live on the shell; without one (bare dev:web,
+   CLI) both calls 404 and the download is none the worse. */
+const shell = (path: string, body: unknown): void => {
+  void send('POST', path, body).catch(() => {})
+}
 
 export interface Pull {
   job: string
@@ -95,7 +101,10 @@ export function useDownloads(onSettled: () => void): Downloads {
     setActive((pulls) => fold(pulls, repo, job))
     void (async () => {
       try {
-        for await (const frame of jobEvents(job.id)) setActive((pulls) => fold(pulls, repo, frame))
+        for await (const frame of jobEvents(job.id)) {
+          if (frame.state === 'ok') shell('/desktop/notify', { title: 'Download complete', body: repo })
+          setActive((pulls) => fold(pulls, repo, frame))
+        }
       } catch {
         /* The stream dying is not itself news: the job's own state is what the next poll
            reads, and a daemon that went away is already drawn by the engine chip. */
@@ -114,6 +123,12 @@ export function useDownloads(onSettled: () => void): Downloads {
       })
       .catch(() => {})
   }, [follow])
+
+  /* The badge counts what is still moving; a failure waiting to be acted on is not. */
+  useEffect(() => {
+    const moving = [...active.values()].filter((pull) => pull.state !== 'error').length
+    shell('/desktop/badge', { count: moving })
+  }, [active])
 
   const forget = useCallback((repo: string) => {
     setActive((pulls) => {

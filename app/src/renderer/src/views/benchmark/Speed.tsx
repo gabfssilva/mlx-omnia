@@ -300,8 +300,8 @@ export function SpeedResult({
             ))}
           </div>
           <p className="note" style={{ marginTop: 8 }}>
-            {body?.warmup ?? 0} warm-up round{(body?.warmup ?? 0) === 1 ? '' : 's'} ran before these
-            and stayed out of the median.
+            One warm-up round ran before the first shape of this checkpoint and stayed out of
+            every median.
           </p>
         </>
       )}
@@ -325,10 +325,8 @@ export function SpeedSetup({ run }: { run: Run }): JSX.Element {
           <span className="v">{body === null ? '—' : `${human(body.context)} → ${body.generate}`}</span>
         </div>
         <div className="kvr">
-          <span className="k">rounds + warm-up</span>
-          <span className="v">
-            {body?.rounds ?? '—'} + {body?.warmup ?? '—'}
-          </span>
+          <span className="k">rounds</span>
+          <span className="v">{body?.rounds ?? '—'}</span>
         </div>
         <div className="kvr">
           <span className="k">streams from</span>

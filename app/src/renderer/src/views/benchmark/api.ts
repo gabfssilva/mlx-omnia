@@ -60,7 +60,6 @@ export interface SpeedBody {
   generate: number
   concurrency: number
   rounds: number
-  warmup: number
   stream_source: 'queue' | 'engine'
   page_cache: 'warm' | 'cold'
   gate_c: number | null
@@ -191,7 +190,6 @@ export type Request =
       generates: number[]
       concurrencies: number[]
       rounds: number
-      warmup: number
       sampling: Sampling
       page_cache: 'warm' | 'cold'
       thermal_gate_c: number | null
@@ -283,12 +281,11 @@ export const speedKey = (
   generate: number,
   concurrency: number,
   rounds: number,
-  warmup: number,
   sampling: Sampling = GREEDY,
   page = 'warm',
   source = 'queue'
 ): string =>
-  `${speedPrefix(context, generate, concurrency)}r${rounds}+${warmup}` +
+  `${speedPrefix(context, generate, concurrency)}r${rounds}` +
   ` · ${samplingKey(sampling)} · ${page} · ${source}`
 
 export const qualityKey = (dataset: string, items: number, seed: number, shots: number): string =>

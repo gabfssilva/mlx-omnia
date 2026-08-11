@@ -4,8 +4,15 @@
 import { type JSX, useCallback, useEffect, useState } from 'react'
 import { GIB, gb, useEngineContext, whole } from '../../api/engine'
 import { readTheme, writeTheme, type Theme } from '../../App'
-import { daemonAction, getOwnership, patchConfig, type Policy } from '../overview/api'
-import { homeless } from '../models/format'
+import {
+  type CatalogEntry,
+  confirmSheet,
+  daemonAction,
+  getOwnership,
+  patchConfig,
+  type Policy
+} from '../overview/api'
+import { displayName, homeless } from '../models/format'
 
 /* The daemon serves no stop or restart route; both act through the desktop shell
    (/desktop/daemon/*), which only controls the process it spawned. */
@@ -28,16 +35,70 @@ const TTLS: { label: string; seconds: number | null }[] = [
 const CLIENTS = ['Claude Code', 'Zed', 'aider'] as const
 type Client = (typeof CLIENTS)[number]
 
-function line(client: Client, base: string, model: string): string {
+/* Claude Code picks a model per alias: ANTHROPIC_MODEL is what it starts on, and each
+   ANTHROPIC_DEFAULT_<TIER>_MODEL is what that alias resolves to when /model switches. */
+const TIERS = ['opus', 'sonnet', 'haiku', 'fable'] as const
+type Tier = (typeof TIERS)[number]
+type Picks = { default: string } & Record<Tier, string>
+
+const EMPTY: Picks = { default: '', opus: '', sonnet: '', haiku: '', fable: '' }
+
+/* Zed's snippet names no model; aider's line names one; Claude Code names one per alias. */
+function slots(client: Client): readonly (keyof Picks)[] {
   switch (client) {
     case 'Claude Code':
-      return `ANTHROPIC_BASE_URL=${base}/api/anthropic ANTHROPIC_MODEL=${model} claude`
+      return ['default', ...TIERS]
+    case 'Zed':
+      return []
+    case 'aider':
+      return ['default']
+  }
+}
+
+function line(client: Client, base: string, key: string, picks: Picks, fallback: string): string {
+  const model = picks.default === '' ? fallback : picks.default
+  switch (client) {
+    case 'Claude Code': {
+      const env = [`ANTHROPIC_BASE_URL=${base}/api/anthropic`]
+      if (key !== '') env.push(`ANTHROPIC_AUTH_TOKEN=${key}`)
+      if (picks.default !== '') env.push(`ANTHROPIC_MODEL=${picks.default}`)
+      for (const tier of TIERS) {
+        if (picks[tier] !== '') env.push(`ANTHROPIC_DEFAULT_${tier.toUpperCase()}_MODEL=${picks[tier]}`)
+      }
+      /* A local model answers slower than the API and has nothing to report home about:
+         the default timeout would cut a long generation short. */
+      env.push('API_TIMEOUT_MS=3000000', 'CLAUDE_CODE_DISABLE_NONESSENTIAL_TRAFFIC=1')
+      return `${env.join(' ')} claude`
+    }
     case 'Zed':
       return `"language_models": { "openai": { "api_url": "${base}/api/openai/v1" } }`
     case 'aider':
       return `aider --openai-api-base ${base}/api/openai/v1 --model ${model}`
   }
 }
+
+/* What the prefix budget buys, read on a model that is actually loaded. A byte count on
+   its own says nothing here: the trie holds conversations, and how many tokens fit in a
+   gigabyte is the checkpoint's `kv_bytes_per_token` away. The costliest resident cache is
+   the one quoted — it is the model that runs out first, and a screen that quoted the
+   cheapest would promise a length the expensive one never reaches. */
+function holds(
+  budget: number | null,
+  catalog: readonly CatalogEntry[] | null
+): { id: string; tokens: number } | null {
+  if (budget === null || catalog === null) return null
+  let worst: { id: string; tokens: number } | null = null
+  for (const entry of catalog) {
+    const perToken = entry.kv_bytes_per_token
+    if (!entry.resident || perToken === null || perToken <= 0) continue
+    const tokens = Math.floor(budget / perToken)
+    if (worst === null || tokens < worst.tokens) worst = { id: entry.id, tokens }
+  }
+  return worst
+}
+
+const thousands = (tokens: number): string =>
+  tokens >= 1000 ? `${Math.round(tokens / 1000)}k` : String(tokens)
 
 const elapsed = (seconds: number): string => {
   const total = Math.max(0, Math.floor(seconds))
@@ -53,6 +114,7 @@ export function Settings(): JSX.Element {
   const [theme, setTheme] = useState<Theme>(readTheme)
   const [owned, setOwned] = useState<boolean | null>(null)
   const [client, setClient] = useState<Client>('Claude Code')
+  const [picks, setPicks] = useState<Picks>(EMPTY)
   const [copied, setCopied] = useState<string | null>(null)
   const [failure, setFailure] = useState<string | null>(null)
   const [ceilingGb, setCeilingGb] = useState<number | null>(null)
@@ -66,10 +128,15 @@ export function Settings(): JSX.Element {
   const configured = whole(engine.config?.['memory_limit_bytes'])
   const totalBytes = engine.system?.memory_bytes ?? null
   const ceiling = ceilingGb ?? (configured === null ? null : Math.round(configured / GIB))
+  const prefixBytes = whole(engine.config?.['prefix_cache_bytes'])
+  const conversation = holds(prefixBytes, engine.catalog)
+  const diskBytes = whole(engine.config?.['prefix_disk_bytes'])
   const ttl = engine.config?.['idle_ttl_seconds']
   const port = engine.config?.['port']?.value ?? 8642
   const base = `http://127.0.0.1:${String(port)}`
   const firstModel = engine.catalog?.[0]?.id ?? 'model-id'
+  const apiKey = engine.config?.['api_key']?.value
+  const command = line(client, base, typeof apiKey === 'string' ? apiKey : '', picks, firstModel)
 
   const copy = useCallback((key: string, text: string) => {
     void navigator.clipboard.writeText(text).then(() => {
@@ -87,9 +154,11 @@ export function Settings(): JSX.Element {
 
   const control = (action: 'stop' | 'restart') => {
     setFailure(null)
-    void daemonAction(action)
-      .then(() => engine.refresh())
-      .catch((error: unknown) => setFailure(error instanceof Error ? error.message : String(error)))
+    void (async () => {
+      if (action === 'stop' && !(await confirmSheet('Stop the engine?', 'Stop', 'Loaded models are unloaded and clients stop being answered.'))) return
+      await daemonAction(action)
+      engine.refresh()
+    })().catch((error: unknown) => setFailure(error instanceof Error ? error.message : String(error)))
   }
 
   return (
@@ -139,8 +208,8 @@ export function Settings(): JSX.Element {
               <section className="blk">
                 <h3>Clients</h3>
                 <div className="urlrow">
-                  <span className="u">{line(client, base, firstModel)}</span>
-                  <button className="btn quiet" onClick={() => copy(client, line(client, base, firstModel))}>
+                  <span className="u">{command}</span>
+                  <button className="btn quiet" onClick={() => copy(client, command)}>
                     {copied === client ? 'Copied' : 'Copy'}
                   </button>
                 </div>
@@ -155,7 +224,34 @@ export function Settings(): JSX.Element {
                     </button>
                   ))}
                 </div>
-                <p className="note">Copy writes the whole line, ready to paste.</p>
+                <div className="kvs">
+                  {slots(client).map((slot) => (
+                    <div className="kvr" key={slot}>
+                      <span className="k" style={{ textTransform: 'capitalize' }}>{slot}</span>
+                      <select
+                        className="input mono"
+                        style={{ marginLeft: 'auto', maxWidth: 260 }}
+                        value={picks[slot]}
+                        onChange={(event) => {
+                          const id = event.currentTarget.value
+                          setPicks((current) => ({ ...current, [slot]: id }))
+                        }}
+                      >
+                        <option value="">{slot === 'default' ? '—' : 'follows the default'}</option>
+                        {(engine.catalog ?? []).map((entry) => (
+                          <option key={entry.id} value={entry.id}>
+                            {entry.id}
+                          </option>
+                        ))}
+                      </select>
+                    </div>
+                  ))}
+                </div>
+                <p className="note">
+                  {client === 'Claude Code'
+                    ? 'Default is what Claude Code starts on; each alias is what /model resolves to.'
+                    : 'Copy writes the whole line, ready to paste.'}
+                </p>
               </section>
 
               {engine.system !== null && (
@@ -209,6 +305,26 @@ export function Settings(): JSX.Element {
                   </>
                 ) : (
                   <p className="note">Waiting for the engine.</p>
+                )}
+                {prefixBytes !== null && (
+                  <p className="note">
+                    Conversation cache: {gb(prefixBytes)} GB across every loaded model, inside the
+                    ceiling above.
+                    {conversation !== null && (
+                      <>
+                        {' '}
+                        About {thousands(conversation.tokens)} tokens on{' '}
+                        {displayName(conversation.id)} — a turn that continues one of those is
+                        answered without reading the whole conversation again.
+                      </>
+                    )}
+                  </p>
+                )}
+                {diskBytes !== null && (
+                  <p className="note">
+                    On disk: {gb(engine.state?.prefix_disk_bytes ?? 0)} GB of {gb(diskBytes)} GB.
+                    What is written there outlives a restart, which the one above does not.
+                  </p>
                 )}
                 <div style={{ display: 'flex', alignItems: 'center', gap: 9 }}>
                   <span className="note" style={{ flex: 1 }}>

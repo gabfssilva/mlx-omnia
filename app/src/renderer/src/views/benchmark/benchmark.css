@@ -36,12 +36,12 @@
 .tradeoff .pt.on { r: 4.6; }
 .tradeoff .pt.miss { fill: var(--surface); stroke: var(--fg3); }
 .tradeoff .val { font-family: var(--mono); font-size: 9.5px; fill: var(--fg); font-weight: 500; }
-.tradeoff .lane { cursor: pointer; }
+.tradeoff .lane { }
 /* The row is reserved whether or not there are chips in it: a chip is 2.3px taller than the
    note alone, and without the floor the whole band — and everything under it — moved by that
    much on every switch between speed, fidelity and quality. */
 .tfoot { display: flex; align-items: center; gap: 7px; padding-top: 8px; min-height: 26px; }
-.tkey { display: inline-flex; align-items: center; gap: 6px; font-size: 10px; color: var(--fg2); cursor: pointer; }
+.tkey { display: inline-flex; align-items: center; gap: 6px; font-size: 10px; color: var(--fg2); }
 .tkey i { width: 9px; height: 2.5px; border-radius: 2px; background: var(--m); flex: none; }
 .tkey.off { color: var(--fg3); }
 .tkey.off i { background: var(--hair2); }
@@ -98,7 +98,7 @@
 
 /* how it scales with concurrency: one bar per level, the current one solid */
 .curve { display: flex; align-items: flex-end; gap: 4px; height: 52px; }
-.curve button { all: unset; cursor: pointer; flex: 1; display: flex; flex-direction: column; justify-content: flex-end; height: 100%; gap: 3px; }
+.curve button { all: unset; flex: 1; display: flex; flex-direction: column; justify-content: flex-end; height: 100%; gap: 3px; }
 .curve b { display: block; background: color-mix(in oklab, var(--m) 26%, var(--surface)); border-radius: 2px 2px 0 0;
   box-shadow: inset 0 0 0 1px color-mix(in oklab, var(--m) 40%, transparent); }
 .curve button.on b { background: var(--m); box-shadow: none; }
@@ -120,7 +120,7 @@
 .cost .r { margin-left: auto; font-family: var(--mono); font-size: 10px; color: var(--fg3); }
 
 .dsrow { display: grid; grid-template-columns: 18px 1fr 92px 58px; align-items: center; gap: 9px;
-  padding: 6px 4px; border-bottom: 1px solid var(--hair); font-size: 11px; cursor: pointer; }
+  padding: 6px 4px; border-bottom: 1px solid var(--hair); font-size: 11px; }
 .dsrow:last-child { border-bottom: 0; }
 .dsrow .t b { font-weight: 500; }
 .dsrow .t span { display: block; font-family: var(--mono); font-size: 9px; color: var(--fg3); margin-top: 1px; }
@@ -140,8 +140,6 @@
 .sheetb { flex: none; height: 540px; min-height: 0; grid-template-columns: 214px 1fr; }
 /* the library is the one list that grows without bound, so it is the one that scrolls */
 .pickscroll { max-height: 420px; overflow-y: auto; }
-.pickscroll::-webkit-scrollbar { width: 9px; }
-.pickscroll::-webkit-scrollbar-thumb { background: var(--hair2); border-radius: 5px; border: 3px solid transparent; background-clip: content-box; }
 .pair { display: grid; grid-template-columns: 18px 1fr 150px; align-items: center; gap: 9px;
   padding: 5px 4px; border-bottom: 1px solid var(--hair); font-size: 11px; }
 .pair:last-child { border-bottom: 0; }
@@ -150,7 +148,7 @@
 .pair select.input { height: 23px; font-size: 10.5px; padding: 0 20px 0 7px; }
 .pair input { accent-color: var(--m); }
 .mrow { display: grid; grid-template-columns: 18px 1fr 62px; align-items: center; gap: 9px;
-  padding: 5px 4px; border-bottom: 1px solid var(--hair); font-size: 11px; cursor: pointer; }
+  padding: 5px 4px; border-bottom: 1px solid var(--hair); font-size: 11px; }
 .mrow:last-child { border-bottom: 0; }
 .mrow b { font-weight: 500; }
 .mrow span { font-family: var(--mono); font-size: 9px; color: var(--fg3); }
@@ -170,7 +168,7 @@
 .prev { padding: 9px 10px; border-radius: 7px; background: var(--sunken); font-family: var(--mono);
   font-size: 9.5px; line-height: 1.65; color: var(--fg2); white-space: pre-wrap; }
 .prev b { color: var(--fg); font-weight: 500; }
-.check { display: flex; align-items: center; gap: 8px; font-size: 11.5px; color: var(--fg2); cursor: pointer; }
+.check { display: flex; align-items: center; gap: 8px; font-size: 11.5px; color: var(--fg2); }
 .check input { accent-color: var(--m); }
 .check b { color: var(--fg); font-weight: 500; }
 .chips .fchip { min-width: 34px; justify-content: center; font-variant-numeric: tabular-nums; }

@@ -3,26 +3,26 @@
 .chatwrap { display: flex; flex: 1; min-height: 0; gap: 12px; padding: 12px; }
 .sessions { width: 216px; flex: none; display: flex; flex-direction: column; padding: 10px;
   background: var(--surface); border: 1px solid var(--hair); border-radius: 10px; }
-.sess { padding: 9px 11px; border-radius: 10px; cursor: pointer; margin-bottom: 2px; position: relative; }
+.sess { padding: 9px 11px; border-radius: 10px; margin-bottom: 2px; position: relative; }
 .sess:hover { background: var(--sunken); }
 .sess.on { background: var(--surface); box-shadow: 0 1px 4px rgba(0,0,0,.1); }
-.sess:focus-visible { outline: 2px solid var(--m); outline-offset: -2px; }
+.sess:focus-visible { outline: 2px solid var(--accent); outline-offset: -2px; }
 .sess b { display: block; font-size: 12.5px; font-weight: 550; letter-spacing: -.01em;
   overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
 .sess span { display: block; margin-top: 3px; font-size: 10.5px; color: var(--fg3);
   overflow: hidden; text-overflow: ellipsis; white-space: nowrap; font-variant-numeric: tabular-nums; }
 .tabbar { display: flex; background: var(--sunken); border-radius: 9px; padding: 2px; gap: 2px; margin: 0 0 12px; }
-.tabbar button { all: unset; cursor: pointer; flex: 1; text-align: center; font-size: 11.5px; font-weight: 500;
+.tabbar button { all: unset; flex: 1; text-align: center; font-size: 11.5px; font-weight: 500;
   color: var(--fg2); padding: 5px 0; border-radius: 7px; }
 .tabbar button.on { background: var(--surface); color: var(--fg); box-shadow: 0 1px 3px rgba(0,0,0,.14); }
 .sesspane { display: none; flex: 1; min-height: 0; flex-direction: column; }
 .sesspane.on { display: flex; }
 .sesslist { flex: 1; overflow-y: auto; min-height: 0; }
 .newchat { all: unset; box-sizing: border-box; width: 100%;
-  display: flex; align-items: center; gap: 7px; padding: 9px 11px; border-radius: 10px; cursor: pointer;
+  display: flex; align-items: center; gap: 7px; padding: 9px 11px; border-radius: 10px;
   font-size: 12.5px; font-weight: 500; color: var(--fg2); margin-bottom: 6px; border: 1px dashed var(--hair2); }
 .newchat:hover { background: var(--sunken); color: var(--fg); }
-.newchat:focus-visible { outline: 2px solid var(--m); outline-offset: 1px; }
+.newchat:focus-visible { outline: 2px solid var(--accent); outline-offset: 1px; }
 .newchat svg { width: 13px; height: 13px; }
 
 /* Not in the mockup: rename and delete, revealed on hover so the resting row is the one
@@ -36,7 +36,7 @@
 .sessname { font-family: var(--sans); font-size: 12.5px; font-weight: 550; letter-spacing: -.01em;
   color: var(--fg); background: var(--sunken); border: 1px solid var(--hair2); border-radius: 6px;
   padding: 1px 5px; width: 100%; outline: none; }
-.sessname:focus-visible { border-color: var(--m); }
+.sessname:focus-visible { border-color: var(--accent); }
 
 .params { flex: 1; overflow-y: auto; padding: 2px 11px 8px; }
 .params .phint { font-size: 10.5px; color: var(--fg3); margin-bottom: 14px; }
@@ -44,11 +44,12 @@
 .param .prow { display: flex; justify-content: space-between; align-items: baseline; margin-bottom: 5px; }
 .param .prow label { font-size: 11px; color: var(--fg2); }
 .param .prow b { font-size: 11px; font-weight: 600; font-variant-numeric: tabular-nums; }
+.param select.input { width: 100%; }
 .params textarea { font-family: var(--sans); font-size: 11.5px; color: var(--fg); background: var(--surface);
   border: 1px solid var(--hair2); border-radius: 8px; padding: 7px 9px; width: 100%; resize: none; outline: none;
   min-height: 58px; line-height: 1.5; }
 .params textarea::placeholder { color: var(--fg3); }
-.params textarea:focus-visible { border-color: var(--m); }
+.params textarea:focus-visible { border-color: var(--accent); }
 
 .chatcol { flex: 1; min-width: 0; display: flex; flex-direction: column;
   background: var(--surface); border: 1px solid var(--hair); border-radius: 10px; overflow: hidden; }
@@ -66,6 +67,7 @@
 .msg.user .bubble {
   background: var(--surface2); border: 1px solid var(--hair); border-radius: 16px 16px 4px 16px;
   padding: 10px 15px; max-width: 80%; font-size: 12.5px; line-height: 1.55; white-space: pre-wrap;
+  user-select: text; -webkit-user-select: text; cursor: auto;
 }
 .msg.model { font-size: 12.5px; line-height: 1.62; }
 /* pre-wrap because this is a model's own text: a list it wrote with single newlines is a
@@ -95,11 +97,11 @@
 .msg.model a { color: var(--m); }
 .msg.model hr { border: none; border-top: 1px solid var(--hair2); margin: 14px 0; }
 .reason {
-  all: unset; cursor: pointer; display: inline-flex; align-items: center; gap: 5px;
+  all: unset; display: inline-flex; align-items: center; gap: 5px;
   font-size: 11.5px; color: var(--fg3); margin-bottom: 10px; border-radius: 6px; padding: 2px 6px;
 }
 .reason:hover { background: var(--sunken); color: var(--fg2); }
-.reason:focus-visible { outline: 2px solid var(--m); outline-offset: 1px; }
+.reason:focus-visible { outline: 2px solid var(--accent); outline-offset: 1px; }
 .reason svg { width: 12px; height: 12px; transition: transform .15s; }
 .reasonbody { display: none; font-size: 11.5px; color: var(--fg3); line-height: 1.6; white-space: pre-wrap;
   border-left: 2px solid var(--hair2); padding: 2px 0 2px 14px; margin: 0 0 14px; }
@@ -128,17 +130,21 @@
 .composer .draft::placeholder { color: var(--fg3); }
 .composer .notice { font-size: 11px; color: var(--bad); padding: 0 4px; }
 .composer footer { display: flex; align-items: center; gap: 10px; }
-.composer .modelpick { font-size: 11.5px; color: var(--fg2); background: var(--sunken); border-radius: 7px; padding: 4px 10px; cursor: pointer;
+/* A pop-up button, and it wears the same well the ones in the forms do: without it the
+   control reads as a label. */
+.composer .modelpick { font-size: 11.5px; color: var(--fg2); background-color: var(--sunken); border-radius: 7px; padding: 4px 26px 4px 10px;
   font-family: var(--sans); border: none; outline: none; appearance: none; -webkit-appearance: none;
-  max-width: 260px; text-overflow: ellipsis; }
-.composer .modelpick:focus-visible { outline: 2px solid var(--m); outline-offset: 1px; }
+  max-width: 260px; text-overflow: ellipsis;
+  background-image: var(--well); background-position: right 3px center;
+  background-size: 17px 18px; background-repeat: no-repeat; }
+.composer .modelpick:focus-visible { outline: 2px solid var(--accent); outline-offset: 1px; }
 .composer .hintk { margin-left: auto; font-size: 11px; color: var(--fg3); }
 .send {
-  all: unset; cursor: pointer; width: 30px; height: 30px; border-radius: 15px;
+  all: unset; width: 30px; height: 30px; border-radius: 15px;
   background: var(--fg); color: var(--win);
   display: grid; place-items: center; flex: none;
 }
-.send:focus-visible { outline: 2px solid var(--m); outline-offset: 2px; }
+.send:focus-visible { outline: 2px solid var(--accent); outline-offset: 2px; }
 .send[disabled] { cursor: default; opacity: .4; }
 .send svg { width: 15px; height: 15px; }
 

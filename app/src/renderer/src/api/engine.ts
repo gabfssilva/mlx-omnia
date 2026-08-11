@@ -34,6 +34,8 @@ export interface EngineState {
   queue: { running: number; waiting: number; reserved: boolean }
   resident_bytes: number
   kv_bytes: number
+  /* What the conversations spilled to disk weigh, over every model. */
+  prefix_disk_bytes: number
 }
 
 export interface Health {

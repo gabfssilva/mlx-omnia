@@ -5,6 +5,7 @@
 import { type JSX, useEffect, useRef, useState } from 'react'
 import { gb, useEngineContext, whole, type CatalogEntry, type Resident as Slot } from '../../api/engine'
 import { Band, scale } from '../../Memory'
+import { useTypeAhead } from '../../keys'
 import { ceilingRate, contextTokens, displayName, percent } from '../models/format'
 import { type Sample, type Snapshot } from '../overview/api'
 import { unloadModel } from '../models/api'
@@ -71,6 +72,7 @@ export function Resident(): JSX.Element {
   const jobs = engine.jobs ?? []
   const [chosen, setChosen] = useState<string | null>(null)
   const [busy, setBusy] = useState(false)
+  const runs = useTypeAhead()
 
   const ceiling = whole(engine.config?.['memory_limit_bytes'])
   const s = scale(engine.system, engine.state, ceiling)
@@ -157,7 +159,7 @@ export function Resident(): JSX.Element {
               </div>
             )}
             {models.length > 0 && (
-              <ul className="runs">
+              <ul className="runs" ref={runs} role="listbox" aria-label="Resident models">
                 {models.map((model) => (
                   <Run
                     key={model.id}
@@ -353,7 +355,10 @@ function Past({ sample }: { sample: Sample }): JSX.Element {
     <div className={failed ? 'logrow err' : 'logrow'}>
       <span className="ts">{clock(sample.started_at)}</span>
       <span className="tx">
-        <b>{displayName(sample.model)}</b> · {sample.prompt_tokens} in, {sample.completion_tokens} out
+        <b>{displayName(sample.model)}</b> · {sample.prompt_tokens} in
+        {sample.reused_tokens > 0 && ` (${sample.reused_tokens} cached)`}
+        {sample.reused_tokens === 0 && !sample.kept_prefix && ' (keeps no prefix)'},{' '}
+        {sample.completion_tokens} out
         {sample.state === 'cancelled' && ' · cancelled'}
         {failed && ' · failed'}
       </span>
@@ -390,8 +395,18 @@ function Run({
   const ceiling =
     entry?.bytes_per_token && sustained !== null ? ceilingRate(entry.bytes_per_token, sustained) : null
 
+  /* A row of a single-select roster, which is what makes it a keyboard target at all: Tab
+     reaches it, focus is the selection, and type-ahead matches on `data-key`. */
   return (
-    <li className={`run ${material}${on ? ' on' : ''}`} onClick={onPick}>
+    <li
+      className={`run ${material}${on ? ' on' : ''}`}
+      role="option"
+      aria-selected={on}
+      tabIndex={0}
+      data-key={displayName(model.id)}
+      onFocus={onPick}
+      onClick={onPick}
+    >
       <div className="id">
         <b>{displayName(model.id)}</b>
         <span>

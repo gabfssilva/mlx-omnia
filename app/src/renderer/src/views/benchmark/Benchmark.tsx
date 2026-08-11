@@ -12,6 +12,7 @@
 import { type JSX, useCallback, useEffect, useMemo, useState } from 'react'
 import './benchmark.css'
 import { useEngineContext } from '../../api/engine'
+import { confirmSheet } from '../overview/api'
 import { jobEvents, type JobView } from '../../api/http'
 import { autofill, Band, type Line } from './Band'
 import { fidelityAxes, fidelityValues, FidelityResult, FidelityRows, split } from './Fidelity'
@@ -97,7 +98,7 @@ export function Benchmark(): JSX.Element {
   const key = useMemo(() => {
     if (view !== 'speed') return undefined
     if (variant !== null && variant.startsWith(prefix)) return variant
-    return variants[0] ?? speedKey(context, generate, concurrency, 3, 1)
+    return variants[0] ?? speedKey(context, generate, concurrency, 3)
   }, [view, variant, variants, prefix, context, generate, concurrency])
 
   const reload = useCallback(() => {
@@ -525,7 +526,10 @@ export function Benchmark(): JSX.Element {
               className="btn danger"
               disabled={chosen === null}
               onClick={() => {
-                if (chosen !== null) void forget(chosen.id).then(reload)
+                if (chosen === null) return
+                void confirmSheet('Delete this run?', 'Delete', 'The measurement is removed from the history.').then(
+                  (ok) => (ok ? forget(chosen.id).then(reload) : undefined)
+                )
               }}
             >
               Delete
@@ -568,7 +572,6 @@ export function Benchmark(): JSX.Element {
                   tokens,
                   streams,
                   request.rounds,
-                  request.warmup,
                   request.sampling,
                   request.page_cache
                 )

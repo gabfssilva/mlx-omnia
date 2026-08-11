@@ -52,7 +52,7 @@
 .frow:last-child { border-bottom: 0; }
 .frow .size { margin-left: auto; color: var(--fg3); font-variant-numeric: tabular-nums; white-space: nowrap; }
 .frow .tag { font-family: var(--sans); font-size: 8.5px; text-transform: uppercase; letter-spacing: .08em; color: var(--fg3); }
-.frow.group { cursor: pointer; border-top: none; border-left: none; border-right: none; background: none; }
+.frow.group { border-top: none; border-left: none; border-right: none; background: none; }
 .frow .chev { width: 11px; height: 11px; color: var(--fg3); transition: transform .15s ease; flex: none; }
 .frow .chev.open { transform: rotate(90deg); }
 .frow.shard { padding-left: 20px; color: var(--fg2); }
@@ -64,7 +64,7 @@
 .srcview .k { color: var(--m); }
 .srcview .h { color: var(--fg); font-weight: 500; }
 
-.hublink { all: unset; cursor: pointer; font-size: 10.5px; color: var(--fg3); }
+.hublink { all: unset; font-size: 10.5px; color: var(--fg3); }
 .hublink:hover { color: var(--m); }
 
 /* ── a download in flight ─────────────────────────────────────────────── */

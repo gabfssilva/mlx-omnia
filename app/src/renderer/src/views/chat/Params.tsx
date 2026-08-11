@@ -60,7 +60,7 @@ function Choice({
       </div>
       <select
         id="chat-effort"
-        className="mini"
+        className="input"
         value={value}
         onChange={(event) => onChange(event.target.value)}
       >

@@ -217,7 +217,8 @@ export function CardBlock({
   store,
   hub = false,
   shown: asked,
-  onFiles
+  onFiles,
+  onReady
 }: {
   id: string
   store?: string
@@ -227,24 +228,33 @@ export function CardBlock({
   shown?: Tab
   /** The one listing this block fetches, shared out so a caller can price it. */
   onFiles?: (files: api.CheckpointFile[]) => void
+  /** Fired once card and listing have both settled, however they went. A caller that
+      reveals several blocks together needs to know this one has stopped being blank. */
+  onReady?: () => void
 }): JSX.Element | null {
   const [raw, setRaw] = useState<string | null | undefined>(undefined)
   const [files, setFiles] = useState<api.CheckpointFile[]>([])
   const [tab, setTab] = useState<Tab>('card')
 
   useEffect(() => {
+    let live = true
     setRaw(undefined)
     setFiles([])
     setTab('card')
-    void (hub ? hubCard(id) : api.getCard(id)).then(setRaw).catch(() => setRaw(null))
-    void (hub ? hubFiles(id) : api.listFiles(id))
-      .then((listed) => {
+    const card = (hub ? hubCard(id) : api.getCard(id)).then(setRaw, () => setRaw(null))
+    const listing = (hub ? hubFiles(id) : api.listFiles(id)).then(
+      (listed) => {
         setFiles(listed)
         onFiles?.(listed)
-      })
-      .catch(() => setFiles([]))
-    // `onFiles` stays out of the deps: it is a notification, not a source, and refetching
-    // because the caller re-rendered would ask the Hub again for the same listing.
+      },
+      () => setFiles([])
+    )
+    void Promise.all([card, listing]).then(() => live && onReady?.())
+    // `onFiles` and `onReady` stay out of the deps: they are notifications, not sources, and
+    // refetching because the caller re-rendered would ask the Hub again for the same listing.
+    return () => {
+      live = false
+    }
   }, [id, hub])
 
   if (raw === undefined) return null

@@ -127,6 +127,22 @@ export function Library(): JSX.Element {
 
   const entry = chosen !== null && !chosen.hub ? disk.find((item) => item.id === chosen.id) ?? null : null
 
+  /* The inspector's blocks each arrive on their own roundtrip. Showing them as they land is
+     what reads as a flicker, so the body is held blank until every block the current tab
+     mounts has reported in. The flags are stamped with the selection they belong to, which
+     is what keeps a late answer from unblanking the next checkpoint. */
+  const picked = chosen === null ? '' : `${chosen.hub ? 'hub' : 'disk'}:${chosen.id}`
+  const [settled, setSettled] = useState({ picked: '', card: false, spec: false })
+  const flags = settled.picked === picked ? settled : { picked, card: false, spec: false }
+  const settle = useCallback(
+    (which: 'card' | 'spec') =>
+      setSettled((prev) => {
+        const base = prev.picked === picked ? prev : { picked, card: false, spec: false }
+        return which === 'card' ? { ...base, card: true } : { ...base, spec: true }
+      }),
+    [picked]
+  )
+
   /* What the selection would cost, drawn as a ghost on the title bar's meter. */
   useEffect(() => {
     if (chosen === null) {
@@ -189,6 +205,10 @@ export function Library(): JSX.Element {
   const used = (engine.state?.resident_bytes ?? 0) + (engine.state?.kv_bytes ?? 0)
   const free = ceiling === null ? null : ceiling - used
   const tooBig = price !== null && free !== null && price > free
+
+  /* Which of the two asynchronous blocks the current tab puts on screen. */
+  const speculates = entry !== null && tab === 'card'
+  const carded = tab !== 'profiles'
 
   const counts = {
     all: disk.length + running.length + failed.length + abandoned.length + hubShown.length,
@@ -372,7 +392,7 @@ export function Library(): JSX.Element {
                 Source
               </button>
             </div>
-            <div className="ibody scroll">
+            <div className={`ibody scroll${(speculates && !flags.spec) || (carded && !flags.card) ? ' waiting' : ''}`}>
               {failure !== null && <div className="err" style={{ marginBottom: 9 }}>{failure}</div>}
               {stalled && flight !== null && flight.error !== null && (
                 <div className="err" style={{ marginBottom: 9 }}>
@@ -386,10 +406,16 @@ export function Library(): JSX.Element {
                 </p>
               )}
               {entry !== null && tab === 'card' && <Facts entry={entry} />}
-              {entry !== null && tab === 'card' && <Speculation model={entry.id} />}
+              {speculates && entry !== null && <Speculation model={entry.id} onReady={() => settle('spec')} />}
               {tab === 'profiles' && entry !== null && <Profiles model={entry.id} />}
-              {tab !== 'profiles' && (
-                <CardBlock id={chosen.id} hub={chosen.hub} shown={tab} store={entry?.store} />
+              {carded && (
+                <CardBlock
+                  id={chosen.id}
+                  hub={chosen.hub}
+                  shown={tab}
+                  store={entry?.store}
+                  onReady={() => settle('card')}
+                />
               )}
             </div>
             {fetching && flight !== null ? (

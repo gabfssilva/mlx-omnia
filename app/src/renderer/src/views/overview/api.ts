@@ -52,6 +52,9 @@ export interface DaemonState {
   /* max(MLX active, the process' RSS, the accumulator) — never one of them alone. */
   resident_bytes: number
   kv_bytes: number
+  /* What the conversations spilled to disk weigh, over every model. A cache nobody can see
+     is rubbish accumulating in silence, which is why it is reported at all. */
+  prefix_disk_bytes: number
 }
 
 /* ── config.py ─────────────────────────────────────────────────────────── */
@@ -72,6 +75,7 @@ export type ConfigKey =
   | 'idle_ttl_seconds'
   | 'max_concurrent_requests'
   | 'prefix_cache_bytes'
+  | 'prefix_disk_bytes'
   | 'port'
   | 'api_key'
   | 'catalog_directory'
@@ -108,6 +112,10 @@ export interface CatalogEntry {
   context: number | null
   bytes_on_disk: number
   bytes_per_token: number | null
+  /* What one token adds to the cache, over the attending layers alone — `null` for a
+     config that does not say enough to price it. It is what turns the prefix budget from
+     a byte count into a length of conversation. */
+  kv_bytes_per_token: number | null
   resident: boolean
 }
 
@@ -119,6 +127,14 @@ export interface Sample {
   model: string
   state: RequestState
   prompt_tokens: number
+  /* How much of `prompt_tokens` a stored prefix covered instead of a forward. Zero is a
+     real answer — the trie was off, or the render did not reproduce what the last turn
+     wrote — and telling those apart is why it sits beside the prompt. */
+  reused_tokens: number
+  /* Whether the run left the next turn anything to start from. It separates the third zero
+     from the other two: a trunk whose layers neither rewind nor serialize keeps nothing at
+     all, and no setting changes that. */
+  kept_prefix: boolean
   completion_tokens: number
   started_at: number
   /* What this request paid to put its model in memory, absent when it found it there. It
@@ -174,6 +190,13 @@ export const getOwnership = (): Promise<{ owned: boolean }> =>
   json<{ owned: boolean }>('/desktop/daemon')
 export const daemonAction = (action: 'stop' | 'restart'): Promise<void> =>
   send<void>('POST', `/desktop/daemon/${action}`)
+
+/* A native sheet off the title bar. No shell means no sheet to ask with, so the answer
+   is yes — the same unguarded behaviour the action had before the sheet existed. */
+export const confirmSheet = (message: string, action: string, detail?: string): Promise<boolean> =>
+  send<{ ok: boolean }>('POST', '/desktop/confirm', { message, action, detail, danger: true })
+    .then((answer) => answer.ok)
+    .catch(() => true)
 
 /* Every frame is a whole snapshot and the stream opens with the state as it is now,
    so a late subscriber loses nothing. It ends only when the client goes away. */

@@ -1,7 +1,7 @@
 /* A daemon-shaped fixture: the same routes `sideros-server` serves, answering the
    numbers the design mockup shows, so the app can be developed and screenshotted
    without an M5 and 63 GB of checkpoints. Shapes come from
-   packages/sideros-server/src/sideros_server/*.py — where those disagree with this
+   packages/server/src/sideros_server/*.py — where those disagree with this
    file, they are right.
 
    `npm run mock`, or `npm run dev:mock` to have the desktop shell start it. */
@@ -258,6 +258,111 @@ function now(): number {
 
 const ok = (body: unknown, status = 200) => Response.json(body, { status })
 const refused = (status: number, detail: string) => Response.json({ detail }, { status })
+const plain = (body: string) =>
+  new Response(body, { headers: { 'content-type': 'text/plain; charset=utf-8' } })
+
+/* ── the checkpoint's own card and listing ────────────────────────────── */
+
+const CARD = (id: string, entry: Entry | undefined): string =>
+  [
+    '---',
+    'license: apache-2.0',
+    `library_name: mlx`,
+    'pipeline_tag: text-generation',
+    `base_model: ${id.split('/').pop()?.replace(/-4bit|-8bit$/, '') ?? id}`,
+    'base_model_relation: quantized',
+    'tags:',
+    '  - mlx',
+    '  - text-generation',
+    '  - apple-silicon',
+    '---',
+    '',
+    `# ${id.split('/').pop() ?? id}`,
+    '',
+    `Converted for MLX from the original checkpoint. Architecture \`${entry?.architecture ?? 'unknown'}\`,`,
+    `quantized to \`${entry?.quantization ?? 'dense'}\`, ${((entry?.bytes_on_disk ?? 0) / GIB).toFixed(1)} GB on disk.`,
+    '',
+    '## Use',
+    '',
+    '```python',
+    'from sideros import load',
+    '',
+    `model = load("${id}")`,
+    'for token in model.generate("Why is bf16 addition not associative?"):',
+    '    print(token, end="")',
+    '```',
+    '',
+    '## Evaluation',
+    '',
+    '| Benchmark | Score | Reference |',
+    '| --- | --- | --- |',
+    '| MMLU | 74.2 | 74.5 |',
+    '| GSM8K | 81.6 | 82.1 |',
+    '| HumanEval | 66.5 | 67.0 |',
+    '',
+    '> Numbers are the checkpoint author’s, measured before conversion. Nothing here is',
+    '> re-measured on this machine.',
+    '',
+    '## Licence',
+    '',
+    'Apache 2.0. See [the upstream repository](https://huggingface.co/' + id + ') for the',
+    'full text and the original weights.'
+  ].join('\n')
+
+/* A safetensors checkpoint the way one lands on disk: config, tokenizer, and a run of
+   shards the listing collapses into a single row. */
+const FILES = (entry: Entry | undefined): { name: string; size: number }[] => {
+  const total = entry?.bytes_on_disk ?? gib(4)
+  const shards = Math.max(2, Math.round(total / gib(4.2)))
+  const each = Math.round((total * 0.985) / shards)
+  return [
+    { name: 'config.json', size: 1420 },
+    { name: 'generation_config.json', size: 243 },
+    { name: 'model.safetensors.index.json', size: 92_318 },
+    ...Array.from({ length: shards }, (_, i) => ({
+      name: `model-${String(i + 1).padStart(5, '0')}-of-${String(shards).padStart(5, '0')}.safetensors`,
+      size: each
+    })),
+    { name: 'README.md', size: 8_412 },
+    { name: 'tokenizer.json', size: 11_422_016 },
+    { name: 'tokenizer_config.json', size: 7_104 },
+    { name: 'special_tokens_map.json', size: 613 }
+  ]
+}
+
+/* ── profiles, keyed by the model they are saved on ───────────────────── */
+
+interface Profile {
+  model: string
+  name: string
+  sampling: Record<string, number | string | null>
+  system_prompt: string | null
+  features: { dflash: { drafter: string | null; block_size: number | null } | null }
+}
+
+const EMPTY_SAMPLING = {
+  temperature: null,
+  top_p: null,
+  top_k: null,
+  min_p: null,
+  repetition_penalty: null,
+  seed: null,
+  reasoning_effort: null,
+  reasoning_budget: null
+}
+
+const PROFILES = new Map<string, Profile>([
+  [
+    'mlx-community/Qwen3-30B-A3B-4bit:code',
+    {
+      model: 'mlx-community/Qwen3-30B-A3B-4bit',
+      name: 'code',
+      sampling: { ...EMPTY_SAMPLING, temperature: 0.2, top_p: 0.95, reasoning_effort: 'high' },
+      system_prompt: 'Answer with code and nothing else. No prose, no apologies.',
+      features: { dflash: null }
+    }
+  ]
+])
 
 function stream(frames: () => AsyncGenerator<string>): Response {
   const body = new ReadableStream<Uint8Array>({
@@ -391,6 +496,65 @@ async function handle(request: Request): Promise<Response> {
     return view(SWITCHES.get(id) ?? { dflash: null })
   }
 
+  const card = path.match(/^\/admin\/models\/(.+)\/card$/)
+  if (card) {
+    const id = decodeURIComponent(card[1])
+    const found = CATALOG.find((e) => e.id === id)
+    if (!found) return refused(404, `${id} is not in the catalog`)
+    /* One checkpoint ships none, so the card-less path is drawable too. */
+    if (found.quantization === 'mxfp4') return refused(404, `${id} ships no card`)
+    return plain(CARD(id, found))
+  }
+
+  const files = path.match(/^\/admin\/models\/(.+)\/files$/)
+  if (files) {
+    const id = decodeURIComponent(files[1])
+    const found = CATALOG.find((e) => e.id === id)
+    if (!found) return refused(404, `${id} is not in the catalog`)
+    return ok(FILES(found))
+  }
+
+  const profile = path.match(/^\/admin\/models\/(.+)\/profiles\/([^/]+)$/)
+  if (profile) {
+    const id = decodeURIComponent(profile[1])
+    const name = decodeURIComponent(profile[2])
+    const key = `${id}:${name}`
+    if (method === 'PUT') {
+      const body = (await request.json()) as {
+        sampling: Record<string, number | string | null>
+        system_prompt: string | null
+      }
+      const saved: Profile = {
+        model: id,
+        name,
+        sampling: { ...EMPTY_SAMPLING, ...body.sampling },
+        system_prompt: body.system_prompt,
+        features: { dflash: null }
+      }
+      PROFILES.set(key, saved)
+      return ok(saved)
+    }
+    if (method === 'DELETE') {
+      if (!PROFILES.delete(key)) return refused(404, `no profile '${name}' on ${id}`)
+      return new Response(null, { status: 204 })
+    }
+    const found = PROFILES.get(key)
+    if (!found) return refused(404, `no profile '${name}' on ${id}`)
+    return ok(found)
+  }
+
+  /* profiles.served_ids: a model with a profile `code` is served under both ids, which is
+     the only listing of a model's profiles there is. */
+  if (path === '/api/openai/v1/models') {
+    return ok({
+      object: 'list',
+      data: [
+        ...CATALOG.map((e) => ({ id: e.id, object: 'model', owned_by: 'sideros' })),
+        ...[...PROFILES.keys()].map((id) => ({ id, object: 'model', owned_by: 'sideros' }))
+      ]
+    })
+  }
+
   const residency = path.match(/^\/admin\/models\/(.+)\/residency$/)
   if (residency) {
     const id = decodeURIComponent(residency[1])
@@ -494,6 +658,12 @@ async function handle(request: Request): Promise<Response> {
       ].filter((hit) => hit.id.toLowerCase().includes(query))
     )
   }
+
+  const hubFiles = path.match(/^\/admin\/hub\/models\/(.+)\/files$/)
+  if (hubFiles) return ok(FILES(undefined))
+
+  const hubCard = path.match(/^\/admin\/hub\/models\/(.+)\/card$/)
+  if (hubCard) return plain(CARD(decodeURIComponent(hubCard[1]), undefined))
 
   /* One repository whose download stopped, so the Incomplete filter has something to draw. */
   if (path === '/admin/hub/staging')

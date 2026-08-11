@@ -1,4 +1,5 @@
 import { type JSX, useRef, useState } from 'react'
+import { useTypeAhead } from '../../keys'
 import type { Params, SessionSummary } from './api'
 import { ago, shortModel } from './format'
 import { ParamsPane } from './Params'
@@ -96,6 +97,8 @@ export function Sessions({
 }): JSX.Element {
   const [tab, setTab] = useState<'chats' | 'params'>('chats')
   const [renaming, setRenaming] = useState<string | null>(null)
+  /* Focus only: a chat opens when it is chosen, and tabbing past one is not choosing it. */
+  const list = useTypeAhead()
 
   return (
     <div className="sessions">
@@ -113,16 +116,23 @@ export function Sessions({
           {PLUS}
           New chat
         </button>
-        <div className="sesslist">
+        <div className="sesslist" ref={list}>
           {summaries.map((entry) => (
             <div
               key={entry.id}
               className={entry.id === current ? 'sess on' : 'sess'}
               role="button"
               tabIndex={0}
+              data-key={entry.title}
               onClick={() => onSelect(entry.id)}
               onKeyDown={(event) => {
-                if (event.key === 'Enter') onSelect(entry.id)
+                /* The row itself, not the rename field inside it: Enter there commits the
+                   title and a space is a space. */
+                if (event.target !== event.currentTarget) return
+                if (event.key === 'Enter' || event.key === ' ') {
+                  event.preventDefault()
+                  onSelect(entry.id)
+                }
               }}
             >
               {renaming === entry.id ? (

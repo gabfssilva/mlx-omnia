@@ -201,7 +201,7 @@ export function FidelityRows({
           </div>
           <ul className="runs">
             {groups.incompatible.map((entry) => (
-              <li key={entry.id} className="run q nofit" style={{ opacity: 0.45, cursor: 'default' }}>
+              <li key={entry.id} className="run q nofit" style={{ opacity: 0.45 }}>
                 <div className="id">
                   <span className="top">
                     <b>{entry.id}</b>
