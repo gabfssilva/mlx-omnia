@@ -1,17 +1,97 @@
 [project]
-name = "mlx-omnia-workspace"
-version = "0.0.0"
+name = "mlx-omnia"
+dynamic = ["version"]
+description = "Inference engine for Apple Silicon on MLX"
+readme = "README.md"
+license = "MIT"
+license-files = ["LICENSE"]
+authors = [{ name = "Gabriel Francisco", email = "gabfssilva@gmail.com" }]
 requires-python = ">=3.13"
+keywords = ["mlx", "llm", "inference", "apple-silicon", "metal", "quantization"]
+classifiers = [
+    "Development Status :: 3 - Alpha",
+    "Environment :: GPU",
+    "Intended Audience :: Developers",
+    "Operating System :: MacOS :: MacOS X",
+    "Programming Language :: Python :: 3.13",
+    "Topic :: Scientific/Engineering :: Artificial Intelligence",
+    "Typing :: Typed",
+]
 dependencies = [
-    "mlx-omnia",
-    "mlx-omnia-server",
-    "mlx-omnia-cli",
-    "mlx-omnia-application",
-    "mlx-omnia-bench[omnia]",
+    "huggingface-hub>=0.30",
+    "jinja2>=3.1.6",
+    "llguidance>=1.7",
+    "mlx==0.32.*",
+    "numpy>=2",
+    "regex>=2026.7.10",
 ]
 
-[tool.uv]
-package = false
+# One distribution, five things inside it. Every subpackage ships; what is optional is what
+# it needs to run, so `pip install mlx-omnia` stays the engine's own dependency set and
+# nothing more. Importing `mlx_omnia.server` without its extra fails on the missing import,
+# which is the honest error.
+[project.optional-dependencies]
+server = ["fastapi>=0.115", "uvicorn>=0.30", "pyarrow>=17", "watchdog>=4"]
+cli = ["httpx>=0.27"]
+app = ["flet[desktop]>=0.86", "httpx>=0.28"]
+# The harness runs an arm; `mlx-lm` is the one arm that is not this engine.
+mlx-lm = ["mlx-lm"]
+all = ["mlx-omnia[server,cli,app]"]
+
+[project.scripts]
+omnia-server = "mlx_omnia.server.main:main"
+omnia = "mlx_omnia.cli.main:run"
+omnia-bench = "mlx_omnia.bench.cli:main"
+omnia-app = "mlx_omnia.app.main:run"
+omnia-appv2 = "mlx_omnia.appv2.main:run"
+
+[project.urls]
+Homepage = "https://github.com/gabfssilva/mlx-omnia"
+Source = "https://github.com/gabfssilva/mlx-omnia"
+Issues = "https://github.com/gabfssilva/mlx-omnia/issues"
+
+# The tag is the version. `hatch-vcs` reads it off `git describe`, so nothing here says
+# 0.2.0 and no commit exists whose only content is bumping a number.
+[build-system]
+requires = ["hatchling", "hatch-vcs"]
+build-backend = "hatchling.build"
+
+[tool.hatch.version]
+source = "vcs"
+
+[tool.hatch.build.targets.wheel]
+packages = ["src/mlx_omnia"]
+
+[tool.hatch.build.targets.sdist]
+include = ["src/mlx_omnia", "tests", "README.md", "LICENSE"]
+
+# The .app. `flet build` packages `src/` as the app payload, so the engine, the server and
+# the window travel as source and only third-party wheels are resolved — which is why the
+# list below is the `server` and `app` extras and not `mlx-omnia` itself. `project.
+# dependencies` is read on top of it, so the engine's own requirements are not repeated.
+[tool.flet]
+org = "io.github.gabfssilva"
+company = "gabfssilva"
+product = "Omnia"
+bundle_id = "io.github.gabfssilva.mlx_omnia"
+copyright = "Copyright (c) 2026 Gabriel Francisco — MIT"
+
+[tool.flet.app]
+path = "src"
+module = "main"
+
+[tool.flet.macos]
+# arm64 only: the framework flet embeds is universal, and `mlx` publishes no x86_64 wheel
+# for macOS, so an Intel slice could never run the engine it is bundled beside.
+target_arch = ["arm64"]
+# The window's own dependencies, and only those — it speaks HTTP to the daemon and the
+# server stack belongs to the interpreter that runs it, not to this one.
+dependencies = ["flet[desktop]>=0.86", "httpx>=0.28"]
+
+[tool.flet.macos.entitlement]
+# The engine's extension modules are signed by us but loaded into a hardened runtime;
+# without this, dyld refuses them and the window comes up with no engine behind it.
+"com.apple.security.cs.disable-library-validation" = true
 
 [dependency-groups]
 dev = [
@@ -29,24 +109,9 @@ dev = [
     "import-linter>=2.13",
 ]
 
-[tool.uv.workspace]
-members = ["packages/*"]
-
-[tool.uv.sources]
-mlx-omnia = { workspace = true }
-mlx-omnia-server = { workspace = true }
-mlx-omnia-cli = { workspace = true }
-mlx-omnia-application = { workspace = true }
-mlx-omnia-bench = { workspace = true }
-
 [tool.ruff]
 line-length = 100
-src = [
-    "packages/engine/src",
-    "packages/server/src",
-    "packages/cli/src",
-    "packages/bench/src",
-]
+src = ["src"]
 
 [tool.ruff.lint]
 select = [
@@ -60,51 +125,65 @@ select = [
 ]
 
 [tool.importlinter]
-root_packages = ["mlx_omnia", "mlx_omnia_application", "mlx_omnia_bench"]
+root_packages = ["mlx_omnia"]
 
+# The engine is a sibling, not the roof, so the boundary is one name and covers whatever
+# the engine grows next. `mlx_omnia.bench.arms` is deliberately not a source module — an
+# adapter's whole job is to know one engine.
 [[tool.importlinter.contracts]]
 name = "the harness knows no engine"
 type = "forbidden"
 source_modules = [
-    "mlx_omnia_bench.arm",
-    "mlx_omnia_bench.battery",
-    "mlx_omnia_bench.ceiling",
-    "mlx_omnia_bench.forcing",
-    "mlx_omnia_bench.gate",
-    "mlx_omnia_bench.paired",
-    "mlx_omnia_bench.prompt",
-    "mlx_omnia_bench.report",
-    "mlx_omnia_bench.sample",
-    "mlx_omnia_bench.worker",
+    "mlx_omnia.bench.arm",
+    "mlx_omnia.bench.battery",
+    "mlx_omnia.bench.ceiling",
+    "mlx_omnia.bench.forcing",
+    "mlx_omnia.bench.gate",
+    "mlx_omnia.bench.paired",
+    "mlx_omnia.bench.prompt",
+    "mlx_omnia.bench.report",
+    "mlx_omnia.bench.sample",
+    "mlx_omnia.bench.worker",
 ]
-forbidden_modules = ["mlx_omnia"]
+forbidden_modules = ["mlx_omnia.engine"]
 
 [[tool.importlinter.contracts]]
 name = "adapters do not know each other"
 type = "independence"
-modules = ["mlx_omnia_bench.arms.omnia", "mlx_omnia_bench.arms.mlx_lm"]
+modules = ["mlx_omnia.bench.arms.omnia", "mlx_omnia.bench.arms.mlx_lm"]
+
+# The window and the CLI speak HTTP and nothing else. This was a rule with no contract
+# behind it until an .app shipped whose window loaded MLX to draw itself: the re-export in
+# `mlx_omnia/__init__` made every import under the roof an engine import, and nothing said
+# so. `allow_indirect_imports` is off on purpose — reaching the engine through the roof is
+# exactly the path that failed.
+[[tool.importlinter.contracts]]
+name = "the window and the CLI know no engine"
+type = "forbidden"
+source_modules = ["mlx_omnia.app", "mlx_omnia.cli"]
+forbidden_modules = ["mlx_omnia.engine"]
 
 [[tool.importlinter.contracts]]
 name = "core and bpe never reach up"
 type = "forbidden"
-source_modules = ["mlx_omnia.core", "mlx_omnia.bpe", "mlx_omnia.parsers", "mlx_omnia.quant"]
-forbidden_modules = ["mlx_omnia.models"]
+source_modules = ["mlx_omnia.engine.core", "mlx_omnia.engine.bpe", "mlx_omnia.engine.parsers", "mlx_omnia.engine.quant"]
+forbidden_modules = ["mlx_omnia.engine.models"]
 
 [[tool.importlinter.contracts]]
 name = "model families are independent, except tokenizers"
 type = "independence"
-modules = ["mlx_omnia.models.*"]
-ignore_imports = ["mlx_omnia.models.** -> mlx_omnia.models.*.tokenizer"]
+modules = ["mlx_omnia.engine.models.*"]
+ignore_imports = ["mlx_omnia.engine.models.** -> mlx_omnia.engine.models.*.tokenizer"]
 
 [[tool.importlinter.contracts]]
 name = "models never name a dialect"
 type = "forbidden"
-source_modules = ["mlx_omnia.models"]
+source_modules = ["mlx_omnia.engine.models"]
 forbidden_modules = [
-    "mlx_omnia.parsers.qwen",
-    "mlx_omnia.parsers.qwen_xml",
-    "mlx_omnia.parsers.harmony",
-    "mlx_omnia.parsers.atem",
+    "mlx_omnia.engine.parsers.qwen",
+    "mlx_omnia.engine.parsers.qwen_xml",
+    "mlx_omnia.engine.parsers.harmony",
+    "mlx_omnia.engine.parsers.atem",
 ]
 allow_indirect_imports = true
 
@@ -112,16 +191,16 @@ allow_indirect_imports = true
 name = "the window stacks one way"
 type = "layers"
 layers = [
-    "mlx_omnia_application.main",
-    "mlx_omnia_application.views",
-    "mlx_omnia_application.ui",
-    "mlx_omnia_application.api",
+    "mlx_omnia.app.main",
+    "mlx_omnia.app.views",
+    "mlx_omnia.app.ui",
+    "mlx_omnia.app.api",
 ]
 
 [[tool.importlinter.contracts]]
 name = "screens do not know each other"
 type = "independence"
-modules = ["mlx_omnia_application.views.*"]
+modules = ["mlx_omnia.app.views.*"]
 
 [tool.pyright]
 typeCheckingMode = "off"
@@ -131,7 +210,7 @@ typeCheckingMode = "off"
 reportMissingTypeStubs = false
 reportUnknownMemberType = false
 pythonVersion = "3.13"
-include = ["packages"]
+include = ["src", "tests"]
 exclude = ["**/__pycache__", ".venv", ".legacy", "**/tests/fixtures", "**/build"]
 venvPath = "."
 venv = ".venv"
@@ -142,28 +221,23 @@ reportUnknownVariableType = false
 
 # huggingface_hub expõe Unknown nos overloads de download (tqdm genérico).
 [[tool.pyright.executionEnvironments]]
-root = "packages/server/src"
+root = "src/mlx_omnia/server"
 reportUnknownVariableType = false
 
 # transformers/huggingface_hub (dev-deps de fixture) expõem Unknown; só nos testes.
 [[tool.pyright.executionEnvironments]]
-root = "packages/server/tests"
+root = "tests/server"
 reportUnknownMemberType = false
 reportUnknownVariableType = false
 reportUnknownArgumentType = false
 reportPrivateUsage = false
 
 [[tool.pyright.executionEnvironments]]
-root = "packages/engine/tests"
+root = "tests"
 reportUnknownMemberType = false
 reportUnknownVariableType = false
 reportUnknownArgumentType = false
 reportPrivateUsage = false
 
 [tool.pytest.ini_options]
-testpaths = [
-    "packages/engine/tests",
-    "packages/server/tests",
-    "packages/cli/tests",
-    "packages/bench/tests",
-]
+testpaths = ["tests"]

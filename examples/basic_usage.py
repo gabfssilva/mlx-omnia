@@ -6,7 +6,7 @@ def main() -> None:
 
     question: ChatMessage = {
         "role": "user",
-        "content": "A simple autoencoder in Python, using Keras 3, backend agnostic."
+        "content": "A function representing an autoencoder in Python, using Keras 3, backend agnostic."
     }
 
     for piece in model.stream(Chat((question,)), GenerationOptions(max_tokens=8192)):

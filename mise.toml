@@ -5,6 +5,10 @@ node = "26"
 [env]
 _.python.venv = { path = ".venv", create = false }
 
+[tasks.sync]
+description = "install the dev environment (the extras are not installed by a bare sync)"
+run = "uv sync --extra all --extra mlx-lm"
+
 [tasks.test]
 description = "pytest (pass paths/-k to narrow; the full suite is slow)"
 run = "uv run pytest -q"
@@ -43,13 +47,13 @@ run = "uv run omnia-bench paired"
 
 [tasks."bench:constrained"]
 description = "constrained-decoding bench (args: <model>)"
-run = "uv run python packages/bench/scripts/constrained.py"
+run = "uv run python scripts/constrained.py"
 
 [tasks."bench:grammar"]
 description = "grammar bench (args: <model>)"
 run = """
 uv run --no-project --with xgrammar --with llguidance --with transformers \
-    python packages/bench/scripts/grammar.py
+    python scripts/grammar.py
 """
 
 [tasks.server]
@@ -60,6 +64,91 @@ run = "uv run omnia-server"
 description = "run the Flet window (it starts the engine when nothing answers on 8642)"
 run = "uv run omnia-app"
 
+[tasks.appv2]
+description = "run the Quieta mockup window (no daemon behind it yet)"
+run = "uv run omnia-appv2"
+
 [tasks.cli]
 description = "run the HTTP-only CLI"
 run = "uv run omnia"
+
+[tasks."dmg:app"]
+description = "build the window bundle (flet build macos) into build/macos"
+run = """
+uvx --from flet-cli==0.86.5 flet build macos --yes --python-version 3.13
+"""
+
+[tasks."dmg:engine"]
+description = "lay a CPython with the engine in it beside the window, inside the .app"
+depends = ["dmg:app"]
+run = """
+set -eu
+app=build/macos/mlx-omnia.app
+resources="$app/Contents/Resources"
+rm -rf build/engine "$resources/engine"
+uv python install --install-dir build/engine 3.13
+# uv leaves a `cpython-3.13-…` symlink beside the versioned directory, and it points at a
+# path relative to the repo root — following it after the move would dangle. The dot after
+# the minor version is what selects the real one.
+runtime=$(ls -d build/engine/cpython-3.13.*-macos-*/ | head -1)
+runtime=${runtime%/}
+# `--break-system-packages` is not a workaround here: uv marks its managed interpreters
+# externally managed, and installing into one is exactly the intent. The tree is
+# self-contained and relocatable — nothing absolute is written into it.
+uv pip install --break-system-packages --python "$runtime/bin/python3" ".[server]"
+mv "$runtime" "$resources/engine"
+rm -rf build/engine
+# The console scripts hold the path they were installed under and break on the move into
+# /Applications. The window invokes `-m`, so they are dead weight either way.
+rm -rf "$resources/engine/bin/omnia-server" "$resources/engine/bin/omnia" \\
+       "$resources/engine/bin/omnia-bench" "$resources/engine/bin/omnia-app"
+
+# `flet build` installs `project.dependencies` into the window's own site-packages and
+# offers no way to say otherwise, so the engine's wheels land there too — mlx, pyarrow and
+# the hub client, inside a process that speaks HTTP and nothing else. What stays is derived
+# rather than listed: the resolved closure of what the window declares. A denylist would go
+# stale the day the engine takes a new dependency, and the mistake would be silent.
+window="$resources/serious_python_darwin_serious_python_darwin.bundle/Contents/Resources/site-packages"
+uv pip compile --quiet --python-version 3.13 --output-file build/window-closure.txt - <<'DEPS'
+flet[desktop]>=0.86
+httpx>=0.28
+DEPS
+uv run python scripts/prune_window.py "$window" build/window-closure.txt
+du -sh "$app"
+"""
+
+[tasks.dmg]
+description = "the shippable disk image (unsigned unless CODESIGN_IDENTITY is set)"
+depends = ["dmg:engine"]
+run = """
+set -eu
+app=build/macos/mlx-omnia.app
+if [ -n "${CODESIGN_IDENTITY:-}" ]; then
+    # Inside out: every nested binary before the bundle that contains it, or the outer
+    # signature is invalidated by the ones sealed after it.
+    find "$app" -type f \\( -name "*.dylib" -o -name "*.so" -o -perm -u+x \\) \\
+        -exec codesign --force --timestamp --options runtime \\
+        --sign "$CODESIGN_IDENTITY" {} + || true
+    codesign --force --timestamp --options runtime --deep \\
+        --entitlements build/flutter/macos/Runner/Release.entitlements \\
+        --sign "$CODESIGN_IDENTITY" "$app"
+    codesign --verify --deep --strict --verbose=2 "$app"
+else
+    echo "CODESIGN_IDENTITY unset — the image is unsigned and Gatekeeper will quarantine it."
+fi
+rm -f build/Omnia.dmg
+hdiutil create -volname Omnia -srcfolder "$app" -ov -format UDZO build/Omnia.dmg
+ls -lh build/Omnia.dmg
+"""
+
+[tasks."pypi:build"]
+description = "build the publishable sdist + wheel into dist/"
+run = """
+rm -rf dist
+uv build --out-dir dist
+"""
+
+[tasks."pypi:check"]
+description = "validate dist/ the way PyPI will (long_description, metadata)"
+depends = ["pypi:build"]
+run = "uvx twine check dist/*"

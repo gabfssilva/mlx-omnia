@@ -1,0 +1,64 @@
+name: publish
+
+# A GitHub Release is what publishes, and its tag is the version: `hatch-vcs` reads the
+# number off `git describe`, so there is nothing in the tree to keep in agreement with it
+# and no commit whose only content is bumping a number. The checkout needs full history and
+# tags for that to resolve — a shallow one yields a `0.1.dev…` string instead.
+on:
+  release:
+    types: [published]
+  workflow_dispatch:
+    inputs:
+      repository:
+        description: "index to publish to"
+        type: choice
+        options: ["testpypi", "pypi"]
+        default: "testpypi"
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v6
+        with:
+          fetch-depth: 0
+      - uses: astral-sh/setup-uv@v7
+        with:
+          enable-cache: true
+
+      - run: uv build --out-dir dist
+      - run: uvx twine check dist/*
+
+      - name: the built version is the tag
+        if: github.event_name == 'release'
+        run: |
+          built=$(ls dist/*.whl | sed -E 's|.*/mlx_omnia-(.+)-py3-none-any\.whl|\1|')
+          if [ "$built" != "${GITHUB_REF_NAME#v}" ]; then
+            echo "::error::built $built from tag $GITHUB_REF_NAME — is the tag reachable?"
+            exit 1
+          fi
+
+      - uses: actions/upload-artifact@v5
+        with:
+          name: dist
+          path: dist/
+
+  publish:
+    needs: build
+    runs-on: ubuntu-latest
+    # Trusted publishing: PyPI verifies this workflow's OIDC token, so there is no API
+    # token to store or rotate. It requires a pending publisher registered on PyPI for
+    # the project, pointing at this repository, this file, and this environment.
+    environment: ${{ inputs.repository == 'testpypi' && 'testpypi' || 'pypi' }}
+    permissions:
+      id-token: write
+    steps:
+      - uses: astral-sh/setup-uv@v7
+      - uses: actions/download-artifact@v6
+        with:
+          name: dist
+          path: dist/
+      - run: >
+          uv publish
+          --trusted-publishing always
+          ${{ inputs.repository == 'testpypi' && '--publish-url https://test.pypi.org/legacy/' || '' }}

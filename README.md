@@ -19,10 +19,20 @@ The other motivation is engineering quality, end to end. Inference engines tend 
 Requires an Apple Silicon Mac and [uv](https://docs.astral.sh/uv/).
 
 ```sh
+pip install "mlx-omnia[server]"
+omnia-server               # OpenAI-compatible API on 127.0.0.1:8642
+```
+
+Or from the checkout:
+
+```sh
 git clone https://github.com/gabfssilva/mlx-omnia
 cd mlx-omnia
-uv run omnia-server        # OpenAI-compatible API on 127.0.0.1:8642
+mise run sync              # the extras are not installed by a bare `uv sync`
+uv run omnia-server
 ```
+
+One distribution ships everything, and the extras decide what its parts need: `mlx-omnia` alone is the engine, `[server]`, `[cli]` and `[app]` add what each one runs on, and `[all]` is the three together.
 
 Then point any OpenAI SDK at `http://127.0.0.1:8642/api/openai/v1`.
 
@@ -39,20 +49,22 @@ There is also a desktop window — `mise run app`, or `uv run omnia-app`: chat a
 
 ## Contributing
 
-uv workspace, one directory per package:
+One distribution, five siblings under it. `mlx_omnia` itself is only the re-export of the engine's public API, so no part is the package the others live inside:
 
-| path | what it is |
+| module | what it is |
 | --- | --- |
-| `packages/engine` | the engine: model packages, checkpoint loading, generation pipeline, Metal kernels, quantization |
-| `packages/server` | FastAPI server speaking the OpenAI API (streaming included), global FCFS queue |
-| `packages/cli` | HTTP client for the server; depends only on httpx |
-| `packages/application` | the desktop window (Flet), talks to the server over HTTP only and starts it when nothing answers |
-| `packages/bench` | the measurement instrument (`omnia-bench`): thermal gate, teacher forcing, interleaved rounds, dominance verdict — engine-agnostic, with mlx-omnia and mlx-lm as optional adapters |
+| `mlx_omnia.engine` | the engine: model packages, checkpoint loading, generation pipeline, Metal kernels, quantization |
+| `mlx_omnia.server` | FastAPI server speaking the OpenAI API (streaming included), global FCFS queue |
+| `mlx_omnia.cli` | HTTP client for the server; depends only on httpx |
+| `mlx_omnia.app` | the desktop window (Flet), talks to the server over HTTP only and starts it when nothing answers |
+| `mlx_omnia.bench` | the measurement instrument (`omnia-bench`): thermal gate, teacher forcing, interleaved rounds, dominance verdict — engine-agnostic, with omnia and mlx-lm as optional adapters |
+
+Being siblings is what makes the boundaries checkable: `lint-imports` forbids the harness `mlx_omnia.engine`, one name that covers whatever the engine grows next.
 
 Inside the engine:
 
 ```
-packages/engine/src/mlx_omnia/
+src/mlx_omnia/engine/
   models/<family>/      one self-contained package per architecture family
   checkpoint.py         the load spine; each architecture declares a CHECKPOINT
   task.py               `load` — the only entry point; dispatches model_type
@@ -79,7 +91,7 @@ uv run pytest -q                                             # suite
 uv run ruff check && uv run pyright && uv run lint-imports   # rest of the gate
 ```
 
-Fixtures are generated from reference implementations (`packages/engine/tests/fixtures/generate_*.py`) and are not checked in; `SHA256SUMS` is. Parity tests compare full logits against them with tolerances derived from measured noise floors.
+Fixtures are generated from reference implementations (`tests/fixtures/generate_*.py`) and are not checked in; `SHA256SUMS` is. Parity tests compare full logits against them with tolerances derived from measured noise floors.
 
 Benchmarks are interleaved A/B in the same process, behind a thermal gate: `omnia-bench interleaved` (against a baseline engine) and `omnia-bench paired` (working tree against a git ref).
 

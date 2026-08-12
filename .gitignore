@@ -36,4 +36,4 @@ docs/
 plans/
 
 # Regenerable test fixtures (see tests/fixtures/generate_*.py)
-packages/engine/tests/fixtures/*.safetensors
+tests/fixtures/*.safetensors

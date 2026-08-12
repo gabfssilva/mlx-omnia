@@ -1,0 +1,9 @@
+# The window had its own rules while it was its own package, and it keeps them: ruff
+# resolves the config nearest the file. BLE is on here and nowhere else — a blind except in
+# a UI callback is a decision, not an oversight — and the typeset characters the stylesheet's
+# copy uses (×, −, ∪, the en dash) are left alone.
+extend = "../../../pyproject.toml"
+
+[lint]
+extend-select = ["BLE"]
+ignore = ["RUF001", "RUF002", "RUF003"]
