@@ -55,6 +55,7 @@ CALLER = "test/caller"
 PAIR = "test/pair"
 TRUNCATED = "test/truncated"
 XML_CALLER = "test/xml-caller"
+BIG = "test/big-call"
 FLAKY = "test/flaky"
 WRITER = "test/json-writer"
 BREAKER = "test/schema-breaker"
@@ -129,8 +130,23 @@ class Weather(BaseModel):
     celsius: float
 
 
+PATCH = "x" * 4096
+"""An argument the size an editing tool really carries. Under the old rule the whole call was
+held until the generation ended, so a client watching a four-kilobyte patch being written saw
+nothing at all until it was over — which is the latency this size is here to measure."""
+
+BIG_SCRIPT = (
+    "Editing.",
+    '<tool_call>\n{"name": "apply_patch", "arguments": {"path": "a.py"',
+    f', "body": "{PATCH[:2048]}',
+    f'{PATCH[2048:]}"',
+    "}}\n</tool_call>",
+)
+"""One call whose arguments straddle four pieces, cut where a detokenizer would cut them."""
+
 SCRIPTS = {
     CALLER: SCRIPT,
+    BIG: BIG_SCRIPT,
     PAIR: (CALL, TIME_CALL),
     # An envelope the token budget cut in half: the call cannot be read, and the text the
     # model did write is the client's either way.
@@ -146,6 +162,23 @@ SCRIPTS = {
     # a detokenizer hands them out: what the block is worth testing over is the seam.
     THINKER: ("<think>\nWeigh", "ing it.\n</think>", "\nParis."),
 }
+
+BIG_TOOLS: list[ChatCompletionToolParam] = [
+    {
+        "type": "function",
+        "function": {
+            "name": "apply_patch",
+            "description": "Write a patch to a file",
+            "parameters": {
+                "type": "object",
+                "properties": {"path": {"type": "string"}, "body": {"type": "string"}},
+                "required": ["path", "body"],
+            },
+        },
+    }
+]
+"""The shape of the tool that made the old rule hurt: one argument carrying a whole edit."""
+
 
 TOOLS: list[ChatCompletionToolParam] = [
     {
@@ -255,7 +288,7 @@ def template() -> ChatTemplate:
     return found
 
 
-FIXTURE = Path(__file__).parents[3] / "packages" / "mlx_omnia" / "tests" / "fixtures"
+FIXTURE = Path(__file__).parents[1] / "fixtures"
 QWEN36 = "mlx-community/Qwen3.6-35B-A3B-6bit"
 
 
@@ -834,8 +867,8 @@ def test_sampling_reaches_the_engine(base_url: str) -> None:
         ({"repetition_penalty": 0}, "repetition_penalty"),
         ({"max_tokens": 0}, "max_tokens"),
         ({"stream_options": {"include_logprobs": True}}, "stream_options"),
-        # Forcing a call is a constraint on decoding, and there is none here: answering
-        # `auto` to a client that asked for `required` is the same lie as `logit_bias`.
+        # `required` with nothing to call is a contradiction, and the one shape of it this
+        # route still refuses: the constraint has no set of functions to pin the call to.
         ({"tool_choice": "required"}, "tool_choice"),
         ({"tool_choice": {"type": "function", "function": {"name": "get_weather"}}}, "tool_choice"),
         # Retries of a check nobody asked for: the field would be read by nobody, which is
@@ -1029,7 +1062,13 @@ def test_the_tools_and_the_call_a_result_answers_reach_the_conversation(
     """The frontier this stage owns: what the dialect's fields become in the `Chat` the
     engine is handed. The template renders from that and from nothing else, so a key the
     conversion drops is a key no checkpoint can put back — `tool_call_id` in particular,
-    which the Qwen template never renders and only this can see."""
+    which the Qwen template never renders and only this can see.
+
+    `arguments` crosses that frontier as a **mapping**, not as the JSON text this dialect
+    spells it in. Eight of the fifteen template families in circulation do
+    `arguments|items`, so the text raised inside the render — a 500 on the second turn of
+    every tool loop against Qwen3.6, Nemotron, Muse-Glimmer, Ling, Laguna and LFM2.5.
+    """
     history = [
         {"role": "user", "content": "Weather in Paris?"},
         {
@@ -1058,12 +1097,61 @@ def test_the_tools_and_the_call_a_result_answers_reach_the_conversation(
                 {
                     "id": "call_1",
                     "type": "function",
-                    "function": {"name": "get_weather", "arguments": '{"city": "Paris"}'},
+                    "function": {"name": "get_weather", "arguments": {"city": "Paris"}},
                 }
             ],
         },
         {"role": "tool", "content": RESULT, "tool_call_id": "call_1"},
     )
+
+
+def test_a_replayed_call_whose_arguments_are_not_json_is_refused_by_name(
+    base_url: str,
+) -> None:
+    """400 and not 500. The client sent something that is not a call; letting it reach the
+    render turns the client's fault into the server's, and what the client would read is
+    `generation_failed`."""
+    history = [
+        {"role": "user", "content": "Weather in Paris?"},
+        {
+            "role": "assistant",
+            "tool_calls": [
+                {
+                    "id": "call_1",
+                    "type": "function",
+                    "function": {"name": "get_weather", "arguments": "{"},
+                }
+            ],
+        },
+        {"role": "tool", "tool_call_id": "call_1", "content": RESULT},
+    ]
+    refusal = offer(base_url, CALLER, tools=TOOLS, messages=history)
+    assert refusal.status_code == 400
+    body = refusal.json()["error"]
+    assert body["code"] == "invalid_tool_arguments"
+    assert "get_weather" in body["message"]
+
+
+def test_arguments_that_are_json_but_not_an_object_are_refused(base_url: str) -> None:
+    """`"[1, 2]"` parses and is still not a call: the templates iterate the arguments by key,
+    and a list has none."""
+    history = [
+        {"role": "user", "content": "Weather in Paris?"},
+        {
+            "role": "assistant",
+            "tool_calls": [
+                {
+                    "id": "call_1",
+                    "type": "function",
+                    "function": {"name": "get_weather", "arguments": "[1, 2]"},
+                }
+            ],
+        },
+        {"role": "tool", "tool_call_id": "call_1", "content": RESULT},
+    ]
+    refusal = offer(base_url, CALLER, tools=TOOLS, messages=history)
+    assert refusal.status_code == 400
+    assert refusal.json()["error"]["code"] == "invalid_tool_arguments"
 
 
 def test_an_envelope_the_budget_cut_in_half_comes_back_as_the_text_it_is(base_url: str) -> None:
@@ -1461,3 +1549,209 @@ def test_a_turn_that_thinks_nothing_carries_no_reasoning_at_all(base_url: str) -
         {"content": "I would rather not."},
         {},
     ]
+
+
+def test_the_arguments_of_one_call_arrive_in_more_than_one_frame(base_url: str) -> None:
+    """The reversal of A11, measured where it matters: a four-kilobyte argument reaches the
+    client while it is being written, not in one frame after the generation ended.
+
+    Counted rather than asserted shape-wise, because one frame carrying everything is also a
+    valid stream — it is the *latency* that was wrong, and only the count says so.
+    """
+    frames = [json.loads(frame) for frame in sse(base_url, BIG, tools=BIG_TOOLS)]
+    carrying = [
+        frame
+        for frame in frames
+        for choice in frame.get("choices", [])
+        if choice["delta"].get("tool_calls")
+    ]
+    assert len(carrying) > 1, "the whole call arrived in one frame; nothing is being streamed"
+
+    entries = [
+        entry
+        for frame in carrying
+        for choice in frame["choices"]
+        for entry in choice["delta"]["tool_calls"]
+    ]
+
+    # The name is on the first entry and on no other: the SDK's accumulator *concatenates*
+    # `function.name` across frames the same way it concatenates the arguments, so a name
+    # repeated four times reaches the client as `apply_patchapply_patchapply_patch…` and the
+    # tool it names does not exist.
+    named = [entry for entry in entries if entry.get("function", {}).get("name") is not None]
+    assert len(named) == 1
+    assert named[0]["function"]["name"] == "apply_patch"
+
+    # And so is the id, for the same reason and one worse: it is what the client sends back
+    # as `tool_call_id`, so two frames disagreeing about it is a result that answers nothing.
+    identified = [entry for entry in entries if entry.get("id") is not None]
+    assert len(identified) == 1
+    assert identified[0]["id"].startswith("call_")
+    assert identified[0] is named[0], "the id and the name belong to the same first frame"
+
+    # Every entry carries `index`, which is what the accumulator matches two frames by.
+    assert all(
+        "index" in entry
+        for frame in carrying
+        for choice in frame["choices"]
+        for entry in choice["delta"]["tool_calls"]
+    )
+
+    joined = "".join(
+        entry["function"].get("arguments", "")
+        for frame in carrying
+        for choice in frame["choices"]
+        for entry in choice["delta"]["tool_calls"]
+    )
+    assert json.loads(joined) == {"path": "a.py", "body": PATCH}
+
+
+def test_the_first_frame_of_a_call_arrives_before_the_generation_ends(base_url: str) -> None:
+    """Ordering and not a clock: the frame that names the call comes before the last frame
+    the generation produces. A stream that announced the call only at the end would put it
+    after everything, which is what it did before."""
+    frames = [json.loads(frame) for frame in sse(base_url, BIG, tools=BIG_TOOLS)]
+    naming = next(
+        at
+        for at, frame in enumerate(frames)
+        for choice in frame.get("choices", [])
+        if any(
+            entry.get("function", {}).get("name")
+            for entry in choice["delta"].get("tool_calls", [])
+        )
+    )
+    assert naming < len(frames) - 1
+
+
+def test_the_official_sdk_accumulates_the_streamed_call(client: OpenAI) -> None:
+    """Judged by the SDK's own accumulator rather than by our reading of the frames: what a
+    harness sees is what that code builds, and it raises on an entry with no `index`."""
+    with client.chat.completions.stream(
+        model=BIG, messages=[{"role": "user", "content": "patch it"}], tools=BIG_TOOLS
+    ) as stream:
+        final = stream.get_final_completion()
+    calls = final.choices[0].message.tool_calls
+    assert calls is not None and len(calls) == 1
+    assert calls[0].function.name == "apply_patch"
+    assert json.loads(calls[0].function.arguments) == {"path": "a.py", "body": PATCH}
+
+
+def test_the_fields_a_client_sends_by_default_reach_the_dialect(base_url: str) -> None:
+    """The refusal this dialect owes a client is about what it cannot honour, and not about
+    what it would do anyway. Every field here is one an ordinary OpenAI client puts on a
+    request without being asked to, and each is accepted at the value that asks for what
+    already happens."""
+    accepted = offer(
+        base_url,
+        CALLER,
+        tools=TOOLS,
+        parallel_tool_calls=True,
+        n=1,
+        user="someone",
+        logprobs=False,
+        presence_penalty=0.0,
+        frequency_penalty=0.0,
+    )
+    assert accepted.status_code == 200
+
+
+def test_ignoring_a_field_does_not_change_the_prompt(base_url: str, engine: Recording) -> None:
+    """An accepted-and-ignored field has to be exactly that. The proof is the conversation
+    the engine was handed: the same characters with the field and without it."""
+    offer(base_url, CALLER, tools=TOOLS)
+    plain = engine.jobs[-1].input
+    offer(base_url, CALLER, tools=TOOLS, parallel_tool_calls=True, user="someone", n=1)
+    assert engine.jobs[-1].input == plain
+
+
+@pytest.mark.parametrize(
+    ("field", "value"),
+    [
+        ("parallel_tool_calls", False),
+        ("n", 2),
+        ("logprobs", True),
+        ("presence_penalty", 0.5),
+        ("frequency_penalty", 0.5),
+    ],
+)
+def test_a_field_that_would_change_the_answer_is_refused_by_name(
+    base_url: str, field: str, value: object
+) -> None:
+    """Each of these asks for something this server does not do, and the difference from the
+    ones above is that honouring them by accident is invisible: `n: 2` answered with one
+    choice, `parallel_tool_calls: false` answered with two calls. The name of the field has to
+    be in the message, because that is the only thing that tells a client which one to drop."""
+    refusal = offer(base_url, CALLER, tools=TOOLS, **{field: value})
+    # 400 through the dialect's own validation handler, which is where every other refused
+    # field in this route lands — the point is the name, not a status of its own.
+    assert refusal.status_code == 400, refusal.text
+    assert field in refusal.json()["error"]["message"]
+
+
+def test_a_stop_sequence_cuts_the_answer_before_it(base_url: str) -> None:
+    """The engine's `stop` is a set of token ids and cannot express a string, so the sequence
+    is honoured over the text: the answer is cut before it, and it never reaches the client."""
+    payload = offer(base_url, CALLER, stop=" check").json()
+    choice = payload["choices"][0]
+    assert choice["message"]["content"] == "Let me"
+    assert choice["finish_reason"] == "stop"
+
+    streamed = [json.loads(frame) for frame in sse(base_url, CALLER, stop=" check")]
+    text = "".join(
+        choice["delta"].get("content", "")
+        for frame in streamed
+        for choice in frame.get("choices", [])
+    )
+    assert text == "Let me"
+    assert " check" not in text
+
+
+def test_a_forced_tool_choice_produces_a_call_the_model_did_not_have_to_make(
+    client: OpenAI,
+) -> None:
+    """`required`, honoured rather than refused: the decode is constrained to the checkpoint's
+    own call envelope over the tools offered, so what comes back cannot be prose.
+
+    Asked something no tool answers, on purpose. A model left to choose would reply in text —
+    that is the whole point of the field, and a test that asked about the weather would pass
+    with the constraint switched off.
+    """
+    answer = client.chat.completions.create(
+        model=MODEL,
+        messages=[{"role": "user", "content": "Say hello. Do not call anything."}],
+        tools=TOOLS,
+        tool_choice="required",
+        max_tokens=64,
+        temperature=0.0,
+    )
+    choice = answer.choices[0]
+    assert choice.finish_reason == "tool_calls"
+    calls = choice.message.tool_calls
+    assert calls is not None and len(calls) >= 1
+
+    # The name is one of the offered functions and the arguments obey that function's own
+    # schema — which is what the grammar's `anyOf` branch ties together. A grammar that let
+    # any offered name stand beside any offered arguments would pass a weaker test.
+    made = calls[0]
+    assert made.function.name in {"get_weather", "get_time"}
+    arguments = json.loads(made.function.arguments)
+    expected = {"get_weather": "city", "get_time": "zone"}[made.function.name]
+    assert expected in arguments
+
+
+def test_forcing_a_call_is_refused_for_a_checkpoint_whose_envelope_has_no_grammar(
+    base_url: str,
+) -> None:
+    """The rule the kernel layer keeps, applied here: a strategy builds only when it
+    implements the declared thing exactly.
+
+    Qwen3.6 spells its arguments as XML elements, which the compiler does not know, so no
+    grammar can promise the decode produces one. Answering `auto` instead would hand the
+    client a turn that may contain no call at all, under a field whose whole purpose is that
+    it does — so the refusal names the checkpoint's limit rather than hiding it.
+    """
+    refusal = offer(base_url, XML_CALLER, tools=TOOLS, tool_choice="required")
+    assert refusal.status_code == 400, refusal.text
+    body = refusal.json()["error"]
+    assert body["code"] == "tool_choice_unsupported"
+    assert "envelope" in body["message"]

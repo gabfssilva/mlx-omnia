@@ -12,7 +12,7 @@ so the spellings it writes are the spellings the model emits, and a table goes s
 checkpoint later. Nothing here or below names a checkpoint.
 """
 
-from mlx_omnia.engine.parsers import atem, harmony, qwen, qwen_xml
+from mlx_omnia.engine.parsers import arg_key, atem, dsml, harmony, python_call, qwen, qwen_xml
 from mlx_omnia.engine.parsers.protocol import (
     CallDelta,
     Channel,
@@ -23,6 +23,7 @@ from mlx_omnia.engine.parsers.protocol import (
     ToolCall,
     ToolFamily,
     ToolReader,
+    assemble,
 )
 
 __all__ = [
@@ -37,12 +38,21 @@ __all__ = [
     "ToolCall",
     "ToolFamily",
     "ToolReader",
+    "assemble",
     "opened",
     "parser_for",
     "unmarked",
 ]
 
-_PARSERS: tuple[Parser, ...] = (qwen.PARSER, qwen_xml.PARSER, harmony.PARSER, atem.PARSER)
+_PARSERS: tuple[Parser, ...] = (
+    qwen.PARSER,
+    qwen_xml.PARSER,
+    arg_key.PARSER,
+    dsml.PARSER,
+    python_call.PARSER,
+    harmony.PARSER,
+    atem.PARSER,
+)
 
 REASONING: tuple[tuple[str, str], ...] = (qwen.REASONING, harmony.REASONING, atem.REASONING)
 """Every spelling of the reasoning block in circulation, as opener/closer pairs, for the

@@ -44,13 +44,13 @@ from mlx_omnia import (
     Text,
     greedy,
 )
+from mlx_omnia import ChatMessage as Turn
 from mlx_omnia.engine.generate import Constraint
 from mlx_omnia.engine.parsers import FALLBACK, Segment, Segmenter
 from mlx_omnia.engine.schema import json_instruction
 from mlx_omnia.server import catalog, gemini
 from mlx_omnia.server.engine import Engine, Job, Loader
 from mlx_omnia.server.profiles import Sampling
-from mlx_omnia.server.responses import ToolTurn
 from mlx_omnia.server.store import Profile, Store
 
 MODEL = "stand/echo"
@@ -674,7 +674,7 @@ def test_a_tool_call_round_trips_through_two_turns_of_the_official_sdk(
     )
 
     assert second.text == ANSWERED
-    expected: tuple[ToolTurn, ...] = (
+    expected: tuple[Turn, ...] = (
         {"role": "user", "content": ASKED},
         {
             "role": "assistant",
@@ -683,7 +683,7 @@ def test_a_tool_call_round_trips_through_two_turns_of_the_official_sdk(
                 {
                     "id": "get_weather",
                     "type": "function",
-                    "function": {"name": "get_weather", "arguments": ARGUMENTS},
+                    "function": {"name": "get_weather", "arguments": json.loads(ARGUMENTS)},
                 }
             ],
         },

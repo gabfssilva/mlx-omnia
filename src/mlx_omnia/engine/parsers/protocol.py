@@ -12,16 +12,26 @@ waits, `<tool` followed by `ing` leaves whole on the same push. The held text ne
 the longest marker minus one character — except inside a header, which is buffered whole
 because nothing can be said about the text under it until the header closes.
 
-The channels are not held the same way, and the asymmetry is the point: reasoning is text
-someone reads while it is written, so it streams; a call means something only whole
-(`ToolFamily.parse_tool_call` reads closed envelopes), so it is held until it closes; a
-header routes and is nobody's prose, so it leaves on a channel of its own for the dialects
-to drop. Markers stay in the text of the segment they delimit — the segments of a
-generation concatenate back into exactly what the model wrote.
+Every channel but one is held the same way, and by the same rule: what could still be a
+marker waits, and everything before it leaves. Reasoning streams because someone reads it
+while it is written; the tool channel streams because a four-kilobyte argument held until
+its envelope closes is a call the client cannot see until the generation is over. A header
+is the exception — it routes, and nothing can be said about the text under one until it
+closes, so it is buffered whole and then leaves on a channel of its own for the dialects to
+drop.
+
+Streaming the tool channel is not the same as deciding a call was made. This machine says
+which channel text is on and never that it is a call: an envelope that turns out to spell
+none goes back to the client as prose, and what does that is the dialect side (`Calls`),
+which holds the fragments until a reader names something. The rule that survives is the one
+that matters — nothing is announced as a call before it has a name.
+
+Markers stay in the text of the segment they delimit: the segments of a generation
+concatenate back into exactly what the model wrote.
 """
 
 import json
-from collections.abc import Callable, Mapping
+from collections.abc import Callable, Mapping, Sequence
 from dataclasses import dataclass
 from typing import Literal, Protocol, TypeIs
 
@@ -36,6 +46,7 @@ __all__ = [
     "ToolCall",
     "ToolFamily",
     "ToolReader",
+    "assemble",
 ]
 
 type Channel = Literal["content", "reasoning", "tool", "header"]
@@ -54,8 +65,19 @@ class CallDelta:
     `index` counts calls from the start of the generation and is what every dialect keys its
     frames by. `name` arrives exactly once per index, on the first delta of that call, and
     never after — a client that has been told a call is named cannot be told otherwise.
-    `arguments` is the **source text** the model wrote, in fragments: concatenating them
-    gives back exactly what it wrote, which is what the field carries on the wire.
+
+    `arguments` is the **JSON text of the arguments**, in fragments: concatenating every
+    fragment of one index gives a JSON object, which is what `function.arguments`,
+    `input_json_delta.partial_json` and `function_call_arguments.delta` all carry. It is not
+    the source text the model wrote, and it cannot be: `<arg_value>3</arg_value>` and
+    `days=3` are calls in two dialects whose source is not JSON at all, and a field that
+    sometimes carries JSON and sometimes carries something else would have to be translated
+    once per dialect on the way out.
+
+    A fragment is not required to be valid JSON on its own — `{`, `"city": "Rio"` and `}` are
+    three of them — only to concatenate into one. How finely a family can cut them is the
+    family's: a dialect that learns a value's type only when the value ends emits one
+    fragment per argument, and that is the floor, not a shortcoming.
     """
 
     index: int
@@ -101,17 +123,50 @@ class ToolFamily:
     channel on the first and closes it on the second, so they are the spelling a model
     generates. A reader may know more than that: replaying a history, a template can write
     the same call in another spelling, and only the reader is ever shown that text.
+
+    `write` is the reader's inverse: one call, in the spelling this family generates. It
+    exists because some templates declare tools and never read `tool_calls` back — SmolLM3
+    and Falcon-H1 tell the model to write `<tool_call>` and have no branch for replaying one,
+    so the assistant's own call vanishes from every history they render and the next turn
+    answers a result with no visible question. What goes into the content there is what the
+    model itself wrote, which is what a history is.
+
+    Declared by every family rather than by the ones with a caller today: it is the same
+    totality contract the kernel layer keeps, and it doubles as the test the readers did not
+    have — write a call, read it back, and the two have to agree without a literal in the
+    test to agree with.
     """
 
     start: str
     end: str
     reader: Callable[[], ToolReader]
+    write: Callable[[ToolCall], str]
+    grammar: Callable[[Sequence[Mapping[str, object]], Callable[[str], str]], str] | None = None
+    """The envelope as a grammar over the tools offered, for a request that asks the model to
+    call *something* — `tool_choice: "required"`, Anthropic's `{"type": "any"}`, a named
+    function. `None` when this family cannot express one exactly, and that is not a gap to be
+    filled by approximation: a grammar is a promise that the decode cannot produce anything
+    else, so a family that spells its arguments in a syntax the compiler does not know
+    (`<arg_value>3</arg_value>`, `days=3`) declares none and the request is refused with the
+    checkpoint named. Forcing a call by any looser means answers with a call the model may
+    never have made, which is the thing the refusal exists to prevent.
+
+    The first argument is the declared tools, in the shape the dialects build (`declared`),
+    because what the grammar has to pin is the name as well as the arguments: a forced call to
+    a function nobody offered is not an answer to the request either.
+
+    The second is how to spell a marker as a grammar term, which the family cannot know on its
+    own: `<tool_call>` is a single added id in Qwen's vocabulary and a run of bytes in one
+    that never added it, and a grammar asking for the bytes of an added id stalls on the first
+    token (measured). `Vocabulary.literal` is what answers, so the same family compiles
+    correctly against either kind of checkpoint.
+    """
 
     def parse_tool_call(self, output: str) -> tuple[ToolCall, ...]:
         """Every call in a whole generation, in the order the model wrote them. The same
         reader the stream uses, driven over the text in one push."""
         machine = self.reader()
-        return _assemble((*machine.push(output), *machine.finish()))
+        return assemble((*machine.push(output), *machine.finish()))
 
 
 @dataclass(frozen=True)
@@ -301,9 +356,6 @@ class Segmenter:
                 continue
             closing = held.find(self._closer)
             if closing < 0:
-                if self._channel == "tool":
-                    self._held = held
-                    return self._filtered(out)
                 break
             cut = closing + len(self._closer)
             out.append(Segment(self._channel, held[:cut]))
@@ -430,8 +482,13 @@ def _arguments(building: _Building) -> Mapping[str, object]:
     return payload
 
 
-def _assemble(deltas: tuple[CallDelta, ...]) -> tuple[ToolCall, ...]:
+def assemble(deltas: tuple[CallDelta, ...]) -> tuple[ToolCall, ...]:
     """The deltas of a whole generation, back into the calls they spell.
+
+    Public because a streaming caller cannot use `parse_tool_call`: it has already driven a
+    reader over the text to hand out fragments, and driving a second one over the same text
+    is how two machines come to disagree about it. What it holds instead is the deltas, and
+    this is what turns them back into calls.
 
     Every way an envelope can fail to be a call raises here and none of them is skipped. A
     call that never closed is one the generation cut in half — the marker missing, or the

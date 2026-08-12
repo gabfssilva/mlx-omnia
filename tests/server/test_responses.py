@@ -49,6 +49,7 @@ from mlx_omnia import (
     ModelSignature,
     Text,
 )
+from mlx_omnia import ChatMessage as Turn
 from mlx_omnia.engine.generate import Constraint
 from mlx_omnia.engine.parsers import FALLBACK, Segment, Segmenter
 from mlx_omnia.engine.schema import json_instruction
@@ -56,7 +57,7 @@ from mlx_omnia.server import catalog
 from mlx_omnia.server import responses as responses_module
 from mlx_omnia.server.engine import Engine, Loader
 from mlx_omnia.server.profiles import Sampling
-from mlx_omnia.server.responses import ToolTurn, router
+from mlx_omnia.server.responses import router
 from mlx_omnia.server.store import Profile, Store
 
 CACHED = "cached"
@@ -659,7 +660,7 @@ def test_a_tool_call_round_trips_through_two_turns_of_the_official_sdk(client: O
 
     assert second.output_text == ANSWERED
     assert [item.type for item in second.output] == ["message"]
-    replayed: tuple[ToolTurn, ...] = (
+    replayed: tuple[Turn, ...] = (
         {"role": "user", "content": ASKED},
         {
             "role": "assistant",
@@ -668,7 +669,7 @@ def test_a_tool_call_round_trips_through_two_turns_of_the_official_sdk(client: O
                 {
                     "id": call_id,
                     "type": "function",
-                    "function": {"name": "get_weather", "arguments": arguments},
+                    "function": {"name": "get_weather", "arguments": {"city": "Paris"}},
                 }
             ],
         },
@@ -691,7 +692,7 @@ def test_two_calls_replayed_fold_into_the_one_turn_that_made_them(client: OpenAI
     ]
     client.responses.create(model=SCRIPTED, input=items)
 
-    folded: tuple[ToolTurn, ...] = (
+    folded: tuple[Turn, ...] = (
         {"role": "user", "content": ASKED},
         {
             "role": "assistant",
@@ -700,12 +701,12 @@ def test_two_calls_replayed_fold_into_the_one_turn_that_made_them(client: OpenAI
                 {
                     "id": "call_1",
                     "type": "function",
-                    "function": {"name": "get_weather", "arguments": "{}"},
+                    "function": {"name": "get_weather", "arguments": {}},
                 },
                 {
                     "id": "call_2",
                     "type": "function",
-                    "function": {"name": "get_time", "arguments": "{}"},
+                    "function": {"name": "get_time", "arguments": {}},
                 },
             ],
         },
@@ -892,7 +893,7 @@ def test_the_text_and_the_call_of_one_generation_replay_as_one_turn(client: Open
     ]
     client.responses.create(model=SCRIPTED, input=items)
 
-    folded: tuple[ToolTurn, ...] = (
+    folded: tuple[Turn, ...] = (
         {"role": "user", "content": ASKED},
         {
             "role": "assistant",
@@ -901,7 +902,7 @@ def test_the_text_and_the_call_of_one_generation_replay_as_one_turn(client: Open
                 {
                     "id": "call_1",
                     "type": "function",
-                    "function": {"name": "get_weather", "arguments": "{}"},
+                    "function": {"name": "get_weather", "arguments": {}},
                 }
             ],
         },

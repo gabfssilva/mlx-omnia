@@ -40,6 +40,7 @@ from mlx_omnia import (
     Penalty,
     Sampler,
     TextPart,
+    ToolCallRequest,
     UnsupportedInput,
     greedy,
     min_p,
@@ -49,6 +50,7 @@ from mlx_omnia import (
     top_k,
     top_p,
 )
+from mlx_omnia import ChatMessage as Turn
 from mlx_omnia.engine.chat import Effort, parser_of
 from mlx_omnia.engine.generate import Constraint, Meter
 from mlx_omnia.engine.grammar import GrammarRefused
@@ -60,7 +62,6 @@ from mlx_omnia.server.profiles import Sampling, StoreDep
 from mlx_omnia.server.responses import (
     Calls,
     Checked,
-    ToolTurn,
     UnreadableImage,
     content_of,
     declared,
@@ -282,14 +283,15 @@ def _output(response: FunctionResponse) -> str:
     return value if isinstance(value, str) else json.dumps(value)
 
 
-def _called(call: FunctionCall) -> dict[str, object]:
-    """The call in the shape the templates read: `function.name` and arguments as JSON text.
-    The id is the name when the client sent none, which is the usual case — it is what a
-    `functionResponse` is matched to its call by here."""
+def _called(call: FunctionCall) -> ToolCallRequest:
+    """The call in the shape the templates read: nested under `function`, arguments as the
+    mapping `functionCall.args` already is. The id is the name when the client sent none,
+    which is the usual case — it is what a `functionResponse` is matched to its call by
+    here."""
     return {
         "id": call.id or call.name,
         "type": "function",
-        "function": {"name": call.name, "arguments": json.dumps(call.args)},
+        "function": {"name": call.name, "arguments": call.args},
     }
 
 
@@ -306,7 +308,7 @@ def _parts(content: Content) -> list[TextPart | ImagePart]:
     return parts
 
 
-def _turns(content: Content) -> list[ToolTurn]:
+def _turns(content: Content) -> list[Turn]:
     """One content, and the turns it spells. Its results come first because they are the
     round the content answers, and the text after them is the client's next word."""
     said = content_of(_parts(content))
@@ -314,12 +316,12 @@ def _turns(content: Content) -> list[ToolTurn]:
     answered = [
         part.functionResponse for part in content.parts if part.functionResponse is not None
     ]
-    turns: list[ToolTurn] = [
+    turns: list[Turn] = [
         {"role": "tool", "content": _output(response), "tool_call_id": response.id or response.name}
         for response in answered
     ]
     if said or made or not answered:
-        turn: ToolTurn = {
+        turn: Turn = {
             "role": "assistant" if content.role == "model" else "user",
             "content": said,
         }
@@ -329,7 +331,7 @@ def _turns(content: Content) -> list[ToolTurn]:
     return turns
 
 
-def _messages(body: GenerateRequest, system_prompt: str | None) -> tuple[ToolTurn, ...]:
+def _messages(body: GenerateRequest, system_prompt: str | None) -> tuple[Turn, ...]:
     """The instruction the request carries wins over the profile's — the same precedence the
     knobs below follow — and there is at most one either way, so no template is left with two
     system turns to pick between."""
@@ -529,13 +531,16 @@ async def _events(
         while (piece := await job.chunks.get()) is not None:
             # No family, nothing that could read a channel back: every segment is text the
             # client asked for, whichever one the model wrote it on.
-            if content := (piece.text if calls is None else calls.push(piece)):
+            # `functionCall` has no partial form in this API — there is no field for half
+            # an argument — so the fragments the reader resolves are accumulated and the
+            # call goes out whole. That is a limit of the dialect, not a held decision.
+            if content := (piece.text if calls is None else calls.push(piece)[0]):
                 sent.append(content)
                 yield f"data: {json.dumps(_reply(model, [{'text': content}], None))}\n\n"
         parts: list[dict[str, object]] = []
         made: tuple[ToolCall, ...] = ()
         if calls is not None:
-            tail, made = calls.finish()
+            tail, _, made = calls.finish()
             if tail:
                 sent.append(tail)
                 parts.append({"text": tail})
@@ -675,8 +680,8 @@ async def generate(
     text = "".join(piece.text for piece in pieces)
     made: tuple[ToolCall, ...] = ()
     if calls is not None:
-        held = "".join(calls.push(piece) for piece in pieces)
-        tail, made = calls.finish()
+        held = "".join(calls.push(piece)[0] for piece in pieces)
+        tail, _, made = calls.finish()
         text = held + tail
     # A content that called something answered with a call and not with a document: the mime
     # type is about the answer, and this turn has none to check.

@@ -20,7 +20,14 @@ import json
 from collections.abc import Iterator
 
 from mlx_omnia.engine.parsers.envelope import Body, EnvelopeScanner
-from mlx_omnia.engine.parsers.protocol import CallDelta, Channel, Headers, Parser, ToolFamily
+from mlx_omnia.engine.parsers.protocol import (
+    CallDelta,
+    Channel,
+    Headers,
+    Parser,
+    ToolCall,
+    ToolFamily,
+)
 
 __all__ = ["PARSER", "REASONING"]
 
@@ -156,10 +163,25 @@ def _classify(header: str) -> tuple[Channel, str] | None:
     return None
 
 
+def write(call: ToolCall) -> str:
+    """The block, one invoke inside it. Strings go in raw and everything else through
+    `tojson`, the convention `_encoded` reads back — and nothing is stripped, because the
+    format's own instructions say spaces in string values are preserved."""
+    parameters = "".join(
+        f'\n{_PARAMETER}{key}{_ATTRIBUTE_END}{_written(value)}{_PARAMETER_END}'
+        for key, value in call.arguments.items()
+    )
+    return f'{_START}\n{_INVOKE}{call.name}{_ATTRIBUTE_END}{parameters}\n{_INVOKE_END}\n{_END}'
+
+
+def _written(value: object) -> str:
+    return value if isinstance(value, str) else json.dumps(value, ensure_ascii=False)
+
+
 PARSER = Parser(
     recognizes=lambda source: _START in source,
     reasoning=(),
-    tools=ToolFamily(start=_START, end=_END, reader=AtemReader),
+    tools=ToolFamily(start=_START, end=_END, reader=AtemReader, write=write),
     headers=Headers(
         # `<|eom|>` opens the next header when a turn continues past a tool call, which is
         # what keeps the separator out of the content channel.

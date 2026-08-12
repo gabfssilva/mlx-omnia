@@ -3,7 +3,7 @@ import json
 import os
 import time
 import uuid
-from collections.abc import AsyncGenerator, AsyncIterator, Mapping
+from collections.abc import AsyncGenerator, AsyncIterator, Iterator, Mapping
 from contextlib import asynccontextmanager
 from dataclasses import replace
 from importlib.metadata import version
@@ -36,7 +36,7 @@ from mlx_omnia.engine.chat import parser_of
 from mlx_omnia.engine.footprint import ceiling
 from mlx_omnia.engine.generate import Constraint, Meter
 from mlx_omnia.engine.grammar import GrammarRefused
-from mlx_omnia.engine.parsers import Segment, ToolCall, unmarked
+from mlx_omnia.engine.parsers import CallDelta, Segment, ToolCall, ToolFamily, unmarked
 from mlx_omnia.engine.schema import MalformedJSON, SchemaViolation
 from mlx_omnia.server import (
     anthropic,
@@ -70,9 +70,11 @@ from mlx_omnia.server.responses import (
     PROFILE_ONLY,
     Calls,
     Checked,
+    Halt,
     OpenAIEffort,
-    ToolTurn,
+    UnreadableArguments,
     UnreadableImage,
+    called,
     content_of,
     declared,
     document,
@@ -234,10 +236,45 @@ class ChatRequest(BaseModel):
     model: str
     messages: list[ChatMessage]
     tools: list[Tool] | None = None
-    tool_choice: Literal["none", "auto"] = "auto"
-    """`required` and a named function are refused by name: forcing a call is a constraint
-    on decoding, and accepting the field without one answers with a call the model may
-    never have made."""
+    tool_choice: Literal["none", "auto", "required"] = "auto"
+    """`required` is honoured by constraining the decode to the checkpoint's own call
+    envelope over the tools offered, so the answer cannot be anything but a call to one of
+    them. A checkpoint whose family cannot express that envelope exactly is refused with its
+    name — answering `auto` to a client that asked for `required` is a call the model may
+    never have made, and that is the failure the field exists to rule out.
+
+    A named function is still refused by the type. The grammar can pin one name as easily as
+    a set, but the field spells it as an object (`{"type": "function", "function": {...}}`)
+    and nothing has asked for it yet."""
+    parallel_tool_calls: Literal[True] = True
+    """Accepted and ignored, because it asks for what already happens: how many calls a
+    generation writes is the model's, and this server does not cap it.
+
+    `false` is refused by the type rather than accepted, and the difference is the whole
+    rule: it asks for **at most one** call, so a generation that wrote two would be answered
+    with something the client said it could not take. Honouring it needs the same envelope
+    grammar that `tool_choice: "required"` needs."""
+    n: Literal[1] = 1
+    """One choice per request. Any other number is refused by the type: this server runs one
+    generation per request, and `n: 4` answered with one choice is three the client paid
+    attention to and never got."""
+    user: str | None = None
+    """Who the request is for, upstream. Accepted and ignored: nothing here bills, meters or
+    rate-limits per user, so it asks for nothing this server would do differently."""
+    logprobs: Literal[False] = False
+    """The engine does not carry the per-token distribution out of the loop, so `true` is
+    refused rather than answered with the field missing."""
+    presence_penalty: float = Field(default=0.0, ge=0.0, le=0.0)
+    frequency_penalty: float = Field(default=0.0, ge=0.0, le=0.0)
+    """Both are declared so a client that sends the OpenAI default reaches this dialect, and
+    both are bounded to that default because neither exists in the sampler: what the engine
+    has is `repetition_penalty`, which is a different function of a different count. A
+    non-zero value is refused with the name of the field rather than silently dropped."""
+    stop: str | list[str] | None = None
+    """The strings this generation ends on, honoured over the text — the engine's `stop` is a
+    set of token ids and cannot express a string. Same machine the Anthropic dialect uses
+    (`Halt`), and the same rule: the answer is cut before the sequence and `finish_reason` is
+    `stop`."""
     max_tokens: int = Field(default=128, gt=0)
     reasoning_effort: OpenAIEffort | None = None
     """How hard the checkpoint is asked to think. There is no budget beside it because
@@ -368,13 +405,15 @@ def _content(content: str | list[Part] | None) -> str | tuple[TextPart | ImagePa
 
 
 def _turn(message: ChatMessage) -> Turn:
-    """A call travels in the shape it arrived in — the templates in circulation read
-    `function.name` and `function.arguments`, and render the arguments as they stand when
-    they are text. The content of a turn that only called something is `''` and not `None`:
-    the template concatenates it."""
-    turn: ToolTurn = {"role": message.role, "content": _content(message.content)}
+    """A call is decoded on the way in, not handed through: this dialect spells `arguments` as
+    JSON text and the templates read a mapping (`called`). The content of a turn that only
+    called something is `''` and not `None`: the template concatenates it."""
+    turn: Turn = {"role": message.role, "content": _content(message.content)}
     if message.tool_calls is not None:
-        turn["tool_calls"] = [call.model_dump() for call in message.tool_calls]
+        turn["tool_calls"] = [
+            called(call.id, call.function.name, call.function.arguments)
+            for call in message.tool_calls
+        ]
     if message.tool_call_id is not None:
         turn["tool_call_id"] = message.tool_call_id
     return turn
@@ -405,6 +444,19 @@ def _checked(request: ChatRequest) -> Checked | None:
     return Checked(schema, request.max_schema_attempts)
 
 
+def _envelope(model: object) -> ToolFamily | None:
+    """This checkpoint's tool family when it can express its envelope as a grammar, and
+    `None` otherwise — which is what a forced `tool_choice` is refused on."""
+    parser = parser_of(model)
+    family = None if parser is None else parser.tools
+    return family if family is not None and family.grammar is not None else None
+
+
+def _forced(request: ChatRequest) -> bool:
+    """Whether this request asks the model to call something rather than letting it choose."""
+    return request.tool_choice == "required" and bool(request.tools)
+
+
 def _strict(request: ChatRequest) -> Mapping[str, object] | None:
     """The schema this request asks to be *guaranteed* rather than checked, or `None` for
     every other shape. Under it decoding is constrained, so there is no answer that violates
@@ -417,14 +469,27 @@ def _strict(request: ChatRequest) -> Mapping[str, object] | None:
 
 
 def _refused(request: ChatRequest) -> JSONResponse | None:
-    """The four shapes of `response_format` this route cannot honour, each named.
+    """The shapes this route cannot honour, each named.
+
+    Four of them are `response_format`'s.
 
     Both halves of the first two are `strict`'s. Without a schema it promises a decode that
     cannot violate one that was never sent, and reading it as `json_object` answers a demand
     for a guarantee with a demand for JSON. With tools it promises two things at once: the
     grammar constrains decoding to the schema from the first token, so the model cannot write
     a call whatever it was offered, and a 200 with no calls in it is that told as a success.
+
+    The fifth is `tool_choice`, and it is the contradiction rather than the constraint: asking
+    the model to call something while offering nothing to call leaves the grammar no set of
+    functions to pin the call to.
     """
+    if request.tool_choice == "required" and not request.tools:
+        return openai_error(
+            400,
+            'tool_choice: "required" asks the model to call something and this request offers '
+            "no tools: the constraint has no set of functions to pin the call to.",
+            "tool_choice",
+        )
     wanted = request.response_format
     if (
         isinstance(wanted, JsonSchemaFormat)
@@ -507,6 +572,46 @@ def _tool_call(index: int, call: ToolCall) -> dict[str, object]:
         "type": "function",
         "function": {"name": call.name, "arguments": json.dumps(call.arguments)},
     }
+
+
+def streamed(
+    deltas: tuple[CallDelta, ...], ids: dict[int, str]
+) -> Iterator[dict[str, object]]:
+    """The dialect's frames for what a reader just resolved.
+
+    The first frame of a call carries `id`, `type` and the name with empty arguments; every
+    frame after it carries only the fragment. That split is the SDK's own accumulator: it
+    matches the entries of two frames by `index` — which is why every entry has one, and why
+    it raises on an entry that has none — and it concatenates `function.arguments` across
+    them, so a name repeated would be appended rather than replaced.
+
+    The id is minted once per index and kept in `ids`, because it is what the client sends
+    back as `tool_call_id` and two frames of one call disagreeing about it is two calls.
+    """
+    for delta in deltas:
+        if delta.name is not None:
+            ids[delta.index] = f"call_{uuid.uuid4().hex}"
+            yield {
+                "tool_calls": [
+                    {
+                        "index": delta.index,
+                        "id": ids[delta.index],
+                        "type": "function",
+                        "function": {"name": delta.name, "arguments": delta.arguments},
+                    }
+                ]
+            }
+            continue
+        if not delta.arguments:
+            # A delta that only says the call closed. The dialect has no frame for that —
+            # `finish_reason` is what ends a call here — and an empty fragment would reach
+            # the accumulator as a zero-length append.
+            continue
+        yield {
+            "tool_calls": [
+                {"index": delta.index, "function": {"arguments": delta.arguments}}
+            ]
+        }
 
 
 def _chunk(
@@ -597,7 +702,14 @@ def _usage_chunk(request_id: str, created: int, model: str, job: Job) -> str:
     return f"data: {json.dumps(payload)}\n\n"
 
 
-def _finish(job: Job, max_tokens: int, called: bool) -> str:
+def _sequences(stop: str | list[str] | None) -> list[str]:
+    """The dialect spells one sequence as a bare string and several as a list."""
+    if stop is None:
+        return []
+    return [stop] if isinstance(stop, str) else stop
+
+
+def _finish(job: Job, max_tokens: int, called: bool, halted: bool = False) -> str:
     """Which of the three ended the turn. `tool_calls` outranks the budget for the reason the
     Anthropic dialect gives: only a call read whole is ever reported, so a client that gets
     one can execute it, and `length` beside an executable call sends it to render a truncation
@@ -605,6 +717,10 @@ def _finish(job: Job, max_tokens: int, called: bool) -> str:
     generation the budget cut hands it a half sentence as the final answer."""
     if called:
         return "tool_calls"
+    if halted:
+        # A client's own sequence ended the turn, and this dialect has no separate reason for
+        # it: `stop` is what upstream reports, and the answer really did stop.
+        return "stop"
     budget = max_tokens
     context = catalog.context_of(job.model_id)
     if context is not None:
@@ -630,8 +746,11 @@ async def _events(
     calls: Calls | None,
     max_tokens: int,
     checked: Checked | None,
+    sequences: list[str],
 ) -> AsyncIterator[str]:
     sent: list[str] = []
+    ids: dict[int, str] = {}
+    halt = Halt(sequences)
     try:
         yield _chunk(request_id, created, model, {"role": "assistant", "content": ""}, None)
         while True:
@@ -653,15 +772,35 @@ async def _events(
                 continue
             # No family, nothing that could read a channel back: every segment is text the
             # client asked for, whichever one the model wrote it on.
-            if content := (piece.text if calls is None else calls.push(piece)):
+            if calls is None:
+                if content := halt.push(piece.text):
+                    sent.append(content)
+                    yield _chunk(request_id, created, model, {"content": content}, None)
+                if halt.matched is not None:
+                    break
+                continue
+            said, deltas = calls.push(piece)
+            if content := halt.push(said):
                 sent.append(content)
                 yield _chunk(request_id, created, model, {"content": content}, None)
+            for frame in streamed(deltas, ids):
+                yield _chunk(request_id, created, model, frame, None)
+            if halt.matched is not None:
+                # The turn is over at the client's own word: what the model writes after the
+                # sequence is not the answer, and the generation is cancelled by the `finally`
+                # rather than drained for text nobody will read.
+                break
         made: tuple[ToolCall, ...] = ()
-        if calls is not None:
-            tail, made = calls.finish()
-            if tail:
+        if calls is not None and halt.matched is None:
+            tail, deltas, made = calls.finish()
+            if tail := halt.push(tail):
                 sent.append(tail)
                 yield _chunk(request_id, created, model, {"content": tail}, None)
+            for frame in streamed(deltas, ids):
+                yield _chunk(request_id, created, model, frame, None)
+        if held := halt.finish():
+            sent.append(held)
+            yield _chunk(request_id, created, model, {"content": held}, None)
         if job.error is not None:
             # A frame carrying `error` is what the SDK raises on, and the only way to fail a
             # request that already answered 200. Without it a generation that died — a render
@@ -684,13 +823,8 @@ async def _events(
                 rejected = openai_envelope(reason, code, "server_error")
                 yield f"data: {json.dumps({'error': rejected})}\n\n"
                 return
-        for index, call in enumerate(made):
-            # One frame per call, and the call whole inside it: the arguments never arrive
-            # in fragments, which is A11's decision. What a client loses is an argument
-            # rendered as it is written, not compatibility.
-            delta = {"tool_calls": [_tool_call(index, call)]}
-            yield _chunk(request_id, created, model, delta, None)
-        yield _chunk(request_id, created, model, {}, _finish(job, max_tokens, bool(made)))
+        finish = _finish(job, max_tokens, bool(made), halt.matched is not None)
+        yield _chunk(request_id, created, model, {}, finish)
         if usage:
             # After the finish frame and before [DONE], where the dialect puts it: the
             # job is over by now, so the meter is the whole request's.
@@ -759,6 +893,11 @@ async def chat(
         turns = tuple(_turn(message) for message in messages)
     except UnreadableImage as unreadable:
         return openai_error(400, str(unreadable), "invalid_image")
+    except UnreadableArguments as unreadable:
+        # 400 and not a 500: the client replayed a call whose arguments are not a JSON
+        # object, and the templates read a mapping. Letting it through raises inside the
+        # render, which is the same fault reported as the server's.
+        return openai_error(400, str(unreadable), "invalid_tool_arguments")
     if checked is not None:
         turns = (*turns, instruction(checked.schema))
     effort = effort_of(request.reasoning_effort, preset.reasoning_effort)
@@ -773,6 +912,21 @@ async def chat(
             # One walk per generation and never one shared between two: the grammar behind it
             # is the engine's to keep, the walk is this attempt's.
             constrained = None if strict is None else await engine.constrain(model_id, strict)
+            if _forced(asked):
+                # The family of this checkpoint's own template, which is what decides whether
+                # its envelope can be constrained at all — read off the loaded model rather
+                # than guessed, for the same reason the reader is.
+                forced = _envelope(await engine.reachable(model_id))
+                if forced is None:
+                    return openai_error(
+                        400,
+                        'tool_choice: "required" cannot be honoured for this checkpoint: '
+                        "forcing a call constrains decoding to its call envelope, and this "
+                        "model's family does not express one exactly. Send tool_choice: "
+                        '"auto", or use a checkpoint whose calls are JSON.',
+                        "tool_choice_unsupported",
+                    )
+                constrained = await engine.constrain_envelope(model_id, forced, tools)
             # A name that does not resolve to a checkpoint and one whose load fails are the
             # same answer to the client: this model is not available here. The reason travels
             # in the message rather than in a second status code. A `model:typo` lands here
@@ -818,7 +972,15 @@ async def chat(
             usage = streaming is not None and streaming.include_usage
             return StreamingResponse(
                 _events(
-                    job, request_id, created, request.model, usage, calls, asked.max_tokens, checked
+                    job,
+                    request_id,
+                    created,
+                    request.model,
+                    usage,
+                    calls,
+                    asked.max_tokens,
+                    checked,
+                    _sequences(asked.stop),
                 ),
                 media_type="text/event-stream",
             )
@@ -841,9 +1003,14 @@ async def chat(
         content = "".join(piece.text for piece in answered)
         made: tuple[ToolCall, ...] = ()
         if calls is not None:
-            held = "".join(calls.push(piece) for piece in answered)
-            tail, made = calls.finish()
+            held = "".join(calls.push(piece)[0] for piece in answered)
+            tail, _, made = calls.finish()
             content = held + tail
+        # The client's own sequences, over the answer and not over the reasoning: what a
+        # sequence is about is the text the client will read. Applied after the calls are
+        # read, so a sequence inside an envelope does not cut a call in half.
+        halted = Halt(_sequences(asked.stop))
+        content = halted.push(content) + halted.finish()
         if checked is None or made:
             # A turn that called something answered with a call and not with a document: the
             # format is about the answer, and this turn has none to check.
@@ -881,7 +1048,9 @@ async def chat(
             {
                 "index": 0,
                 "message": message,
-                "finish_reason": _finish(job, asked.max_tokens, bool(made)),
+                "finish_reason": _finish(
+                    job, asked.max_tokens, bool(made), halted.matched is not None
+                ),
             }
         ],
         "usage": _usage(spent),

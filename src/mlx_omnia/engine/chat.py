@@ -42,7 +42,7 @@ from mlx_omnia.engine.model import (
     ModelInput,
     Wrapping,
 )
-from mlx_omnia.engine.parsers import Parser, Segment, parser_for
+from mlx_omnia.engine.parsers import Parser, Segment, ToolCall, parser_for
 from mlx_omnia.engine.vision import RGB_IMAGE, Image
 
 __all__ = [
@@ -58,6 +58,8 @@ __all__ = [
     "MultimodalChatCapability",
     "SeeingChat",
     "TextPart",
+    "ToolCallFunction",
+    "ToolCallRequest",
     "chat_capabilities",
     "chat_template",
     "composite",
@@ -125,9 +127,41 @@ class ImagePart(TypedDict):
 type ContentPart = TextPart | ImagePart
 
 
+class ToolCallFunction(TypedDict):
+    name: str
+    arguments: Mapping[str, object]
+    """The arguments as a value, never as the JSON text of one.
+
+    Measured over the fifteen `model_type` with a template that declares `tools`: seven read
+    either shape, **eight read only the mapping** (`qwen3_5`, `qwen3_5_moe`, `nemotron_h`,
+    `muse_glimmer`, `bailing_hybrid`, `laguna`, `lfm2_moe` — they do `arguments|items`, and
+    atem raises a message written by hand saying it wants a dict), and none reads only the
+    text. A dialect that receives the text on the wire decodes it at its own boundary, which
+    is what a dialect is for; handing it through raises inside the render, which is a 500 on
+    the second turn of every tool loop.
+    """
+
+
+class ToolCallRequest(TypedDict):
+    """One call as the templates read it back. The nesting under `function` is the shape they
+    are written against — they unwrap it themselves (`if tool_call.function is defined`), and
+    the id is carried because some of them render it."""
+
+    id: str
+    type: Literal["function"]
+    function: ToolCallFunction
+
+
 class ChatMessage(TypedDict):
     role: Literal["system", "user", "assistant", "tool"]
     content: str | Sequence[ContentPart]
+    tool_calls: NotRequired[Sequence[ToolCallRequest]]
+    """The calls this assistant turn made, when it made any. Declared here and not bolted on
+    by whoever renders a conversation: the template iterates the messages and reads what is in
+    each dict, so a turn that called something is a shape of message and not a dialect's
+    private extension."""
+    tool_call_id: NotRequired[str]
+    """Which call a `tool` turn answers."""
 
 
 @dataclass(frozen=True)
@@ -293,15 +327,55 @@ class ChatTemplate:
     def parser(self) -> Parser | None:
         return parser_for(self.source)
 
+    @property
+    def replays_calls(self) -> bool:
+        """Whether this template renders back a turn that called something.
+
+        Read off the source and not by rendering one and looking: a template that never
+        mentions the key cannot read it, and that is decidable without guessing what an
+        empty render meant. SmolLM3's and Falcon-H1's declare tools in the prompt — they
+        instruct the model to write `<tool_call>` — and have no branch for `tool_calls` at
+        all, so the assistant's own call is dropped from every history they render.
+        """
+        return "tool_calls" in self.source
+
     def render(self, chat: Chat, *, add_generation_prompt: bool = True) -> str:
         return self.template.render(
-            messages=list(chat.messages),
+            messages=list(self._messages(chat)),
             tools=list(chat.tools) or None,
             documents=None,
             add_generation_prompt=add_generation_prompt,
             **self.special_tokens,
             **_thinking(chat.reasoning_effort),
         )
+
+    def _messages(self, chat: Chat) -> Iterator[ChatMessage]:
+        """The conversation as this template can read it.
+
+        For every template that replays a call this is the conversation untouched. For the
+        ones that cannot, the call is written into the content it would otherwise be dropped
+        from, in the family's own spelling — which is what the model itself wrote, and what a
+        history is. `tool_calls` is left on the message either way: a template that ignores
+        the key ignores it, and taking it off would be this deciding what the next template
+        gets to see.
+        """
+        family = None if self.replays_calls or (parser := self.parser) is None else parser.tools
+        for message in chat.messages:
+            calls = message.get("tool_calls")
+            if family is None or not calls:
+                yield message
+                continue
+            content = message["content"]
+            if not isinstance(content, str):
+                # A call beside pictures is not a shape any of these templates renders, and
+                # splicing an envelope between the parts would move the image markers.
+                yield message
+                continue
+            written = "".join(
+                family.write(ToolCall(call["function"]["name"], call["function"]["arguments"]))
+                for call in calls
+            )
+            yield {**message, "content": f"{content}{written}"}
 
 
 def chat_template(

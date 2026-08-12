@@ -20,6 +20,7 @@ from mlx_omnia.engine.parsers import (
     atem,
     harmony,
     parser_for,
+    python_call,
     qwen,
     qwen_xml,
 )
@@ -184,8 +185,9 @@ FAMILIES = [
     # the difference is written down.
     ("mlx-community/Qwen3.6-35B-A3B-6bit", qwen_xml.PARSER),
     # One more spelling, none of these three: LFM2.5 writes
-    # `<|tool_call_start|>[fn(arg=1)]<|tool_call_end|>`.
-    ("LiquidAI/LFM2.5-8B-A1B", None),
+    # `<|tool_call_start|>[fn(arg=1)]<|tool_call_end|>`, a Python list of calls rather than
+    # anything JSON-shaped, which is why it is a family of its own.
+    ("LiquidAI/LFM2.5-8B-A1B", python_call.PARSER),
 ]
 
 

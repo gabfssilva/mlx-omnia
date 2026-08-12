@@ -157,6 +157,7 @@ class Vocabulary:
         self.size = size
         pieces = _pieces(tokenizer, size)
         added = tokenizer.added.values() if isinstance(tokenizer, AddedTokens) else ()
+        self._added = dict(tokenizer.added) if isinstance(tokenizer, AddedTokens) else {}
         self._tokens = LLTokenizer(
             TokenizerWrapper(
                 _Table(min(stop), None, pieces, sorted({*added, *stop}), tokenizer.encode)
@@ -177,6 +178,36 @@ class Vocabulary:
             source = LLMatcher.grammar_from_json_schema(json.dumps(schema))
         except ValueError as error:
             raise GrammarRefused(str(error)) from error
+        failed, messages = LLMatcher.validate_grammar_with_warnings(source, self._tokens)
+        if failed:
+            raise GrammarRefused(" / ".join(messages))
+        return Grammar(self, source)
+
+    def literal(self, text: str) -> str:
+        """`text` as a grammar term, in whichever form this vocabulary can actually match.
+
+        A marker like `<tool_call>` is usually a **single added id**, and added ids go into
+        the table as special — which keeps their bytes out of the grammar's trie on purpose
+        (see `AddedTokens`). So a grammar asking for the eleven characters can never be
+        satisfied: the model emits one id and the parser is still waiting for a `<`. Measured
+        against Qwen3, where it stalls on the first token with `forced bytes: got '<'`.
+
+        llguidance spells a token by id (`<[151657]>`), and that is what an added marker
+        becomes here. Anything the vocabulary carries as ordinary bytes stays a quoted
+        literal.
+        """
+        identifier = self._added.get(text)
+        return f"<[{identifier}]>" if identifier is not None else json.dumps(text)
+
+    def written(self, source: str) -> "Grammar":
+        """A grammar this vocabulary did not compile from a schema, validated the same way.
+
+        The envelope of a tool call is the one thing here that is not a JSON document: it is
+        a marker, a document, and a marker. llguidance spells that as a Lark rule with the
+        schema embedded (`%json`), so what a family hands over is grammar text and this is
+        the door for it — `compile` stays the schema path, because a caller that has a schema
+        should not have to know how one becomes grammar text.
+        """
         failed, messages = LLMatcher.validate_grammar_with_warnings(source, self._tokens)
         if failed:
             raise GrammarRefused(" / ".join(messages))

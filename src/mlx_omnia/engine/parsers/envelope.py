@@ -13,9 +13,31 @@ segmenter applies one level up: `<` waits because it can still become `<tool_cal
 `<tool` followed by `ing` leaves on the same push.
 """
 
+import json
 from dataclasses import dataclass
 
-__all__ = ["Body", "EnvelopeScanner"]
+__all__ = ["Body", "EnvelopeScanner", "encoded"]
+
+
+def encoded(value: str) -> str:
+    """The JSON text of a value whose format gave it no type.
+
+    Three families in circulation spell arguments as bare text — `<parameter=days>3`,
+    `<arg_value>3</arg_value>`, `days=3` — and the type has to be recovered from the
+    characters, because `CallDelta.arguments` is JSON and JSON has types. What parses is what
+    the template's own `tojson` wrote; what does not is the string the model typed.
+
+    The known loss is a string that happens to spell a literal: a city named `3`, or the text
+    `true`, comes back as the number and the boolean. The alternative loses every integer
+    parameter in every one of those families, which is the far larger set — a tool declaring
+    `{"type": "integer"}` would receive `"3"` and reject it.
+    """
+    body = value.strip("\n")
+    try:
+        json.loads(body)
+    except json.JSONDecodeError:
+        return json.dumps(body)
+    return body
 
 
 @dataclass(frozen=True)

@@ -197,12 +197,19 @@ def test_text_with_no_marker_comes_out_piece_by_piece_as_it_went_in() -> None:
 
 def test_a_marker_split_across_two_pieces_is_still_a_marker() -> None:
     """The case tokenization produces all the time: the `>` closing a marker merges with the
-    next byte, so a machine that only matches within a push never sees the call."""
+    next byte, so a machine that only matches within a push never sees the call.
+
+    The envelope leaves in pieces, because that is what lets a four-kilobyte argument reach a
+    client while it is being written; what may never leave in pieces is a *marker*, and the
+    two pushes below are the case that would break it — the second ends on `</tool`, which is
+    held because it can still become the closer."""
     machine = Segmenter(QWEN)
     assert machine.push("Sure. <tool") == (Segment("content", "Sure. "),)
-    assert machine.push('_call>{"name": "f", "arguments": {"x": 1}}</tool') == ()
+    assert machine.push('_call>{"name": "f", "arguments": {"x": 1}}</tool') == (
+        Segment("tool", '<tool_call>{"name": "f", "arguments": {"x": 1}}'),
+    )
     assert machine.push("_call> done") == (
-        Segment("tool", CALL),
+        Segment("tool", "</tool_call>"),
         Segment("content", " done"),
     )
     assert QWEN.tools is not None and QWEN.tools.parse_tool_call(CALL) == (ToolCall("f", {"x": 1}),)
@@ -235,12 +242,19 @@ def test_the_reasoning_block_streams_instead_of_waiting_for_its_closing_tag() ->
     )
 
 
-def test_an_envelope_is_held_until_it_closes() -> None:
-    """The opposite rule for the other block: half a call on the wire is a client parsing
-    text as prose that was about to be a function invocation."""
+def test_an_envelope_leaves_on_its_channel_as_it_arrives() -> None:
+    """The tool channel streams like the others, and what stops half a call from reaching a
+    client as prose is not this machine: it is the channel label. A dialect holds the
+    fragments until a reader has named something (`Calls`), so an envelope that spells no call
+    still goes back as text — and one that does spell a call is visible while it is written
+    instead of only once the generation ends."""
     machine = Segmenter(QWEN)
-    assert machine.push('<tool_call>{"name": "f", ') == ()
-    assert machine.push('"arguments": {"x": 1}}</tool_call>') == (Segment("tool", CALL),)
+    assert machine.push('<tool_call>{"name": "f", ') == (
+        Segment("tool", '<tool_call>{"name": "f", '),
+    )
+    assert machine.push('"arguments": {"x": 1}}</tool_call>') == (
+        Segment("tool", '"arguments": {"x": 1}}</tool_call>'),
+    )
 
 
 def test_what_is_still_held_when_the_generation_stops_is_not_lost() -> None:
@@ -252,8 +266,16 @@ def test_what_is_still_held_when_the_generation_stops_is_not_lost() -> None:
     assert ambiguous.flush() == (Segment("content", "<"),)
 
     cut = Segmenter(QWEN)
-    assert cut.push('<tool_call>{"name": "f"') == ()
-    assert cut.flush() == (Segment("tool", '<tool_call>{"name": "f"'),)
+    # The envelope streams, so most of it has already left; what `flush` still owes is the
+    # tail held back because it could have been the closing marker.
+    assert cut.push('<tool_call>{"name": "f"') == (
+        Segment("tool", '<tool_call>{"name": "f"'),
+    )
+    assert cut.flush() == ()
+
+    holding = Segmenter(QWEN)
+    assert holding.push('<tool_call>{"x": 1}</tool') == (Segment("tool", '<tool_call>{"x": 1}'),)
+    assert holding.flush() == (Segment("tool", "</tool"),)
 
 
 def test_the_markers_are_the_family_s_own() -> None:
@@ -298,7 +320,10 @@ def test_the_segments_of_a_generation_concatenate_back_into_what_the_model_wrote
         ]
         segments += machine.flush()
         assert "".join(segment.text for segment in segments) == text
-        assert [segment.text for segment in segments if segment.channel == "tool"] == [CALL]
+        # Concatenated and not compared piece by piece: the tool channel streams, so how
+        # many segments it arrives in is the detokenizer's business, and what they spell is
+        # this machine's.
+        assert "".join(s.text for s in segments if s.channel == "tool") == CALL
 
 
 def test_a_stream_with_no_marker_yields_exactly_the_pieces_it_did_before() -> None:
@@ -313,11 +338,12 @@ def test_a_stream_never_hands_out_half_a_marker() -> None:
     """What the client used to see: `Sure. <tool` as a piece of the answer, and the rest of
     the envelope after it."""
     pieces = [b"Sure. <tool", b'_call>{"name": "f", "arguments": {"x": 1}}', b"</tool_call>", b"!"]
-    assert streamed(pieces, QWEN) == [
-        Segment("content", "Sure. "),
-        Segment("tool", CALL),
-        Segment("content", "!"),
+    segments = streamed(pieces, QWEN)
+    assert [segment.text for segment in segments if segment.channel == "content"] == [
+        "Sure. ",
+        "!",
     ]
+    assert "".join(s.text for s in segments if s.channel == "tool") == CALL
 
 
 def test_a_stream_labels_the_block_the_model_opened_itself() -> None:
@@ -366,11 +392,9 @@ def test_the_served_stream_never_hands_out_half_a_marker(facade: Facade) -> None
     already cut."""
     pieces = [b"Sure. <tool", b'_call>{"name": "f", "arguments": {"x": 1}}', b"</tool_call>", b"!"]
     stream, _ = facade(pieces, QWEN, "prompt")
-    assert list(stream) == [
-        Segment("content", "Sure. "),
-        Segment("tool", CALL),
-        Segment("content", "!"),
-    ]
+    segments = list(stream)
+    assert [s.text for s in segments if s.channel == "content"] == ["Sure. ", "!"]
+    assert "".join(s.text for s in segments if s.channel == "tool") == CALL
 
 
 @pytest.mark.parametrize("facade", FACADES)
@@ -405,7 +429,9 @@ def test_the_served_stream_starts_inside_the_block_the_prompt_left_open(facade: 
         Segment("content", "done"),
     ]
     outside, _ = facade(pieces, QWEN, generation_prompt(QWEN36, "no-thinking"))
-    assert list(outside) == [Segment("tool", "<tool_call> is the marker</think>done")]
+    written = list(outside)
+    assert {s.channel for s in written} == {"tool"}
+    assert "".join(s.text for s in written) == "<tool_call> is the marker</think>done"
 
 
 def prepared(repo: str) -> Text:
@@ -431,15 +457,18 @@ def test_the_served_stream_suppresses_with_the_family_its_template_spells() -> N
     both open the same channel; what tells the two apart is the reader on the other side of
     it, and the difference is written down in one place, the family's own recognizer."""
     pieces = [b"Sure. <tool", b'_call>{"name": "f", "arguments": {"x": 1}}', b"</tool_call>", b"!"]
-    channels = [
-        Segment("content", "Sure. "),
-        Segment("tool", CALL),
-        Segment("content", "!"),
-    ]
+    def channels(stream: Iterator[Segment]) -> tuple[list[str], str]:
+        segments = list(stream)
+        return (
+            [segment.text for segment in segments if segment.channel == "content"],
+            "".join(segment.text for segment in segments if segment.channel == "tool"),
+        )
+
+    expected = (["Sure. ", "!"], CALL)
     json_spelling, _ = text_stream(prepared(QWEN3), pieces)
-    assert list(json_spelling) == channels
+    assert channels(json_spelling) == expected
     xml_spelling, _ = text_stream(prepared(QWEN36), pieces)
-    assert list(xml_spelling) == channels
+    assert channels(xml_spelling) == expected
 
 
 # --- the channel a generation starts in, off the real templates ------------------------
@@ -596,7 +625,10 @@ def test_an_atem_tool_turn_is_one_envelope_on_the_tool_channel() -> None:
 ASKED = "write a dense autoencoder returned by a function, typed and trivial, in Keras 3"
 """Long enough to be a restatement rather than a phrase two texts happen to share."""
 
-PROMPT = f"<|start|>system<|message|>You are helpful.<|eot|><|start|>user<|message|>{ASKED}<|eot|><|start|>assistant"
+PROMPT = (
+    "<|start|>system<|message|>You are helpful.<|eot|>"
+    f"<|start|>user<|message|>{ASKED}<|eot|><|start|>assistant"
+)
 
 
 def _reasoning(machine: Segmenter, text: str, size: int = 5) -> str:

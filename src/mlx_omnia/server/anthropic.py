@@ -56,7 +56,7 @@ dialect where a prompt exists on this side of the queue.
 import asyncio
 import json
 import uuid
-from collections.abc import AsyncIterator, Iterator, Mapping, Sequence
+from collections.abc import AsyncIterator, Iterator, Mapping
 from dataclasses import replace
 from itertools import count
 from typing import Annotated, Literal
@@ -71,6 +71,7 @@ from mlx_omnia import (
     ImagePart,
     LogitFilter,
     TextPart,
+    ToolCallRequest,
     UnsupportedInput,
     greedy,
     min_p,
@@ -80,17 +81,18 @@ from mlx_omnia import (
     top_k,
     top_p,
 )
+from mlx_omnia import ChatMessage as Turn
 from mlx_omnia.engine.chat import Effort, parser_of, template_of
 from mlx_omnia.engine.generate import Constraint, Meter
 from mlx_omnia.engine.grammar import GrammarRefused
 from mlx_omnia.engine.language import tokenizer_of
-from mlx_omnia.engine.parsers import Segment, ToolCall, unmarked
+from mlx_omnia.engine.parsers import CallDelta, Segment, ToolCall, unmarked
 from mlx_omnia.server import profiles
 from mlx_omnia.server.engine import Engine, Job, NotConstrainable, NotQuantizable
 from mlx_omnia.server.profiles import Sampling, StoreDep
 from mlx_omnia.server.responses import (
     Calls,
-    ToolTurn,
+    Halt,
     UnreadableImage,
     content_of,
     declared,
@@ -211,12 +213,23 @@ class Tool(BaseModel):
 class ToolChoice(BaseModel):
     """`any` and `tool` are refused by name: forcing a call is a constraint on decoding, and
     answering `auto` to a client that asked for one is a call the model may never have made.
-    `disable_parallel_tool_use` goes with them — nothing here decides how many calls a
-    generation writes."""
+
+    `disable_parallel_tool_use: false` is **accepted and ignored**, and it has to be: Claude
+    Code sends it beside `{"type": "auto"}` on its first request, so refusing it made the
+    whole dialect unreachable for the client this module exists for. It asks for something
+    this server would not do differently — nothing here decides how many calls a generation
+    writes; the model does.
+
+    `true` is another matter and is refused by name. It asks for at most one call, and a
+    generation that wrote two would be answered with something the client said it could not
+    take. Honouring it needs the envelope grammar that forcing a call needs, and until that
+    exists the honest answer is the name of the field.
+    """
 
     model_config = ConfigDict(extra="forbid")
 
     type: Literal["auto", "none"]
+    disable_parallel_tool_use: Literal[False] = False
 
 
 class JsonFormat(BaseModel):
@@ -383,58 +396,6 @@ def _text(content: str | list[TextBlock]) -> str:
     return content if isinstance(content, str) else "".join(block.text for block in content)
 
 
-class Halt:
-    """The sequences this request ends on, over the text as it arrives.
-
-    Held like the engine's own segmenter holds a marker, and for the same reason: a piece
-    ending in `<` when the client asked to stop on `<end>` must not go out, because the next
-    piece decides whether those characters are the answer or the sequence that ends it. What
-    is held never exceeds the longest sequence minus one character, so a generation that
-    writes none streams with the boundaries it would have had.
-
-    The earliest match wins when two sequences match in the same push — it is the one the
-    model reached first, and it is what `stop_sequence` reports.
-    """
-
-    def __init__(self, sequences: Sequence[str]) -> None:
-        self._sequences = tuple(sequence for sequence in sequences if sequence)
-        self._held = ""
-        self.matched: str | None = None
-
-    def push(self, text: str) -> str:
-        """What may go out now: everything before a match, and never a prefix of one. Empty
-        once something has matched — the generation is over and the rest is not the answer."""
-        if self.matched is not None:
-            return ""
-        if not self._sequences:
-            return text
-        self._held += text
-        found = [(self._held.find(s), s) for s in self._sequences]
-        hits = sorted((at, s) for at, s in found if at != -1)
-        if hits:
-            at, self.matched = hits[0]
-            out, self._held = self._held[:at], ""
-            return out
-        keep = max(
-            (
-                size
-                for sequence in self._sequences
-                for size in range(1, len(sequence))
-                if self._held.endswith(sequence[:size])
-            ),
-            default=0,
-        )
-        at = len(self._held) - keep
-        out, self._held = self._held[:at], self._held[at:]
-        return out
-
-    def finish(self) -> str:
-        """What was held when the generation ended without matching — the tail of the answer,
-        which was only ever held because it could still have become a sequence."""
-        out, self._held = self._held, ""
-        return "" if self.matched is not None else out
-
-
 class Blocks:
     """The answer as blocks, in the order the model wrote them: one block per run of a
     channel, and consecutive pieces of the same channel in the same block.
@@ -466,13 +427,18 @@ class Blocks:
         ]
 
 
-def _called(block: ToolUseBlock) -> dict[str, object]:
-    """The call in the shape the templates read: `function.name` and arguments as JSON text,
-    which is `chat/completions`'s spelling and the one transformers documents."""
+def _called(block: ToolUseBlock) -> ToolCallRequest:
+    """The call in the shape the templates read: nested under `function`, arguments as the
+    mapping they already are on this wire.
+
+    `tool_use.input` is an object here, so this dialect used to serialize it to JSON text on
+    the way in — matching a spelling that eight of the fifteen template families raise on.
+    Nothing serializes now: `called` decodes the two wires that carry text, and this one
+    hands over what it was given."""
     return {
         "id": block.id,
         "type": "function",
-        "function": {"name": block.name, "arguments": json.dumps(block.input)},
+        "function": {"name": block.name, "arguments": block.input},
     }
 
 
@@ -482,7 +448,7 @@ def _part(block: TextBlock | ImageBlock) -> TextPart | ImagePart:
     return image_part(block.source.data, block.source.media_type)
 
 
-def _turns(message: Message) -> list[ToolTurn]:
+def _turns(message: Message) -> list[Turn]:
     """One message, and the turns it spells. Its results come first because they are the
     round the message answers, and the text after them is the client's next word. The text and
     image blocks keep the order they arrived in — where an image sits among the words is what
@@ -495,12 +461,12 @@ def _turns(message: Message) -> list[ToolTurn]:
     )
     made = [_called(block) for block in content if isinstance(block, ToolUseBlock)]
     results = [block for block in content if isinstance(block, ToolResultBlock)]
-    turns: list[ToolTurn] = [
+    turns: list[Turn] = [
         {"role": "tool", "content": _text(block.content), "tool_call_id": block.tool_use_id}
         for block in results
     ]
     if said or made or not results:
-        turn: ToolTurn = {"role": message.role, "content": said}
+        turn: Turn = {"role": message.role, "content": said}
         if made:
             turn["tool_calls"] = made
         turns.append(turn)
@@ -545,7 +511,7 @@ def _conversation(request: Conversation, preset: str | None, effort: Effort | No
     first turn on the way out. The profile's prompt fills it only when the request left it
     out — the same precedence the sampling knobs below follow, `effort` included."""
     system = _text(request.system) if request.system is not None else preset
-    turns: list[ToolTurn] = [] if system is None else [{"role": "system", "content": system}]
+    turns: list[Turn] = [] if system is None else [{"role": "system", "content": system}]
     for message in request.messages:
         turns += _turns(message)
     return Chat(tuple(turns), tools=_tools(request), reasoning_effort=_thinks(request, effort))
@@ -768,15 +734,52 @@ async def _events(
                 },
             )
 
+    def calling(fragments: tuple[CallDelta, ...]) -> Iterator[str]:
+        """A call's block, opened when the reader first names it and filled as it resolves.
+
+        `input` opens empty and the arguments arrive as `input_json_delta`, which is the one
+        shape the SDK's accumulator reads: it concatenates `partial_json` and parses what it
+        has at every step. A block is closed by the delta that says the call closed — the
+        reader knows that before the generation ends, so the next call's block can open
+        while this one is already executable on the client.
+        """
+        nonlocal index, kind
+        for fragment in fragments:
+            if fragment.name is not None:
+                yield from opened(
+                    f"tool:{fragment.index}",
+                    _use(f"toolu_{uuid.uuid4().hex}", fragment.name, {}),
+                )
+            assert index is not None
+            if fragment.arguments:
+                yield _frame(
+                    "content_block_delta",
+                    {
+                        "type": "content_block_delta",
+                        "index": index,
+                        "delta": {
+                            "type": "input_json_delta",
+                            "partial_json": fragment.arguments,
+                        },
+                    },
+                )
+            if fragment.closed:
+                yield from closed()
+
     def emitted(piece: Segment) -> Iterator[str]:
         if piece.channel == "reasoning":
             yield from reasoned(unmarked(piece.text))
             return
         # No family, nothing that could read a channel back: every segment is text the client
         # asked for, whichever one the model wrote it on.
-        content = piece.text if calls is None else calls.push(piece)
-        if content := halt.push(content):
+        if calls is None:
+            if content := halt.push(piece.text):
+                yield from deltas(content)
+            return
+        said, fragments = calls.push(piece)
+        if content := halt.push(said):
             yield from deltas(content)
+        yield from calling(fragments)
 
     try:
         pieces = _pieces(job)
@@ -811,10 +814,12 @@ async def _events(
 
         made: tuple[ToolCall, ...] = ()
         if calls is not None and halt.matched is None:
-            tail, made = calls.finish()
+            tail, fragments, made = calls.finish()
             if tail := halt.push(tail):
                 for frame in deltas(tail):
                     yield frame
+            for frame in calling(fragments):
+                yield frame
         if held := halt.finish():
             for frame in deltas(held):
                 yield frame
@@ -825,33 +830,10 @@ async def _events(
                 "error", {"type": "error", "error": {"type": "api_error", "message": job.error}}
             )
             return
+        # Every block the calls needed was opened, filled and closed by `calling` as the
+        # reader resolved them; this closes whichever one the generation ended inside.
         for frame in closed():
             yield frame
-        for call in made:
-            # The call whole, in the one delta its block carries: the SDK's accumulator
-            # concatenates `partial_json` and parses what it has at every step, so a single
-            # fragment is the valid degenerate case of that. A11's decision.
-            at = next(blocks)
-            yield _frame(
-                "content_block_start",
-                {
-                    "type": "content_block_start",
-                    "index": at,
-                    "content_block": _use(f"toolu_{uuid.uuid4().hex}", call.name, {}),
-                },
-            )
-            yield _frame(
-                "content_block_delta",
-                {
-                    "type": "content_block_delta",
-                    "index": at,
-                    "delta": {
-                        "type": "input_json_delta",
-                        "partial_json": json.dumps(call.arguments),
-                    },
-                },
-            )
-            yield _frame("content_block_stop", {"type": "content_block_stop", "index": at})
         yield _frame(
             "message_delta",
             {
@@ -1100,7 +1082,8 @@ async def messages(
             if piece.channel == "reasoning":
                 written.wrote("thinking", unmarked(piece.text))
                 continue
-            written.wrote("text", halt.push(piece.text if calls is None else calls.push(piece)))
+            content = piece.text if calls is None else calls.push(piece)[0]
+            written.wrote("text", halt.push(content))
             if halt.matched is not None:
                 # The client's sequence, in the text as it arrived: what the model writes
                 # after it is not the answer, so it is not waited for either.
@@ -1111,7 +1094,7 @@ async def messages(
         return encode_error(500, "api_error", job.error)
     made: tuple[ToolCall, ...] = ()
     if calls is not None and halt.matched is None:
-        tail, made = calls.finish()
+        tail, _, made = calls.finish()
         written.wrote("text", halt.push(tail))
     written.wrote("text", halt.finish())
     # A turn that only called something carries no text block: an empty one is an assistant

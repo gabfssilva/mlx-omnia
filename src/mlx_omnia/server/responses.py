@@ -59,6 +59,7 @@ from mlx_omnia import (
     Penalty,
     Sampler,
     TextPart,
+    ToolCallRequest,
     UnsupportedInput,
     greedy,
     min_p,
@@ -72,7 +73,14 @@ from mlx_omnia import ChatMessage as Turn
 from mlx_omnia.engine.chat import Effort, parser_of
 from mlx_omnia.engine.generate import Constraint, Meter
 from mlx_omnia.engine.grammar import GrammarRefused
-from mlx_omnia.engine.parsers import MalformedToolCall, Segment, ToolCall, ToolFamily
+from mlx_omnia.engine.parsers import (
+    CallDelta,
+    MalformedToolCall,
+    Segment,
+    ToolCall,
+    ToolFamily,
+    assemble,
+)
 from mlx_omnia.engine.schema import (
     MalformedJSON,
     SchemaViolation,
@@ -87,13 +95,44 @@ from mlx_omnia.server.profiles import Sampling, StoreDep
 _KEEP_ALIVE_SECONDS = 0.5
 
 
-class ToolTurn(Turn, total=False):
-    """The two keys a conversation that used tools carries and a plain one does not. The
-    template iterates the messages and reads what is in each dict: the assistant's own calls
-    when it replays the turn that made them, and the id of the call a result answers."""
+class UnreadableArguments(ValueError):
+    """A call the client replayed whose arguments are not a JSON object.
 
-    tool_calls: list[dict[str, object]]
-    tool_call_id: str
+    Raised where the dialect reads the wire and never later: what fails inside a render is a
+    500, and this is a client that sent something which is not a call. The message is the
+    client's — each dialect puts it in its own envelope, the way `UnreadableImage` is
+    handled.
+    """
+
+
+def called(id: str, name: str, arguments: str) -> ToolCallRequest:
+    """One replayed call, from the JSON **text** two dialects put it in to the value the
+    templates read.
+
+    Measured over the fifteen `model_type` in circulation with a template that declares
+    tools: eight read only a mapping (`arguments|items`), seven read either, and none reads
+    only the text — so the text is a fact of two wire formats and not of a conversation, and
+    it stops being one here. Handed through as text it raised inside the render, which was a
+    500 on the second turn of every tool loop against Qwen3.6, Nemotron, Muse-Glimmer, Ling,
+    Laguna and LFM2.5.
+
+    Anthropic and Gemini never come through here: `tool_use.input` and `functionCall.args`
+    are objects on their own wires, so those dialects build the same shape directly. That the
+    four now agree on one shape is what makes the same conversation render the same
+    characters through any of them.
+    """
+    try:
+        payload = json.loads(arguments) if arguments else {}
+    except json.JSONDecodeError as error:
+        raise UnreadableArguments(
+            f"the arguments of the call to {name!r} are not JSON ({error.msg})"
+        ) from error
+    if not isinstance(payload, dict):
+        raise UnreadableArguments(
+            f"the arguments of the call to {name!r} are not a JSON object"
+        )
+    named: dict[str, object] = {str(key): value for key, value in payload.items()}
+    return {"id": id, "type": "function", "function": {"name": name, "arguments": named}}
 
 
 class Calls:
@@ -117,36 +156,117 @@ class Calls:
     """
 
     def __init__(self, family: ToolFamily) -> None:
-        self._family = family
+        self._reader = family.reader()
+        self._deltas: list[CallDelta] = []
         self._envelopes: list[str] = []
+        self._named: set[int] = set()
 
-    def push(self, segment: Segment) -> str:
-        """The content of `segment` that is safe to hand out now — nothing, when it is an
-        envelope this holds on to until the generation ends."""
-        if segment.channel == "tool":
-            self._envelopes.append(segment.text)
-            return ""
-        return segment.text
+    @property
+    def announced(self) -> bool:
+        """Whether any call has been named to the client. Once one has, the stream cannot take
+        it back, and what a generation that then breaks off owes the client is a truncation
+        rather than the envelope as prose."""
+        return bool(self._named)
 
-    def finish(self) -> tuple[str, tuple[ToolCall, ...]]:
-        """What the end of the generation releases: the calls the envelopes spell, or those
-        envelopes as content when they spell none. An envelope that spells no call goes back
-        into the content, at the end of it — it was held as a possible call and it is not one,
-        and text held and then dropped reaches the client as a model that chose to call
-        nothing, which is the shape of a refusal. All of them or none: a turn whose calls
-        cannot be read whole is not a turn to half-execute."""
-        calls = self._parsed()
-        return ("", calls) if calls else ("".join(self._envelopes), ())
+    def push(self, segment: Segment) -> tuple[str, tuple[CallDelta, ...]]:
+        """The content safe to hand out now, and what can be said about the calls now.
 
-    def _parsed(self) -> tuple[ToolCall, ...]:
+        A tool segment yields no content and, usually, some deltas: the reader resolves what
+        it can and holds the rest. The envelope text is kept as well, because an envelope that
+        never names anything is not a call and goes back as prose at the end.
+        """
+        if segment.channel != "tool":
+            return segment.text, ()
+        self._envelopes.append(segment.text)
+        return "", self._sayable(self._reader.push(segment.text))
+
+    def finish(self) -> tuple[str, tuple[CallDelta, ...], tuple[ToolCall, ...]]:
+        """What the end of the generation releases.
+
+        The calls come from the deltas this already collected, not from a second pass over
+        the text: a reader has been driven over it once to hand out fragments, and driving
+        another would be two machines answering about the same characters.
+
+        An envelope that spells no call goes back into the content — it was held as a possible
+        call and it is not one, and text held then dropped reaches the client as a model that
+        chose to call nothing, which is the shape of a refusal. That release is only available
+        while nothing has been announced: once a `tool_use` block has gone out, the same text
+        cannot also arrive as prose, so a stream that broke mid-call ends truncated instead.
+        """
+        deltas = self._sayable(self._reader.finish())
         try:
-            return tuple(
-                call
-                for envelope in self._envelopes
-                for call in self._family.parse_tool_call(envelope)
-            )
+            calls = assemble(tuple(self._deltas))
         except MalformedToolCall:
-            return ()
+            calls = ()
+        if calls or self.announced:
+            return "", deltas, calls
+        return "".join(self._envelopes), (), ()
+
+    def _sayable(self, deltas: tuple[CallDelta, ...]) -> tuple[CallDelta, ...]:
+        """Which of these may leave now: everything for a call already named, and the delta
+        that names one. A fragment for an index nothing has named is kept for `assemble` and
+        withheld from the stream — it is an envelope that may yet turn out not to be a call,
+        and announcing it is the one thing that cannot be undone."""
+        self._deltas.extend(deltas)
+        out: list[CallDelta] = []
+        for delta in deltas:
+            if delta.name is not None:
+                self._named.add(delta.index)
+            if delta.index in self._named:
+                out.append(delta)
+        return tuple(out)
+
+
+class Halt:
+    """The sequences this request ends on, over the text as it arrives.
+
+    Held like the engine's own segmenter holds a marker, and for the same reason: a piece
+    ending in `<` when the client asked to stop on `<end>` must not go out, because the next
+    piece decides whether those characters are the answer or the sequence that ends it. What
+    is held never exceeds the longest sequence minus one character, so a generation that
+    writes none streams with the boundaries it would have had.
+
+    The earliest match wins when two sequences match in the same push — it is the one the
+    model reached first, and it is what `stop_sequence` reports.
+    """
+
+    def __init__(self, sequences: Sequence[str]) -> None:
+        self._sequences = tuple(sequence for sequence in sequences if sequence)
+        self._held = ""
+        self.matched: str | None = None
+
+    def push(self, text: str) -> str:
+        """What may go out now: everything before a match, and never a prefix of one. Empty
+        once something has matched — the generation is over and the rest is not the answer."""
+        if self.matched is not None:
+            return ""
+        if not self._sequences:
+            return text
+        self._held += text
+        found = [(self._held.find(s), s) for s in self._sequences]
+        hits = sorted((at, s) for at, s in found if at != -1)
+        if hits:
+            at, self.matched = hits[0]
+            out, self._held = self._held[:at], ""
+            return out
+        keep = max(
+            (
+                size
+                for sequence in self._sequences
+                for size in range(1, len(sequence))
+                if self._held.endswith(sequence[:size])
+            ),
+            default=0,
+        )
+        at = len(self._held) - keep
+        out, self._held = self._held[:at], self._held[at:]
+        return out
+
+    def finish(self) -> str:
+        """What was held when the generation ended without matching — the tail of the answer,
+        which was only ever held because it could still have become a sequence."""
+        out, self._held = self._held, ""
+        return "" if self.matched is not None else out
 
 
 class UnreadableImage(ValueError):
@@ -683,7 +803,7 @@ def _given_part(part: ContentPart | InputImage) -> TextPart | ImagePart:
     return inline_image(part.image_url)
 
 
-def _turn(item: MessageItem) -> ToolTurn:
+def _turn(item: MessageItem) -> Turn:
     """`developer` is the dialect's newer name for a system turn, and the template knows
     only the older one. The text parts of a content list concatenate: what separates them is a
     boundary in the client's own structure, not text the model should read."""
@@ -695,7 +815,7 @@ def _turn(item: MessageItem) -> ToolTurn:
     return {"role": "system" if item.role == "developer" else item.role, "content": content}
 
 
-def _given(input: str | list[InputItem]) -> tuple[ToolTurn, ...]:
+def _given(input: str | list[InputItem]) -> tuple[Turn, ...]:
     """What the client sent, as turns: a bare string is the user message it stands for.
 
     A call is an item of its own here and a key of the assistant's turn in every template, so
@@ -704,17 +824,13 @@ def _given(input: str | list[InputItem]) -> tuple[ToolTurn, ...]:
     """
     if isinstance(input, str):
         return ({"role": "user", "content": input},)
-    turns: list[ToolTurn] = []
+    turns: list[Turn] = []
     for item in input:
         match item:
             case MessageItem():
                 turns.append(_turn(item))
             case FunctionCallItem():
-                call: dict[str, object] = {
-                    "id": item.call_id,
-                    "type": "function",
-                    "function": {"name": item.name, "arguments": item.arguments},
-                }
+                call = called(item.call_id, item.name, item.arguments)
                 previous = turns[-1] if turns else None
                 if previous is not None and previous["role"] == "assistant":
                     # Whether or not it already carries calls: the canonical replay is
@@ -758,8 +874,8 @@ def _tools(request: ResponsesRequest) -> tuple[Mapping[str, object], ...]:
 
 
 def _prefixed(
-    given: tuple[ToolTurn, ...], instructions: str | None, system_prompt: str | None
-) -> tuple[ToolTurn, ...]:
+    given: tuple[Turn, ...], instructions: str | None, system_prompt: str | None
+) -> tuple[Turn, ...]:
     """The profile's system prompt goes in only when nothing else claimed the place — the
     same precedence the chat route follows, and what keeps the template from rendering two
     system turns for the model to pick between."""
@@ -907,12 +1023,20 @@ async def _events(
     sequence = count()
     pieces: list[str] = []
     started = False
+    output: list[dict[str, object]] = []
+    items: dict[int, tuple[str, str, str]] = {}
+    """Per call index: the item id, the call id and the name. The two ids are minted once,
+    when the reader first names the call, because they are what the client matches its
+    `function_call_output` to — an item announced under one id and completed under another is
+    two calls to anybody reading the events."""
 
     def deltas(content: str) -> Iterator[str]:
         """The item and its content part are announced on the first text there is, not before:
         a generation that only called something has no message item at all, and one announced
         empty would put a blank assistant turn in the client's transcript."""
         nonlocal started
+        if not content:
+            return
         if not started:
             started = True
             yield _event(
@@ -943,6 +1067,90 @@ async def _events(
             },
         )
 
+    def message_done() -> Iterator[str]:
+        """The text item closed, so that a call item can be opened after it.
+
+        The dialect numbers items in the order they are announced, and the SDK's accumulator
+        builds the response from that order — so the message has to be finished before the
+        first call is added, not left open while calls are announced around it. It is
+        idempotent: `started` says whether there is an item at all, and `output` whether it
+        has already been closed.
+        """
+        nonlocal output
+        if not started or output:
+            return
+        text = "".join(pieces)
+        for event, payload in [
+            ("response.output_text.done", {"text": text, "logprobs": []}),
+            ("response.content_part.done", {"part": _part(text)}),
+        ]:
+            yield _event(
+                event,
+                next(sequence),
+                {"output_index": 0, "content_index": 0, "item_id": message_id, **payload},
+            )
+        yield _event(
+            "response.output_item.done",
+            next(sequence),
+            {"output_index": 0, "item": _message(message_id, text)},
+        )
+        output.append(_message(message_id, text))
+
+    def calling(fragments: tuple[CallDelta, ...]) -> Iterator[str]:
+        """One call item per index, opened when the reader names it and filled as it resolves.
+
+        `arguments` is empty on `output_item.added` and arrives as
+        `function_call_arguments.delta`: the SDK's accumulator concatenates those into the
+        item it was told about, which is what makes a call visible to the client while it is
+        still being written.
+        """
+        for fragment in fragments:
+            if fragment.name is not None:
+                yield from message_done()
+                items[fragment.index] = (
+                    f"fc_{uuid.uuid4().hex}",
+                    f"call_{uuid.uuid4().hex}",
+                    fragment.name,
+                )
+                item_id, call_id, name = items[fragment.index]
+                yield _event(
+                    "response.output_item.added",
+                    next(sequence),
+                    {
+                        "output_index": len(output),
+                        "item": _call_item(item_id, call_id, name, None),
+                    },
+                )
+                output.append(_call_item(item_id, call_id, name, ""))
+            item_id, call_id, name = items[fragment.index]
+            at = next(i for i, entry in enumerate(output) if entry.get("id") == item_id)
+            if fragment.arguments:
+                written = output[at]
+                written["arguments"] = f"{written.get('arguments', '')}{fragment.arguments}"
+                yield _event(
+                    "response.function_call_arguments.delta",
+                    next(sequence),
+                    {"output_index": at, "item_id": item_id, "delta": fragment.arguments},
+                )
+            if fragment.closed:
+                arguments = str(output[at].get("arguments", ""))
+                yield _event(
+                    "response.function_call_arguments.done",
+                    next(sequence),
+                    {
+                        "output_index": at,
+                        "item_id": item_id,
+                        "name": name,
+                        "arguments": arguments,
+                    },
+                )
+                output[at] = _call_item(item_id, call_id, name, arguments)
+                yield _event(
+                    "response.output_item.done",
+                    next(sequence),
+                    {"output_index": at, "item": output[at]},
+                )
+
     try:
         opened = _response(request_id, created, request, [], "in_progress", None)
         yield _event("response.created", next(sequence), {"response": opened})
@@ -957,15 +1165,22 @@ async def _events(
                 break
             # No family, nothing that could read a channel back: every segment is text the
             # client asked for, whichever one the model wrote it on.
-            if content := (piece.text if calls is None else calls.push(piece)):
-                for frame in deltas(content):
+            if calls is None:
+                for frame in deltas(piece.text):
                     yield frame
+                continue
+            content, fragments = calls.push(piece)
+            for frame in deltas(content):
+                yield frame
+            for frame in calling(fragments):
+                yield frame
         made: tuple[ToolCall, ...] = ()
         if calls is not None:
-            tail, made = calls.finish()
-            if tail:
-                for frame in deltas(tail):
-                    yield frame
+            tail, fragments, made = calls.finish()
+            for frame in deltas(tail):
+                yield frame
+            for frame in calling(fragments):
+                yield frame
         text = "".join(pieces)
         if job.error is not None:
             # The text that did arrive stays in the item: what failed is the rest of the
@@ -1004,66 +1219,11 @@ async def _events(
                 )
                 yield _event("response.failed", next(sequence), {"response": rejected})
                 return
-        output: list[dict[str, object]] = []
-        if started:
-            yield _event(
-                "response.output_text.done",
-                next(sequence),
-                {
-                    "output_index": 0,
-                    "content_index": 0,
-                    "item_id": message_id,
-                    "text": text,
-                    "logprobs": [],
-                },
-            )
-            yield _event(
-                "response.content_part.done",
-                next(sequence),
-                {
-                    "output_index": 0,
-                    "content_index": 0,
-                    "item_id": message_id,
-                    "part": _part(text),
-                },
-            )
-            yield _event(
-                "response.output_item.done",
-                next(sequence),
-                {"output_index": 0, "item": _message(message_id, text)},
-            )
-            output.append(_message(message_id, text))
-        for item_id, call_id, call in _items(made):
-            # The arguments in one delta and whole, which is A11's decision: the SDK's
-            # accumulator concatenates them into the item it was told about above, and a
-            # single fragment is the valid degenerate case of that.
-            index = len(output)
-            arguments = json.dumps(call.arguments)
-            yield _event(
-                "response.output_item.added",
-                next(sequence),
-                {"output_index": index, "item": _call_item(item_id, call_id, call.name, None)},
-            )
-            yield _event(
-                "response.function_call_arguments.delta",
-                next(sequence),
-                {"output_index": index, "item_id": item_id, "delta": arguments},
-            )
-            yield _event(
-                "response.function_call_arguments.done",
-                next(sequence),
-                {
-                    "output_index": index,
-                    "item_id": item_id,
-                    "name": call.name,
-                    "arguments": arguments,
-                },
-            )
-            item = _call_item(item_id, call_id, call.name, arguments)
-            yield _event(
-                "response.output_item.done", next(sequence), {"output_index": index, "item": item}
-            )
-            output.append(item)
+        # The message item is closed here when no call ever opened it: `message_done` is
+        # idempotent and is called from `calling` for the ordering, so whichever happens
+        # first closes it and the other is a no-op.
+        for frame in message_done():
+            yield frame
         done = _response(request_id, created, request, output, "completed", job.meter)
         yield _event("response.completed", next(sequence), {"response": done})
     finally:
@@ -1112,6 +1272,8 @@ async def respond(
         given = _given(request.input)
     except UnreadableImage as unreadable:
         return openai_error(400, str(unreadable), "invalid_image")
+    except UnreadableArguments as unreadable:
+        return openai_error(400, str(unreadable), "invalid_tool_arguments")
     if not any(turn["content"] or turn.get("tool_calls") for turn in given):
         return openai_error(400, "input must contain non-empty text", "empty_input")
 
@@ -1197,8 +1359,8 @@ async def respond(
     content = "".join(piece.text for piece in pieces)
     made: tuple[ToolCall, ...] = ()
     if calls is not None:
-        held = "".join(calls.push(piece) for piece in pieces)
-        tail, made = calls.finish()
+        held = "".join(calls.push(piece)[0] for piece in pieces)
+        tail, _, made = calls.finish()
         content = held + tail
     # A turn that called something answered with a call and not with a document: the format is
     # about the answer, and this turn has none to check.

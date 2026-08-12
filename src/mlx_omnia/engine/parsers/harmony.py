@@ -12,10 +12,18 @@ Builtin namespaces (`browser`, `python`) are never rendered into our prompts and
 nothing on the other side to route them to, which the opener excludes by construction.
 """
 
+import json
 import re
 
 from mlx_omnia.engine.parsers.envelope import Body, EnvelopeScanner
-from mlx_omnia.engine.parsers.protocol import CallDelta, Channel, Headers, Parser, ToolFamily
+from mlx_omnia.engine.parsers.protocol import (
+    CallDelta,
+    Channel,
+    Headers,
+    Parser,
+    ToolCall,
+    ToolFamily,
+)
 
 __all__ = ["PARSER", "REASONING"]
 
@@ -79,10 +87,18 @@ def _classify(header: str) -> tuple[Channel, str] | None:
     return None
 
 
+def write(call: ToolCall) -> str:
+    """One call in the spelling the model generates — the recipient on the channel, which is
+    the form the reader opens on. `<|constrain|>json` is what the format writes when the body
+    is JSON, and the body always is here."""
+    payload = json.dumps(call.arguments, ensure_ascii=False)
+    return f"{_START}functions.{call.name} <|constrain|>json{_BODY}{payload}{_END}"
+
+
 PARSER = Parser(
     recognizes=lambda source: _CHANNEL in source,
     reasoning=(),
-    tools=ToolFamily(start=_START, end=_END, reader=HarmonyReader),
+    tools=ToolFamily(start=_START, end=_END, reader=HarmonyReader, write=write),
     headers=Headers(
         openers=("<|start|>", "<|channel|>"),
         body=_BODY,

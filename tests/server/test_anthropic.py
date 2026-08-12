@@ -52,6 +52,7 @@ from mlx_omnia import (
     Text,
     greedy,
 )
+from mlx_omnia import ChatMessage as Turn
 from mlx_omnia.engine.generate import Constraint
 from mlx_omnia.engine.parsers import FALLBACK, Segment, Segmenter
 from mlx_omnia.server import anthropic as dialect
@@ -59,7 +60,6 @@ from mlx_omnia.server import catalog
 from mlx_omnia.server.app import _invalid_request
 from mlx_omnia.server.engine import Engine, Job, Loader
 from mlx_omnia.server.profiles import Sampling
-from mlx_omnia.server.responses import ToolTurn
 from mlx_omnia.server.store import Profile, Store
 
 ECHO = "echo"
@@ -69,6 +69,7 @@ BASE = "base"
 """A model with no chat template: the conversation has nowhere to go."""
 
 CALLER = "caller"
+BIG = "big"
 MUTE = "mute"
 STRANGER = "stranger"
 """Scripted callers: what a checkpoint writes when it is offered a function is the
@@ -165,6 +166,18 @@ CALL_PIECES = (
 )
 """One generation, cut where a detokenizer would not: both markers straddle two pieces, so a
 route that hands a piece out before it can tell hands out half a marker."""
+
+PATCH = "x" * 4096
+"""An argument the size an editing tool really carries — the case the old rule made invisible
+until the generation ended."""
+
+BIG_PIECES = (
+    "Editing.",
+    '<tool_call>\n{"name": "apply_patch", "arguments": {"path": "a.py"',
+    f', "body": "{PATCH[:2048]}',
+    f'{PATCH[2048:]}"',
+    "}}\n</tool_call>",
+)
 
 PREAMBLE = CALL_PIECES[0]
 ENVELOPE = "".join(CALL_PIECES[1:])
@@ -302,6 +315,8 @@ def load(model_id: str) -> CompositeModel[Text, Segment, GenerationOptions]:
             return CompositeModel(Caller(CALL_PIECES), [ChatCapability(CALLING_TEMPLATE)])
         case "mute":
             return CompositeModel(Caller(CALL_PIECES[1:]), [ChatCapability(CALLING_TEMPLATE)])
+        case "big":
+            return CompositeModel(Caller(BIG_PIECES), [ChatCapability(CALLING_TEMPLATE)])
         case "stranger":
             return CompositeModel(Caller(CALL_PIECES), [ChatCapability(TEMPLATE)])
         case "guided":
@@ -723,7 +738,7 @@ def test_the_models_route_lists_the_catalog_and_its_profiles(client: anthropic.A
 ASKED = "Weather in Paris?"
 
 
-def conversation(turns: tuple[ToolTurn, ...]) -> str:
+def conversation(turns: tuple[Turn, ...]) -> str:
     """What the template writes for the conversation `chat/completions` would have built out of
     the same round: the tools nested under `function`, the call on the assistant's turn, the
     result as a turn of its own. Rendered rather than spelled out, because what is under test
@@ -829,7 +844,7 @@ def test_the_tools_and_the_blocks_of_a_round_become_the_conversation_openai_woul
         ],
     )
 
-    expected: tuple[ToolTurn, ...] = (
+    expected: tuple[Turn, ...] = (
         {"role": "user", "content": ASKED},
         {
             "role": "assistant",
@@ -838,7 +853,7 @@ def test_the_tools_and_the_blocks_of_a_round_become_the_conversation_openai_woul
                 {
                     "id": "toolu_1",
                     "type": "function",
-                    "function": {"name": "get_weather", "arguments": ARGUMENTS},
+                    "function": {"name": "get_weather", "arguments": json.loads(ARGUMENTS)},
                 }
             ],
         },
@@ -1367,3 +1382,121 @@ def test_the_models_route_answers_for_one_id_and_refuses_a_name_nothing_serves(
     kind, message = envelope(raised.value.body)
     assert kind == "not_found_error"
     assert "vendor/nothing" in message
+
+
+def test_the_input_of_one_call_arrives_in_more_than_one_delta(stand: Stand) -> None:
+    """The reversal of A11 in the dialect Claude Code speaks: a four-kilobyte argument is
+    handed over as it is written, in `input_json_delta` frames, instead of one frame after
+    the generation is over.
+
+    The SDK's accumulator concatenates `partial_json` and parses what it has at every step,
+    so several fragments and one fragment both build the same block — what differs is when
+    the client can start drawing it, which is what the count measures.
+    """
+    captured = frames(stand, model=BIG, tools=TOOLS)
+    names = [name for name, _ in captured]
+    assert "content_block_start" in names
+
+    started = [
+        payload
+        for name, payload in captured
+        if name == "content_block_start"
+        and entry(payload["content_block"])["type"] == "tool_use"
+    ]
+    assert len(started) == 1, "one call, one block"
+    block = entry(started[0]["content_block"])
+    assert block["name"] == "apply_patch"
+    assert block["input"] == {}, "the block opens empty and the deltas fill it"
+    assert text(block["id"]).startswith("toolu_")
+
+    fragments = [
+        text(entry(payload["delta"])["partial_json"])
+        for name, payload in captured
+        if name == "content_block_delta" and entry(payload["delta"])["type"] == "input_json_delta"
+    ]
+    assert len(fragments) > 1, "the whole input arrived at once; nothing is being streamed"
+    assert json.loads("".join(fragments)) == {"path": "a.py", "body": PATCH}
+
+    # Opened, filled and closed, in that order and around the deltas.
+    order = [name for name, _ in captured if name.startswith("content_block")]
+    opened_at = order.index("content_block_start")
+    assert "content_block_stop" in order[opened_at:]
+
+
+def test_the_official_sdk_accumulates_the_streamed_call(client: anthropic.Anthropic) -> None:
+    """Judged by the SDK that Claude Code uses, not by our reading of the frames."""
+    with client.messages.stream(
+        model=BIG,
+        messages=[{"role": "user", "content": "patch it"}],
+        max_tokens=BUDGET,
+        tools=TOOLS,
+    ) as stream:
+        final = stream.get_final_message()
+    used = [block for block in final.content if block.type == "tool_use"]
+    assert len(used) == 1
+    assert used[0].name == "apply_patch"
+    assert used[0].input == {"path": "a.py", "body": PATCH}
+    assert final.stop_reason == "tool_use"
+
+
+def test_the_tool_choice_claude_code_sends_is_accepted(client: anthropic.Anthropic) -> None:
+    """The field that made this dialect unreachable for the client it exists for.
+
+    Claude Code puts `disable_parallel_tool_use` beside `{"type": "auto"}` on its first
+    request, and `extra="forbid"` refused the whole body over it — so every session ended
+    before the first token. `false` asks for what already happens (nothing here caps how many
+    calls a generation writes), so it is accepted and ignored.
+    """
+    reply = client.messages.create(
+        model=CALLER,
+        messages=[{"role": "user", "content": "Weather in Paris?"}],
+        max_tokens=BUDGET,
+        tools=TOOLS,
+        tool_choice={"type": "auto", "disable_parallel_tool_use": False},
+    )
+    assert [block.type for block in reply.content] == ["text", "tool_use"]
+    assert reply.stop_reason == "tool_use"
+
+
+def test_disabling_parallel_tool_use_is_refused_by_name(stand: Stand) -> None:
+    """`true` is the other half and is not the same request: it asks for at most one call,
+    and a generation that wrote two would be answered with something the client said it could
+    not take. Refused with the field named, which is what tells a client to drop it."""
+    refusal = httpx.post(
+        stand.url,
+        json={
+            "model": CALLER,
+            "messages": [{"role": "user", "content": "Weather?"}],
+            "max_tokens": BUDGET,
+            "tools": TOOLS,
+            "tool_choice": {"type": "auto", "disable_parallel_tool_use": True},
+        },
+        timeout=30,
+    )
+    assert refusal.status_code == 400
+    assert "disable_parallel_tool_use" in refusal.json()["error"]["message"]
+
+
+def test_the_prompt_is_untouched_by_the_field_that_is_ignored(stand: Stand) -> None:
+    """Accepted-and-ignored has to mean the prompt is the same characters.
+
+    Read off the echo, which answers with the prompt it was handed — so the comparison is
+    between two renders and not against a string written here, and it stays about the field
+    rather than about the template."""
+    body: dict[str, object] = {
+        "model": ECHO,
+        "messages": [{"role": "user", "content": "Weather in Paris?"}],
+        "max_tokens": BUDGET,
+        "tools": TOOLS,
+    }
+
+    def echoed(sent: dict[str, object]) -> str:
+        answer = httpx.post(stand.url, json=sent, timeout=30)
+        assert answer.status_code == 200, answer.text
+        blocks = entry(answer.json())["content"]
+        assert isinstance(blocks, list)
+        return "".join(text(entry(block)["text"]) for block in blocks)
+
+    plain = echoed(body)
+    with_field = body | {"tool_choice": {"type": "auto", "disable_parallel_tool_use": False}}
+    assert echoed(with_field) == plain

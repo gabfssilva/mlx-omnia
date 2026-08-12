@@ -11,21 +11,35 @@ open. `json.loads` answers whole documents and can do neither.
 """
 
 import json
+from collections.abc import Callable, Mapping, Sequence
 from dataclasses import dataclass
 
 from mlx_omnia.engine.parsers.envelope import Body, EnvelopeScanner
-from mlx_omnia.engine.parsers.protocol import CallDelta, Parser, ToolFamily
+from mlx_omnia.engine.parsers.protocol import CallDelta, Parser, ToolCall, ToolFamily
 
-__all__ = ["PARSER", "REASONING"]
+__all__ = ["ARG_KEY_BODY", "END", "PARSER", "REASONING", "START", "XML_BODY"]
 
 REASONING = ("<think>", "</think>")
 
-_START = "<tool_call>"
-_END = "</tool_call>"
-# Qwen3.6 keeps `<tool_call>` and changes everything inside it. In the template source the
-# newline is the two characters of a Jinja string literal, which is how every checkpoint in
-# circulation spells it.
-_XML = "<tool_call>\\n<function="
+START = "<tool_call>"
+END = "</tool_call>"
+"""The marker three families share. Public because they share it: a module that spelled it
+again would be a second place deciding what an envelope is."""
+
+XML_BODY = "<tool_call>\\n<function="
+"""Qwen3.6's body. In the template source the newline is the two characters of a Jinja string
+literal, which is how every checkpoint in circulation spells it."""
+
+ARG_KEY_BODY = "<arg_key>"
+"""Ling-3.0's and Laguna's body.
+
+Both discriminators live here, in the module that owns the marker, rather than in the
+families they name. The recognizers have to agree about which body belongs to whom, and a
+string written in two modules is how two of them come to disagree — which is the bug this
+constant exists to close: on the marker alone this dialect claimed those templates, its
+scanner read their XML as malformed JSON, and every call they wrote reached the client as
+prose with nothing raised anywhere.
+"""
 
 _NAME = "name"
 _ARGUMENTS = "arguments"
@@ -163,7 +177,7 @@ def _string(text: str) -> str | None:
 
 class QwenReader:
     def __init__(self) -> None:
-        self._scan = EnvelopeScanner(_START, _END)
+        self._scan = EnvelopeScanner(START, END)
         self._members = _Members()
         self._envelope = -1
         self._name = ""
@@ -217,8 +231,63 @@ class QwenReader:
         return ()
 
 
+def _recognizes(source: str) -> bool:
+    """`<tool_call>` and neither of the two bodies that are not this one.
+
+    Three families share the marker and only the body tells them apart, so the marker alone
+    is not a recognizer — it is how this dialect came to claim Ling-3.0 and Laguna, whose
+    `<arg_key>` bodies its scanner reads as malformed JSON. A malformed call is dropped, and
+    a dropped call reaches the client as prose: the model appears to have answered in text,
+    with nothing raised anywhere.
+
+    The two exclusions are imported from the families that own them rather than spelled here,
+    because a marker written twice is how two recognizers come to disagree about one
+    template.
+    """
+    return START in source and XML_BODY not in source and ARG_KEY_BODY not in source
+
+
+def write(call: ToolCall) -> str:
+    """One call as this family generates it. `separators` is jinja's own `tojson` default,
+    which is what the templates that do replay a call write."""
+    payload = {"name": call.name, "arguments": call.arguments}
+    return f"{START}{json.dumps(payload, ensure_ascii=False)}{END}"
+
+
+def grammar(
+    tools: Sequence[Mapping[str, object]], literal: Callable[[str], str]
+) -> str:
+    """`<tool_call>` around an object whose `name` is one of the offered functions and whose
+    `arguments` obey that function's own schema.
+
+    One `anyOf` branch per tool and not a free-form object: the branch is what ties the name
+    to the schema, so a grammar that allowed any offered name beside any offered arguments
+    would guarantee a well-formed call to the wrong function.
+    """
+    branches = [
+        {
+            "type": "object",
+            "properties": {
+                "name": {"const": entry["name"]},
+                "arguments": entry.get("parameters") or {"type": "object"},
+            },
+            "required": ["name", "arguments"],
+        }
+        for entry in (_function(tool) for tool in tools)
+    ]
+    body = json.dumps({"anyOf": branches})
+    return f"start: {literal(START)} body {literal(END)}\nbody: %json {body}"
+
+
+def _function(tool: Mapping[str, object]) -> Mapping[str, object]:
+    """The dialects nest a function under `function`, which is the shape transformers
+    documents and the templates read."""
+    nested = tool.get("function")
+    return nested if isinstance(nested, Mapping) else tool
+
+
 PARSER = Parser(
-    recognizes=lambda source: _START in source and _XML not in source,
+    recognizes=_recognizes,
     reasoning=(REASONING,),
-    tools=ToolFamily(start=_START, end=_END, reader=QwenReader),
+    tools=ToolFamily(start=START, end=END, reader=QwenReader, write=write, grammar=grammar),
 )

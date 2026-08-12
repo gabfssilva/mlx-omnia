@@ -16,7 +16,7 @@ import asyncio
 import json
 import threading
 import time
-from collections.abc import AsyncIterator, Callable, Collection, Mapping
+from collections.abc import AsyncIterator, Callable, Collection, Mapping, Sequence
 from contextlib import asynccontextmanager, suppress
 from dataclasses import dataclass, field, replace
 from types import MappingProxyType
@@ -33,7 +33,7 @@ from mlx_omnia.engine.generate import Constraint, Meter
 from mlx_omnia.engine.grammar import Grammar, Vocabulary
 from mlx_omnia.engine.language import tokenizer_of
 from mlx_omnia.engine.model import Wrapping
-from mlx_omnia.engine.parsers import Segment
+from mlx_omnia.engine.parsers import Segment, ToolFamily
 from mlx_omnia.engine.quant.quantization import Quantization
 from mlx_omnia.engine.quantizing import Quantizing, admits
 from mlx_omnia.server.metrics import Metrics, RequestState
@@ -770,6 +770,12 @@ class Engine:
         await release.done.wait()
         return True
 
+    async def reachable(self, model_id: str) -> LanguageModel[ModelInput]:
+        """The loaded model, for a caller that has to read something off the checkpoint before
+        the job is submitted — which is the call envelope a forced `tool_choice` constrains
+        to. No lease, for `constrain`'s reason: what a race costs is a reload."""
+        return await self._reachable(model_id)
+
     async def _reachable(self, model_id: str) -> LanguageModel[ModelInput]:
         """The model a request named, loaded if this daemon loads on demand.
 
@@ -795,9 +801,40 @@ class Engine:
         next request load it again — what comes back is the same table, so the walk stays
         valid and what the race costs is a reload, not a wrong mask.
         """
+        return await self._walk(model_id, json.dumps(schema, sort_keys=True), schema)
+
+    async def constrain_envelope(
+        self, model_id: str, family: ToolFamily, tools: Sequence[Mapping[str, object]]
+    ) -> Constraint:
+        """The walk that makes a forced `tool_choice` mean what it says: the decode
+        constrained to this checkpoint's own call envelope over the tools offered.
+
+        The family builds the grammar and the vocabulary tells it how to spell a marker, so
+        this method is where the two meet — the family cannot know whether `<tool_call>` is
+        an added id here, and the vocabulary lives inside this class. Everything else is
+        shared with `constrain`: the token table, the per-model cache and the per-request
+        walk.
+        """
+        assert family.grammar is not None, "a family with no grammar is refused by the route"
         model = await self._reachable(model_id)
         entry = self._residency[model_id]
-        key = json.dumps(schema, sort_keys=True)
+        async with self._compiling:
+            vocabulary = entry.vocabulary
+            if vocabulary is None:
+                vocabulary = await asyncio.to_thread(_vocabulary, model_id, model)
+                entry.vocabulary = vocabulary
+            source = family.grammar(tools, vocabulary.literal)
+            grammar = entry.grammars.get(source)
+            if grammar is None:
+                grammar = vocabulary.written(source)
+                entry.grammars[source] = grammar
+        return grammar.constrain()
+
+    async def _walk(
+        self, model_id: str, key: str, schema: Mapping[str, object]
+    ) -> Constraint:
+        model = await self._reachable(model_id)
+        entry = self._residency[model_id]
         async with self._compiling:
             grammar = entry.grammars.get(key)
             if grammar is None:

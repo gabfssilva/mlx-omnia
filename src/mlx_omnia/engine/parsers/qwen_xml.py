@@ -18,15 +18,11 @@ convention read back here.
 import json
 from collections.abc import Iterator
 
-from mlx_omnia.engine.parsers.envelope import Body, EnvelopeScanner
-from mlx_omnia.engine.parsers.protocol import CallDelta, Parser, ToolFamily
-from mlx_omnia.engine.parsers.qwen import REASONING
+from mlx_omnia.engine.parsers.envelope import Body, EnvelopeScanner, encoded
+from mlx_omnia.engine.parsers.protocol import CallDelta, Parser, ToolCall, ToolFamily
+from mlx_omnia.engine.parsers.qwen import END, REASONING, START, XML_BODY
 
 __all__ = ["PARSER"]
-
-_START = "<tool_call>"
-_END = "</tool_call>"
-_XML = "<tool_call>\\n<function="
 
 _FUNCTION = "<function="
 _PARAMETER = "<parameter="
@@ -34,20 +30,9 @@ _PARAMETER_END = "</parameter>"
 _CLOSE = ">"
 
 
-def _encoded(value: str) -> str:
-    """The JSON text of a value the format left untyped. What parses is what the template's
-    own `tojson` wrote; what does not is the string the model typed."""
-    body = value.strip("\n")
-    try:
-        json.loads(body)
-    except json.JSONDecodeError:
-        return json.dumps(body)
-    return body
-
-
 class QwenXmlReader:
     def __init__(self) -> None:
-        self._scan = EnvelopeScanner(_START, _END)
+        self._scan = EnvelopeScanner(START, END)
         self._envelope = -1
         self._held = ""
         self._named = False
@@ -99,7 +84,7 @@ class QwenXmlReader:
                 separator = ", " if self._written else ""
                 self._written += 1
                 yield CallDelta(
-                    index, None, f"{separator}{json.dumps(key)}: {_encoded(value)}", False
+                    index, None, f"{separator}{json.dumps(key)}: {encoded(value)}", False
                 )
 
     def _between(self, opener: str) -> str | None:
@@ -123,8 +108,23 @@ class QwenXmlReader:
         return value
 
 
+def write(call: ToolCall) -> str:
+    """The elements the reader scans for, in the whitespace Qwen3.6's own template uses."""
+    parameters = "".join(
+        f"\n<parameter={key}>\n{_written(value)}\n</parameter>"
+        for key, value in call.arguments.items()
+    )
+    return f"{START}\n<function={call.name}>{parameters}\n</function>\n{END}"
+
+
+def _written(value: object) -> str:
+    """`encoded`'s inverse: a string goes in raw, everything else through `tojson` — the
+    convention the template writes and `encoded` reads back."""
+    return value if isinstance(value, str) else json.dumps(value, ensure_ascii=False)
+
+
 PARSER = Parser(
-    recognizes=lambda source: _XML in source,
+    recognizes=lambda source: XML_BODY in source,
     reasoning=(REASONING,),
-    tools=ToolFamily(start=_START, end=_END, reader=QwenXmlReader),
+    tools=ToolFamily(start=START, end=END, reader=QwenXmlReader, write=write),
 )
