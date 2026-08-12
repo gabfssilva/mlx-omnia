@@ -4,7 +4,7 @@
 `(context, generate, concurrency)` — and the result is four measurements: how long the
 checkpoint takes to become ready, how fast it reads a prompt, how long the first token
 takes, and how fast it decodes after that. The line 34.4 drew still holds:
-`bench/interleaved.py` is the measurement instrument, and none of this counts a regression
+`omnia-bench interleaved` is the measurement instrument, and none of this counts a regression
 against mlx-lm. What it answers is how the checkpoints of this house compare to each other
 under a shape both of them were asked about.
 
@@ -35,7 +35,6 @@ import subprocess
 import time
 from collections.abc import Sequence
 from dataclasses import dataclass
-from pathlib import Path
 
 from mlx_omnia import (
     GenerationOptions,
@@ -52,6 +51,7 @@ from mlx_omnia import (
     top_p,
 )
 from mlx_omnia.footprint import checkpoint_bytes
+from mlx_omnia_bench.gate import Macmon, find_macmon
 from mlx_omnia_server.catalog import CatalogEntry
 from mlx_omnia_server.engine import Engine
 from mlx_omnia_server.jobs import Cancelled, Job, Progress
@@ -79,10 +79,10 @@ and would sit on two different axes."""
 BANDWIDTH_GBS = 610.0
 """The working limit of this machine, and the denominator of every fraction below.
 
-Not `footprint.SUSTAINED_GBS`, which is 490 and is the figure `/admin/benches` and the
-model card have divided by since 34.4. Changing that one would silently restate every
-number already in the file; this section is new, so it starts on the figure the house
-holds today (CLAUDE.md) and says which one it used.
+Held apart from `footprint.SUSTAINED_GBS` on purpose, from when that one read 490 and was
+the figure `/admin/benches` and the model card had divided by since 34.4: changing it would
+have silently restated every number already in the file. The two agree at 610 today, and
+this section still says which one it used.
 """
 
 _FILLER = (
@@ -98,8 +98,6 @@ _TICK = 0.1
 
 _GATE_POLL_S = 5.0
 _GATE_MAX_S = 900.0
-
-_MACMON_CANDIDATES = ("/opt/homebrew/bin/macmon", "/usr/local/bin/macmon")
 
 
 def human(context: int) -> str:
@@ -310,27 +308,16 @@ def refusal(shape: SpeedShape, facts: ModelFacts, budget_bytes: int) -> Refusal 
 
 
 def macmon() -> str | None:
-    """The GPU temperature source `bench/interleaved.py` already gates on. Absent is not an
-    error: the gate then does not run, and the row records no temperature rather than a
-    made-up one."""
+    """The GPU temperature source the instrument gates on, found the same way it finds it.
+    Absent is not an error: the gate then does not run, and the row records no temperature
+    rather than a made-up one."""
     if os.environ.get("OMNIA_COOL_GATE") == "0":
         return None
-    found = shutil.which("macmon")
-    if found is not None:
-        return found
-    return next((path for path in _MACMON_CANDIDATES if Path(path).exists()), None)
+    return find_macmon()
 
 
 def gpu_temperature(tool: str | None) -> float | None:
-    if tool is None:
-        return None
-    try:
-        output = subprocess.run([tool, "pipe", "-s1"], capture_output=True, timeout=30, check=True)
-        sample = json.loads(output.stdout.splitlines()[0])
-        reading = sample["temp"]["gpu_temp_avg"]
-    except (OSError, subprocess.SubprocessError, ValueError, KeyError, IndexError):
-        return None
-    return float(reading) if isinstance(reading, int | float) else None
+    return None if tool is None else Macmon(tool).temperature()
 
 
 def wait_cool(
@@ -590,7 +577,7 @@ def measure(
         gate_c=shape.gate_c,
         load_s=load_s,
         # The prefill rate is `prompt ÷ ttft`, which carries one decode step with it — the
-        # convention `bench/interleaved.py` and `bench/selfpair.py` already report under.
+        # convention `omnia-bench interleaved` and `omnia-bench paired` already report under.
         prefill_tps=prompt_tokens / (statistics.median(ttfts) / 1000),
         ttft_p50_ms=percentile(ttfts, 0.5),
         ttft_p95_ms=percentile(ttfts, 0.95),

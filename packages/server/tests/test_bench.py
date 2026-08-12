@@ -335,7 +335,7 @@ def test_the_history_says_in_the_body_that_it_is_not_interleaved_against_mlx_lm(
     assert isinstance(method, str)
     assert "interleaved" in method
     assert "mlx-lm" in method
-    assert "bench/interleaved.py" in method, "the instrument is not named"
+    assert "omnia-bench interleaved" in method, "the instrument is not named"
 
 
 def test_a_delete_stops_the_bench_inside_a_round_and_records_nothing(

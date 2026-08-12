@@ -31,20 +31,26 @@ uv run lint-imports
 """
 
 [tasks."bench:interleaved"]
-description = "interleaved bench vs mlx-lm git main"
-run = "uv run python bench/interleaved.py"
+description = "interleaved bench vs mlx-lm git main (args: <model> [--draft <name>])"
+run = """
+uv run --with "mlx-lm @ git+https://github.com/ml-explore/mlx-lm" \
+    omnia-bench interleaved --against mlx-lm
+"""
 
-[tasks."bench:selfpair"]
-description = "selfpair bench: working tree vs a git ref (args: <model> <ref>)"
-run = "uv run python bench/selfpair.py"
+[tasks."bench:paired"]
+description = "paired bench: working tree vs a git ref (args: <model> [--ref <ref>])"
+run = "uv run omnia-bench paired"
 
 [tasks."bench:constrained"]
 description = "constrained-decoding bench (args: <model>)"
-run = "uv run python bench/constrained.py"
+run = "uv run python packages/bench/scripts/constrained.py"
 
 [tasks."bench:grammar"]
 description = "grammar bench (args: <model>)"
-run = "uv run python bench/grammar.py"
+run = """
+uv run --no-project --with xgrammar --with llguidance --with transformers \
+    python packages/bench/scripts/grammar.py
+"""
 
 [tasks.server]
 description = "run the FastAPI server"

@@ -3,7 +3,7 @@
 The chip, the GPU core count, the memory and the free space of the catalog's volume are
 discovered — `sysctl`, the IO registry, `statvfs`. The two bandwidth figures are not:
 614 GB/s is Apple's published number for this chip and 490 GB/s is what a serial chain of
-dependent kernels sustains here, measured by `bench/interleaved.py`. The sustained one is
+dependent kernels sustains here, measured by `omnia-bench interleaved`. The sustained one is
 the denominator of every "% of ceiling" the engine reports, which is exactly why it must
 not travel disguised as a reading: `constants` names the fields that were calibrated
 rather than read.
@@ -31,7 +31,7 @@ CONSTANTS = {
     ),
     "bandwidth_sustained_gbs": (
         "Measured, not published: what a serial chain of dependent kernels holds on this "
-        "machine (~80% of theoretical), calibrated with bench/interleaved.py. Every "
+        "machine (~80% of theoretical), calibrated with omnia-bench interleaved. Every "
         "% of ceiling divides by it."
     ),
 }

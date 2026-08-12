@@ -22,7 +22,12 @@ import sys
 import numpy as np
 
 MODEL = "tencent/Hy3"
-PROMPT_PATH = pathlib.Path(__file__).resolve().parents[3] / "reference" / "bench_prompt.txt"
+PROMPT_PATH = (
+    pathlib.Path(__file__).resolve().parents[4]
+    / "packages/bench/src/mlx_omnia_bench/bench_prompt.txt"
+)
+"""`parents[4]` is the repository root. It used to be `parents[3] / "reference"`, which
+resolved to `packages/reference` and never existed — the fallback below hid it."""
 PROMPT = PROMPT_PATH.read_text() if PROMPT_PATH.is_file() else "The capital of France is"
 
 # Hy3 eos: 120025 (<|hy_eos:opensource|>)

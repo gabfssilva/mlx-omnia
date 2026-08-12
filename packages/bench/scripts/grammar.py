@@ -12,9 +12,10 @@ token, say whether it is done, and roll back n tokens for speculation.
 
 Neither library is a workspace dependency and this script imports nothing from `mlx_omnia`:
 
-  uv run --no-project --with xgrammar --with llguidance --with transformers bench/grammar.py
   uv run --no-project --with xgrammar --with llguidance --with transformers \\
-      bench/grammar.py mlx-community/Qwen3-30B-A3B-4bit
+      packages/bench/scripts/grammar.py
+  uv run --no-project --with xgrammar --with llguidance --with transformers \\
+      packages/bench/scripts/grammar.py mlx-community/Qwen3-30B-A3B-4bit
 
 Whichever of the two is missing is skipped with its import error. Note that `--with
 xgrammar` drags torch, transformers, pydantic and apache-tvm-ffi in with it — its
@@ -43,7 +44,7 @@ import numpy as np
 from numpy.typing import NDArray
 from transformers import AutoTokenizer
 
-FIXTURE = Path(__file__).parent.parent / "packages/engine/tests/fixtures/grammar_schemas.json"
+FIXTURE = Path(__file__).parents[3] / "packages/engine/tests/fixtures/grammar_schemas.json"
 HUB = Path.home() / ".cache/huggingface/hub"
 DEFAULT_MODEL = "mlx-community/Qwen3-30B-A3B-4bit"
 

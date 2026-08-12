@@ -79,7 +79,7 @@ def test_the_bandwidth_pair_is_declared_constant_and_nothing_else_is(
     # published number, or like a spec sheet on the measured one, is the failure this route
     # exists to prevent, and `all(...)` on non-empty strings would not see it.
     assert "published" in constants["bandwidth_theoretical_gbs"]
-    assert "bench/interleaved.py" in constants["bandwidth_sustained_gbs"]
+    assert "omnia-bench interleaved" in constants["bandwidth_sustained_gbs"]
 
 
 def test_the_version_is_the_engine_package_s(payload: dict[str, object]) -> None:

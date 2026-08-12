@@ -1,7 +1,7 @@
 """`POST /admin/benches` runs a model through the daemon's own queue and keeps the number;
 `GET /admin/benches` is the history the model card reads.
 
-The line this does not cross: `bench/interleaved.py` is the measurement instrument.
+The line this does not cross: `omnia-bench interleaved` is the measurement instrument.
 Alternating A/B rounds against mlx-lm git main over the same checkpoint, median of 5, is
 what counts a regression, and none of it fits behind an endpoint — the reference has to be
 loaded in the same process and interleaved with ours, or the ~8% the machine drifts over a
@@ -44,7 +44,7 @@ from mlx_omnia_server.profiles import StoreDep
 from mlx_omnia_server.store import Bench, Store
 
 _TOKENS = 128
-"""Generated per round, the count `bench/interleaved.py` also measures over."""
+"""Generated per round, the count `omnia-bench interleaved` also measures over."""
 
 _ROUNDS = 5
 """Taken when the caller names no number, the instrument's own median of 5."""
@@ -58,13 +58,14 @@ _PROMPT = (
     "Describe, in as much detail as you can, how a transformer decodes a single token: "
     "what is read from memory, what is recomputed, and where the time goes."
 )
-"""What a round runs when the caller names none. Not `reference/bench_prompt.txt` — that
-file is not part of the installed package — so a ttft read against the instrument's is a
-ttft over a different prompt."""
+"""What a round runs when the caller names none. Not the instrument's prompt, which is now
+reachable (`mlx_omnia_bench.BENCH_PROMPT`): switching to it would restate every number
+already stored under this route. So a ttft read against the instrument's is still a ttft over
+a different prompt, and that is the standing caveat rather than a packaging accident."""
 
 METHOD = (
     "median of the rounds this daemon ran on this machine, through its own queue. Not an "
-    "interleaved A/B against mlx-lm: bench/interleaved.py is the measurement instrument, "
+    "interleaved A/B against mlx-lm: omnia-bench interleaved is the measurement instrument, "
     "and only its alternating rounds against mlx-lm git main count a regression. This is "
     "operational history — whether this machine got slower than it was."
 )

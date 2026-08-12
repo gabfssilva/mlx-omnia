@@ -350,7 +350,7 @@ class Meter:
     @property
     def tokens_per_second(self) -> float | None:
         """Decode only. The first token belongs to `ttft`, so the rate covers the ones
-        after it — the same split `bench/interleaved.py` reports."""
+        after it — the same split `omnia-bench interleaved` reports."""
         elapsed = self.decode_seconds
         if elapsed is None or elapsed <= 0 or self.completion_tokens < 2:
             return None

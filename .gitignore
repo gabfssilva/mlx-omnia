@@ -23,9 +23,9 @@ node_modules/
 # Swift (aguardando deleção)
 .legacy/
 
-# Local-only docs and reference scripts (bench_prompt.txt is a bench dependency)
+# Local-only docs and reference scripts. The bench prompt used to live here behind an
+# exception; it is part of the instrument now (packages/bench/src/mlx_omnia_bench).
 reference/*
-!reference/bench_prompt.txt
 PLAN.md
 DSL.md
 MIGRATION.md

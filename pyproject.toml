@@ -2,7 +2,13 @@
 name = "mlx-omnia-workspace"
 version = "0.0.0"
 requires-python = ">=3.13"
-dependencies = ["mlx-omnia", "mlx-omnia-server", "mlx-omnia-cli", "mlx-omnia-application"]
+dependencies = [
+    "mlx-omnia",
+    "mlx-omnia-server",
+    "mlx-omnia-cli",
+    "mlx-omnia-application",
+    "mlx-omnia-bench[omnia]",
+]
 
 [tool.uv]
 package = false
@@ -31,10 +37,16 @@ mlx-omnia = { workspace = true }
 mlx-omnia-server = { workspace = true }
 mlx-omnia-cli = { workspace = true }
 mlx-omnia-application = { workspace = true }
+mlx-omnia-bench = { workspace = true }
 
 [tool.ruff]
 line-length = 100
-src = ["packages/engine/src", "packages/server/src", "packages/cli/src"]
+src = [
+    "packages/engine/src",
+    "packages/server/src",
+    "packages/cli/src",
+    "packages/bench/src",
+]
 
 [tool.ruff.lint]
 select = [
@@ -48,7 +60,29 @@ select = [
 ]
 
 [tool.importlinter]
-root_packages = ["mlx_omnia", "mlx_omnia_application"]
+root_packages = ["mlx_omnia", "mlx_omnia_application", "mlx_omnia_bench"]
+
+[[tool.importlinter.contracts]]
+name = "the harness knows no engine"
+type = "forbidden"
+source_modules = [
+    "mlx_omnia_bench.arm",
+    "mlx_omnia_bench.battery",
+    "mlx_omnia_bench.ceiling",
+    "mlx_omnia_bench.forcing",
+    "mlx_omnia_bench.gate",
+    "mlx_omnia_bench.paired",
+    "mlx_omnia_bench.prompt",
+    "mlx_omnia_bench.report",
+    "mlx_omnia_bench.sample",
+    "mlx_omnia_bench.worker",
+]
+forbidden_modules = ["mlx_omnia"]
+
+[[tool.importlinter.contracts]]
+name = "adapters do not know each other"
+type = "independence"
+modules = ["mlx_omnia_bench.arms.omnia", "mlx_omnia_bench.arms.mlx_lm"]
 
 [[tool.importlinter.contracts]]
 name = "core and bpe never reach up"
@@ -127,4 +161,9 @@ reportUnknownArgumentType = false
 reportPrivateUsage = false
 
 [tool.pytest.ini_options]
-testpaths = ["packages/engine/tests", "packages/server/tests", "packages/cli/tests"]
+testpaths = [
+    "packages/engine/tests",
+    "packages/server/tests",
+    "packages/cli/tests",
+    "packages/bench/tests",
+]

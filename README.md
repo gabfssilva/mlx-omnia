@@ -47,6 +47,7 @@ uv workspace, one directory per package:
 | `packages/server` | FastAPI server speaking the OpenAI API (streaming included), global FCFS queue |
 | `packages/cli` | HTTP client for the server; depends only on httpx |
 | `packages/application` | the desktop window (Flet), talks to the server over HTTP only and starts it when nothing answers |
+| `packages/bench` | the measurement instrument (`omnia-bench`): thermal gate, teacher forcing, interleaved rounds, dominance verdict — engine-agnostic, with mlx-omnia and mlx-lm as optional adapters |
 
 Inside the engine:
 
@@ -80,7 +81,7 @@ uv run ruff check && uv run pyright && uv run lint-imports   # rest of the gate
 
 Fixtures are generated from reference implementations (`packages/engine/tests/fixtures/generate_*.py`) and are not checked in; `SHA256SUMS` is. Parity tests compare full logits against them with tolerances derived from measured noise floors.
 
-Benchmarks are interleaved A/B in the same process, behind a thermal gate: `bench/interleaved.py` (against a baseline engine) and `bench/selfpair.py` (working tree against a git ref).
+Benchmarks are interleaved A/B in the same process, behind a thermal gate: `omnia-bench interleaved` (against a baseline engine) and `omnia-bench paired` (working tree against a git ref).
 
 ## Acknowledgements
 
