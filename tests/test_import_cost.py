@@ -41,3 +41,27 @@ def test_the_public_api_still_resolves_through_the_roof() -> None:
     from mlx_omnia import load
 
     assert load.__module__ == "mlx_omnia.engine.task"
+
+
+ROOF = """
+import sys
+import mlx_omnia
+print("mlx" in sys.modules, len(mlx_omnia.__all__), "mlx" in sys.modules)
+"""
+
+
+def test_the_roof_promises_the_same_names_it_defers() -> None:
+    """`mlx_omnia/__init__` says the engine's API twice — once in a `TYPE_CHECKING` branch an
+    editor reads, once through the hook the interpreter runs. This is the runtime half: the
+    star import has to take the 160 names the branch above promised, and importing the roof
+    still has to cost nothing until a name is asked for.
+
+    A fresh interpreter is the whole point. This one already has the engine resident.
+    """
+    done = subprocess.run(
+        [sys.executable, "-c", ROOF], capture_output=True, text=True, check=True
+    )
+    before, names, after = done.stdout.split()
+    assert before == "False", "importing the roof loaded the engine"
+    assert int(names) > 100, "the star import would take nothing at runtime"
+    assert after == "True", "reading __all__ off the roof did not reach the engine"
