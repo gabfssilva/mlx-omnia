@@ -10,6 +10,7 @@ from mlx_omnia.engine.checkpoint import (
     concat_gate_up,
     interleave_gate_up,
     load_shards,
+    materialize,
     prepare_weights,
     stack_experts,
     stop_tokens,
@@ -38,7 +39,7 @@ def _normalize_head(weights: dict[str, mx.array]) -> dict[str, mx.array]:
     head = weights["lm_head.weight"]
     norm = mx.linalg.norm(head.astype(mx.float32), axis=0, keepdims=True) + 1e-7
     weights["lm_head.weight"] = (head / norm).astype(head.dtype)
-    mx.eval(weights["lm_head.weight"])
+    materialize(weights["lm_head.weight"])
     return weights
 
 

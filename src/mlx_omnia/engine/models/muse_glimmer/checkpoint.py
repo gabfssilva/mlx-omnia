@@ -9,16 +9,20 @@ from mlx_omnia.engine.bpe import ByteLevelBPE
 from mlx_omnia.engine.chat import ChatCapability, MultimodalChatCapability, chat_template
 from mlx_omnia.engine.checkpoint import (
     Drafter,
+    ImageCost,
     Pending,
+    Sight,
     attach_weights,
     checkpoint,
     concat_gate_up,
     declared_plan,
     load_shards,
+    materialize,
     prepare_weights,
     reject_dtype_cast,
     stop_tokens,
 )
+from mlx_omnia.engine.core.config import load_config
 from mlx_omnia.engine.language import LanguageModel
 from mlx_omnia.engine.model import CompositeModel, ModelInput
 from mlx_omnia.engine.models.muse_glimmer.config import (
@@ -27,8 +31,19 @@ from mlx_omnia.engine.models.muse_glimmer.config import (
     MuseGlimmerRoPE,
 )
 from mlx_omnia.engine.models.muse_glimmer.dflash import MuseGlimmerAssistant
-from mlx_omnia.engine.models.muse_glimmer.model import MuseGlimmer, MuseGlimmerLanguageModel
-from mlx_omnia.engine.models.muse_glimmer.vision import load_processor_config
+from mlx_omnia.engine.models.muse_glimmer.model import (
+    MuseGlimmer,
+    MuseGlimmerLanguageModel,
+    sees,
+)
+from mlx_omnia.engine.models.muse_glimmer.vision import (
+    Grid,
+    ProcessorConfig,
+    load_processor_config,
+    smart_resize,
+)
+
+_TYPES = ("muse_glimmer",)
 
 _RENAMES = (
     ("model.language_model.", "model."),
@@ -74,7 +89,7 @@ def _fold_block_norms(weights: dict[str, mx.array]) -> dict[str, mx.array]:
     for key, value in weights.items():
         if key.endswith("layernorm.weight"):
             weights[key] = value + 1
-    mx.eval(list(weights.values()))
+    materialize(list(weights.values()))
     return weights
 
 
@@ -90,14 +105,40 @@ def _chat(
     return [MultimodalChatCapability(template, marker)]
 
 
+def _processor(directory: Path) -> ProcessorConfig | None:
+    path = directory / "processor_config.json"
+    return load_processor_config(path) if path.exists() else None
+
+
 def _composite(directory: Path, model: MuseGlimmer) -> LanguageModel[ModelInput]:
     tokenizer = ByteLevelBPE.from_file(directory / "tokenizer.json")
-    processor_path = directory / "processor_config.json"
-    processor = load_processor_config(processor_path) if processor_path.exists() else None
+    processor = _processor(directory)
     facade = MuseGlimmerLanguageModel(
         model, tokenizer, processor, stop=stop_tokens(directory, model.config.eos)
     )
     return CompositeModel(facade, _chat(directory, facade))
+
+
+def _sight(directory: Path) -> Sight | None:
+    """The two steps `process_image` takes before the tower reads anything. The resize is
+    this family's own — the merged-patch grid closest to the aspect ratio *under a token
+    cap*, not qwen's area window — so the cap is the number that decides here."""
+    processor = _processor(directory)
+    config = load_config(MuseGlimmerConfig, directory / "config.json", allowed_model_types=_TYPES)
+    if processor is None or not sees(config, processor):
+        return None
+
+    def cost(height: int, width: int) -> ImageCost:
+        read = smart_resize(
+            height,
+            width,
+            processor.patch_size * processor.merge_size,
+            processor.max_image_tokens,
+        )
+        grid = Grid(1, read[0] // processor.patch_size, read[1] // processor.patch_size)
+        return ImageCost(read[0], read[1], grid.tokens(processor.merge_size))
+
+    return cost
 
 
 def assistant_weights(
@@ -193,5 +234,6 @@ CHECKPOINT = checkpoint(
     MuseGlimmer,
     weights,
     _composite,
-    model_types=("muse_glimmer",),
+    model_types=_TYPES,
+    sight=_sight,
 )

@@ -24,8 +24,18 @@ class PoolCache(LayerCache):
         self.tail_gate: mx.array | None = None
         self.remainder = 0
         self.pooled: mx.array | None = None
-        self.rows = 0
+        # Not `rows`: the base answers that name with the offset, and this counter is the
+        # pooled rows written — one per `ratio` tokens, not one per token.
+        self.pooled_rows = 0
         self.previous: tuple[mx.array, mx.array] | None = None
+
+    @property
+    def is_replayable(self) -> bool:
+        """No. `checkpoint()` cannot capture the tail: a call that completes a window reads
+        `tail[:remainder]` and then overwrites those same rows with what is left over, so a
+        restore rewinds the counter onto rows the round already destroyed. A replay would
+        pool a window out of the wrong tokens and say nothing."""
+        return False
 
     @property
     def nbytes(self) -> int:
@@ -39,11 +49,11 @@ class PoolCache(LayerCache):
 
     def checkpoint(self) -> Callable[[], None]:
         parent = super().checkpoint()
-        state = (self.remainder, self.rows, self.previous, self.pooled)
+        state = (self.remainder, self.pooled_rows, self.previous, self.pooled)
 
         def restore() -> None:
             parent()
-            self.remainder, self.rows, self.previous, self.pooled = state
+            self.remainder, self.pooled_rows, self.previous, self.pooled = state
 
         return restore
 
@@ -79,15 +89,15 @@ class PoolCache(LayerCache):
         return ready_kv, ready_gate, base
 
     def append(self, pooled: mx.array) -> None:
-        needed = self.rows + pooled.shape[2]
+        needed = self.pooled_rows + pooled.shape[2]
         self.pooled = reserve(self.pooled, needed, pooled)
-        self.pooled[..., self.rows : needed, :] = pooled
-        self.rows = needed
+        self.pooled[..., self.pooled_rows : needed, :] = pooled
+        self.pooled_rows = needed
 
     def fetch(self, head_dim: int, dtype: mx.Dtype) -> mx.array:
         if self.pooled is None:
             return mx.zeros((1, 1, 0, head_dim), dtype=dtype)
-        return self.pooled[..., : self.rows, :]
+        return self.pooled[..., : self.pooled_rows, :]
 
     def mask(self, length: int, offset: int) -> mx.array | None:
         """Pooled row `i` is visible to the query at absolute position `p` while
@@ -95,7 +105,7 @@ class PoolCache(LayerCache):
         if length == 1:
             return None
         rows = mx.arange(offset + 1, offset + length + 1).reshape(-1, 1)
-        return mx.arange(self.rows).reshape(1, -1) < rows // self.ratio
+        return mx.arange(self.pooled_rows).reshape(1, -1) < rows // self.ratio
 
 
 class DeepseekV4Cache(LayerCache):
@@ -122,6 +132,16 @@ class DeepseekV4Cache(LayerCache):
     @property
     def is_trimmable(self) -> bool:
         return self.compressor is None and self.attention.is_trimmable
+
+    @property
+    def is_replayable(self) -> bool:
+        """The pools answer for themselves — a layer that carries one cannot be rewound by
+        either road, and saying otherwise is what lets speculation run off a pooled window
+        that was built from tokens the sequence never had."""
+        pools = (self.compressor, self.indexer)
+        return self.attention.is_replayable and all(
+            pool.is_replayable for pool in pools if pool is not None
+        )
 
     @property
     def nbytes(self) -> int:

@@ -3,7 +3,13 @@ from pathlib import Path
 import mlx.core as mx
 
 from mlx_omnia.engine.chat import chat_capabilities
-from mlx_omnia.engine.checkpoint import checkpoint, load_shards, prepare_weights, stop_tokens
+from mlx_omnia.engine.checkpoint import (
+    checkpoint,
+    load_shards,
+    materialize,
+    prepare_weights,
+    stop_tokens,
+)
 from mlx_omnia.engine.language import LanguageModel, TextLanguageModel
 from mlx_omnia.engine.model import CompositeModel, ModelInput
 from mlx_omnia.engine.models.gemma3.tokenizer import Gemma3Tokenizer
@@ -43,7 +49,7 @@ def _clip_altup(weights: dict[str, mx.array], config: Gemma3nConfig) -> dict[str
     for key, value in weights.items():
         if key.endswith(("altup.prediction_coefs.weight", "altup.correction_coefs.weight")):
             weights[key] = mx.clip(value, -clip, clip)
-    mx.eval(list(weights.values()))
+    materialize(list(weights.values()))
     return weights
 
 

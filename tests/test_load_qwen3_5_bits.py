@@ -3,13 +3,18 @@ and the shared expert's logit row ship at 8 bits while every other leaf ships at
 nothing in the config says so — the tensors do. A per-leaf plan takes that further: the
 shared expert at a width the routed stack does not have, and a dense router beside a
 packed shared gate. Every fusion the loader performs is conditional on the tensors
-agreeing, and what does not fuse stays addressable as separate leaves."""
+agreeing, and what does not fuse stays addressable as separate leaves.
+
+And the two spellings the same sparse trunk ships in: an mlx conversion writes the expert
+stack, a raw HuggingFace checkpoint writes one leaf per expert. Both have to land on the
+same model."""
 
 import json
 from pathlib import Path
 
 import mlx.core as mx
 import mlx.nn as nn
+from mlx.utils import tree_flatten
 
 from mlx_omnia.engine.core.layers import QuantizedSwitchLinear, SegmentedLinear
 from mlx_omnia.engine.models.qwen3_5 import CHECKPOINT, Qwen35MoE
@@ -96,8 +101,58 @@ def _moe(prefix: str, *, shared_bits: int = EXPERT_BITS, dense_router: bool = Fa
     return weights
 
 
+_ZERO_CENTERED = (
+    "input_layernorm.weight",
+    "post_attention_layernorm.weight",
+    "q_norm.weight",
+    "k_norm.weight",
+)
+
+
+def _centred(name: str) -> bool:
+    return name == "model.norm.weight" or name.endswith(_ZERO_CENTERED)
+
+
+def _mlx(weights: dict[str, mx.array]) -> dict[str, mx.array]:
+    """What a conversion writes: house names, the conv as `[dim, kernel, 1]`, the norm
+    shift already folded in, the routed experts stacked."""
+    return {
+        name: value.reshape(*value.shape, 1)
+        if name.endswith("conv1d.weight")
+        else value + 1
+        if _centred(name)
+        else value
+        for name, value in weights.items()
+    }
+
+
+def _raw_hf(weights: dict[str, mx.array]) -> dict[str, mx.array]:
+    """What a source checkpoint writes: the trunk under `model.language_model.*`, the conv
+    in the torch layout `[dim, 1, kernel]`, the RMSNorms still centred on zero, and the
+    routed experts one leaf each — scales and biases sliced with the packed rows.
+
+    The shift stays on this side of the fixture rather than being undone on the other, so
+    both dialects reach the model through the same `w + 1` and compare exactly."""
+    written: dict[str, mx.array] = {}
+    for name, value in weights.items():
+        if name.endswith("conv1d.weight"):
+            value = value.reshape(value.shape[0], 1, value.shape[1])
+        renamed = f"model.language_model.{name.removeprefix('model.')}"
+        if ".switch_mlp." not in name:
+            written[renamed] = value
+            continue
+        head, tail = renamed.split(".switch_mlp.")
+        for expert in range(value.shape[0]):
+            written[f"{head}.experts.{expert}.{tail}"] = value[expert]
+    return written
+
+
 def _checkpoint(
-    directory: Path, *, shared_bits: int = EXPERT_BITS, dense_router: bool = False
+    directory: Path,
+    *,
+    shared_bits: int = EXPERT_BITS,
+    dense_router: bool = False,
+    raw_hf: bool = False,
 ) -> None:
     mx.random.seed(0)
     queries = HEADS * HEAD_DIM
@@ -105,8 +160,9 @@ def _checkpoint(
     weights: dict[str, mx.array] = {
         "model.embed_tokens.weight": _dense(VOCAB, HIDDEN),
         "model.norm.weight": _dense(HIDDEN),
-        # An mlx conversion ships the conv as [dim, kernel, 1] with the norm shift folded.
-        "model.layers.0.linear_attn.conv1d.weight": _dense(CONV_DIM, KERNEL, 1),
+        # Neutral between the dialects: `_mlx` and `_raw_hf` give the conv its layout and
+        # the zero-centred norms their shift.
+        "model.layers.0.linear_attn.conv1d.weight": _dense(CONV_DIM, KERNEL),
         "model.layers.0.linear_attn.in_proj_qkv.weight": _dense(CONV_DIM, HIDDEN),
         "model.layers.0.linear_attn.in_proj_z.weight": _dense(VALUE_DIM, HIDDEN),
         "model.layers.0.linear_attn.in_proj_b.weight": _dense(VALUE_HEADS, HIDDEN),
@@ -128,6 +184,7 @@ def _checkpoint(
         weights |= _moe(
             f"model.layers.{layer}.mlp.", shared_bits=shared_bits, dense_router=dense_router
         )
+    weights = _raw_hf(weights) if raw_hf else _mlx(weights)
     mx.eval(list(weights.values()))
     directory.mkdir(parents=True, exist_ok=True)
     (directory / "config.json").write_text(json.dumps(_CONFIG))
@@ -182,6 +239,24 @@ def test_the_shared_expert_keeps_a_width_the_routed_stack_does_not_have(
         routed = mlp.switch_mlp.gate_up_proj
         assert isinstance(routed, QuantizedSwitchLinear)
         assert routed.bits == EXPERT_BITS
+
+
+def test_one_leaf_per_expert_loads_as_the_stack_the_mlx_spelling_ships(tmp_path: Path) -> None:
+    """The routed experts arrive numbered in a raw HuggingFace checkpoint and stacked in an
+    mlx conversion. Compared leaf by leaf against the stacked load, so the assertion is the
+    whole model and not the shape of one tensor."""
+    # mutação: inverter a ordem em `stack_experts` (`reversed(range(experts))`) mantém todo
+    # shape e todo dtype — e quebra aqui, porque o slot `e` deixa de ser o expert que o
+    # router endereça como `e`. Só a comparação tensor a tensor pega isso.
+    _checkpoint(tmp_path / "mlx")
+    _checkpoint(tmp_path / "hf", raw_hf=True)
+
+    stacked = dict(tree_flatten(CHECKPOINT.load(tmp_path / "mlx", None).parameters()))
+    numbered = dict(tree_flatten(CHECKPOINT.load(tmp_path / "hf", None).parameters()))
+
+    assert numbered.keys() == stacked.keys()
+    for name, value in stacked.items():
+        assert mx.array_equal(numbered[name], value), name
 
 
 def test_a_dense_router_beside_a_quantized_shared_gate_stays_segmented(tmp_path: Path) -> None:

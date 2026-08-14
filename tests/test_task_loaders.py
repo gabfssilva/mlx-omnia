@@ -131,7 +131,10 @@ def test_every_checkpoint_pulls_the_generation_config(model_type: str) -> None:
 def test_the_loader_hands_over_every_eos_the_checkpoint_declares(tmp_path: Path) -> None:
     """Checkpoints declare more than one (Qwen3.6: `<|im_end|>` and `<|endoftext|>`), and
     the facade has to receive all of them — taking the first is what left a raw prompt
-    running to `max_tokens`."""
+    running to `max_tokens`.
+
+    The two the config names come first and in order; the tokenizer's own `eos_token` rides
+    behind them (`stop_tokens`), so the set is checked at its head rather than whole."""
     repo = "mlx-community/Qwen3-0.6B-4bit"
     directory = local_snapshot(repo)
     if directory is None:
@@ -146,4 +149,4 @@ def test_the_loader_hands_over_every_eos_the_checkpoint_declares(tmp_path: Path)
     assert isinstance(model, CompositeModel)
     backend = model.model
     assert isinstance(backend, TextLanguageModel)
-    assert tuple(backend.stop) == (7, 9)
+    assert tuple(backend.stop)[:2] == (7, 9)

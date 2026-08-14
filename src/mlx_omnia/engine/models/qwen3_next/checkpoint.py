@@ -8,6 +8,7 @@ from mlx_omnia.engine.checkpoint import (
     checkpoint,
     interleave_gate_up,
     load_shards,
+    materialize,
     prepare_weights,
     stack_experts,
     stop_tokens,
@@ -58,7 +59,7 @@ def _fold_norm_scales(weights: dict[str, mx.array]) -> dict[str, mx.array]:
     for key, value in weights.items():
         if value.ndim == 1 and (key.endswith(ZERO_CENTRED) or key == "model.norm.weight"):
             weights[key] = value + 1
-    mx.eval(list(weights.values()))
+    materialize(list(weights.values()))
     return weights
 
 

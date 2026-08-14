@@ -4,7 +4,12 @@ from collections.abc import Callable
 import mlx.core as mx
 import mlx.nn as nn
 
-from mlx_omnia.engine.core.cache import DeltaCache, KVCache
+from mlx_omnia.engine.core.cache import (
+    DeltaCache,
+    FixedDeltaCache,
+    FixedKVCache,
+    KVCache,
+)
 from mlx_omnia.engine.core.kernels.add_norm import AddRmsNorm, AddRmsNormStrategy, DefaultAddRmsNorm
 from mlx_omnia.engine.core.layers import SwiGLU
 from mlx_omnia.engine.models.qwen3_5.config import Qwen35TextConfig
@@ -57,16 +62,25 @@ class Qwen35Block(nn.Module):
         self._join_strategy: AddRmsNormStrategy | None = None
         self._join_key: tuple[object, ...] | None = None
         self._tail = self._build_tail()
+        # The uncompiled DeltaNet body, kept beside its trace: a trunk-level compile calls
+        # this one, so the outer graph is the only trace.
+        self._step_body: _DeltaStep | None = None
+        # Whether the delegators were last resolved for a trunk-level graph rather than
+        # inside this block's own traces. `_rebuild` reads it; `prepare_decode` sets it.
+        self._resolved_outside = False
+        # Bumped every time the delegators are dropped, so a graph built over them can
+        # tell that what it baked is gone.
+        self.epoch = 0
         self._traced = _trace_key(self)
-        # `inputs=self.state` keeps the weights this module reads directly implicit
-        # inputs of the trace instead of baked constants: a swapped tensor
-        # (quantize-on-load, a mutation test) is read on the next call, no retrace
-        # needed. Tensors a delegator captured at resolution are baked, which is why
-        # resolution is lazy — it happens at the first step, past the loader.
+        # `_traced_state()` keeps the weights this module reads directly implicit inputs
+        # of the trace instead of baked constants: a swapped tensor (quantize-on-load, a
+        # mutation test) is read on the next call, no retrace needed. What a delegator
+        # holds is baked instead, and `Qwen35MoE._kernels` is what notices a swap there.
         if self.attends:
-            self._tail_step = mx.compile(self._build_tail(), inputs=self.state)
+            self._tail_step = mx.compile(self._tail, inputs=self._traced_state())
         else:
-            self._step = mx.compile(self._build_step(), inputs=self.state)
+            self._step_body = self._build_step()
+            self._step = mx.compile(self._step_body, inputs=self._traced_state())
 
     def _join(self) -> AddRmsNormStrategy:
         """Resolved once, at the first T=1 step — after load, when the norm leaf's
@@ -87,13 +101,60 @@ class Qwen35Block(nn.Module):
         return join
 
     def mix(
-        self, x: mx.array, cache: KVCache | DeltaCache, positions: mx.array | None
+        self,
+        x: mx.array,
+        cache: KVCache | FixedKVCache | DeltaCache,
+        positions: mx.array | None,
+        mask: mx.array | None = None,
     ) -> mx.array:
         if self.attends:
-            assert isinstance(cache, KVCache)
-            return self.self_attn(self.input_layernorm(x), cache, positions)
+            assert isinstance(cache, KVCache | FixedKVCache)
+            return self.self_attn(self.input_layernorm(x), cache, positions, mask)
         assert isinstance(cache, DeltaCache)
         return self.linear_attn(self.input_layernorm(x), cache)
+
+    def prepare_decode(self) -> None:
+        """Every resolution the trunk's decode graph will need, taken fresh and outside
+        any trace, before that graph is built.
+
+        Dropped first and not merely resolved: the per-block steps resolve on their first
+        call, which happens *inside* their own trace, so a strategy left over from one
+        holds that trace's tracers as its weight fields. The mark is what makes the trade
+        reversible — a block that streams again through its own step rebuilds instead of
+        reading arrays that trace never captured."""
+        self._rebuild()
+        self._drop_resolutions()
+        self._join()
+        if not self.attends:
+            self.linear_attn.rule()
+        mlp = self.mlp
+        if isinstance(mlp, Qwen35MoE):
+            mlp._kernels()
+        self._resolved_outside = True
+
+    def graph_step(
+        self,
+        x: mx.array,
+        cache: FixedKVCache | FixedDeltaCache,
+        positions: mx.array | None,
+        mask: mx.array | None,
+    ) -> mx.array:
+        """One token through this block reading every array off a graph-visible cache —
+        the body a trunk-level `mx.compile` traces.
+
+        Deliberately not `self._step`/`self._tail_step`: those are traces of their own,
+        and a trace inside a trace is either inlined twice or a barrier the outer graph
+        cannot fuse across. The arithmetic is the same closure either way, so the two
+        paths round identically."""
+        if self.attends:
+            assert isinstance(cache, FixedKVCache)
+            return self._tail(x, self.self_attn(self.input_layernorm(x), cache, positions, mask))
+        assert isinstance(cache, FixedDeltaCache)
+        window, state = cache.window, cache.state
+        step = self._step_body
+        assert window is not None and state is not None and step is not None
+        out, cache.window, cache.state = step(x, window, state)
+        return out
 
     def _build_tail(self) -> _TailStep:
         """The tail every one-token layer ends in: the residual join and the norm that
@@ -167,26 +228,76 @@ class Qwen35Block(nn.Module):
 
         return step
 
+    def _traced_state(self) -> list[object]:
+        """The containers a trace of this block must re-read on every call.
+
+        A sparse MLP is deliberately absent. Its leaves reach the graph through the three
+        resolved kernels, which hold them as their own fields — and an array that is both
+        a declared input and a strategy's frozen field is exactly what `mx.compile`
+        rejects: it swaps the one inside the container for a tracer and the strategy goes
+        on reading the original. `Qwen35MoE._kernels` re-resolves when a leaf is replaced,
+        so nothing is lost by leaving them baked. A dense MLP stays: the trace reads it
+        directly."""
+        mixer = self.self_attn if self.attends else self.linear_attn
+        state: list[object] = [
+            self.input_layernorm.state,
+            self.post_attention_layernorm.state,
+            mixer.state,
+        ]
+        if not isinstance(self.mlp, Qwen35MoE):
+            state.append(self.mlp.state)
+        return state
+
+    def _resolve(self) -> None:
+        """The MLP's kernels, bound outside the trace about to read them. A strategy
+        decides applicability by inspecting the checkpoint's tensors — the nvfp4 pair
+        reads the scale plane — and an array read inside `mx.compile` raises."""
+        mlp = self.mlp
+        if isinstance(mlp, Qwen35MoE):
+            mlp._kernels()
+
+    def _drop_resolutions(self) -> None:
+        """Every lazily-bound delegator back to unresolved.
+
+        A strategy resolved inside a trace holds that trace's tracers as its weight
+        fields; one resolved outside every trace holds real arrays — and those arrays are
+        the module's own leaves, which the per-block traces already declare through
+        `inputs=self._traced_state()`, so a trace reading them a second time as constants is the
+        uncaptured-input error. Neither resolution survives being borrowed by the other
+        path, so both sides drop first and resolve their own.
+
+        `epoch` is how the trunk's graph finds out: it baked whatever was resolved when it
+        was traced, and a drop here makes that graph stale."""
+        self.epoch += 1
+        self._join_strategy = None
+        self._join_key = None
+        if not self.attends:
+            self.linear_attn._rule = None
+        mlp = self.mlp
+        if isinstance(mlp, Qwen35MoE):
+            mlp._route = None
+            mlp._gate_up = None
+            mlp._down = None
+
     def _rebuild(self) -> None:
         # The traces bake the resolved delegators and the A/B flags in; rebuild when any
-        # changes so the mutation tests (and any monkeypatch) reach inside them.
+        # changes so the mutation tests (and any monkeypatch) reach inside them — and
+        # whenever a trunk-level compile resolved them eagerly, which leaves this block's
+        # own traces reading arrays they never captured.
         key = _trace_key(self)
-        if self._traced != key:
+        if self._traced != key or self._resolved_outside:
             self._traced = key
-            # A strategy resolved inside a trace holds that trace's tracers as its
-            # weight fields; a new trace (or the eager path) reading it evals a dead
-            # placeholder. Drop the resolutions so the fresh trace resolves its own.
-            self._join_strategy = None
-            self._join_key = None
-            mlp = self.mlp
-            if isinstance(mlp, Qwen35MoE):
-                mlp._route = None
-                mlp._gate_up = None
-                mlp._down = None
+            self._resolved_outside = False
+            self._drop_resolutions()
+            self._tail = self._build_tail()
             if self.attends:
-                self._tail_step = mx.compile(self._build_tail(), inputs=self.state)
+                self._tail_step = mx.compile(self._tail, inputs=self._traced_state())
             else:
-                self._step = mx.compile(self._build_step(), inputs=self.state)
+                self._step_body = self._build_step()
+                self._step = mx.compile(self._step_body, inputs=self._traced_state())
+        # After the rebuild and outside every trace, which is the whole point of doing it
+        # here: the step this returns to is about to run compiled.
+        self._resolve()
 
     def _compiled_delta(self, x: mx.array, cache: DeltaCache) -> mx.array:
         config = self.linear_attn.config

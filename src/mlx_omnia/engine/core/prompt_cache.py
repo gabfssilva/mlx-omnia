@@ -67,6 +67,8 @@ class Ledger(Protocol):
 
     def drain(self) -> None: ...
 
+    def discard(self) -> None: ...
+
 
 class Budget:
     """One ceiling, shared by every trie that joined it.
@@ -128,6 +130,13 @@ class Budget:
         — which is to say the ones being used — are exactly the ones a restart loses."""
         for member in self._live():
             member.drain()
+
+    def discard(self) -> None:
+        """Empty every trie and write none of it, for somebody who asked for the memory back.
+        The opposite of `drain` and not a variant of it: a clear that spilled would answer
+        "free this memory" by filling the disk tier with what was just freed."""
+        for member in self._live():
+            member.discard()
 
     def _live(self) -> list[Ledger]:
         held = [(ref, member) for ref in self._members if (member := ref()) is not None]
@@ -294,6 +303,13 @@ class PromptCache[C: LayerCache]:
         over what is left rather than over a list taken before any of it moved."""
         while (entry := self._oldest()) is not None:
             self._evict(entry)
+
+    def discard(self) -> None:
+        """Every entry out and nowhere. `_drop` and not `_evict`: this is what a reader asking
+        for the memory back means, and a spill would hand the same conversations to the disk
+        tier instead of releasing them."""
+        while (entry := self._oldest()) is not None:
+            self._drop(entry)
 
     def _oldest(self) -> _Entry[C] | None:
         for role in _EVICTION_ORDER:

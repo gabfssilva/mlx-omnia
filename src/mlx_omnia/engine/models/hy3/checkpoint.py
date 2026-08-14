@@ -10,6 +10,7 @@ from mlx_omnia.engine.checkpoint import (
     drop_tied_head,
     fuse_qkv,
     load_shards,
+    materialize,
     reject_dtype_cast,
     stop_tokens,
 )
@@ -88,7 +89,7 @@ def _convert_experts(
                 gate_up = weights.pop(stacked_key)
                 gate, up = gate_up[:, :inner], gate_up[:, inner:]
                 interleaved = mx.stack([gate, up], axis=2).reshape(e, 2 * inner, -1)
-                mx.eval(interleaved)
+                materialize(interleaved)
                 weights[f"{prefix}switch_mlp.gate_up_proj.{suffix}"] = interleaved
                 continue
 
@@ -100,7 +101,7 @@ def _convert_experts(
             if all(key in weights for key in split_keys):
                 gates, ups = (weights.pop(key) for key in split_keys)
                 interleaved = mx.stack([gates, ups], axis=2).reshape(e, 2 * inner, -1)
-                mx.eval(interleaved)
+                materialize(interleaved)
                 weights[f"{prefix}switch_mlp.gate_up_proj.{suffix}"] = interleaved
                 continue
 
@@ -111,7 +112,7 @@ def _convert_experts(
                 gates = mx.stack([weights.pop(key) for key in gate_keys])
                 ups = mx.stack([weights.pop(key) for key in up_keys])
                 interleaved = mx.stack([gates, ups], axis=2).reshape(e, 2 * inner, -1)
-                mx.eval(interleaved)
+                materialize(interleaved)
                 weights[f"{prefix}switch_mlp.gate_up_proj.{suffix}"] = interleaved
 
         for suffix in ("weight", "scales", "biases"):
@@ -127,7 +128,7 @@ def _convert_experts(
             down_keys = [f"{prefix}experts.{i}.down_proj.{suffix}" for i in range(e)]
             if all(key in weights for key in down_keys):
                 stacked = mx.stack([weights.pop(key) for key in down_keys])
-                mx.eval(stacked)
+                materialize(stacked)
                 weights[f"{prefix}switch_mlp.down_proj.{suffix}"] = stacked
 
     return weights
@@ -144,7 +145,7 @@ def _fuse_shared(weights: dict[str, mx.array], config: Hy3Config) -> dict[str, m
             if not all(key in weights for key in keys):
                 continue
             fused = mx.concatenate([weights.pop(key) for key in keys], axis=0)
-            mx.eval(fused)
+            materialize(fused)
             weights[f"{prefix}gate_up_proj.{suffix}"] = fused
     return weights
 

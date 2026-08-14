@@ -5,11 +5,13 @@ Nothing here knows an architecture. The JSON shapes, the config parsing and the 
 only one model uses live in that model's file, next to the tree they feed; what stays is
 the part a second model would otherwise copy — the shard merge, the row-aligned fusions,
 and the four-step tail (build → `nn.quantize` filtered by the tensors → `load_weights`
-strict → `mx.eval`).
+strict → `materialize`).
 """
 
 import json
-from collections.abc import Callable, Mapping, Sequence
+from collections.abc import Callable, Iterator, Mapping, Sequence
+from contextlib import contextmanager
+from contextvars import ContextVar
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Literal, NotRequired, Protocol, TypedDict, assert_never
@@ -29,6 +31,47 @@ from mlx_omnia.engine.quant.quantization import (
     QuantizationPlan,
     infer_quantization,
 )
+
+_DORMANT: ContextVar[bool] = ContextVar("dormant", default=False)
+
+
+def materialize(*arrays: object) -> None:
+    """Read what the load path has only described so far — the one door every fusion and
+    the loader's tail go through.
+
+    A checkpoint is mmapped and mlx is lazy, so a loaded tree is a plan until something
+    asks for the numbers. That is normally exactly once, at the end, and the fusions in
+    between stay lazy on purpose so that a concatenate does not resident a dense copy of
+    what the quantizing load is about to pack. Routing them all here is what lets the door
+    close.
+    """
+    if not _DORMANT.get():
+        mx.eval(*arrays)
+
+
+@contextmanager
+def dormant() -> Iterator[None]:
+    """Build a checkpoint's tree without reading a weight.
+
+    Everything but the numbers is already free: the shard headers give shape and dtype,
+    which is all `_build_segments` and `infer_quantization` read, and `nn.quantize` swaps
+    a module's class rather than its values. So a tree built in here is the same tree the
+    loader returns — same segments, same per-leaf format, and therefore the same kernel
+    each `build()` picks — while nothing it points at has been faulted in.
+
+    What it is for is asking a question *about* the model: which pieces there are, how they
+    are wired, which strategy each operation resolved to. It is not a load. The tree comes
+    back unwired and unread, and generating with it would fault the checkpoint in through
+    the page cache one tensor at a time, which is the cost this exists to avoid.
+
+    Scoped to the calling context rather than the process: a blueprint served on one
+    request must not stop another request's load from materializing.
+    """
+    token = _DORMANT.set(True)
+    try:
+        yield
+    finally:
+        _DORMANT.reset(token)
 
 
 class QuantizationJson(TypedDict):
@@ -120,8 +163,9 @@ def leaf_json(format: Quantization) -> QuantizationJson:
     match format:
         case Affine(group_size=group_size, bits=bits):
             return {"group_size": group_size, "bits": bits}
-        case MXFP(mode=mode, group_size=group_size, bits=bits) | NVFP(
-            mode=mode, group_size=group_size, bits=bits
+        case (
+            MXFP(mode=mode, group_size=group_size, bits=bits)
+            | NVFP(mode=mode, group_size=group_size, bits=bits)
         ):
             return {"group_size": group_size, "bits": bits, "mode": mode}
 
@@ -135,28 +179,71 @@ def leaf_format(raw: QuantizationJson) -> Quantization:
     return MXFP(mode=mode, group_size=raw["group_size"], bits=raw["bits"])
 
 
-def stop_tokens(directory: Path, declared: tuple[int, ...]) -> tuple[int, ...]:
-    """Every id that ends a turn: what `config.json` said, plus what `generation_config.json`
-    adds. In load order, without repeats — the first is the one a checkpoint means by "the"
-    eos, and the set is what the loop compares against.
+class _TokenizerJson(TypedDict):
+    """Only what the eos is looked up in. `added_tokens` carries the id of every special
+    token by name, which is what turns the tokenizer's `eos_token` string into an id
+    without building a tokenizer."""
 
-    The second file is where transformers keeps the generation defaults, and it is the only
-    place some checkpoints say the whole truth. openai/gpt-oss-20b declares
+    added_tokens: NotRequired[list[dict[str, object]]]
+
+
+class _TokenizerConfigJson(TypedDict):
+    eos_token: NotRequired[str | dict[str, object] | None]
+
+
+def _named_eos(directory: Path) -> int | None:
+    """The id of the token `tokenizer_config.json` calls the eos, or nothing when it names
+    none — or names one `tokenizer.json` has no id for."""
+    settings = directory / "tokenizer_config.json"
+    tokens = directory / "tokenizer.json"
+    if not settings.is_file() or not tokens.is_file():
+        return None
+    declared: _TokenizerConfigJson = json.loads(settings.read_text(encoding="utf-8"))
+    named = declared.get("eos_token")
+    # transformers writes it either as the string or as the whole AddedToken object.
+    content = named.get("content") if isinstance(named, dict) else named
+    if not isinstance(content, str):
+        return None
+    raw: _TokenizerJson = json.loads(tokens.read_text(encoding="utf-8"))
+    for entry in raw.get("added_tokens", []):
+        if entry.get("content") == content and isinstance(identifier := entry.get("id"), int):
+            return identifier
+    return None
+
+
+def stop_tokens(directory: Path, declared: tuple[int, ...]) -> tuple[int, ...]:
+    """Every id that ends a turn: what `config.json` said, plus what
+    `generation_config.json` adds, plus the one the tokenizer itself calls the eos. In load
+    order, without repeats — the first is the one a checkpoint means by "the" eos, and the
+    set is what the loop compares against.
+
+    The generation config is where transformers keeps the generation defaults, and it is the
+    only place some checkpoints say the whole truth. openai/gpt-oss-20b declares
     `eos_token_id: 200002` (`<|return|>`) in its config and `[200002, 199999, 200012]` in its
     generation config: the one missing is `<|call|>`, which is how harmony ends a turn *that
     called a tool*. Reading only the config, a model offered a function writes the call, does
     not stop, and spends the rest of the budget inventing the result of its own call.
 
-    A checkpoint without the file, or with an `eos_token_id` that is not ids, keeps what it
-    declared: this widens a stop set and never narrows one.
+    The tokenizer is the third source because a conversion that drops the generation config
+    can leave a config whose `eos_token_id` is not the token its own template ends turns
+    with. `mlx-community/Qwen3.5-0.8B-bf16` ships no generation config, declares
+    `eos_token_id: 248044` (`<|endoftext|>`, which is its *pad* token) and a template that
+    ends every turn with `<|im_end|>` — so every answer it gives carries `<|im_end|>` in the
+    text and runs on until it happens to write the pad token. What ends a turn is what the
+    template writes, and the tokenizer is where the checkpoint names it.
+
+    A file that is missing, or that names something the other cannot resolve, changes
+    nothing: this widens a stop set and never narrows one.
     """
+    ids = list(declared)
     path = directory / "generation_config.json"
-    if not path.is_file():
-        return declared
-    raw: _GenerationJson = json.loads(path.read_text(encoding="utf-8"))
-    found = raw.get("eos_token_id")
-    extra = found if isinstance(found, list) else [found]
-    ids = [*declared, *(token for token in extra if isinstance(token, int))]
+    if path.is_file():
+        raw: _GenerationJson = json.loads(path.read_text(encoding="utf-8"))
+        found = raw.get("eos_token_id")
+        extra = found if isinstance(found, list) else [found]
+        ids += [token for token in extra if isinstance(token, int)]
+    if (named := _named_eos(directory)) is not None:
+        ids.append(named)
     return tuple(dict.fromkeys(ids))
 
 
@@ -238,7 +325,7 @@ def fuse_qkv(weights: dict[str, mx.array], layers: int) -> dict[str, mx.array]:
             if not all(key in weights for key in keys):
                 continue
             fused = mx.concatenate([weights.pop(key) for key in keys], axis=0)
-            mx.eval(fused)
+            materialize(fused)
             weights[f"{prefix}qkv_proj.{suffix}"] = fused
     return weights
 
@@ -272,7 +359,7 @@ def stack_experts(
 
     Lazy on purpose, like every dict-side fusion: the quantizing load packs leaf by
     leaf, and an eval here materializes every dense expert of the checkpoint at once —
-    the load path still evaluates everything through the loader's final `mx.eval`."""
+    the load path still evaluates everything through the loader's final `materialize`."""
     for layer in range(layers):
         source = f"model.layers.{layer}.{prefix}.experts."
         target = f"model.layers.{layer}.{prefix}.switch_mlp."
@@ -299,7 +386,7 @@ def split_stacked_gate_up(weights: dict[str, mx.array], layers: int) -> dict[str
         weights[f"{target}gate_proj.weight"] = fused[..., :middle].swapaxes(-2, -1)
         weights[f"{target}up_proj.weight"] = fused[..., middle:].swapaxes(-2, -1)
         weights[f"{target}down_proj.weight"] = weights.pop(f"{source}down_proj").swapaxes(-2, -1)
-        mx.eval(
+        materialize(
             weights[f"{target}gate_proj.weight"],
             weights[f"{target}up_proj.weight"],
             weights[f"{target}down_proj.weight"],
@@ -316,7 +403,7 @@ def fold_norm_scales(weights: dict[str, mx.array]) -> dict[str, mx.array]:
             key == "model.norm.weight"
         ):
             weights[key] = value + 1
-    mx.eval(list(weights.values()))
+    materialize(list(weights.values()))
     return weights
 
 
@@ -472,8 +559,9 @@ def _quantization(
     match format:
         case Affine(group_size=group_size, bits=bits):
             return {"group_size": group_size, "bits": bits}
-        case MXFP(mode=mode, group_size=group_size, bits=bits) | NVFP(
-            mode=mode, group_size=group_size, bits=bits
+        case (
+            MXFP(mode=mode, group_size=group_size, bits=bits)
+            | NVFP(mode=mode, group_size=group_size, bits=bits)
         ):
             return {"group_size": group_size, "bits": bits, "mode": mode}
     assert_never(format)
@@ -495,8 +583,9 @@ def attach_weights[M: nn.Module](
         class_predicate=lambda path, module: _quantization(weights, path, module, declared),
     )
     model.load_weights(list(weights.items()), strict=True)
-    mx.eval(model.parameters())
-    wire_resident()
+    materialize(model.parameters())
+    if not _DORMANT.get():
+        wire_resident()
     return model
 
 
@@ -522,9 +611,7 @@ def wire_resident() -> int:
     mx.clear_cache()
     recommended = mx.device_info()["max_recommended_working_set_size"]
     assert isinstance(recommended, int)
-    return mx.set_wired_limit(
-        min(mx.get_active_memory() + (64 << 20), recommended - (256 << 20))
-    )
+    return mx.set_wired_limit(min(mx.get_active_memory() + (64 << 20), recommended - (256 << 20)))
 
 
 def prepare_weights(
@@ -560,7 +647,7 @@ def load_checkpoint[M: nn.Module](
 ) -> M:
     """The spine every loader shares: `prepare_weights` on the dict side, then
     `attach_weights` — per-leaf format off the tensors, `load_weights(strict=True)`
-    and `mx.eval`."""
+    and `materialize`."""
     prepared = prepare_weights(config, weights, fusions, dtype)
     return attach_weights(model, prepared, declared=declared)
 
@@ -581,6 +668,30 @@ class Pending[M]:
 
 
 @dataclass(frozen=True, slots=True)
+class ImageCost:
+    """What one image of a given size costs a checkpoint: the size its tower would actually
+    read, and the rows that reserves in the prompt.
+
+    The two are separate because neither implies the other. Every family resizes before it
+    looks — to a multiple of its patch block, under a cap on area or on rows — and how the
+    resized pixels become rows is the family's own arithmetic again: a merge of 2x2 on one,
+    a fixed grid on the next.
+    """
+
+    height: int
+    width: int
+    tokens: int
+
+
+type Sight = Callable[[int, int], ImageCost]
+"""`(height, width)` → what this checkpoint would do with an image that size."""
+
+
+def _blind(directory: Path) -> Sight | None:
+    return None
+
+
+@dataclass(frozen=True, slots=True)
 class Checkpoint[M: nn.Module]:
     """What one architecture declares about its own checkpoint, and the whole of what
     `mlx_omnia.load` knows about it.
@@ -594,6 +705,16 @@ class Checkpoint[M: nn.Module]:
     load: Callable[[Path, mx.Dtype | None], M]
     task: Callable[[Path, mx.Dtype | None], LanguageModel[ModelInput]]
     quantize: Callable[[Path, mx.Dtype | None], Pending[LanguageModel[ModelInput]]] | None = None
+    sight: Callable[[Path], Sight | None] = _blind
+    """Whether this checkpoint takes images, and what one costs — answered off the config
+    files, before a weight is read.
+
+    It is declared rather than derived because the answer is a property of the *checkpoint*
+    and not of the architecture: the same family ships text-only conversions, and a family
+    whose name carries VL may have been ported without its tower. `None` is a checkpoint
+    this engine takes no image for, and it must agree with what `task` builds — the
+    capability that accepts a picture and this function read the same fields.
+    """
 
 
 @dataclass(frozen=True, slots=True)
@@ -639,6 +760,7 @@ def checkpoint[M: nn.Module, C](
     composite: Callable[[Path, M], LanguageModel[ModelInput]],
     *,
     model_types: tuple[str, ...] = (),
+    sight: Callable[[Path], Sight | None] = _blind,
 ) -> Checkpoint[M]:
     """`load`, `task` and `quantize` derived from the four parts an architecture actually
     owns: the config reader (handed `config.json`), the lazy tree, the checkpoint's tensors
@@ -699,4 +821,4 @@ def checkpoint[M: nn.Module, C](
         )
 
     carried = patterns + tuple(name for name in _CARRIED if name not in patterns)
-    return Checkpoint(carried, load, task, quantize)
+    return Checkpoint(carried, load, task, quantize, sight)

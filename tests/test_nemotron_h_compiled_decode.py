@@ -102,7 +102,7 @@ def test_compiled_verify_regrows_past_capacity(monkeypatch: pytest.MonkeyPatch) 
     _spread(model)
     mx.eval(model.parameters())
 
-    monkeypatch.setattr(model_module, "_fit", lambda offset: (offset + 8 + 7) // 8 * 8)
+    monkeypatch.setattr(model_module, "fit", lambda offset: (offset + 8 + 7) // 8 * 8)
 
     committed = [*PROMPT, 0]
     cache = model.make_cache()

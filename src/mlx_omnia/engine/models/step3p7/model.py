@@ -160,6 +160,18 @@ def stream_step3p7_ids(
         y = next_y
 
 
+def sees(config: Step3p7Config, processor: Step3p7Processor | None) -> bool:
+    """Whether this checkpoint takes images: a tower in the config, the special ids the
+    processor reads out of `tokenizer_config.json`, and the id the marker is spelled with.
+    The catalog asks the same question of a directory it has not loaded, and the two
+    answers have to be one function."""
+    return (
+        processor is not None
+        and config.vision_config is not None
+        and config.image_token_id >= 0
+    )
+
+
 class Step3p7LanguageModel:
     def __init__(
         self,
@@ -174,12 +186,7 @@ class Step3p7LanguageModel:
         self.processor = processor
         self.stop = stop
         self.prefix: object | None = None
-        config = model.config
-        self._vision = (
-            processor is not None
-            and config.vision_config is not None
-            and config.image_token_id >= 0
-        )
+        self._vision = sees(model.config, processor)
 
     @property
     def native_signature(self) -> ModelSignature:
@@ -233,7 +240,7 @@ class Step3p7LanguageModel:
                     raise TypeError(f"unsupported prompt part {type(part).__name__}")
 
         image_features = process_images(images, processor, config)
-        ids = image_features.assemble_ids(left_ids, right_ids, config)
+        ids = image_features.assemble_ids(left_ids, right_ids)
         embeddings = self._vision_embeddings(mx.array(ids)[None], image_features)
         return Step3p7Prompt(ids, embeddings)
 

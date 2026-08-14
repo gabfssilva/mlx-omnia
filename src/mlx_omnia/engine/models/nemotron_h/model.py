@@ -10,32 +10,13 @@ from mlx_omnia.engine.core.cache import (
     FixedKVCache,
     KVCache,
     LayerCache,
+    fit,
+    regrow,
 )
 from mlx_omnia.engine.core.kernels.add_norm import RowsAddRmsNorm
 from mlx_omnia.engine.models.nemotron_h.config import ATTENTION, MAMBA, NemotronHConfig
 from mlx_omnia.engine.models.nemotron_h.layers.block import NemotronHBlock
 from mlx_omnia.engine.models.nemotron_h.layers.mamba import NemotronHMamba
-
-_HEADROOM = 768
-
-
-def _fit(offset: int) -> int:
-    """The smallest 256-multiple holding `offset` plus generation headroom."""
-    return (offset + _HEADROOM + 255) // 256 * 256
-
-
-def _regrow(layer: FixedKVCache, capacity: int) -> tuple[mx.array, mx.array, int]:
-    """A full fixed buffer copied into a larger one, rows and position preserved."""
-    keys, values = layer.fetch()
-    rows = layer.rows
-    shape = list(keys.shape)
-    shape[2] = capacity
-    grown_keys = mx.zeros(shape, dtype=keys.dtype)
-    grown_values = mx.zeros(shape, dtype=values.dtype)
-    grown_keys[..., :rows, :] = keys[..., :rows, :]
-    grown_values[..., :rows, :] = values[..., :rows, :]
-    mx.eval(grown_keys, grown_values)
-    return grown_keys, grown_values, rows
 
 
 def _joins(
@@ -184,7 +165,7 @@ class NemotronH(nn.Module):
             for layer, kind in zip(cache, self.config.pattern, strict=True):
                 if kind == ATTENTION:
                     assert isinstance(layer, KVCache | FixedKVCache)
-                    grown = FixedKVCache(*_regrow(layer, fitting)) if isinstance(
+                    grown = regrow(layer, fitting) if isinstance(
                         layer, FixedKVCache
                     ) else FixedKVCache.promote(layer, fitting)
                     promoted.append(grown)
@@ -230,19 +211,19 @@ class NemotronH(nn.Module):
             return mx.compile(forward, inputs=state, outputs=state), promoted, fitting
 
         offset = cache[0].offset
-        fit = capacity if capacity is not None else _fit(offset)
-        if offset >= fit:
-            fit = _fit(offset)
-        compiled, promoted, fit = build(fit)
+        room = capacity if capacity is not None else fit(offset)
+        if offset >= room:
+            room = fit(offset)
+        compiled, promoted, room = build(room)
         base = offset
         steps = 0
 
         def decode(ids: mx.array) -> mx.array:
             # The python-side offsets are assigned, not incremented: the trace's own pass
             # through the layers already bumped them once, and only once.
-            nonlocal steps, compiled, promoted, fit
-            if base + steps + 1 >= fit:
-                compiled, promoted, fit = build(_fit(base + steps))
+            nonlocal steps, compiled, promoted, room
+            if base + steps + 1 >= room:
+                compiled, promoted, room = build(fit(base + steps))
             logits = compiled(ids)
             steps += 1
             for layer in promoted:
@@ -290,7 +271,7 @@ class NemotronH(nn.Module):
         for layer, kind in zip(cache, pattern, strict=True):
             if kind == ATTENTION:
                 assert isinstance(layer, KVCache)
-                promoted.append(FixedKVCache.promote(layer, _fit(offset)))
+                promoted.append(FixedKVCache.promote(layer, fit(offset)))
             elif kind == MAMBA:
                 assert isinstance(layer, DeltaCache)
                 fixed = FixedDeltaCache.promote(layer)
@@ -320,7 +301,7 @@ class NemotronH(nn.Module):
                 layer = promoted[index]
                 assert isinstance(layer, FixedKVCache)
                 if layer.state[0].shape[2] < fitting:
-                    promoted[index] = FixedKVCache(*_regrow(layer, fitting))
+                    promoted[index] = regrow(layer, fitting)
             cache[:] = promoted
             state_containers = [
                 layer.state if isinstance(layer, FixedKVCache) else layer.graph
@@ -366,14 +347,14 @@ class NemotronH(nn.Module):
                 fitting,
             )
 
-        compiled, fit = build(_fit(offset))
+        compiled, room = build(fit(offset))
         current = offset
         before = offset
 
         def verify(ids: mx.array) -> tuple[mx.array, mx.array]:
-            nonlocal current, before, compiled, fit
-            if current + rows > fit:
-                compiled, fit = build(_fit(current))
+            nonlocal current, before, compiled, room
+            if current + rows > room:
+                compiled, room = build(fit(current))
             before = current
             logits, features = compiled(ids)
             current = before + rows

@@ -354,6 +354,32 @@ class FixedKVCache(LayerCache):
         raise NotImplementedError("a compiled cache cannot be rewound")
 
 
+HEADROOM = 768
+
+
+def fit(offset: int) -> int:
+    """The smallest 256-multiple holding `offset` plus generation headroom.
+
+    Sized to the prompt rather than to a constant: a fixed buffer is read whole by every
+    step's attention, so an oversized one is bytes on the decode's critical path."""
+    return (offset + HEADROOM + 255) // 256 * 256
+
+
+def regrow(cache: FixedKVCache, capacity: int) -> FixedKVCache:
+    """A full fixed buffer copied into a larger one, rows and position preserved — what a
+    generation that outgrows its capacity pays once per doubling, never per token."""
+    keys, values = cache.fetch()
+    rows = cache.rows
+    shape = list(keys.shape)
+    shape[2] = capacity
+    grown_keys = mx.zeros(shape, dtype=keys.dtype)
+    grown_values = mx.zeros(shape, dtype=values.dtype)
+    grown_keys[..., :rows, :] = keys[..., :rows, :]
+    grown_values[..., :rows, :] = values[..., :rows, :]
+    mx.eval(grown_keys, grown_values)
+    return FixedKVCache(grown_keys, grown_values, rows)
+
+
 class FixedDeltaCache(DeltaCache):
     """A `DeltaCache` whose window and state live in a graph-visible container.
 

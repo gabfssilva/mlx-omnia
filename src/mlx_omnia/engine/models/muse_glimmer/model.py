@@ -229,6 +229,17 @@ def _parser(input: MuseGlimmerInput) -> Parser | None:
             assert_never(input)
 
 
+def sees(config: MuseGlimmerConfig, processor: ProcessorConfig | None) -> bool:
+    """Whether this checkpoint takes images: a tower in the config, the processor file
+    beside it, and the id the marker is spelled with. The catalog asks the same question of
+    a directory it has not loaded, and the two answers have to be one function."""
+    return (
+        processor is not None
+        and config.vision_config is not None
+        and config.image_token_id >= 0
+    )
+
+
 class MuseGlimmerLanguageModel:
     def __init__(
         self,
@@ -248,12 +259,7 @@ class MuseGlimmerLanguageModel:
         (`speculative.Drafting`). It is not part of `model` — two checkpoints, two trees —
         and it is `None` for every model nobody paired one with."""
         self._draft_block: int | None = None
-        config = model.full_config
-        self._vision = (
-            processor is not None
-            and config.vision_config is not None
-            and config.image_token_id >= 0
-        )
+        self._vision = sees(model.full_config, processor)
 
     @property
     def native_signature(self) -> ModelSignature:

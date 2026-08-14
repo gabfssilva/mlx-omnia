@@ -6,9 +6,10 @@ search picks, whether it is allowed to rewind, and who leaves under pressure.
 """
 
 import gc
+from collections.abc import Sequence
 
 from mlx_omnia.engine.core.cache import DeltaCache, KVCache, LayerCache
-from mlx_omnia.engine.core.prompt_cache import Budget, PromptCache
+from mlx_omnia.engine.core.prompt_cache import Budget, PromptCache, Role
 
 PROMPT = [11, 12, 13, 14, 15, 16, 17, 18, 19, 20, 21, 22]
 SYSTEM = PROMPT[:4]
@@ -230,6 +231,57 @@ def test_an_unloaded_model_gives_its_bytes_back() -> None:
     survivor.insert(PROMPT, kv(len(PROMPT)), role="assistant", nbytes=10)
 
     assert shared.nbytes == 20 and len(survivor) == 2
+
+
+class Counted:
+    """A spill that only remembers what it was handed — enough to tell an eviction from a
+    drop, which is the whole difference between draining and discarding."""
+
+    def __init__(self) -> None:
+        self.kept: list[list[int]] = []
+
+    def keep(self, tokens: Sequence[int], caches: Sequence[LayerCache], *, role: Role) -> None:
+        self.kept.append(list(tokens))
+
+    def recall(self, tokens: Sequence[int], into: Sequence[LayerCache]) -> int | None:
+        return None
+
+
+def test_draining_writes_what_it_empties_and_discarding_does_not() -> None:
+    """The two ways a trie is emptied on purpose, told apart by the one thing that
+    distinguishes them: a daemon on its way out keeps what was warm, and somebody asking for
+    the memory back does not want it handed to the disk instead."""
+    # Mutation: `discard` calling `_evict` breaks it — the second half of `kept` fills with
+    # the conversations that were supposed to be released.
+    written = Counted()
+    drained = PromptCache[LayerCache](Budget(100), written)
+    drained.insert(USER, kv(len(USER)), role="user", nbytes=10)
+    drained.drain()
+
+    thrown = Counted()
+    discarded = PromptCache[LayerCache](Budget(100), thrown)
+    discarded.insert(USER, kv(len(USER)), role="user", nbytes=10)
+    discarded.insert(PROMPT, kv(len(PROMPT)), role="assistant", nbytes=10)
+    discarded.discard()
+
+    assert written.kept == [USER]
+    assert thrown.kept == []
+    assert len(discarded) == 0
+
+
+def test_a_shared_ceiling_discards_every_trie_that_joined_it() -> None:
+    """One `Clear` is one route, and the ceiling is what knows who is under it."""
+    # Mutation: discarding only the first member breaks it — `second` keeps its entry and the
+    # total stays at 10.
+    shared = Budget(100)
+    first = PromptCache[LayerCache](shared)
+    second = PromptCache[LayerCache](shared)
+    first.insert(USER, kv(len(USER)), role="user", nbytes=10)
+    second.insert(PROMPT, kv(len(PROMPT)), role="assistant", nbytes=10)
+
+    shared.discard()
+
+    assert (len(first), len(second), shared.nbytes) == (0, 0, 0)
 
 
 def test_one_entry_over_the_whole_ceiling_is_handed_back_and_then_dropped() -> None:

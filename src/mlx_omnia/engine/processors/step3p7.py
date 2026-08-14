@@ -64,9 +64,7 @@ class ImageFeatures(NamedTuple):
         base_markers = self.num_images * 2  # im_start + im_end per base
         return tiles + bases + tile_markers + base_markers
 
-    def assemble_ids(
-        self, left_ids: list[int], right_ids: list[int], config: Step3p7Config
-    ) -> list[int]:
+    def assemble_ids(self, left_ids: list[int], right_ids: list[int]) -> list[int]:
         """Build the full input_ids: left text → [patch repls] → [image repls] → right text."""
         ids = list(left_ids)
         # Patch tokens (tiles) for all images.

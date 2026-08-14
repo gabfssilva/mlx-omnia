@@ -9,6 +9,7 @@ from mlx_omnia.engine.checkpoint import (
     drop_tied_head,
     interleave_gate_up,
     load_shards,
+    materialize,
     reject_dtype_cast,
     stop_tokens,
 )
@@ -58,7 +59,7 @@ def _stack_experts(
                         for e in range(config.n_routed_experts)
                     ]
                 )
-                mx.eval(stacked)
+                materialize(stacked)
                 weights[f"model.layers.{layer}.mlp.switch_mlp.{proj}.{suffix}"] = stacked
     return weights
 
@@ -76,7 +77,7 @@ def _concat_dense_gate_up(
                 if not all(key in weights for key in keys):
                     continue
                 fused = mx.concatenate([weights.pop(key) for key in keys], axis=0)
-                mx.eval(fused)
+                materialize(fused)
                 weights[f"{prefix}gate_up_proj.{suffix}"] = fused
     return weights
 
@@ -113,7 +114,7 @@ def _split_kv_b(
             v = v.reshape(heads, nope + v_head, kv_lora)
             wk = mx.contiguous(v[:, :nope, :].swapaxes(-1, -2))
             wv = mx.contiguous(v[:, nope:, :])
-            mx.eval(wk, wv)
+            materialize(wk, wv)
             weights[f"{prefix}.embed_q.weight"] = wk
             weights[f"{prefix}.unembed_out.weight"] = wv
     return weights

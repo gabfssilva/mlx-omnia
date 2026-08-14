@@ -10,6 +10,7 @@ from mlx_omnia.engine.checkpoint import (
     fuse_qkv,
     interleave_gate_up,
     load_shards,
+    materialize,
     prepare_weights,
     stop_tokens,
 )
@@ -68,14 +69,14 @@ def _prepare_experts(weights: dict[str, mx.array], layers: int) -> dict[str, mx.
             gate, up = mx.split(v, 2, axis=-1)
             weights[f"{sp}gate_proj.weight"] = mx.swapaxes(gate, 1, 2)
             weights[f"{sp}up_proj.weight"] = mx.swapaxes(up, 1, 2)
-            mx.eval(weights[f"{sp}gate_proj.weight"], weights[f"{sp}up_proj.weight"])
+            materialize(weights[f"{sp}gate_proj.weight"], weights[f"{sp}up_proj.weight"])
 
         # Non-sanitized: single down_proj parameter [E, inner, hidden]
         key = f"{ep}down_proj"
         if key in weights:
             v = weights.pop(key)
             weights[f"{sp}down_proj.weight"] = mx.swapaxes(v, 1, 2)
-            mx.eval(weights[f"{sp}down_proj.weight"])
+            materialize(weights[f"{sp}down_proj.weight"])
 
         # Sanitized: already split + transposed, just rename
         for suffix in ("weight", "scales", "biases"):
@@ -102,7 +103,7 @@ def _fuse_shared_expert(weights: dict[str, mx.array], layers: int) -> dict[str, 
             if not all(key in weights for key in keys):
                 continue
             fused = mx.concatenate([weights.pop(key) for key in keys], axis=0)
-            mx.eval(fused)
+            materialize(fused)
             weights[f"{prefix}gate_up_proj.{suffix}"] = fused
     return weights
 

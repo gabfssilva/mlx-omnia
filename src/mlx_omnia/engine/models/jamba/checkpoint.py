@@ -7,6 +7,7 @@ from mlx_omnia.engine.chat import chat_capabilities
 from mlx_omnia.engine.checkpoint import (
     checkpoint,
     load_shards,
+    materialize,
     prepare_weights,
     stack_experts,
     stop_tokens,
@@ -37,7 +38,7 @@ def _stack_feed_forward(weights: dict[str, mx.array], config: JambaConfig) -> di
         parts = [weights.pop(key) for key in keys]
         experts, rows, cols = parts[0].shape
         fused = mx.stack(parts, axis=2).reshape(experts, 2 * rows, cols)
-        mx.eval(fused)
+        materialize(fused)
         weights[f"{prefix}gate_up_proj.weight"] = fused
     return weights
 
@@ -49,7 +50,7 @@ def _fuse_dense(weights: dict[str, mx.array], layers: int) -> dict[str, mx.array
         if not all(key in weights for key in keys):
             continue
         fused = mx.concatenate([weights.pop(key) for key in keys], axis=0)
-        mx.eval(fused)
+        materialize(fused)
         weights[f"{prefix}gate_up_proj.weight"] = fused
     return weights
 

@@ -13,7 +13,7 @@ import huggingface_hub
 import mlx.core as mx
 import mlx.nn as nn
 
-from mlx_omnia.engine.checkpoint import MTP_PREFIX, Drafter, Pending, save_quantized
+from mlx_omnia.engine.checkpoint import MTP_PREFIX, Drafter, Pending, Sight, save_quantized
 from mlx_omnia.engine.core.cache import LayerCache
 from mlx_omnia.engine.footprint import checkpoint_bytes
 from mlx_omnia.engine.generate import CausalLM
@@ -79,6 +79,7 @@ from mlx_omnia.engine.quant.quantization import (
 
 __all__ = [
     "Source",
+    "architectures",
     "digest",
     "load",
     "load_drafter",
@@ -535,11 +536,30 @@ head of its own, so it has no `Checkpoint` and does not answer to `load`. It is 
 bound to a target — `speculative.Drafting.speculate_with` is where the two meet."""
 
 
+def architectures() -> frozenset[str]:
+    """The model_types this engine loads — the static half of "will it run here". The
+    tokenizer can still refuse at load time; that refusal stays a load-time answer."""
+    return frozenset(_MODEL_SPECS)
+
+
 def drafts(model_type: str) -> bool:
     """Whether an architecture is a drafter. A caller with a checkpoint in hand and no
     tree yet asks this: what a drafter cannot do is not a shape it fails at but a fact
     about the checkpoint — it has no tokenizer, so nothing that reads a corpus reaches it."""
     return model_type in _DRAFTER_SPECS
+
+
+def sight(model_type: str, directory: Path) -> Sight | None:
+    """What this checkpoint would do with an image, or `None` for one this engine takes no
+    image for — off the config files, without loading a weight.
+
+    The counterpart of `architectures` for pictures, and asked the same way: a client that
+    wants to know whether it may attach one has a directory and no tree. The answer is per
+    checkpoint and not per architecture — the same family ships text-only conversions, and
+    a family whose name carries VL may have been ported without its tower.
+    """
+    spec = _MODEL_SPECS.get(model_type)
+    return None if spec is None else spec.sight(directory)
 
 
 def _quantizable() -> dict[str, _Packaged]:

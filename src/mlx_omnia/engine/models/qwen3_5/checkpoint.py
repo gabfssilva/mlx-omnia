@@ -9,19 +9,27 @@ from mlx_omnia.engine.chat import (
     chat_template,
 )
 from mlx_omnia.engine.checkpoint import (
+    ImageCost,
+    Sight,
     checkpoint,
     drop_tied_head,
     fusible,
+    materialize,
     reject_dtype_cast,
+    stack_experts,
     stop_tokens,
 )
+from mlx_omnia.engine.core.config import load_config
 from mlx_omnia.engine.language import LanguageModel
 from mlx_omnia.engine.model import CompositeModel, ModelInput
 from mlx_omnia.engine.models.qwen3_5.config import Qwen35Config, Qwen35TextConfig
-from mlx_omnia.engine.models.qwen3_5.model import Qwen35, Qwen35LanguageModel
+from mlx_omnia.engine.models.qwen3_5.model import Qwen35, Qwen35LanguageModel, sees
 from mlx_omnia.engine.models.qwen3_5.vision import (
+    Grid,
+    ProcessorConfig,
     load_processor_config,
     normalized_patch_weight,
+    smart_resize,
 )
 
 
@@ -67,6 +75,7 @@ def weights(
     if config.vision_config is not None and patch in loaded:
         loaded[patch] = normalized_patch_weight(loaded[patch], config.vision_config)
 
+    loaded = stack_experts(loaded, text.num_hidden_layers, text.num_experts)
     loaded = _fuse_projections(loaded, text)
     return _fuse_moe(loaded, text)
 
@@ -129,7 +138,7 @@ def _fuse(
         if not all(key in weights for key in keys):
             continue
         fused = mx.concatenate([weights.pop(key) for key in keys], axis=0)
-        mx.eval(fused)
+        materialize(fused)
         weights[f"{prefix}{name}.{suffix}"] = fused
 
 
@@ -161,7 +170,7 @@ def _interleave(weights: dict[str, mx.array], prefix: str) -> None:
         stacked = [weights.pop(key) for key in keys]
         *lead, rows, cols = stacked[0].shape
         fused = mx.stack(stacked, axis=-2).reshape(*lead, 2 * rows, cols)
-        mx.eval(fused)
+        materialize(fused)
         weights[f"{prefix}gate_up_proj.{suffix}"] = fused
 
 
@@ -199,14 +208,37 @@ def _chat(
     return [MultimodalChatCapability(template, marker)]
 
 
+_TYPES = ("qwen3_5", "qwen3_5_moe")
+
+
+def _processor(directory: Path) -> ProcessorConfig | None:
+    path = directory / "preprocessor_config.json"
+    return load_processor_config(path) if path.exists() else None
+
+
 def _composite(directory: Path, model: Qwen35) -> LanguageModel[ModelInput]:
     tokenizer = ByteLevelBPE.from_file(directory / "tokenizer.json")
-    processor_path = directory / "preprocessor_config.json"
-    processor = load_processor_config(processor_path) if processor_path.exists() else None
+    processor = _processor(directory)
     facade = Qwen35LanguageModel(
         model, tokenizer, processor, stop=stop_tokens(directory, model.config.eos)
     )
     return CompositeModel(facade, _chat(directory, facade))
+
+
+def _sight(directory: Path) -> Sight | None:
+    """The same two steps `process_image` takes before the tower reads anything: the
+    resize, then the patch grid the merger folds by 2x2."""
+    processor = _processor(directory)
+    config = load_config(Qwen35Config, directory / "config.json", allowed_model_types=_TYPES)
+    if processor is None or not sees(config, processor):
+        return None
+
+    def cost(height: int, width: int) -> ImageCost:
+        read = smart_resize(height, width, processor)
+        grid = Grid(1, read[0] // processor.patch_size, read[1] // processor.patch_size)
+        return ImageCost(read[0], read[1], grid.tokens(processor.merge_size))
+
+    return cost
 
 
 CHECKPOINT = checkpoint(
@@ -222,5 +254,6 @@ CHECKPOINT = checkpoint(
     Qwen35,
     weights,
     _composite,
-    model_types=("qwen3_5", "qwen3_5_moe"),
+    model_types=_TYPES,
+    sight=_sight,
 )

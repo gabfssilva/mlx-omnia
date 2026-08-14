@@ -74,6 +74,7 @@ class Qwen35MoE(nn.Module):
         self._route: Route | None = None
         self._gate_up: GateUp | None = None
         self._down: DownCombine | None = None
+        self._resolved_over: tuple[int, ...] = ()
 
     def route(self, logits: mx.array) -> tuple[mx.array, mx.array, mx.array]:
         """The softmax spans all 256 experts, so the kept weights depend on the dropped
@@ -110,10 +111,36 @@ class Qwen35MoE(nn.Module):
         shared = mx.sigmoid(logits[..., self.experts :]) * self._shared(x)
         return Qwen35MoEInternals(probs, chosen, weights, routed, shared, routed + shared)
 
+    def _leaves(self) -> tuple[int, ...]:
+        """The identity of every tensor the three strategies read.
+
+        The resolution is not free to be permanent: a strategy holds the arrays it was
+        built over, so a leaf swapped afterwards (quantize-on-load, a mutation test that
+        perturbs one scale plane) would go on being read at its old value. Identity and
+        not content — the question is whether this is still the same tensor, and reading
+        the values back to answer it would cost what the check is meant to save."""
+        leaves = [self.gate]
+        switch, shared = self.switch_mlp, self.shared_expert
+        leaves += [switch.gate_up_proj, switch.down_proj, shared.gate_up_proj, shared.down_proj]
+        return tuple(
+            id(getattr(leaf, name))
+            for leaf in leaves
+            for name in ("weight", "scales", "biases")
+            if getattr(leaf, name, None) is not None
+        )
+
     def _kernels(self) -> tuple[Route, GateUp, DownCombine]:
-        """Resolved once, at the first T=1 step — after load, when the leaves'
-        formats are final."""
+        """Resolved outside any trace, and re-resolved when a leaf is replaced.
+
+        Not lazily inside the first traced step, which is where it used to happen: a
+        strategy decides whether it applies by *reading* what the checkpoint holds — the
+        nvfp4 pair inspects the scale plane before it accepts the stack — and reading an
+        array inside `mx.compile` is not allowed. The callers resolve before they call
+        their compiled step, which is also what the kernel contract asks for."""
         route, gate_up, down = self._route, self._gate_up, self._down
+        leaves = self._leaves()
+        if leaves != self._resolved_over:
+            route = gate_up = down = None
         if route is None or gate_up is None or down is None:
             switch = self.switch_mlp
             gate = self.gate
@@ -139,6 +166,7 @@ class Qwen35MoE(nn.Module):
                 shared=self.shared_expert.down_proj,
             )
             self._route, self._gate_up, self._down = route, gate_up, down
+            self._resolved_over = leaves
         return route, gate_up, down
 
     def fused_step(self, x: mx.array, residual: mx.array) -> mx.array:

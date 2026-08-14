@@ -10,6 +10,7 @@ from mlx_omnia.engine.checkpoint import (
     drop_tied_head,
     fuse_qkv,
     load_shards,
+    materialize,
     reject_dtype_cast,
     stop_tokens,
 )
@@ -82,7 +83,7 @@ def _stack_experts(weights: dict[str, mx.array], config: LagunaConfig) -> dict[s
             interleaved = mx.stack([gates, ups], axis=2).reshape(
                 config.num_experts, 2 * config.moe_intermediate_size, -1
             )
-            mx.eval(interleaved)
+            materialize(interleaved)
             weights[f"{prefix}switch_mlp.gate_up_proj.{suffix}"] = interleaved
 
         for suffix in ("weight", "scales", "biases"):
@@ -92,7 +93,7 @@ def _stack_experts(weights: dict[str, mx.array], config: LagunaConfig) -> dict[s
             if not all(key in weights for key in down_keys):
                 continue
             stacked = mx.stack([weights.pop(key) for key in down_keys])
-            mx.eval(stacked)
+            materialize(stacked)
             weights[f"{prefix}switch_mlp.down_proj.{suffix}"] = stacked
 
     return weights
@@ -116,7 +117,7 @@ def _interleave_stacked_experts(
             interleaved = mx.stack([gates, ups], axis=2).reshape(
                 config.num_experts, 2 * config.moe_intermediate_size, -1
             )
-            mx.eval(interleaved)
+            materialize(interleaved)
             weights[f"{prefix}gate_up_proj.{suffix}"] = interleaved
     return weights
 
@@ -132,7 +133,7 @@ def _fuse_shared(weights: dict[str, mx.array], config: LagunaConfig) -> dict[str
             if not all(key in weights for key in keys):
                 continue
             fused = mx.concatenate([weights.pop(key) for key in keys], axis=0)
-            mx.eval(fused)
+            materialize(fused)
             weights[f"{prefix}gate_up_proj.{suffix}"] = fused
     return weights
 
@@ -189,7 +190,7 @@ def _pack(
     if weight is None or f"{path}.scales" in weights:
         return
     packed, scales, *rest = quantize(weight, group_size=group_size, bits=bits, mode=mode)
-    mx.eval(packed, scales, *rest)
+    materialize(packed, scales, *rest)
     weights[f"{path}.weight"] = packed
     weights[f"{path}.scales"] = scales
     if rest:

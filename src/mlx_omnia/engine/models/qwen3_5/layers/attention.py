@@ -5,7 +5,7 @@ import mlx.core as mx
 import mlx.nn as nn
 import numpy as np
 
-from mlx_omnia.engine.core.cache import KVCache
+from mlx_omnia.engine.core.cache import FixedKVCache, KVCache
 from mlx_omnia.engine.models.qwen3_5.config import Qwen35TextConfig
 
 
@@ -37,7 +37,7 @@ class Qwen35Attention(nn.Module):
         self.q_norm = nn.RMSNorm(config.head_dim, eps=config.rms_norm_eps)
         self.k_norm = nn.RMSNorm(config.head_dim, eps=config.rms_norm_eps)
 
-    def rope(self, x: mx.array, offset: int) -> mx.array:
+    def rope(self, x: mx.array, offset: int | mx.array) -> mx.array:
         """Text-only MRoPE is a plain partial rope: the three sections read the same
         position, so the interleave rewrites each frequency with its own value."""
         config = self.config
@@ -89,12 +89,24 @@ class Qwen35Attention(nn.Module):
         )
 
     def __call__(
-        self, x: mx.array, cache: KVCache, positions: mx.array | None = None
+        self,
+        x: mx.array,
+        cache: KVCache | FixedKVCache,
+        positions: mx.array | None = None,
+        mask: mx.array | None = None,
     ) -> mx.array:
+        """`mask` is the fixed buffer's own fill, and only a compiled decode passes one: a
+        growing cache holds exactly the rows written, so `None` attends all of them. A
+        fixed buffer holds its whole capacity, and the columns past the position are
+        zeros the softmax would otherwise weigh."""
         config = self.config
         length = x.shape[1]
         queries = config.num_attention_heads * config.head_dim
-        offset = cache.offset
+        # Read before `update_and_fetch` moves it: the rotation belongs to the row this
+        # step is about to write. The fixed buffer answers with an array, which is what
+        # keeps the offset an input of the trace instead of a constant baked at the first
+        # token — `mx.fast.rope` takes either, and the two are bit-identical.
+        offset = cache.position if isinstance(cache, FixedKVCache) else cache.offset
         q, k, v, gate = self.split_heads(x)
         if positions is None:
             q, k = self.rope(q.transpose(0, 2, 1, 3), offset), self.rope(
@@ -107,7 +119,7 @@ class Qwen35Attention(nn.Module):
         attended = mx.fast.scaled_dot_product_attention(
             q, keys, values,
             scale=1 / math.sqrt(config.head_dim),
-            mask=None if length == 1 else "causal",
+            mask=mask if length == 1 else "causal",
         )
         attended = attended.transpose(0, 2, 1, 3).reshape(1, length, queries)
         return self.o_proj(attended * mx.sigmoid(gate))

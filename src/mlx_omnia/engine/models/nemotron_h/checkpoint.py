@@ -13,6 +13,7 @@ from mlx_omnia.engine.checkpoint import (
     checkpoint,
     declared_plan,
     load_shards,
+    materialize,
     prepare_weights,
     reject_dtype_cast,
     stop_tokens,
@@ -207,7 +208,7 @@ def _stack_experts(
                     for expert in range(config.routed_experts)
                 ]
             )
-            mx.eval(stacked)
+            materialize(stacked)
             weights[f"{target}{leaf}.weight"] = stacked
     return weights
 
