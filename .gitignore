@@ -35,9 +35,8 @@ MIGRATION.md
 MODELS.md
 APP.md
 .tasks/
-docs/*
-!docs/abstractions.svg
-!docs/qwen3-moe.svg
+docs/catalog.md
+docs/models/
 plans/
 
 # Regenerable test fixtures (see tests/fixtures/generate_*.py)

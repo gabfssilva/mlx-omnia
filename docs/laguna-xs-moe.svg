@@ -1,0 +1,72 @@
+<svg viewBox="0 0 760 244" fill="none" xmlns="http://www.w3.org/2000/svg" font-family="ui-monospace, SFMono-Regular, Menlo, Consolas, monospace">
+  <style>
+    .card    { fill: #f6f8fa; stroke: #d0d7de; }
+    .win     { fill: #dafbe1; stroke: #1a7f37; }
+    .sep     { stroke: #d0d7de; }
+    .txt     { fill: #1f2328; }
+    .sub     { fill: #656d76; }
+    .accent  { fill: #1a7f37; }
+    .line    { stroke: #656d76; }
+    .winline { stroke: #1a7f37; }
+    @media (prefers-color-scheme: dark) {
+      .card    { fill: #161b22; stroke: #30363d; }
+      .win     { fill: #12261e; stroke: #3fb950; }
+      .sep     { stroke: #30363d; }
+      .txt     { fill: #e6edf3; }
+      .sub     { fill: #8b949e; }
+      .accent  { fill: #3fb950; }
+      .line    { stroke: #8b949e; }
+      .winline { stroke: #3fb950; }
+    }
+  </style>
+  <defs>
+    <marker id="arrow" viewBox="0 0 8 8" refX="7" refY="4" markerWidth="7" markerHeight="7" orient="auto-start-reverse">
+      <path d="M 0 0 L 8 4 L 0 8 z" class="accent"/>
+    </marker>
+  </defs>
+
+  <text x="24" y="22" font-size="11" class="sub">laguna XS 2.1 · single-token MoE step · NVFP4 group-16 expert leaves</text>
+
+  <!-- flow -->
+  <text x="24" y="108" font-size="12" class="txt">h, residual</text>
+  <path d="M 108 104 H 126" stroke-width="1.5" class="winline" marker-end="url(#arrow)"/>
+
+  <rect x="130" y="76" width="170" height="56" rx="10" class="card"/>
+  <text x="215" y="99" font-size="13" font-weight="600" text-anchor="middle" class="txt">Route</text>
+  <text x="215" y="118" font-size="11" text-anchor="middle" class="sub">sigmoid + bias + top-8</text>
+
+  <path d="M 300 104 H 332" stroke-width="1.5" class="winline" marker-end="url(#arrow)"/>
+
+  <rect x="336" y="76" width="170" height="56" rx="10" class="card"/>
+  <text x="421" y="99" font-size="13" font-weight="600" text-anchor="middle" class="txt">GateUp</text>
+  <text x="421" y="118" font-size="11" text-anchor="middle" class="sub">nvfp4 gemvs + SwiGLU</text>
+
+  <path d="M 506 104 H 538" stroke-width="1.5" class="winline" marker-end="url(#arrow)"/>
+
+  <rect x="542" y="76" width="170" height="56" rx="10" class="card"/>
+  <text x="627" y="99" font-size="13" font-weight="600" text-anchor="middle" class="txt">DownCombine</text>
+  <text x="627" y="118" font-size="11" text-anchor="middle" class="sub">gemv + sum + residual</text>
+
+  <path d="M 712 104 H 730" stroke-width="1.5" class="winline" marker-end="url(#arrow)"/>
+  <text x="734" y="108" font-size="12" class="txt">h′</text>
+
+  <!-- bindings: dotted, no arrowheads -->
+  <path d="M 215 132 V 156" stroke-width="1.2" stroke-dasharray="3 4" class="line"/>
+  <path d="M 421 132 V 156" stroke-width="1.2" stroke-dasharray="3 4" class="line"/>
+  <path d="M 627 132 V 156" stroke-width="1.2" stroke-dasharray="3 4" class="line"/>
+  <text x="24" y="180" font-size="11" class="sub">bound at load:</text>
+
+  <rect x="145" y="156" width="140" height="40" rx="8" class="win"/>
+  <text x="215" y="172" font-size="10" font-weight="600" text-anchor="middle" class="txt">SigmoidTopkRoute</text>
+  <text x="215" y="187" font-size="9" text-anchor="middle" class="accent">exact sigmoid routing ✓</text>
+
+  <rect x="351" y="156" width="140" height="40" rx="8" class="win"/>
+  <text x="421" y="172" font-size="10" font-weight="600" text-anchor="middle" class="txt">Nvfp4PackedGateUp</text>
+  <text x="421" y="187" font-size="9" text-anchor="middle" class="accent">nvfp4 group-16 experts ✓</text>
+
+  <rect x="549" y="156" width="156" height="40" rx="8" class="win"/>
+  <text x="627" y="172" font-size="10" font-weight="600" text-anchor="middle" class="txt">Nvfp4PackedDownCombine</text>
+  <text x="627" y="187" font-size="9" text-anchor="middle" class="accent">nvfp4 + residual join ✓</text>
+
+  <text x="380" y="228" font-size="11" text-anchor="middle" class="sub">the whole step is three dispatches, one per stage</text>
+</svg>
