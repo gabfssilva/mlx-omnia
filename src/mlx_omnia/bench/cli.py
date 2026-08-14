@@ -1,4 +1,4 @@
-"""`omnia-bench`: the two batteries over an mlx-omnia checkpoint.
+"""`omnia-bench`: the batteries over an mlx-omnia checkpoint.
 
 The model is a nickname from the adapter's table or a repository id taken as it stands. The
 prompt is the one that ships with the package, tiled to the asked-for length, encoded with the
@@ -9,6 +9,7 @@ arms run over the same ids.
   omnia-bench interleaved qwen3-14b --against mlx-lm --draft qwen3-4b-4bit --lookahead 4
   omnia-bench interleaved mlx-community/Qwen3-30B-A3B-4bit --prompt-tokens 8192
   omnia-bench paired qwen3-moe --ref main
+  omnia-bench constrained qwen3-moe
 """
 
 import argparse
@@ -20,6 +21,7 @@ from pathlib import Path
 from mlx_omnia.bench.arms import omnia
 from mlx_omnia.bench.battery import Comparison, default_gate, interleaved
 from mlx_omnia.bench.ceiling import ceiling
+from mlx_omnia.bench.constrained import run as run_constrained
 from mlx_omnia.bench.gate import Cool
 from mlx_omnia.bench.paired import Side, git, git_root, paired, worktree
 from mlx_omnia.bench.prompt import BENCH_PROMPT, tile
@@ -28,7 +30,11 @@ from mlx_omnia.bench.report import Calibration, stderr
 CALIBRATION = Path.home() / ".cache/mlx_omnia/selfpair.json"
 """Still the file the script this replaced wrote: renaming it would throw away every stored
 baseline, and a calibration with nothing to compare against says nothing."""
-ENGINE_ROOT = "packages/engine/src"
+ENGINE_ROOT = "src"
+"""What goes on the worker's PYTHONPATH, per side. It was `packages/engine/src` until the
+packages became one distribution, and a path that is not there resolves `mlx_omnia` out of
+the installed environment instead — which `imported_from` catches, so the failure was a
+refusal and not a wrong number."""
 
 
 def _gated(args: argparse.Namespace) -> bool:
@@ -226,6 +232,20 @@ def parser() -> argparse.ArgumentParser:
         "--floor-mhz", type=int, default=int(os.environ.get("OMNIA_GPU_MIN_MHZ", 1300))
     )
     two.set_defaults(run=run_paired)
+
+    # No `--against` and no `--json`: both arms are this engine, and what this prints beyond
+    # the comparison — the mask and accept microseconds — has no place in the shared shape.
+    three = commands.add_parser("constrained", help="the same decode, free and under a schema")
+    three.add_argument("model", help="a nickname from the table, or a repository id")
+    three.add_argument("--prompt-tokens", type=int, default=1024)
+    three.add_argument("--tokens", type=int, default=128)
+    three.add_argument("--runs", type=int, default=5)
+    three.add_argument(
+        "--no-gate",
+        action="store_true",
+        help="run without the thermal gate; the numbers do not compare with gated ones",
+    )
+    three.set_defaults(run=run_constrained)
     return root
 
 

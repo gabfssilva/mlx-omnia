@@ -10,12 +10,15 @@ The four calls, the same shape on both sides: fill the next-token bitmask (**ret
 whether it has to be applied** — an all-legal step skips the whole elementwise op), accept a
 token, say whether it is done, and roll back n tokens for speculation.
 
-Neither library is a workspace dependency and this script imports nothing from `mlx_omnia`:
+Neither library is a workspace dependency and this module imports nothing from `mlx_omnia`,
+which is why it runs outside the project and by path rather than by `-m`: there is no
+installed `mlx_omnia` in that environment to import it out of. `mise run bench:grammar
+[model]` is:
 
   uv run --no-project --with xgrammar --with llguidance --with transformers \\
-      packages/bench/scripts/grammar.py
+      python src/mlx_omnia/bench/grammar.py
   uv run --no-project --with xgrammar --with llguidance --with transformers \\
-      packages/bench/scripts/grammar.py mlx-community/Qwen3-30B-A3B-4bit
+      python src/mlx_omnia/bench/grammar.py mlx-community/Qwen3-30B-A3B-4bit
 
 Whichever of the two is missing is skipped with its import error. Note that `--with
 xgrammar` drags torch, transformers, pydantic and apache-tvm-ffi in with it — its

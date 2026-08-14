@@ -167,7 +167,18 @@ reportMissingTypeStubs = false
 reportUnknownMemberType = false
 pythonVersion = "3.13"
 include = ["src", "tests"]
-exclude = ["**/__pycache__", ".venv", ".legacy", "**/tests/fixtures", "**/build"]
+exclude = [
+    "**/__pycache__",
+    ".venv",
+    ".legacy",
+    "**/tests/fixtures",
+    "**/build",
+    # The one module here that runs outside this environment: xgrammar and llguidance are
+    # not dependencies of anything, they are what it compares, and `uv run --no-project
+    # --with` is where it has them. Checked here, every handle it holds is `object` and
+    # every import is unresolved — twenty errors that say nothing about the file.
+    "src/mlx_omnia/bench/grammar.py",
+]
 venvPath = "."
 venv = ".venv"
 

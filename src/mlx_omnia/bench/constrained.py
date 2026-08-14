@@ -9,17 +9,20 @@ constrained, the queue waits for the sync.
 The schema is an array of free strings with a `minItems` the window cannot reach on purpose. A
 schema the model can finish inside the window ends the constrained arm early — measured, it
 closed at 50 of 128 steps — and two runs of different lengths have no ratio between them. The
-harness refuses that comparison by itself; this script only explains it.
+harness refuses that comparison by itself; this module only explains it.
 
 `max_tokens` is twice the cut so the grammar's closing rule never fires inside the
 measurement, which is why `Generate` is handed the token count at all.
 
-  uv run packages/bench/scripts/constrained.py qwen3
-  uv run packages/bench/scripts/constrained.py qwen3-moe
+  omnia-bench constrained qwen3
+  omnia-bench constrained qwen3-moe --runs 3
+
+Both arms are this engine, which is why this sits beside the adapters and not beside the
+harness: it names `stream_ids` and the vocabulary compiler directly.
 """
 
+import argparse
 import json
-import sys
 from collections.abc import Iterator, Sequence
 from pathlib import Path
 
@@ -32,10 +35,6 @@ from mlx_omnia.bench.arms.hub import snapshot
 from mlx_omnia.bench.prompt import BENCH_PROMPT
 from mlx_omnia.engine.bpe import ByteLevelBPE
 from mlx_omnia.engine.grammar import Grammar, Vocabulary
-
-TOKENS = 128
-RUNS = 5
-PROMPT_TOKENS = 1024
 
 SCHEMA = {
     "type": "object",
@@ -81,10 +80,11 @@ class Timed:
         return out
 
 
-def main() -> None:
-    name = sys.argv[1] if len(sys.argv) > 1 else "qwen3"
-    known = omnia.resolve(name)
-    built = omnia.loaded(known.repo, patterns=known.patterns, dtype=known.dtype, tokens=TOKENS)
+def run(args: argparse.Namespace) -> None:
+    known = omnia.resolve(args.model)
+    built = omnia.loaded(
+        known.repo, patterns=known.patterns, dtype=known.dtype, tokens=args.tokens
+    )
     model = built.model
 
     directory = Path(snapshot(known.repo, "tokenizer.json", "config.json"))
@@ -101,7 +101,7 @@ def main() -> None:
     grammar = vocabulary.compile(SCHEMA)
     print(f"vocabulary {size} ids built in {built_in:.2f} s, widest open {vocabulary.widest_open}")
 
-    ids = tile(tokenizer.encode, BENCH_PROMPT.read_text() + INSTRUCTION, PROMPT_TOKENS)
+    ids = tile(tokenizer.encode, BENCH_PROMPT.read_text() + INSTRUCTION, args.prompt_tokens)
     rounds: list[Timed] = []
 
     def free(prompt: Sequence[int], script: Sequence[int] | None, limit: int) -> Iterator[int]:
@@ -115,12 +115,12 @@ def main() -> None:
     # Both arms run free: a constrained arm cannot follow a script whose ids its own mask
     # forbids, and pinning only the other one would compare two different computations.
     arms = [
-        arm("free", free, tokens=TOKENS, free=True),
-        arm("constrained", bound, tokens=TOKENS, free=True),
+        arm("free", free, tokens=args.tokens, free=True),
+        arm("constrained", bound, tokens=args.tokens, free=True),
     ]
-    gate = Cool(None) if "--no-gate" in sys.argv else default_gate()
+    gate = Cool(None) if args.no_gate else default_gate()
     try:
-        result = interleaved(arms, ids, runs=RUNS, gate=gate)
+        result = interleaved(arms, ids, runs=args.runs, gate=gate)
     except Incomparable as short:
         print(
             f"\nNO RATIO: {short}. The schema completes inside the window — give the model a"
@@ -141,7 +141,3 @@ def main() -> None:
         f"per step, free {1e3 / a:.3f} ms   constrained {1e3 / b:.3f} ms   "
         f"gap {1e3 / b - 1e3 / a:.3f} ms"
     )
-
-
-if __name__ == "__main__":
-    main()

@@ -47,13 +47,13 @@ run = "uv run omnia-bench paired"
 
 [tasks."bench:constrained"]
 description = "constrained-decoding bench (args: <model>)"
-run = "uv run python scripts/constrained.py"
+run = "uv run omnia-bench constrained"
 
 [tasks."bench:grammar"]
-description = "grammar bench (args: <model>)"
+description = "grammar bench: xgrammar against llguidance (args: [model])"
 run = """
 uv run --no-project --with xgrammar --with llguidance --with transformers \
-    python scripts/grammar.py
+    python src/mlx_omnia/bench/grammar.py
 """
 
 [tasks.server]
