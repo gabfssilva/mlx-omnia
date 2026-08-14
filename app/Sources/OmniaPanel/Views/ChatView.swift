@@ -69,7 +69,6 @@ struct ModelLine: View {
                         // A long checkpoint name would otherwise take the row and leave the
                         // context reading beside it cut down to an ellipsis.
                         .frame(maxWidth: 190, alignment: .leading)
-                    if entry?.sees == true { EyeMark() }
                     Text("▾").sans(9, t.fg3)
                 }
             }
@@ -101,19 +100,6 @@ struct ModelLine: View {
         guard used > 0 else { return "0 · \(Fmt.tokens(window)) ctx" }
         let share = Double(used) / Double(window)
         return "\(Fmt.tokens(used)) · \(Fmt.percent(share, share < 0.01 ? 2 : 1)) of \(Fmt.tokens(window))"
-    }
-}
-
-/// The mark a checkpoint with a tower wears. Drawn rather than spelled: it sits inside a
-/// pill next to a name that is already long.
-struct EyeMark: View {
-    @Environment(\.tokens) private var t
-
-    var body: some View {
-        Image(systemName: "eye")
-            .font(.system(size: 10, weight: .medium))
-            .foregroundColor(t.accent)
-            .help("This checkpoint takes images")
     }
 }
 

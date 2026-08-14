@@ -32,6 +32,7 @@ let package = Package(
                 .product(name: "Sparkle", package: "Sparkle"),
             ],
             path: "Sources/OmniaPanel",
+            resources: [.process("Resources")],
             // The tools version is 6.2 for `.macOS(.v26)` and for nothing else. Swift 6 is
             // the default language mode at that version, and adopting it is a concurrency
             // migration across the whole panel — a separate change from what a tools version

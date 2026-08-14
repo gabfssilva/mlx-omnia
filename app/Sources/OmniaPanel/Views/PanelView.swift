@@ -7,6 +7,16 @@
 
 import SwiftUI
 
+private enum BrandLogo {
+    static let image: NSImage = {
+        guard let url = Bundle.module.url(forResource: "logo", withExtension: "svg"),
+              let image = NSImage(contentsOf: url)
+        else { preconditionFailure("logo.svg is missing from the app resources") }
+        image.isTemplate = true
+        return image
+    }()
+}
+
 struct PanelView: View {
     @Environment(\.tokens) private var t
     @Bindable var app: AppModel
@@ -30,6 +40,10 @@ struct PanelView: View {
                 options: Tab.allCases.map { ($0, $0.label) },
                 chosen: app.tab,
                 size: 12,
+                status: { tab -> (state: String, text: String)? in
+                    guard tab == .server else { return nil }
+                    return (app.store.down ? "bad" : "ok", ":\(app.store.port)")
+                },
                 pick: { app.go($0) }
             )
             .padding(.horizontal, Panel.pad)
@@ -93,7 +107,7 @@ struct Head: View {
     @Environment(\.tokens) private var t
     @Bindable var app: AppModel
 
-    private var track: CGFloat { Panel.width - 2 * Panel.pad }
+    private var track: CGFloat { Panel.width - 2 * Panel.pad - 76 - 22 - 16 }
 
     var body: some View {
         let store = app.store
@@ -102,28 +116,17 @@ struct Head: View {
         let ceiling = store.ceiling
         let down = store.down
 
-        VStack(alignment: .leading, spacing: 0) {
-            HStack {
-                Text("MLX Omnia").display(15, t.fg)
-                Spacer(minLength: 0)
-                Overflow(app: app)
-            }
+        HStack(spacing: 8) {
+            Image(nsImage: BrandLogo.image)
+                .resizable()
+                .scaledToFit()
+                .frame(width: 76, height: 36)
+                .foregroundStyle(t.fg)
 
             // The band: the residents drawn to its scale — weights solid, KV the same
-            // material thinned.
+            // material thinned. Its figures live on the instrument rather than below it.
             ZStack(alignment: .leading) {
-                HStack(spacing: 1) {
-                    ForEach(store.models) { slot in
-                        let material = t.mat(store.materials[slot.id] ?? 0)
-                        Rectangle().fill(material)
-                            .frame(width: CGFloat(Double(slot.weightsBytes) / total) * track)
-                        if slot.kvBytes > 0 {
-                            Rectangle().fill(material.opacity(0.4))
-                                .frame(width: CGFloat(Double(slot.kvBytes) / total) * track)
-                        }
-                    }
-                    Spacer(minLength: 0)
-                }
+                memoryFill(store, total: total, weightsOpacity: 0.78, kvOpacity: 0.34)
                 // The tick is the daemon's number. With the daemon gone the band is empty,
                 // and a mark left standing on it is the last answer pretending to be the
                 // current one.
@@ -132,27 +135,55 @@ struct Head: View {
                         .frame(width: 1.5)
                         .offset(x: CGFloat(ceiling / total) * track)
                 }
+                memoryReading(used: used, total: total, ceiling: ceiling, down: down,
+                              primary: t.fg, secondary: t.fg3)
+                memoryReading(used: used, total: total, ceiling: ceiling, down: down,
+                              primary: .white, secondary: .white)
+                    .mask(memoryFill(store, total: total, weightsOpacity: 1, kvOpacity: 1))
             }
-            .frame(height: 7)
+            .frame(maxWidth: .infinity)
+            .frame(height: 22)
             .background(t.sel)
-            .clipShape(RoundedRectangle(cornerRadius: 4))
-            .padding(.top, 11)
+            .clipShape(RoundedRectangle(cornerRadius: 7))
+            .overlay(RoundedRectangle(cornerRadius: 7).stroke(t.hair, lineWidth: 1))
 
-            HStack(spacing: 6) {
-                Text(down ? "— of 128 GB" : "\(Fmt.gb(used)) of \(Fmt.gb(total, 0)) GB")
-                    .mono(10.5, t.fg2).lineLimit(1)
-                if let ceiling, !down {
-                    Text("· ceiling \(Fmt.gb(ceiling, 0))").mono(10.5, t.fg3).lineLimit(1)
-                }
-                Spacer(minLength: 0)
-                DotView(state: down ? "bad" : "ok")
-                Text(":\(store.port)").mono(10.5, t.fg2).lineLimit(1)
-            }
-            .padding(.top, 7)
+            Overflow(app: app)
         }
         .padding(.horizontal, Panel.pad)
         .padding(.top, 12)
         .padding(.bottom, 11)
+    }
+
+    private func memoryFill(
+        _ store: EngineStore, total: Double, weightsOpacity: Double, kvOpacity: Double
+    ) -> some View {
+        HStack(spacing: 1) {
+            ForEach(store.models) { slot in
+                let material = t.mat(store.materials[slot.id] ?? 0)
+                Rectangle().fill(material.opacity(weightsOpacity))
+                    .frame(width: CGFloat(Double(slot.weightsBytes) / total) * track)
+                if slot.kvBytes > 0 {
+                    Rectangle().fill(material.opacity(kvOpacity))
+                        .frame(width: CGFloat(Double(slot.kvBytes) / total) * track)
+                }
+            }
+            Spacer(minLength: 0)
+        }
+    }
+
+    private func memoryReading(
+        used: Double, total: Double, ceiling: Double?, down: Bool,
+        primary: Color, secondary: Color
+    ) -> some View {
+        HStack(spacing: 6) {
+            Text(down ? "— of 128 GB" : "\(Fmt.gb(used)) of \(Fmt.gb(total, 0)) GB")
+                .mono(10.5, primary, weight: .semibold).lineLimit(1)
+            if let ceiling, !down {
+                Text("· ceiling \(Fmt.gb(ceiling, 0))").mono(10.5, secondary).lineLimit(1)
+            }
+            Spacer(minLength: 0)
+        }
+        .padding(.horizontal, 8)
     }
 }
 

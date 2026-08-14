@@ -8,10 +8,6 @@
 
 import SwiftUI
 
-enum ServerLayout {
-    static let summaryMaxHeight: CGFloat = 160
-}
-
 struct ServerView: View {
     @Bindable var app: AppModel
     @State private var tab: ServerTab = .settings
@@ -59,7 +55,7 @@ private struct ServerStatus: View {
         let moving = store.jobs.filter(\.moving)
         let recent = store.metrics?.requests.prefix(4) ?? []
 
-        VStack(spacing: 0) {
+        GeometryReader { area in
             ScrollView {
                 VStack(alignment: .leading, spacing: 7) {
                     if store.down {
@@ -130,23 +126,22 @@ private struct ServerStatus: View {
                     if !app.refusal.isEmpty {
                         Refusal(message: app.refusal).padding(.top, 4)
                     }
+
+                    SectionHead(title: "Log")
+                    LogsView(app: app)
+                        .frame(minHeight: 220, maxHeight: .infinity)
+                        .layoutPriority(1)
                 }
-                .frame(maxWidth: .infinity, alignment: .leading)
+                .frame(
+                    maxWidth: .infinity,
+                    minHeight: max(0, area.size.height - 26),
+                    alignment: .topLeading
+                )
                 .padding(.horizontal, Panel.pad)
                 .padding(.top, 14)
-                .padding(.bottom, 7)
+                .padding(.bottom, 12)
             }
-            .frame(maxHeight: ServerLayout.summaryMaxHeight)
             .scrollIndicators(.never)
-
-            VStack(alignment: .leading, spacing: 7) {
-                SectionHead(title: "Log")
-                LogsView(app: app)
-            }
-            .frame(maxHeight: .infinity)
-            .padding(.horizontal, Panel.pad)
-            .padding(.bottom, 12)
-            .layoutPriority(1)
         }
     }
 }

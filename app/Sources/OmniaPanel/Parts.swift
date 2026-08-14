@@ -163,6 +163,7 @@ struct Segmented<Key: Hashable>: View {
     let chosen: Key
     var dimmed: Set<Key> = []
     var size: CGFloat = 12
+    var status: ((Key) -> (state: String, text: String)?)?
     let pick: (Key) -> Void
 
     var body: some View {
@@ -170,8 +171,21 @@ struct Segmented<Key: Hashable>: View {
             ForEach(options, id: \.0) { key, label in
                 let on = key == chosen
                 let dim = dimmed.contains(key) && !on
-                Text(label)
-                    .sans(size, on ? t.fg : (dim ? t.fg3 : t.fg2), weight: on ? .medium : .regular)
+                HStack(spacing: 5) {
+                    if let status = status?(key) {
+                        DotView(state: status.state)
+                    }
+                    Text(label)
+                        .sans(
+                            size, on ? t.fg : (dim ? t.fg3 : t.fg2),
+                            weight: on ? .medium : .regular
+                        )
+                    if let status = status?(key) {
+                        Text(status.text)
+                            .mono(size - 1, on ? t.fg2 : t.fg3)
+                            .padding(.leading, 3)
+                    }
+                }
                     .lineLimit(1)
                     .frame(maxWidth: .infinity)
                     .padding(.vertical, 4)

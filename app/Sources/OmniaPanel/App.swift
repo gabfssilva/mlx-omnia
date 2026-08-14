@@ -11,6 +11,17 @@ import AppKit
 import Observation
 import SwiftUI
 
+enum MenuBarIcon {
+    static let image: NSImage = {
+        guard let url = Bundle.module.url(forResource: "icon", withExtension: "svg"),
+              let image = NSImage(contentsOf: url)
+        else { preconditionFailure("icon.svg is missing from the app resources") }
+        image.size = NSSize(width: 24, height: 15)
+        image.isTemplate = true
+        return image
+    }()
+}
+
 enum Tab: String, CaseIterable, Hashable {
     case server, models, chat
 
@@ -196,7 +207,7 @@ struct OmniaPanelApp: App {
         } label: {
             // The daemon that is not answering is the state the bar sees more than the
             // window does — the app opens at login, the engine may not be up.
-            Image(systemName: app.store.down ? "minus" : "waveform.path.ecg")
+            Image(nsImage: MenuBarIcon.image)
                 .opacity(app.store.down ? 0.45 : 1)
         }
         .menuBarExtraStyle(.window)

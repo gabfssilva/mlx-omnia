@@ -1,3 +1,7 @@
+<p align="center">
+  <img src="logo.svg" alt="MLX Omnia" width="400">
+</p>
+
 # Omnia
 
 LLM inference engine for Apple Silicon, written in Python on raw [MLX](https://github.com/ml-explore/mlx).
