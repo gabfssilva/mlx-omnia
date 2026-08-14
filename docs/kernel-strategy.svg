@@ -1,0 +1,92 @@
+<svg viewBox="0 0 760 412" fill="none" xmlns="http://www.w3.org/2000/svg" font-family="ui-monospace, SFMono-Regular, Menlo, Consolas, monospace">
+  <style>
+    .card    { fill: #f6f8fa; stroke: #d0d7de; }
+    .win     { fill: #dafbe1; stroke: #1a7f37; }
+    .sep     { stroke: #d0d7de; }
+    .txt     { fill: #1f2328; }
+    .sub     { fill: #656d76; }
+    .accent  { fill: #1a7f37; }
+    .line    { stroke: #656d76; }
+    .winline { stroke: #1a7f37; }
+    .tri     { fill: #ffffff; stroke: #656d76; }
+    @media (prefers-color-scheme: dark) {
+      .card    { fill: #161b22; stroke: #30363d; }
+      .win     { fill: #12261e; stroke: #3fb950; }
+      .sep     { stroke: #30363d; }
+      .txt     { fill: #e6edf3; }
+      .sub     { fill: #8b949e; }
+      .accent  { fill: #3fb950; }
+      .line    { stroke: #8b949e; }
+      .winline { stroke: #3fb950; }
+      .tri     { fill: #0d1117; stroke: #8b949e; }
+    }
+  </style>
+  <defs>
+    <marker id="arrow" viewBox="0 0 8 8" refX="7" refY="4" markerWidth="7" markerHeight="7" orient="auto-start-reverse">
+      <path d="M 0 0 L 8 4 L 0 8 z" class="accent"/>
+    </marker>
+    <marker id="realize" viewBox="0 0 12 10" refX="11" refY="5" markerWidth="12" markerHeight="10" orient="auto">
+      <path d="M 1 1 L 11 5 L 1 9 z" stroke-width="1" class="tri"/>
+    </marker>
+  </defs>
+
+  <!-- context -->
+  <text x="24" y="20" font-size="11" class="sub">the model calls Qmv(leaf, epilogue="gate", …)</text>
+  <rect x="24" y="33" width="250" height="94" rx="10" class="card"/>
+  <text x="149" y="58" font-size="13" font-weight="600" text-anchor="middle" class="txt">Qmv</text>
+  <line x1="24" y1="68" x2="274" y2="68" class="sep"/>
+  <text x="42" y="88" font-size="12" class="txt">strategy: QmvStrategy</text>
+  <text x="42" y="107" font-size="12" class="txt">__call__(x, gate)</text>
+
+  <!-- the one binding, made at construction -->
+  <path d="M 149 127 V 208" stroke-width="1.5" class="winline" marker-end="url(#arrow)"/>
+  <text x="162" y="160" font-size="11" class="sub">bound at construction:</text>
+  <text x="162" y="176" font-size="11" font-weight="600" class="accent">GatedNvfp4Qmv ✓</text>
+
+  <!-- the protocol -->
+  <rect x="24" y="212" width="250" height="72" rx="10" class="card"/>
+  <text x="149" y="234" font-size="11" text-anchor="middle" class="sub">«protocol»</text>
+  <text x="149" y="252" font-size="13" font-weight="600" text-anchor="middle" class="txt">QmvStrategy</text>
+  <line x1="24" y1="262" x2="274" y2="262" class="sep"/>
+  <text x="42" y="278" font-size="12" class="txt">__call__(x, gate) → array</text>
+
+  <!-- realizations converge on the protocol -->
+  <path d="M 352 248 H 282" stroke-width="1.2" stroke-dasharray="5 4" class="line" marker-end="url(#realize)"/>
+  <path d="M 430 59 L 352 248" stroke-width="1.2" stroke-dasharray="5 4" class="line"/>
+  <path d="M 430 121 L 352 248" stroke-width="1.2" stroke-dasharray="5 4" class="line"/>
+  <path d="M 430 183 L 352 248" stroke-width="1.2" stroke-dasharray="5 4" class="line"/>
+  <path d="M 430 245 L 352 248" stroke-width="1.2" stroke-dasharray="5 4" class="winline"/>
+  <path d="M 430 307 L 352 248" stroke-width="1.2" stroke-dasharray="5 4" class="line"/>
+  <path d="M 430 369 L 352 248" stroke-width="1.2" stroke-dasharray="5 4" class="line"/>
+
+  <!-- the strategies -->
+  <text x="430" y="20" font-size="11" class="sub">core/kernels/qmv/</text>
+
+  <g opacity="0.45">
+    <rect x="430" y="33" width="300" height="52" rx="10" class="card"/>
+    <text x="448" y="54" font-size="13" class="txt">TernaryQmv</text>
+    <text x="448" y="73" font-size="11" class="sub">build(leaf, …) → Self | None</text>
+
+    <rect x="430" y="95" width="300" height="52" rx="10" class="card"/>
+    <text x="448" y="116" font-size="13" class="txt">Nvfp4Qmv</text>
+    <text x="448" y="135" font-size="11" class="sub">build(leaf, …) → Self | None</text>
+
+    <rect x="430" y="157" width="300" height="52" rx="10" class="card"/>
+    <text x="448" y="178" font-size="13" class="txt">SoftplusQmv</text>
+    <text x="448" y="197" font-size="11" class="sub">build(leaf, …) → Self | None</text>
+  </g>
+
+  <rect x="430" y="219" width="300" height="52" rx="10" class="win"/>
+  <text x="448" y="240" font-size="13" font-weight="600" class="txt">GatedNvfp4Qmv</text>
+  <text x="448" y="259" font-size="11" class="accent">build(leaf, …) → self ✓</text>
+
+  <g opacity="0.45">
+    <rect x="430" y="281" width="300" height="52" rx="10" class="card"/>
+    <text x="448" y="302" font-size="13" class="txt">Int8Qmv</text>
+    <text x="448" y="321" font-size="11" class="sub">build(leaf, …) → Self | None</text>
+
+    <rect x="430" y="343" width="300" height="52" rx="10" class="card"/>
+    <text x="448" y="364" font-size="13" class="txt">DefaultQmv</text>
+    <text x="448" y="383" font-size="11" class="sub">build(leaf, …) → Self | None</text>
+  </g>
+</svg>
