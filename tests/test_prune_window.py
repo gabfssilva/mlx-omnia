@@ -15,7 +15,7 @@ import pytest
 
 sys.path.insert(0, str(pathlib.Path(__file__).parents[1] / "scripts"))
 
-from prune_window import prune  # noqa: E402
+from prune_window import prune
 
 
 @pytest.fixture

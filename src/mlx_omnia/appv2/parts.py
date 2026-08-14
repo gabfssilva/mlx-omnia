@@ -7,6 +7,7 @@ controls are 30 pt tall against v1's 26, and no face is smaller than 11 pt.
 
 from __future__ import annotations
 
+import math
 from collections.abc import Callable
 
 import flet as ft
@@ -165,8 +166,12 @@ def scope(
     )
 
 
-def searchbox(placeholder: str, on_change: Callable[[str], None]) -> ft.Control:
-    """The v1 search box, one size up: a field with a magnifier, 32 pt tall."""
+def searchbox(placeholder: str, value: str, on_change: Callable[[str], None]) -> ft.Control:
+    """The v1 search box, one size up: a field with a magnifier, 32 pt tall.
+
+    The field is controlled: every render hands the current value back, because this
+    Flet's controls are frozen — the state is the only place the text lives, and a
+    rebuild without it erases what was typed."""
     glass = cv.Canvas(
         [
             cv.Circle(
@@ -202,6 +207,7 @@ def searchbox(placeholder: str, on_change: Callable[[str], None]) -> ft.Control:
                 glass,
                 ft.TextField(
                     expand=True,
+                    value=value,
                     text_style=theme.sans(13),
                     hint_text=placeholder,
                     hint_style=theme.sans(13, t().fg3),
@@ -219,8 +225,8 @@ def searchbox(placeholder: str, on_change: Callable[[str], None]) -> ft.Control:
     )
 
 
-def toggle(on: bool) -> ft.Container:
-    """A switch drawn at rest — the mockup flips nothing yet."""
+def toggle(on: bool, on_flip: Callable[[], None] | None = None) -> ft.Container:
+    """A switch; hand it on_flip and it answers the pointer."""
     knob = ft.Container(width=16, height=16, border_radius=8, bgcolor="#FFFFFF")
     return ft.Container(
         width=36,
@@ -230,4 +236,171 @@ def toggle(on: bool) -> ft.Container:
         padding=2,
         alignment=ft.Alignment.CENTER_RIGHT if on else ft.Alignment.CENTER_LEFT,
         content=knob,
+        on_click=None if on_flip is None else (lambda _: on_flip()),
+    )
+
+
+def chip(text: str) -> ft.Container:
+    """A quiet measure worn inline — the decode chip on a model's row."""
+    return ft.Container(
+        content=ft.Text(text, style=theme.mono(11, t().fg2), no_wrap=True),
+        padding=ft.Padding(left=8, right=8, top=2, bottom=2),
+        bgcolor=t().sel,
+        border_radius=6,
+    )
+
+
+def glyph(kind: str, color: str, size: float = 13.0) -> ft.Control:
+    """The sidebar's thin-stroke marks: pulse, bubble, stack, grain, dial."""
+    paint = ft.Paint(
+        color=color,
+        stroke_width=1.2,
+        style=ft.PaintingStyle.STROKE,
+        stroke_cap=ft.StrokeCap.ROUND,
+        stroke_join=ft.StrokeJoin.ROUND,
+    )
+    shapes: list[cv.Shape]
+    if kind == "pulse":
+        shapes = [
+            cv.Path(
+                [
+                    cv.Path.MoveTo(1.5, 8),
+                    cv.Path.LineTo(4, 8),
+                    cv.Path.LineTo(5.5, 4),
+                    cv.Path.LineTo(7.5, 11),
+                    cv.Path.LineTo(9, 8),
+                    cv.Path.LineTo(11.5, 8),
+                ],
+                paint=paint,
+            )
+        ]
+    elif kind == "bubble":
+        shapes = [
+            cv.Path(
+                [
+                    cv.Path.MoveTo(2, 2.5),
+                    cv.Path.LineTo(11, 2.5),
+                    cv.Path.LineTo(11, 9),
+                    cv.Path.LineTo(5.5, 9),
+                    cv.Path.LineTo(3, 11.5),
+                    cv.Path.LineTo(3, 9),
+                    cv.Path.LineTo(2, 9),
+                    cv.Path.Close(),
+                ],
+                paint=paint,
+            )
+        ]
+    elif kind == "stack":
+        shapes = [
+            cv.Path(
+                [
+                    cv.Path.MoveTo(2, 2),
+                    cv.Path.LineTo(11, 2),
+                    cv.Path.LineTo(11, 11),
+                    cv.Path.LineTo(2, 11),
+                    cv.Path.Close(),
+                ],
+                paint=paint,
+            ),
+            cv.Line(2, 5, 11, 5, paint=paint),
+            cv.Line(2, 8, 11, 8, paint=paint),
+        ]
+    elif kind == "grain":
+        shapes = [
+            cv.Path(
+                [
+                    cv.Path.MoveTo(2, 2),
+                    cv.Path.LineTo(11, 2),
+                    cv.Path.LineTo(11, 11),
+                    cv.Path.LineTo(2, 11),
+                    cv.Path.Close(),
+                ],
+                paint=paint,
+            ),
+            cv.Path(
+                [
+                    cv.Path.MoveTo(5.1, 5.1),
+                    cv.Path.LineTo(7.9, 5.1),
+                    cv.Path.LineTo(7.9, 7.9),
+                    cv.Path.LineTo(5.1, 7.9),
+                    cv.Path.Close(),
+                ],
+                paint=ft.Paint(color=color, style=ft.PaintingStyle.FILL),
+            ),
+        ]
+    else:  # dial
+        shapes = [
+            cv.Arc(2, 5, 9, 9, math.pi, math.pi, paint=paint),
+            cv.Line(6.5, 9.5, 9.2, 6.2, paint=paint),
+        ]
+    return cv.Canvas(shapes, width=size, height=size)
+
+
+@ft.component
+def Slider(
+    width: float,
+    fraction: float,
+    on_fraction: Callable[[float], None],
+) -> ft.Control:
+    """A thin native-looking slider: a filled track and a knob, dragged by fraction."""
+
+    def place(x: float) -> None:
+        on_fraction(min(1.0, max(0.0, x / width)))
+
+    knob = ft.Container(
+        width=14,
+        height=14,
+        border_radius=7,
+        bgcolor="#FFFFFF",
+        border=theme.hair(t().hair2),
+        shadow=ft.BoxShadow(
+            offset=ft.Offset(0, 1), blur_radius=2, color=theme.alpha("#000000", 0.25)
+        ),
+    )
+    track = ft.Stack(
+        [
+            ft.Container(
+                top=5, left=0, width=width, height=4, border_radius=2, bgcolor=t().sel
+            ),
+            ft.Container(
+                top=5,
+                left=0,
+                width=max(2.0, fraction * width),
+                height=4,
+                border_radius=2,
+                bgcolor=t().accent,
+            ),
+            ft.Container(top=0, left=min(width - 14, max(0.0, fraction * width - 7)), content=knob),
+        ],
+        width=width,
+        height=14,
+    )
+    return ft.GestureDetector(
+        content=track,
+        on_tap_down=lambda event: place(event.local_position.x),
+        on_pan_update=lambda event: place(event.local_position.x),
+    )
+
+
+def stepper(on_minus: Callable[[], None], on_plus: Callable[[], None]) -> ft.Container:
+    """The − / + pair, joined the way AppKit joins them."""
+
+    def half(mark: str, act: Callable[[], None], left: bool) -> ft.Container:
+        return ft.Container(
+            width=26,
+            height=22,
+            alignment=ft.Alignment.CENTER,
+            border=ft.Border.only(right=ft.BorderSide(1, t().hair)) if left else None,
+            content=ft.Text(mark, style=theme.sans(13, t().fg2, ft.FontWeight.W_500)),
+            on_click=lambda _: act(),
+        )
+
+    return ft.Container(
+        bgcolor=t().elev,
+        border=theme.hair(t().hair2),
+        border_radius=6,
+        clip_behavior=ft.ClipBehavior.ANTI_ALIAS,
+        content=ft.Row(
+            [half("−", on_minus, True), half("+", on_plus, False)], spacing=0, tight=True
+        ),
     )

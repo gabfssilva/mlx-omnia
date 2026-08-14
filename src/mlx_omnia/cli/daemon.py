@@ -3,8 +3,9 @@
 Three decisions live here.
 
 **Where the log goes.** The child is detached and nobody is watching its terminal, so its
-output goes to `${XDG_CONFIG_HOME:-~/.config}/mlx_omnia/daemon.log` — the same file the app's
-Settings card already names, because it is the same daemon: one address, one port, one log.
+output goes to `~/Library/Logs/mlx-omnia/daemon.log` — the same file the window writes its
+own daemon into, and the one the app's Settings card names, because it is the same daemon:
+one address, one port, one log. `mlx_omnia.paths` owns the path.
 It is truncated at each start; uvicorn writes an access line per request, and the run whose
 lines answer "why is it not up" is the one that has just failed.
 
@@ -22,7 +23,6 @@ that dies with the client that happened to start it is not a daemon.
 """
 
 import fcntl
-import os
 import subprocess
 import sys
 import time
@@ -31,6 +31,7 @@ from contextlib import contextmanager
 from pathlib import Path
 from urllib.parse import urlsplit
 
+from mlx_omnia import paths
 from mlx_omnia.cli.client import PROBE_TIMEOUT, ServerError, health
 
 LOOPBACK = frozenset({"127.0.0.1", "localhost", "::1"})
@@ -41,19 +42,12 @@ BOOT_TIMEOUT = 90.0
 _POLL_SECONDS = 0.25
 
 
-def state_dir() -> Path:
-    """Where the app writes `app.json` and the server its `server.db`, same XDG rule."""
-    root = os.environ.get("XDG_CONFIG_HOME")
-    base = Path(root) if root else Path.home() / ".config"
-    return base / "mlx_omnia"
-
-
 def log_path() -> Path:
-    return state_dir() / "daemon.log"
+    return paths.daemon_log()
 
 
 def lock_path() -> Path:
-    return state_dir() / "daemon.lock"
+    return paths.daemon_lock()
 
 
 def address(base_url: str) -> tuple[str, int] | None:

@@ -234,12 +234,16 @@ async def served_models() -> list[str]:
 
 @dataclass(frozen=True)
 class Params:
-    temperature: float = 1.0
-    top_p: float = 1.0
-    # None is the dialect's "no cut": the field is left out of the body.
+    """The knobs this client names on the request — its overrides. A named knob beats
+    the profile the request also names, which beats the checkpoint's declared defaults:
+    the daemon's own order. `None` is not named — the field stays out of the body and
+    the daemon's preset decides."""
+
+    temperature: float | None = None
+    top_p: float | None = None
     top_k: int | None = None
-    min_p: float = 0.0
-    repetition_penalty: float = 1.0
+    min_p: float | None = None
+    repetition_penalty: float | None = None
     max_tokens: int = 4096
     # `default` leaves the field out, which is the checkpoint's own template deciding.
     reasoning_effort: str = "default"
@@ -247,53 +251,55 @@ class Params:
 
 
 DEFAULTS = Params()
+"""Nothing named: the profile and the checkpoint decide every sampling knob."""
 
 
 def params_of(entry: object, base: Params = DEFAULTS) -> Params:
-    """The knobs a chat opens on: the checkpoint's declared defaults over the dialect's,
-    which is the same order the daemon resolves them in.
+    """The knobs the checkpoint itself names, as this client's starting overrides —
+    the same numbers the daemon's preset would fill, surfaced so a knob panel can show
+    them. What the checkpoint does not declare stays unnamed.
 
-    `max_tokens`, the effort and the system prompt are not in that file and stay as they
-    were: they are the reader's, not the checkpoint's.
+    `max_tokens`, the effort and the system prompt are not in that file and stay as
+    `base` has them: they are the reader's, not the checkpoint's.
     """
     if not isinstance(entry, dict):
         return base
     declared = entry.get("defaults")
     if not isinstance(declared, dict):
         return base
-    def knob(name: str, fallback: float) -> float:
-        # Not `or`: a declared 0.0 is falsy and is the one value that matters most here.
-        # `do_sample: false` reaches this file as `temperature: 0.0` — the checkpoint saying
-        # greedy — and falling back to the dialect's 1.0 samples where it said not to, which
-        # also costs the turn its speculation (that is greedy-only).
-        value = _number(declared.get(name))
-        return fallback if value is None else value
 
+    # A declared 0.0 is kept, not dropped: `do_sample: false` reaches this file as
+    # `temperature: 0.0` — the checkpoint saying greedy — and losing it samples where it
+    # said not to, which also costs the turn its speculation (that is greedy-only).
     return replace(
         base,
-        temperature=knob("temperature", DEFAULTS.temperature),
-        top_p=knob("top_p", DEFAULTS.top_p),
+        temperature=_number(declared.get("temperature")),
+        top_p=_number(declared.get("top_p")),
         top_k=int(top_k) if (top_k := _number(declared.get("top_k"))) is not None else None,
-        min_p=knob("min_p", DEFAULTS.min_p),
-        repetition_penalty=knob("repetition_penalty", DEFAULTS.repetition_penalty),
+        min_p=_number(declared.get("min_p")),
+        repetition_penalty=_number(declared.get("repetition_penalty")),
     )
 
 
 def _body(model: str, turns: list[dict[str, str]], params: Params) -> dict[str, object]:
+    """Only what is named rides: a knob in the body beats the profile the model field
+    names, so an unnamed one must stay out, not be restated at some default."""
     asked: dict[str, object] = {
         "model": model,
         "messages": turns,
         "stream": True,
         "stream_options": {"include_usage": True},
         "max_tokens": params.max_tokens,
-        "temperature": params.temperature,
-        "top_p": params.top_p,
     }
+    if params.temperature is not None:
+        asked["temperature"] = params.temperature
+    if params.top_p is not None:
+        asked["top_p"] = params.top_p
     if params.top_k is not None:
         asked["top_k"] = params.top_k
-    if params.min_p > 0:
+    if params.min_p is not None:
         asked["min_p"] = params.min_p
-    if params.repetition_penalty > 1:
+    if params.repetition_penalty is not None:
         asked["repetition_penalty"] = params.repetition_penalty
     if params.reasoning_effort != "default":
         asked["reasoning_effort"] = params.reasoning_effort

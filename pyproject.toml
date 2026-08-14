@@ -44,6 +44,7 @@ omnia = "mlx_omnia.cli.main:run"
 omnia-bench = "mlx_omnia.bench.cli:main"
 omnia-app = "mlx_omnia.app.main:run"
 omnia-appv2 = "mlx_omnia.appv2.main:run"
+omnia-menubar = "mlx_omnia.appv2.menubar.main:run"
 
 [project.urls]
 Homepage = "https://github.com/gabfssilva/mlx-omnia"
@@ -85,8 +86,30 @@ module = "main"
 # for macOS, so an Intel slice could never run the engine it is bundled beside.
 target_arch = ["arm64"]
 # The window's own dependencies, and only those — it speaks HTTP to the daemon and the
-# server stack belongs to the interpreter that runs it, not to this one.
+# server stack belongs to the interpreter that runs it, not to this one. Sparkle is not
+# among them because it is a framework and not a wheel: `mlx_omnia.app.updates` opens the
+# one laid into the bundle through ctypes, and pyobjc — the obvious way to do that — cannot
+# be here. Its `PyObjCTest` package carries a .dSYM, and Xcode's strip phase over the
+# packaged site-packages fails on the DWARF file rather than skipping it.
 dependencies = ["flet[desktop]>=0.86", "httpx>=0.28"]
+
+# Sparkle's whole configuration. `updates.start()` hands it the framework and nothing
+# else, so the feed is named here once.
+#
+# SUPublicEDKey is what makes an update acceptable, and it is missing on purpose until
+# `mise run sparkle:keys` has printed one: absent, Sparkle refuses every update rather
+# than taking an unsigned one on trust, which is the failure to want. Nothing else in
+# this file has to change when it is filled in.
+#
+# The interval reaches Info.plist as <string> and not <integer> — flet's template renders
+# every non-boolean that way. Sparkle reads this one through a coercion that accepts
+# NSString beside NSNumber, so it does land as 86400 seconds; the next numeric key put here
+# needs that checked rather than assumed.
+[tool.flet.macos.info]
+SUFeedURL = "https://gabfssilva.github.io/mlx-omnia/appcast.xml"
+SUEnableAutomaticChecks = true
+SUScheduledCheckInterval = 86400
+# SUPublicEDKey = ""
 
 [tool.flet.macos.entitlement]
 # The engine's extension modules are signed by us but loaded into a hardened runtime;
@@ -114,6 +137,9 @@ line-length = 100
 src = ["src"]
 
 [tool.ruff.lint]
+# The window draws real glyphs — the breadcrumb's ‹ ›, the stepper's − — not typos for
+# their ASCII lookalikes.
+allowed-confusables = ["‹", "›", "−"]
 select = [
     "E", "W",    # pycodestyle
     "F",         # pyflakes
@@ -160,7 +186,7 @@ modules = ["mlx_omnia.bench.arms.omnia", "mlx_omnia.bench.arms.mlx_lm"]
 [[tool.importlinter.contracts]]
 name = "the window and the CLI know no engine"
 type = "forbidden"
-source_modules = ["mlx_omnia.app", "mlx_omnia.cli"]
+source_modules = ["mlx_omnia.app", "mlx_omnia.appv2", "mlx_omnia.cli"]
 forbidden_modules = ["mlx_omnia.engine"]
 
 [[tool.importlinter.contracts]]

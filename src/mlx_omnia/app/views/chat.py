@@ -640,12 +640,21 @@ class Room:
                     style=theme.sans(10.5, t().fg3),
                 ),
             ),
-            self._slide("Temperature", _decimal(params.temperature), params.temperature, 0, 2,
-                        lambda v: self._set_params(replace(params, temperature=round(v, 2))), 0),
+            # "—" is a knob not named: the request leaves it out and the daemon's
+            # resolution stands. The slider then rests at the dialect's effective
+            # value, and touching it is what names the knob.
+            self._slide(
+                "Temperature",
+                "—" if params.temperature is None else _decimal(params.temperature),
+                1.0 if params.temperature is None else params.temperature, 0, 2,
+                lambda v: self._set_params(replace(params, temperature=round(v, 2))), 0),
             # From 0.01 and not 0: the dialect refuses a top_p of zero, and a slider that
             # can reach a value the daemon will not take is a 400 nobody asked for.
-            self._slide("Top-p", _decimal(params.top_p), params.top_p, 0.01, 1,
-                        lambda v: self._set_params(replace(params, top_p=round(v, 2))), 1),
+            self._slide(
+                "Top-p",
+                "—" if params.top_p is None else _decimal(params.top_p),
+                1.0 if params.top_p is None else params.top_p, 0.01, 1,
+                lambda v: self._set_params(replace(params, top_p=round(v, 2))), 1),
             self._slide(
                 "Top-k",
                 "—" if params.top_k is None else str(params.top_k),
@@ -658,15 +667,17 @@ class Room:
             # To .99 and not 1: min_p is a fraction below 1, and 1.0 keeps nothing.
             self._slide(
                 "Min-p",
-                "—" if params.min_p == 0 else _decimal(params.min_p),
-                params.min_p, 0, 0.99,
+                "—" if not params.min_p else _decimal(params.min_p),
+                params.min_p or 0.0, 0, 0.99,
                 lambda v: self._set_params(replace(params, min_p=round(v, 2))),
                 3,
             ),
             self._slide(
                 "Repetition penalty",
-                "—" if params.repetition_penalty <= 1 else _decimal(params.repetition_penalty),
-                params.repetition_penalty, 1, 2,
+                "—"
+                if params.repetition_penalty is None or params.repetition_penalty <= 1
+                else _decimal(params.repetition_penalty),
+                params.repetition_penalty or 1.0, 1, 2,
                 lambda v: self._set_params(replace(params, repetition_penalty=round(v, 2))),
                 4,
             ),
@@ -748,7 +759,9 @@ class Room:
             for part in (
                 short(self.model) or "no model",
                 None if self._entry is None else self._entry["quantization"],
-                f"t {_decimal(self.params.temperature)}",
+                None
+                if self.params.temperature is None
+                else f"t {_decimal(self.params.temperature)}",
             )
             if part
         )

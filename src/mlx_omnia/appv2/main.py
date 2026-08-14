@@ -1,9 +1,10 @@
 """The Quieta window: the same fixed 1160x760 canvas as v1, with the sidebar owning
-which view is on and the Now panel stacked over whatever that is.
+which view is on. The app opens on the Server — Omnia is a server with a chat beside
+it, not the other way around.
 
-The sizing dance is v1's, kept verbatim: window properties are applied on the Flutter
-side and do not compose within one batch, so the title bar goes first, the measure
-after it, and the reveal is its own batch.
+The wiring is v1's: one Engine filled by the daemon's event stream, a Daemon that
+starts the server when nobody answers on the port and owns only the one it started,
+and Downloads folding the job streams. The sizing dance is v1's too, kept verbatim.
 """
 
 from __future__ import annotations
@@ -12,40 +13,46 @@ import asyncio
 
 import flet as ft
 
-from mlx_omnia.appv2 import theme
+from mlx_omnia.app.api import engine as engine_api
+from mlx_omnia.app.api.daemon import Daemon
+from mlx_omnia.app.api.downloads import Downloads
+from mlx_omnia.appv2 import runtime, theme
 from mlx_omnia.appv2.shell import Shell
 from mlx_omnia.appv2.sidebar import Sidebar
 from mlx_omnia.appv2.theme import t
+from mlx_omnia.appv2.views.benchmark import Benchmark
 from mlx_omnia.appv2.views.chat import Chat
 from mlx_omnia.appv2.views.models import Models
-from mlx_omnia.appv2.views.now import Now
-from mlx_omnia.appv2.views.settings import Settings
+from mlx_omnia.appv2.views.quantize import Quantize
+from mlx_omnia.appv2.views.server import Server
 
 WIDTH, HEIGHT = 1160, 760
 
 
 @ft.component
-def App(shell: Shell) -> ft.Control:
+def App(
+    shell: Shell, engine: engine_api.Engine, downloads: Downloads, daemon: Daemon
+) -> ft.Control:
     theme.use(shell.dark)
     ft.context.page.bgcolor = t().win
 
-    if shell.view == "models":
-        body: ft.Control = Models(shell)
-    elif shell.view == "settings":
-        body = Settings(shell)
+    if shell.view == "chat":
+        body: ft.Control = Chat(shell, engine)
+    elif shell.view == "models":
+        body = Models(shell, engine, downloads)
+    elif shell.view == "quantize":
+        body = Quantize(shell, engine)
+    elif shell.view == "benchmark":
+        body = Benchmark(shell, engine)
     else:
-        body = Chat(shell)
+        body = Server(shell, engine, daemon)
 
-    window = ft.Row(
-        [Sidebar(shell), ft.Container(content=body, expand=True, bgcolor=t().surface)],
+    return ft.Row(
+        [Sidebar(shell, engine), ft.Container(content=body, expand=True, bgcolor=t().surface)],
         spacing=0,
         expand=True,
         vertical_alignment=ft.CrossAxisAlignment.STRETCH,
     )
-    layers: list[ft.Control] = [window]
-    if shell.now_open:
-        layers.append(Now(shell))
-    return ft.Stack(layers, expand=True)
 
 
 async def _size(page: ft.Page) -> None:
@@ -87,6 +94,10 @@ async def main(page: ft.Page) -> None:
 
     await _size(page)
 
+    engine = engine_api.Engine()
+    downloads = Downloads()
+    daemon = Daemon()
+
     def brightness(_event: object) -> None:
         shell.system_dark = page.platform_brightness is ft.Brightness.DARK
         if shell.mode == "system":
@@ -109,14 +120,17 @@ async def main(page: ft.Page) -> None:
         else None
     )
 
-    page.on_keyboard_event = lambda event: (
-        setattr(shell, "now_open", False) if event.key == "Escape" else None
-    )
-
-    page.render(App, shell)
+    page.render(App, shell, engine, downloads, daemon)
     await asyncio.sleep(0.2)
     page.window.opacity = 1
     page.update()
+
+    # Not awaited: a daemon that is slow to come up shows on the sidebar's dot, and the
+    # window is drawn either way.
+    page.run_task(daemon.boot)
+    page.run_task(engine_api.follow, engine)
+    page.run_task(downloads.boot)
+    page.run_task(runtime.trace, engine)
 
 
 def run() -> None:

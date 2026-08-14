@@ -18,30 +18,29 @@ import sys
 import flet as ft
 import httpx
 
+from mlx_omnia import paths
 from mlx_omnia.app.api.http import BASE
 
 # src/mlx_omnia/app/api/daemon.py — the checkout is four up, and it is where `uv run` has
 # to be pointed when the console script is not on this path.
 ROOT = pathlib.Path(os.environ.get("OMNIA_PROJECT") or pathlib.Path(__file__).parents[4])
 
-def _bundled() -> pathlib.Path | None:
+def bundled_python() -> pathlib.Path | None:
     """The engine's own interpreter inside the .app, or None outside one.
 
     Flet embeds Python as a dylib in the Flutter host and ships no executable, so in the
     packaged window `sys.executable` is the window itself and there is nothing there to
     exec. `mise run dmg` lays a CPython beside it with the engine installed into it.
 
-    The anchor is the enclosing `.app` rather than a fixed number of parents: the app code
-    sits several levels inside serious_python's own nested bundle, and that depth is Flet's
-    to change. Nothing absolute is stored, which is what lets the bundle be dragged into
-    /Applications — the same reason the console scripts in `engine/bin` are unusable here,
-    since their shebangs hold the path they were installed under.
+    Nothing absolute is stored, which is what lets the bundle be dragged into /Applications
+    — the same reason the console scripts in `engine/bin` are unusable here, since their
+    shebangs hold the path they were installed under.
     """
-    for parent in pathlib.Path(__file__).parents:
-        if parent.suffix == ".app":
-            python = parent / "Contents" / "Resources" / "engine" / "bin" / "python3"
-            return python if python.exists() else None
-    return None
+    app = paths.bundle()
+    if app is None:
+        return None
+    python = app / "Contents" / "Resources" / "engine" / "bin" / "python3"
+    return python if python.exists() else None
 
 FOREIGN = "The engine was started outside the app. Stop it where it was started."
 
@@ -109,7 +108,7 @@ async def up() -> bool:
 
 def _command() -> list[str]:
     """How to start the engine, in the three places the window runs from."""
-    if (bundled := _bundled()) is not None:
+    if (bundled := bundled_python()) is not None:
         return [str(bundled), "-m", "mlx_omnia.server.main"]
     beside = pathlib.Path(sys.executable).parent / "omnia-server"
     if beside.exists():
@@ -117,16 +116,48 @@ def _command() -> list[str]:
     return ["uv", "run", "--project", str(ROOT), "omnia-server"]
 
 
+def child_environment() -> dict[str, str]:
+    """The child's environment, with this interpreter's own settings taken out of it.
+
+    serious_python points `PYTHONHOME` and `PYTHONPATH` at the window's embedded runtime,
+    and a child inherits them: the engine's interpreter would then read the window's stdlib
+    and the window's site-packages, where the server's dependencies are deliberately not.
+    Inherited, it does not even reach an import error — `Py_Initialize` fails and the
+    process dies with no Python frame to blame.
+    """
+    return {
+        key: value
+        for key, value in os.environ.items()
+        if not key.startswith("PYTHON") and key != "SERIOUS_PYTHON_APP"
+    }
+
+
 async def _spawn() -> asyncio.subprocess.Process:
     command = _command()
-    # The bundle has no checkout to sit in, and the engine needs no working directory of
-    # its own — the model cache is addressed absolutely through the hub.
-    cwd = ROOT if ROOT.is_dir() else None
+    bundled = bundled_python() is not None
+    # The checkout is where `uv run` has to start; the bundle has no checkout, and `ROOT`
+    # there is whatever lies four levels above a temp directory. The engine needs no working
+    # directory of its own — the model cache is addressed absolutely through the hub.
+    cwd = None if bundled else ROOT
     # The daemon's half of "quit is a stop": it watches this pid and shuts itself down
     # when it goes, which is the only path that survives a force quit.
-    process = await asyncio.create_subprocess_exec(
-        *command, "--parent-pid", str(os.getpid()), cwd=cwd
-    )
+    # Nobody is watching this child's terminal — in the bundle there is not one. Truncated
+    # at each start, because the run whose lines answer "why is it not up" is the one that
+    # has just failed, and uvicorn writes an access line per request.
+    handle = paths.daemon_log().open("wb")
+    try:
+        process = await asyncio.create_subprocess_exec(
+            *command,
+            "--parent-pid",
+            str(os.getpid()),
+            cwd=cwd,
+            env=child_environment() if bundled else None,
+            stdout=handle,
+            stderr=asyncio.subprocess.STDOUT,
+        )
+    finally:
+        # The child holds its own descriptor now.
+        handle.close()
     # Quit is a stop, immediately. The --parent-pid watchdog is what covers the paths
     # this never runs on.
     atexit.register(_term, process.pid)

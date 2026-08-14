@@ -1,6 +1,7 @@
-"""Quieta — the appv2 window: three places and a gauge, mocked before it is wired.
+"""Quieta — the appv2 window: four places and a gauge, wired to the daemon.
 
-Every screen here draws invented numbers from `data.py`; nothing talks to the daemon
-yet. The layout, the tokens and the components are the real ones, so wiring a screen
-later replaces its data source and not its shape.
+The app opens on the Server; Chat, Models and Benchmark sit beside it. Every screen
+draws the daemon's own resources — the event stream fills one Engine, the window
+starts a server when nobody answers on the port, and every write goes back over HTTP.
+The window knows no engine: `mlx_omnia.app.api` is its whole reach.
 """

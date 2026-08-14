@@ -1,4 +1,4 @@
-"""What the window knows about itself — the v1 Chrome, with the Agora panel on it.
+"""What the window knows about itself — the v1 Chrome, re-rooted at the server.
 
 Its own module because every view reads it and `main` mounts them all: a view importing
 `main` for it would be a cycle.
@@ -17,12 +17,13 @@ class Shell:
     """Observable rather than component state, because the window's own events — focus,
     the system going dark — arrive from outside any render."""
 
-    view: str = "chat"
+    view: str = "server"
     focused: bool = True
     mode: str = "system"
     system_dark: bool = False
     dark: bool = False
-    now_open: bool = False
+    conversation: str | None = None
+    """The open chat; None is a fresh one, which is where the empty state lives."""
 
     def choose(self, mode: str) -> None:
         self.mode = mode

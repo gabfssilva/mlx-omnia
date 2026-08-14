@@ -7,6 +7,7 @@ from pathlib import Path
 
 import pytest
 
+from mlx_omnia import paths
 from mlx_omnia.cli import daemon
 from mlx_omnia.cli.client import ServerError
 
@@ -43,14 +44,24 @@ def test_an_address_this_machine_does_not_own_is_refused_before_anything_is_spaw
     assert "loopback" in str(raised.value)
 
 
-def test_the_daemon_log_and_lock_sit_where_the_app_keeps_its_settings(
+def test_the_lock_sits_with_the_state_and_not_with_the_logs(
     monkeypatch: pytest.MonkeyPatch, tmp_path: Path
 ) -> None:
-    """One daemon, one address, one log: the app's Settings card names this exact file, and
-    a CLI writing somewhere else leaves the user reading the wrong one."""
-    monkeypatch.setenv("XDG_CONFIG_HOME", str(tmp_path))
-    assert daemon.log_path() == tmp_path / "mlx_omnia" / "daemon.log"
-    assert daemon.lock_path() == tmp_path / "mlx_omnia" / "daemon.lock"
+    """The lock is state — it belongs beside `server.db`, in the directory a user backs up,
+    and not in the one they delete."""
+    monkeypatch.setenv("OMNIA_STATE_DIR", str(tmp_path))
+    assert daemon.lock_path() == tmp_path / "daemon.lock"
+    assert paths.server_db().parent == daemon.lock_path().parent
+    assert daemon.log_path().parent != daemon.lock_path().parent
+
+
+def test_the_log_is_the_one_the_window_writes_too(monkeypatch: pytest.MonkeyPatch) -> None:
+    """One daemon, one address, one log. The CLI reads this file to say why a daemon that
+    did not answer stopped, and the app's Settings card names it on screen — a CLI writing
+    somewhere else leaves the user reading a file nobody filled. It is a log, not state, so
+    it goes where a Mac app puts logs and not where XDG puts configuration."""
+    assert daemon.log_path() == paths.daemon_log()
+    assert daemon.log_path().parent == Path.home() / "Library" / "Logs" / "mlx-omnia"
 
 
 def test_the_reason_survives_the_shutdown_chatter() -> None:

@@ -23,6 +23,9 @@ node_modules/
 # Swift (aguardando deleção)
 .legacy/
 
+# SwiftPM: app/.build é cache de compilação; app/build é o .app montado (build/ já cobre)
+.build/
+
 # Local-only docs and reference scripts. The bench prompt used to live here behind an
 # exception; it is part of the instrument now (packages/bench/src/mlx_omnia_bench).
 reference/*

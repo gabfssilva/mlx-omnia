@@ -13,10 +13,13 @@ answers with a full remount — which loses, among other things, every scroll po
 from __future__ import annotations
 
 import asyncio
+import sys
 
 import flet as ft
 import flet.canvas as cv
 
+from mlx_omnia import paths
+from mlx_omnia.app import updates
 from mlx_omnia.app.api import engine as engine_api
 from mlx_omnia.app.api.daemon import Daemon
 from mlx_omnia.app.api.downloads import Downloads
@@ -335,6 +338,17 @@ async def main(page: ft.Page) -> None:
     page.run_task(downloads.boot)
     page.run_task(resident.trace, engine)
 
+    # Sparkle, and only in the bundle. Started after the window is drawn because it is not
+    # the window's business: from here on the schedule in Info.plist is what checks, and a
+    # build without the framework in it is a window that simply never offers an update.
+    updates.start()
+
 
 def run() -> None:
+    # In the bundle there is no terminal to write to and a traceback would be lost, or shown
+    # in a red box and gone with it. From a checkout the terminal that started this is the
+    # better place, so the file is only claimed when the window is packaged.
+    if paths.bundle() is not None:
+        stream = paths.app_log().open("w", buffering=1)
+        sys.stdout = sys.stderr = stream
     ft.run(main)

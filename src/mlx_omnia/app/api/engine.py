@@ -105,6 +105,10 @@ class CatalogEntry(TypedDict):
     vocab_size: int | None
     shape: str | None
     resident: bool
+    # Whether the engine has a loader for the architecture — what a picker may offer to
+    # run. Residency itself is the state stream's to say: this list is republished on
+    # catalog changes, not on loads.
+    supported: bool
 
 
 class Progress(TypedDict):

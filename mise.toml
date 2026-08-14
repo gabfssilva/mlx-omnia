@@ -5,6 +5,12 @@ node = "26"
 [env]
 _.python.venv = { path = ".venv", create = false }
 
+# Sparkle is fetched at build time rather than vendored — 15 MB of binary that nothing in
+# the tree reads. The tarball ships ad-hoc signed and is re-signed with our own identity on
+# the way into the .app, so the pin and its checksum are the only provenance left.
+SPARKLE_VERSION = "2.9.5"
+SPARKLE_SHA256 = "015336b601493e05c237964954bff6191370003d94edefe663724c88840d73cc"
+
 [tasks.sync]
 description = "install the dev environment (the extras are not installed by a bare sync)"
 run = "uv sync --extra all --extra mlx-lm"
@@ -68,14 +74,59 @@ run = "uv run omnia-app"
 description = "run the Quieta mockup window (no daemon behind it yet)"
 run = "uv run omnia-appv2"
 
+[tasks.menubar]
+description = "run the menu bar panel (puts an icon in the bar; the panel hangs off it)"
+run = "uv run omnia-menubar"
+
+[tasks.panel]
+description = "build and run the SwiftUI panel in app/ (MenuBarExtra; replaces the Flet one)"
+run = """
+set -eu
+pkill -f 'MLX Omnia.app/Contents/MacOS/OmniaPanel' 2>/dev/null || true
+bundle="$(app/build.sh release | tail -1)"
+open "app/$bundle"
+echo "app/$bundle"
+"""
+
+[tasks."panel:build"]
+description = "build app/ into an .app without launching it"
+run = "app/build.sh release"
+
 [tasks.cli]
 description = "run the HTTP-only CLI"
 run = "uv run omnia"
 
+[tasks."sparkle:fetch"]
+description = "unpack the pinned Sparkle into build/sparkle"
+run = """
+set -eu
+if [ -d build/sparkle/Sparkle.framework ]; then exit 0; fi
+mkdir -p build/sparkle build/cache
+tarball="build/cache/Sparkle-$SPARKLE_VERSION.tar.xz"
+if [ ! -f "$tarball" ]; then
+    curl -fsSL -o "$tarball" \\
+        "https://github.com/sparkle-project/Sparkle/releases/download/$SPARKLE_VERSION/Sparkle-$SPARKLE_VERSION.tar.xz"
+fi
+echo "$SPARKLE_SHA256  $tarball" | shasum -a 256 -c -
+tar xf "$tarball" -C build/sparkle
+"""
+
+[tasks."sparkle:keys"]
+description = "the EdDSA pair Sparkle verifies with — private into the Keychain, public to stdout"
+depends = ["sparkle:fetch"]
+run = "build/sparkle/bin/generate_keys"
+
 [tasks."dmg:app"]
 description = "build the window bundle (flet build macos) into build/macos"
 run = """
-uvx --from flet-cli==0.86.5 flet build macos --yes --python-version 3.13
+set -eu
+# Sparkle compares CFBundleVersion, and flet's default for it is the literal 1 — every
+# build would look like the same version and no update would ever be offered. The tag is
+# what the app shows; the commit count is the number that has to keep going up, and it
+# does so before the first tag exists.
+version=$(git describe --tags --abbrev=0 2>/dev/null || echo v0.0.0)
+uvx --from flet-cli==0.86.5 flet build macos --yes --python-version 3.13 \\
+    --build-version "${version#v}" --build-number "$(git rev-list --count HEAD)"
 """
 
 [tasks."dmg:engine"]
@@ -117,19 +168,48 @@ uv run python scripts/prune_window.py "$window" build/window-closure.txt
 du -sh "$app"
 """
 
+[tasks."dmg:sparkle"]
+description = "lay Sparkle.framework into the .app, so the window has an updater to load"
+depends = ["dmg:engine", "sparkle:fetch"]
+run = """
+set -eu
+frameworks=build/macos/mlx-omnia.app/Contents/Frameworks
+rm -rf "$frameworks/Sparkle.framework"
+# ditto and not cp -R: a versioned framework is symlinks into Versions/Current, and a copy
+# that resolves them is a directory tree that no longer signs as one bundle.
+ditto build/sparkle/Sparkle.framework "$frameworks/Sparkle.framework"
+"""
+
 [tasks.dmg]
 description = "the shippable disk image (unsigned unless CODESIGN_IDENTITY is set)"
-depends = ["dmg:engine"]
+depends = ["dmg:sparkle"]
 run = """
 set -eu
 app=build/macos/mlx-omnia.app
+sparkle="$app/Contents/Frameworks/Sparkle.framework"
 if [ -n "${CODESIGN_IDENTITY:-}" ]; then
+    sign() {
+        codesign --force --timestamp --options runtime --sign "$CODESIGN_IDENTITY" "$@"
+    }
     # Inside out: every nested binary before the bundle that contains it, or the outer
-    # signature is invalidated by the ones sealed after it.
-    find "$app" -type f \\( -name "*.dylib" -o -name "*.so" -o -perm -u+x \\) \\
+    # signature is invalidated by the ones sealed after it. Sparkle is pruned out of the
+    # sweep and taken separately below — its XPC services and Updater.app are bundles, and
+    # signing the Mach-O inside a bundle instead of the bundle leaves its Info.plist
+    # unsealed, which is the state notarization rejects.
+    find "$app" -name Sparkle.framework -prune -o -type f \\
+        \\( -name "*.dylib" -o -name "*.so" -o -perm -u+x \\) \\
         -exec codesign --force --timestamp --options runtime \\
         --sign "$CODESIGN_IDENTITY" {} + || true
-    codesign --force --timestamp --options runtime --deep \\
+    # Read off Versions/Current rather than spelled B, so a Sparkle bump that moves the
+    # letter fails here instead of signing nothing and shipping the ad-hoc signature.
+    current=$(readlink "$sparkle/Versions/Current")
+    for nested in XPCServices/Downloader.xpc XPCServices/Installer.xpc Updater.app Autoupdate; do
+        sign "$sparkle/Versions/$current/$nested"
+    done
+    sign "$sparkle/Versions/$current"
+    # No --deep on the app: it re-signs everything below with these entitlements, which is
+    # wrong for Sparkle's helpers and throws away the signatures placed just above.
+    codesign --force --timestamp --options runtime \\
         --entitlements build/flutter/macos/Runner/Release.entitlements \\
         --sign "$CODESIGN_IDENTITY" "$app"
     codesign --verify --deep --strict --verbose=2 "$app"
