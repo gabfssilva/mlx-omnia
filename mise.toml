@@ -5,12 +5,6 @@ node = "26"
 [env]
 _.python.venv = { path = ".venv", create = false }
 
-# Sparkle is fetched at build time rather than vendored — 15 MB of binary that nothing in
-# the tree reads. The tarball ships ad-hoc signed and is re-signed with our own identity on
-# the way into the .app, so the pin and its checksum are the only provenance left.
-SPARKLE_VERSION = "2.9.5"
-SPARKLE_SHA256 = "015336b601493e05c237964954bff6191370003d94edefe663724c88840d73cc"
-
 [tasks.sync]
 description = "install the dev environment (the extras are not installed by a bare sync)"
 run = "uv sync --extra all --extra mlx-lm"
@@ -67,19 +61,7 @@ description = "run the FastAPI server"
 run = "uv run omnia-server"
 
 [tasks.app]
-description = "run the Flet window (it starts the engine when nothing answers on 8642)"
-run = "uv run omnia-app"
-
-[tasks.appv2]
-description = "run the Quieta mockup window (no daemon behind it yet)"
-run = "uv run omnia-appv2"
-
-[tasks.menubar]
-description = "run the menu bar panel (puts an icon in the bar; the panel hangs off it)"
-run = "uv run omnia-menubar"
-
-[tasks.panel]
-description = "build and run the SwiftUI panel in app/ (MenuBarExtra; replaces the Flet one)"
+description = "build and run the panel (it starts the engine when nothing answers on 8642)"
 run = """
 set -eu
 pkill -f 'MLX Omnia.app/Contents/MacOS/OmniaPanel' 2>/dev/null || true
@@ -88,53 +70,43 @@ open "app/$bundle"
 echo "app/$bundle"
 """
 
-[tasks."panel:build"]
+[tasks."app:build"]
 description = "build app/ into an .app without launching it"
 run = "app/build.sh release"
+
+[tasks."app:test"]
+description = "the panel's own tests (swift test)"
+run = "cd app && swift test"
 
 [tasks.cli]
 description = "run the HTTP-only CLI"
 run = "uv run omnia"
 
-[tasks."sparkle:fetch"]
-description = "unpack the pinned Sparkle into build/sparkle"
-run = """
-set -eu
-if [ -d build/sparkle/Sparkle.framework ]; then exit 0; fi
-mkdir -p build/sparkle build/cache
-tarball="build/cache/Sparkle-$SPARKLE_VERSION.tar.xz"
-if [ ! -f "$tarball" ]; then
-    curl -fsSL -o "$tarball" \\
-        "https://github.com/sparkle-project/Sparkle/releases/download/$SPARKLE_VERSION/Sparkle-$SPARKLE_VERSION.tar.xz"
-fi
-echo "$SPARKLE_SHA256  $tarball" | shasum -a 256 -c -
-tar xf "$tarball" -C build/sparkle
-"""
-
 [tasks."sparkle:keys"]
 description = "the EdDSA pair Sparkle verifies with — private into the Keychain, public to stdout"
-depends = ["sparkle:fetch"]
-run = "build/sparkle/bin/generate_keys"
-
-[tasks."dmg:app"]
-description = "build the window bundle (flet build macos) into build/macos"
 run = """
 set -eu
-# Sparkle compares CFBundleVersion, and flet's default for it is the literal 1 — every
-# build would look like the same version and no update would ever be offered. The tag is
-# what the app shows; the commit count is the number that has to keep going up, and it
-# does so before the first tag exists.
-version=$(git describe --tags --abbrev=0 2>/dev/null || echo v0.0.0)
-uvx --from flet-cli==0.86.5 flet build macos --yes --python-version 3.13 \\
-    --build-version "${version#v}" --build-number "$(git rev-list --count HEAD)"
+swift package --package-path app resolve
+# Sparkle's release tools ride in the same artifact the framework comes out of, so the
+# version that signs an update is the version that ships in the app by construction.
+app/.build/artifacts/sparkle/Sparkle/bin/generate_keys
+echo "put the public key in app/Info.plist as SUPublicEDKey — without it there is no updater"
+"""
+
+[tasks."sparkle:sign"]
+description = "sign a built image for the appcast (args: <path to .dmg>)"
+run = """
+set -eu
+swift package --package-path app resolve
+app/.build/artifacts/sparkle/Sparkle/bin/sign_update "$@"
 """
 
 [tasks."dmg:engine"]
-description = "lay a CPython with the engine in it beside the window, inside the .app"
-depends = ["dmg:app"]
+description = "lay a CPython with the engine in it inside the panel's .app"
+depends = ["app:build"]
 run = """
 set -eu
-app=build/macos/mlx-omnia.app
+app="app/build/MLX Omnia.app"
 resources="$app/Contents/Resources"
 rm -rf build/engine "$resources/engine"
 uv python install --install-dir build/engine 3.13
@@ -150,46 +122,23 @@ uv pip install --break-system-packages --python "$runtime/bin/python3" ".[server
 mv "$runtime" "$resources/engine"
 rm -rf build/engine
 # The console scripts hold the path they were installed under and break on the move into
-# /Applications. The window invokes `-m`, so they are dead weight either way.
-rm -rf "$resources/engine/bin/omnia-server" "$resources/engine/bin/omnia" \\
-       "$resources/engine/bin/omnia-bench" "$resources/engine/bin/omnia-app"
-
-# `flet build` installs `project.dependencies` into the window's own site-packages and
-# offers no way to say otherwise, so the engine's wheels land there too — mlx, pyarrow and
-# the hub client, inside a process that speaks HTTP and nothing else. What stays is derived
-# rather than listed: the resolved closure of what the window declares. A denylist would go
-# stale the day the engine takes a new dependency, and the mistake would be silent.
-window="$resources/serious_python_darwin_serious_python_darwin.bundle/Contents/Resources/site-packages"
-uv pip compile --quiet --python-version 3.13 --output-file build/window-closure.txt - <<'DEPS'
-flet[desktop]>=0.86
-httpx>=0.28
-DEPS
-uv run python scripts/prune_window.py "$window" build/window-closure.txt
+# /Applications. The panel invokes `-m`, so they are dead weight either way.
+rm -f "$resources/engine/bin/omnia-server" "$resources/engine/bin/omnia" \\
+      "$resources/engine/bin/omnia-bench"
 du -sh "$app"
-"""
-
-[tasks."dmg:sparkle"]
-description = "lay Sparkle.framework into the .app, so the window has an updater to load"
-depends = ["dmg:engine", "sparkle:fetch"]
-run = """
-set -eu
-frameworks=build/macos/mlx-omnia.app/Contents/Frameworks
-rm -rf "$frameworks/Sparkle.framework"
-# ditto and not cp -R: a versioned framework is symlinks into Versions/Current, and a copy
-# that resolves them is a directory tree that no longer signs as one bundle.
-ditto build/sparkle/Sparkle.framework "$frameworks/Sparkle.framework"
 """
 
 [tasks.dmg]
 description = "the shippable disk image (unsigned unless CODESIGN_IDENTITY is set)"
-depends = ["dmg:sparkle"]
+depends = ["dmg:engine"]
 run = """
 set -eu
-app=build/macos/mlx-omnia.app
+app="app/build/MLX Omnia.app"
 sparkle="$app/Contents/Frameworks/Sparkle.framework"
 if [ -n "${CODESIGN_IDENTITY:-}" ]; then
     sign() {
-        codesign --force --timestamp --options runtime --sign "$CODESIGN_IDENTITY" "$@"
+        codesign --force --timestamp --options runtime \\
+            --entitlements app/Omnia.entitlements --sign "$CODESIGN_IDENTITY" "$@"
     }
     # Inside out: every nested binary before the bundle that contains it, or the outer
     # signature is invalidated by the ones sealed after it. Sparkle is pruned out of the
@@ -199,6 +148,7 @@ if [ -n "${CODESIGN_IDENTITY:-}" ]; then
     find "$app" -name Sparkle.framework -prune -o -type f \\
         \\( -name "*.dylib" -o -name "*.so" -o -perm -u+x \\) \\
         -exec codesign --force --timestamp --options runtime \\
+        --entitlements app/Omnia.entitlements \\
         --sign "$CODESIGN_IDENTITY" {} + || true
     # Read off Versions/Current rather than spelled B, so a Sparkle bump that moves the
     # letter fails here instead of signing nothing and shipping the ad-hoc signature.
@@ -209,14 +159,13 @@ if [ -n "${CODESIGN_IDENTITY:-}" ]; then
     sign "$sparkle/Versions/$current"
     # No --deep on the app: it re-signs everything below with these entitlements, which is
     # wrong for Sparkle's helpers and throws away the signatures placed just above.
-    codesign --force --timestamp --options runtime \\
-        --entitlements build/flutter/macos/Runner/Release.entitlements \\
-        --sign "$CODESIGN_IDENTITY" "$app"
+    sign "$app"
     codesign --verify --deep --strict --verbose=2 "$app"
 else
     echo "CODESIGN_IDENTITY unset — the image is unsigned and Gatekeeper will quarantine it."
 fi
 rm -f build/Omnia.dmg
+mkdir -p build
 hdiutil create -volname Omnia -srcfolder "$app" -ov -format UDZO build/Omnia.dmg
 ls -lh build/Omnia.dmg
 """

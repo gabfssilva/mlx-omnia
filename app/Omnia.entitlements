@@ -1,0 +1,13 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0">
+<dict>
+	<!-- The engine's extension modules — mlx, numpy, pyarrow — are signed by us and loaded
+	     into the hardened runtime of the interpreter laid inside this bundle. Library
+	     validation would refuse every one of them, and the panel would come up with a
+	     daemon that dies on `import mlx`. Carried by the interpreter, which is the process
+	     that loads them, and by the app that spawns it. -->
+	<key>com.apple.security.cs.disable-library-validation</key>
+	<true/>
+</dict>
+</plist>

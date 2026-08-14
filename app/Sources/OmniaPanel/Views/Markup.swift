@@ -379,9 +379,9 @@ struct PanelStyle: StructuredText.Style {
         thematicBreakStyle = PanelThematicBreakStyle(t)
     }
 
-    /// The window's own highlighting palette — `SYN_LIGHT` and `SYN_DARK` in
-    /// `mlx_omnia/app/views/chat.py`, transcribed the way the tokens are. Prism's token names
-    /// map onto the same six slots the hljs classes there do.
+    /// The highlighting palette, transcribed the way the tokens are — six slots, which is
+    /// what the hljs classes the transcript used to be drawn with came down to. Prism's
+    /// token names map onto the same six.
     static func highlighting(_ t: Tokens) -> StructuredText.HighlighterTheme {
         let key = Color(hex: t.dark ? "#C792EA" : "#7B2FA0")
         let text = Color(hex: t.dark ? "#7EE787" : "#1B6B3A")

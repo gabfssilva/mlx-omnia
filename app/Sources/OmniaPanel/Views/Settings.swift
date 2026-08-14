@@ -20,6 +20,7 @@ struct DaemonSettings: View {
         Appearance(app: app)
         Fixed(app: app)
         ProcessRow(app: app)
+        About()
     }
 }
 
@@ -280,6 +281,27 @@ private struct ProcessRow: View {
             SettingRow(label: "This panel's process", first: true) {
                 PushButton(label: "Restart") { app.restartEngine() }
                 PushButton(label: "Stop", kind: "danger") { app.stopEngine() }
+            }
+        }
+    }
+}
+
+/// The version, and the check when there is one to make. A build with no updater says so
+/// instead of offering a button that can only refuse — see `Updates`.
+private struct About: View {
+    @Environment(\.tokens) private var t
+
+    var body: some View {
+        SectionHead(title: "About")
+        SettingsGroup {
+            SettingRow(label: "Version", first: true) {
+                Text(Updates.version).mono(11.5, t.fg2)
+                if Updates.shared.available {
+                    PushButton(label: "Check for updates") { Updates.shared.check() }
+                }
+            }
+            if !Updates.shared.available {
+                SettingNote(text: "This build carries no updater.")
             }
         }
     }

@@ -26,25 +26,22 @@ dependencies = [
     "regex>=2026.7.10",
 ]
 
-# One distribution, five things inside it. Every subpackage ships; what is optional is what
+# One distribution, four things inside it. Every subpackage ships; what is optional is what
 # it needs to run, so `pip install mlx-omnia` stays the engine's own dependency set and
 # nothing more. Importing `mlx_omnia.server` without its extra fails on the missing import,
-# which is the honest error.
+# which is the honest error. The app is not among them: it is `app/`, a Swift bundle that
+# reaches this distribution over HTTP and takes nothing from it at import time.
 [project.optional-dependencies]
 server = ["fastapi>=0.115", "uvicorn>=0.30", "pyarrow>=17", "watchdog>=4"]
 cli = ["httpx>=0.27"]
-app = ["flet[desktop]>=0.86", "httpx>=0.28"]
 # The harness runs an arm; `mlx-lm` is the one arm that is not this engine.
 mlx-lm = ["mlx-lm"]
-all = ["mlx-omnia[server,cli,app]"]
+all = ["mlx-omnia[server,cli]"]
 
 [project.scripts]
 omnia-server = "mlx_omnia.server.main:main"
 omnia = "mlx_omnia.cli.main:run"
 omnia-bench = "mlx_omnia.bench.cli:main"
-omnia-app = "mlx_omnia.app.main:run"
-omnia-appv2 = "mlx_omnia.appv2.main:run"
-omnia-menubar = "mlx_omnia.appv2.menubar.main:run"
 
 [project.urls]
 Homepage = "https://github.com/gabfssilva/mlx-omnia"
@@ -65,56 +62,6 @@ packages = ["src/mlx_omnia"]
 
 [tool.hatch.build.targets.sdist]
 include = ["src/mlx_omnia", "tests", "README.md", "LICENSE"]
-
-# The .app. `flet build` packages `src/` as the app payload, so the engine, the server and
-# the window travel as source and only third-party wheels are resolved — which is why the
-# list below is the `server` and `app` extras and not `mlx-omnia` itself. `project.
-# dependencies` is read on top of it, so the engine's own requirements are not repeated.
-[tool.flet]
-org = "io.github.gabfssilva"
-company = "gabfssilva"
-product = "Omnia"
-bundle_id = "io.github.gabfssilva.mlx_omnia"
-copyright = "Copyright (c) 2026 Gabriel Francisco — MIT"
-
-[tool.flet.app]
-path = "src"
-module = "main"
-
-[tool.flet.macos]
-# arm64 only: the framework flet embeds is universal, and `mlx` publishes no x86_64 wheel
-# for macOS, so an Intel slice could never run the engine it is bundled beside.
-target_arch = ["arm64"]
-# The window's own dependencies, and only those — it speaks HTTP to the daemon and the
-# server stack belongs to the interpreter that runs it, not to this one. Sparkle is not
-# among them because it is a framework and not a wheel: `mlx_omnia.app.updates` opens the
-# one laid into the bundle through ctypes, and pyobjc — the obvious way to do that — cannot
-# be here. Its `PyObjCTest` package carries a .dSYM, and Xcode's strip phase over the
-# packaged site-packages fails on the DWARF file rather than skipping it.
-dependencies = ["flet[desktop]>=0.86", "httpx>=0.28"]
-
-# Sparkle's whole configuration. `updates.start()` hands it the framework and nothing
-# else, so the feed is named here once.
-#
-# SUPublicEDKey is what makes an update acceptable, and it is missing on purpose until
-# `mise run sparkle:keys` has printed one: absent, Sparkle refuses every update rather
-# than taking an unsigned one on trust, which is the failure to want. Nothing else in
-# this file has to change when it is filled in.
-#
-# The interval reaches Info.plist as <string> and not <integer> — flet's template renders
-# every non-boolean that way. Sparkle reads this one through a coercion that accepts
-# NSString beside NSNumber, so it does land as 86400 seconds; the next numeric key put here
-# needs that checked rather than assumed.
-[tool.flet.macos.info]
-SUFeedURL = "https://gabfssilva.github.io/mlx-omnia/appcast.xml"
-SUEnableAutomaticChecks = true
-SUScheduledCheckInterval = 86400
-# SUPublicEDKey = ""
-
-[tool.flet.macos.entitlement]
-# The engine's extension modules are signed by us but loaded into a hardened runtime;
-# without this, dyld refuses them and the window comes up with no engine behind it.
-"com.apple.security.cs.disable-library-validation" = true
 
 [dependency-groups]
 dev = [
@@ -137,9 +84,6 @@ line-length = 100
 src = ["src"]
 
 [tool.ruff.lint]
-# The window draws real glyphs — the breadcrumb's ‹ ›, the stepper's − — not typos for
-# their ASCII lookalikes.
-allowed-confusables = ["‹", "›", "−"]
 select = [
     "E", "W",    # pycodestyle
     "F",         # pyflakes
@@ -178,15 +122,16 @@ name = "adapters do not know each other"
 type = "independence"
 modules = ["mlx_omnia.bench.arms.omnia", "mlx_omnia.bench.arms.mlx_lm"]
 
-# The window and the CLI speak HTTP and nothing else. This was a rule with no contract
-# behind it until an .app shipped whose window loaded MLX to draw itself: the re-export in
-# `mlx_omnia/__init__` made every import under the roof an engine import, and nothing said
-# so. `allow_indirect_imports` is off on purpose — reaching the engine through the roof is
-# exactly the path that failed.
+# The CLI speaks HTTP and nothing else. This was a rule with no contract behind it until an
+# .app shipped whose window loaded MLX to draw itself: the re-export in `mlx_omnia/__init__`
+# made every import under the roof an engine import, and nothing said so. The window that
+# failed that way is gone — the app is Swift now — and the client that still ships beside
+# the engine is this one. `allow_indirect_imports` is off on purpose: reaching the engine
+# through the roof is exactly the path that failed.
 [[tool.importlinter.contracts]]
-name = "the window and the CLI know no engine"
+name = "the CLI knows no engine"
 type = "forbidden"
-source_modules = ["mlx_omnia.app", "mlx_omnia.appv2", "mlx_omnia.cli"]
+source_modules = ["mlx_omnia.cli"]
 forbidden_modules = ["mlx_omnia.engine"]
 
 [[tool.importlinter.contracts]]
@@ -212,21 +157,6 @@ forbidden_modules = [
     "mlx_omnia.engine.parsers.atem",
 ]
 allow_indirect_imports = true
-
-[[tool.importlinter.contracts]]
-name = "the window stacks one way"
-type = "layers"
-layers = [
-    "mlx_omnia.app.main",
-    "mlx_omnia.app.views",
-    "mlx_omnia.app.ui",
-    "mlx_omnia.app.api",
-]
-
-[[tool.importlinter.contracts]]
-name = "screens do not know each other"
-type = "independence"
-modules = ["mlx_omnia.app.views.*"]
 
 [tool.pyright]
 typeCheckingMode = "off"

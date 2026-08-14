@@ -6,7 +6,7 @@ LLM inference engine for Apple Silicon, written in Python on raw [MLX](https://g
 
 ## What it is
 
-Omnia is an LLM inference engine built from scratch: model implementations, checkpoint loading, KV cache, tokenizer, quantization, and Metal kernels are all in-house, with no third-party inference or tokenization libraries at runtime. It ships as a Python library, an OpenAI-compatible server, a CLI, and a desktop app. Around 45 architecture families are supported, from GPT-2 to current MoE, hybrid, and vision models (Qwen, Gemma, Llama, gpt-oss, LFM2, Mamba2, Falcon-H1, …).
+Omnia is an LLM inference engine built from scratch: model implementations, checkpoint loading, KV cache, tokenizer, quantization, and Metal kernels are all in-house, with no third-party inference or tokenization libraries at runtime. It ships as a Python library, an OpenAI-compatible server, a CLI, and a macOS menu bar app. Around 45 architecture families are supported, from GPT-2 to current MoE, hybrid, and vision models (Qwen, Gemma, Llama, gpt-oss, LFM2, Mamba2, Falcon-H1, …).
 
 ## Motivation
 
@@ -32,11 +32,11 @@ mise run sync              # the extras are not installed by a bare `uv sync`
 uv run omnia-server
 ```
 
-One distribution ships everything, and the extras decide what its parts need: `mlx-omnia` alone is the engine, `[server]`, `[cli]` and `[app]` add what each one runs on, and `[all]` is the three together.
+One distribution ships everything, and the extras decide what its parts need: `mlx-omnia` alone is the engine, `[server]` and `[cli]` add what each one runs on, and `[all]` is both together.
 
 Then point any OpenAI SDK at `http://127.0.0.1:8642/api/openai/v1`.
 
-There is also a desktop window — `mise run app`, or `uv run omnia-app`: chat and model management over the same HTTP API, which it starts itself when nothing answers on the port. Download, quantize and chat without touching a terminal.
+There is also a macOS app — `mise run app`: a SwiftUI panel that hangs off the menu bar, with chat and model management over the same HTTP API, which it starts itself when nothing answers on the port. Download, quantize and chat without touching a terminal.
 
 ## What it does to be fast
 
@@ -49,17 +49,18 @@ There is also a desktop window — `mise run app`, or `uv run omnia-app`: chat a
 
 ## Contributing
 
-One distribution, five siblings under it. `mlx_omnia` itself is only the re-export of the engine's public API, so no part is the package the others live inside:
+One distribution, four siblings under it. `mlx_omnia` itself is only the re-export of the engine's public API, so no part is the package the others live inside:
 
 | module | what it is |
 | --- | --- |
 | `mlx_omnia.engine` | the engine: model packages, checkpoint loading, generation pipeline, Metal kernels, quantization |
 | `mlx_omnia.server` | FastAPI server speaking the OpenAI API (streaming included), global FCFS queue |
 | `mlx_omnia.cli` | HTTP client for the server; depends only on httpx |
-| `mlx_omnia.app` | the desktop window (Flet), talks to the server over HTTP only and starts it when nothing answers |
 | `mlx_omnia.bench` | the measurement instrument (`omnia-bench`): thermal gate, teacher forcing, interleaved rounds, dominance verdict — engine-agnostic, with omnia and mlx-lm as optional adapters |
 
 Being siblings is what makes the boundaries checkable: `lint-imports` forbids the harness `mlx_omnia.engine`, one name that covers whatever the engine grows next.
+
+The app is not one of them. It is `app/`, a SwiftUI menu bar panel with its own SwiftPM package, and it reaches the daemon over HTTP like any other client — which is why it can be a different language at all.
 
 Inside the engine:
 
@@ -80,7 +81,7 @@ Design rules that keep it this shape:
 - **No shared modeling layer between families.** Two families repeating an attention shape is fine; a shared abstraction couples architectures that will diverge. Code moves to `core/` only on the second byte-identical use.
 - **One door for loading.** `mlx_omnia.load` reads `model_type` and dispatches to that architecture's `CHECKPOINT`. There is no public per-architecture loader.
 - **Protocols at the boundary.** Model-agnostic code depends on a `Protocol` sized to what it actually calls, defined where it is consumed. Models satisfy it structurally and never import the consumer.
-- **Strict one-directional layering**, enforced by import-linter contracts and `uv tree`: the server knows only the engine's public API; the CLI and the app speak HTTP only.
+- **Strict one-directional layering**, enforced by import-linter contracts and `uv tree`: the server knows only the engine's public API; the CLI speaks HTTP only, and so does the app.
 - **Kernels are operation-named, never model-named**, live in `core/kernels/`, and export a cheap `*_applies(...)` predicate. The model decides when a kernel applies to *it*; the kernel never knows the model exists.
 - **Strict typing with no escape hatches.** pyright strict, zero errors; stale upstream stubs are corrected in `core/mxcompat.py`, never `# type: ignore`.
 

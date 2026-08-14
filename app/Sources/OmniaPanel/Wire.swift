@@ -1,4 +1,5 @@
-// The daemon's shapes, typed off `mlx_omnia/app/api/{engine,catalog,benchmarks}.py`.
+// The daemon's shapes, typed off what it serves — `mlx_omnia.server`'s catalog, state and
+// benchmark responses.
 //
 // Where a field is optional there it is optional here, because FastAPI serialises null
 // rather than dropping the key. Fields this panel does not draw are left out: a decoder
@@ -424,8 +425,8 @@ struct PricedPlan: Decodable {
     let entryBytes: Int
 }
 
-/// The leaves collapse into the groups the numbered segments make — `group_leaves` in
-/// `appv2/views/quantize.py`. Two spellings come out of it: the label a reader gets, where
+/// The leaves collapse into the groups the numbered segments make. Two spellings come out
+/// of it: the label a reader gets, where
 /// a number is a `*`, and the key an override is taken under, where it is `\d+` and every
 /// other segment is matched literally.
 struct LeafGroup: Identifiable {

@@ -1,4 +1,4 @@
-// Numbers and names as they are read — `mlx_omnia/app/ui/format.py`, transcribed.
+// Numbers and names as they are read.
 // Storage and memory are GiB under the label GB; a download is decimal GB, because that
 // is what the Hub quotes and what the two sides of a progress bar divide out against.
 

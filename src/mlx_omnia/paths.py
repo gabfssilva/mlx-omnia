@@ -1,6 +1,6 @@
-"""Where Omnia keeps its files, and how the bundle is recognised.
+"""Where Omnia keeps its files.
 
-macOS draws the line between the two, and so does this:
+macOS draws the line between state and logs, and so does this:
 
 - `~/Library/Application Support/mlx-omnia/` holds state — `server.db` with the bench
   history, the job rows and the config, and `daemon.lock`. It is what a user backs up.
@@ -9,11 +9,13 @@ macOS draws the line between the two, and so does this:
   what a user deletes.
 
 One path per file, wherever it is read from. The CLI reads `daemon.log` to say why a daemon
-that did not answer stopped and the window's Settings card names it on screen; a second
-definition drifting from the first leaves someone reading a file nobody wrote.
+that did not answer stopped and the panel's Settings card names it on screen; a second
+definition drifting from the first leaves someone reading a file nobody wrote. The panel is
+Swift and spells these itself — `app/Sources/OmniaPanel/Daemon.swift` — so the agreement
+between the two is the directory names above, and nothing else.
 
-This module sits at the roof because the window, the CLI and the server all need these and
-none of them may import the other two.
+This module sits at the roof because the CLI and the server both need these and neither may
+import the other.
 """
 
 from __future__ import annotations
@@ -21,25 +23,11 @@ from __future__ import annotations
 import os
 import pathlib
 import shutil
-import sys
 
 LOGS = pathlib.Path.home() / "Library" / "Logs" / "mlx-omnia"
 _SUPPORT = pathlib.Path.home() / "Library" / "Application Support" / "mlx-omnia"
 # Where the state lived while the layout followed XDG rather than macOS.
 _FORMER = pathlib.Path.home() / ".config" / "mlx_omnia"
-
-
-def bundle() -> pathlib.Path | None:
-    """The enclosing `.app`, or None outside one.
-
-    `sys.executable` and not `__file__`: serious_python extracts the packaged code to
-    `/var/folders/…/T/serious_python_temp…/` and imports it from there, so no parent of any
-    module in the window is ever a `.app`. The Flutter host does live in `Contents/MacOS`.
-    """
-    for parent in pathlib.Path(sys.executable).parents:
-        if parent.suffix == ".app":
-            return parent
-    return None
 
 
 def state_dir() -> pathlib.Path:
@@ -68,12 +56,6 @@ def _log(name: str) -> pathlib.Path:
 def daemon_log() -> pathlib.Path:
     """The engine's output, whoever started it."""
     return _log("daemon.log")
-
-
-def app_log() -> pathlib.Path:
-    """The window's own. Only written from the bundle: run from a checkout, the terminal
-    that started it is a better place for this than a file nobody thinks to open."""
-    return _log("app.log")
 
 
 def adopt_former_state() -> pathlib.Path | None:

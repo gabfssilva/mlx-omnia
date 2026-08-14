@@ -88,6 +88,9 @@ final class AppModel {
     func start() {
         guard !running else { return }
         running = true
+        // Touched here and not in Settings: constructing it is what puts the scheduled
+        // check on the clock, and a panel nobody opens is still a copy to be updated.
+        _ = Updates.shared.available
         startEngine()
         following = Task { await store.follow() }
         Task { await store.pulse() }

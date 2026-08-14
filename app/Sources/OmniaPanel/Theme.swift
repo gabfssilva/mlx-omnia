@@ -1,7 +1,7 @@
-// The Quieta tokens, transcribed from `mlx_omnia/appv2/theme.py` — same strings, same
-// order, so a change there is a diff here and not a redesign. The colour arithmetic is
-// the same too: mixing happens in oklab, and mixing into transparent is a scaled alpha,
-// which is the shortcut the browser takes and the one the window takes.
+// The Quieta tokens: the palette the panel is drawn from, and the only copy of it left —
+// it was transcribed from the Flet window's stylesheet, which is gone. The colour
+// arithmetic is that stylesheet's: mixing happens in oklab, and mixing into transparent is
+// a scaled alpha, which is the shortcut a browser takes.
 
 import SwiftUI
 

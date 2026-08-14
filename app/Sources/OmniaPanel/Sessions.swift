@@ -166,10 +166,9 @@ final class Sessions {
     }
 }
 
-/// The title the window writes, transcribed: the first thing said, whitespace collapsed, cut
-/// at 48 with an ellipsis. Not this panel's own rule, because there are already two spellings
-/// in the store — the window's and appv2's bare `[:48]` — and a third would be one more shape
-/// the list has to be read across.
+/// The title a conversation is listed under: the first thing said, whitespace collapsed, cut
+/// at 48 with an ellipsis. Rows written before this panel existed carry a bare `[:48]` of the
+/// same text, so the list is read across two shapes already and this adds no third.
 func titled(_ text: String) -> String {
     let line = text.split(whereSeparator: \.isWhitespace).joined(separator: " ")
     guard line.count > 48 else { return line }

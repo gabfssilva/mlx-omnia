@@ -16,10 +16,13 @@
 	<string>MLX Omnia</string>
 	<key>CFBundlePackageType</key>
 	<string>APPL</string>
+	<!-- What a checkout builds. `build.sh` overwrites both in the copy inside the .app:
+	     the tag is what the panel shows, and Sparkle compares CFBundleVersion, so that one
+	     is the commit count — a number that goes up before the first tag exists. -->
 	<key>CFBundleShortVersionString</key>
-	<string>1.0</string>
+	<string>0.0.0</string>
 	<key>CFBundleVersion</key>
-	<string>1</string>
+	<string>0</string>
 	<key>LSMinimumSystemVersion</key>
 	<string>14.0</string>
 	<!-- No Dock tile, no ⌘-Tab, no application menu: the icon in the bar is the app. -->
@@ -34,5 +37,16 @@
 		<key>NSAllowsLocalNetworking</key>
 		<true/>
 	</dict>
+	<!-- Sparkle's whole configuration; `Updates` hands it nothing but the decision to
+	     start. SUPublicEDKey is what makes an update acceptable and is missing until
+	     `mise run sparkle:keys` has printed one — absent, the panel ships with no updater
+	     at all rather than one that would take an unsigned update on trust. -->
+	<key>SUFeedURL</key>
+	<string>https://gabfssilva.github.io/mlx-omnia/appcast.xml</string>
+	<key>SUEnableAutomaticChecks</key>
+	<true/>
+	<key>SUScheduledCheckInterval</key>
+	<integer>86400</integer>
+	<!-- <key>SUPublicEDKey</key><string></string> -->
 </dict>
 </plist>

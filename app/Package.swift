@@ -16,12 +16,21 @@ let package = Package(
     name: "OmniaPanel",
     platforms: [.macOS(.v26)],
     dependencies: [
-        .package(url: "https://github.com/gonzalezreal/textual", from: "0.4.0")
+        .package(url: "https://github.com/gonzalezreal/textual", from: "0.4.0"),
+        // Sparkle is the updater, and it is a dependency of the panel rather than something
+        // laid into the bundle afterwards: it used to be fetched as a tarball and opened
+        // through ctypes, because the app it updated was Python. Here it is a framework a
+        // Swift target links, which is the shape it was written for. `build.sh` copies it
+        // into Contents/Frameworks and the executable carries the rpath to find it there.
+        .package(url: "https://github.com/sparkle-project/Sparkle", from: "2.9.0"),
     ],
     targets: [
         .executableTarget(
             name: "OmniaPanel",
-            dependencies: [.product(name: "Textual", package: "textual")],
+            dependencies: [
+                .product(name: "Textual", package: "textual"),
+                .product(name: "Sparkle", package: "Sparkle"),
+            ],
             path: "Sources/OmniaPanel",
             // The tools version is 6.2 for `.macOS(.v26)` and for nothing else. Swift 6 is
             // the default language mode at that version, and adopting it is a concurrency

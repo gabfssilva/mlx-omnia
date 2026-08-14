@@ -39,9 +39,25 @@ final class Daemon {
         return nil
     }()
 
-    /// How to start one of Omnia's console scripts, in the two places the panel runs from:
-    /// beside the checkout's venv, or through `uv` when there is no venv to point at.
-    static func command(_ script: String) -> (URL, [String])? {
+    /// The interpreter shipped inside this .app, or nil outside one. `mise run dmg` lays a
+    /// CPython with the engine installed into it under Contents/Resources/engine; a panel
+    /// built by `build.sh` alone has none, and falls through to the checkout.
+    ///
+    /// The console scripts are not used even when they are there: their shebang holds the
+    /// path they were installed under, which is wrong the moment the .app is dragged into
+    /// /Applications. `-m` is addressed relative to the interpreter that runs it.
+    static var bundled: URL? {
+        guard let resources = Bundle.main.resourceURL else { return nil }
+        let python = resources.appendingPathComponent("engine/bin/python3")
+        return FileManager.default.fileExists(atPath: python.path) ? python : nil
+    }
+
+    /// How to start one of Omnia's console scripts, in the three places the panel runs from:
+    /// the interpreter inside the bundle, the checkout's venv, or `uv` when there is no venv
+    /// to point at. The module is named for the bundle's sake — a script is a path there,
+    /// and `-m` is not.
+    static func command(_ script: String, module: String) -> (URL, [String])? {
+        if let bundled { return (bundled, ["-m", module]) }
         guard let root else { return nil }
         let beside = root.appendingPathComponent(".venv/bin/\(script)")
         if FileManager.default.fileExists(atPath: beside.path) { return (beside, []) }
@@ -78,8 +94,10 @@ final class Daemon {
     }
 
     private func spawn() throws {
-        guard let (executable, arguments) = Self.command("omnia-server") else {
-            throw Refused(detail: "no checkout to start the engine from")
+        guard let (executable, arguments) =
+            Self.command("omnia-server", module: "mlx_omnia.server.main")
+        else {
+            throw Refused(detail: "no engine in this bundle and no checkout to start one from")
         }
         // Truncated at each start, because the run whose lines answer "why is it not up"
         // is the one that has just failed, and uvicorn writes an access line per request.
