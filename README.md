@@ -4,13 +4,13 @@
 
 > **Work in progress.** APIs, model coverage, and internals change without notice.
 
-mlx-omnia is an open-source inference engine for Apple Silicon, written in Python and [Metal Shading Language](https://developer.apple.com/metal/Metal-Shading-Language-Specification.pdf), on top of [MLX](https://github.com/ml-explore/mlx). It runs models locally and exposes them through APIs compatible with OpenAI, Anthropic and Gemini, and it can also be used as a Python library, from the command line, or from a macOS menu bar app.
+mlx-omnia is an open-source inference engine for Apple Silicon. It is written in Python and [Metal Shading Language](https://developer.apple.com/metal/Metal-Shading-Language-Specification.pdf) on top of [MLX](https://github.com/ml-explore/mlx). Models run locally through a Python library, a command-line client, a macOS menu bar app, or APIs compatible with OpenAI, Anthropic and Gemini.
 
-mlx-omnia depends on MLX alone to run a model and supports around 45 model architecture families, and it downloads and quantizes checkpoints itself. Its goal is to get as close as possible to the physical limit of the machine while respecting numerical accuracy and maintainable engineering.
+Running a model depends on MLX alone. The engine supports around 45 architecture families and handles checkpoint downloads and quantization. Performance work targets the machine's physical limit, subject to measured numerical accuracy and code that remains maintainable.
 
 ## Installation
 
-Everything below needs an Apple Silicon Mac. One distribution ships all the parts, and the extras decide which of them you install.
+Everything below needs an Apple Silicon Mac. One distribution ships every component; extras select which ones to install.
 
 ### Engine
 
@@ -46,7 +46,7 @@ pip install "mlx-omnia[cli]"
 omnia chat
 ```
 
-The CLI speaks HTTP and nothing else, so it needs a server to talk to, and `--url` points it at one that is not local. Besides `chat`, it has `omnia run` for a single prompt on stdout, `omnia models list` for what is on disk and what is loaded, and `omnia status` for the daemon and the machine under it.
+The CLI speaks HTTP, so it needs a server. Use `--url` to point it at a remote one. Besides `chat`, it provides `omnia run` for a single prompt on stdout, `omnia models list` for models on disk and in memory, and `omnia status` for the daemon and its host.
 
 Installing `mlx-omnia[all]` gives you the server and the CLI at once.
 
@@ -60,113 +60,71 @@ cd mlx-omnia
 mise run app
 ```
 
-It is a SwiftUI panel hanging off the menu bar that does chat and model management over the same HTTP API, and it starts the server itself when nothing answers on the port. From that checkout, `mise run sync` installs the extras that a bare `uv sync` leaves out.
+The SwiftUI menu bar panel provides chat and model management over the same HTTP API. It starts the server when nothing answers on the configured port. From that checkout, `mise run sync` installs the extras omitted by a bare `uv sync`.
 
 ## How it works
 
-Every layer of the engine declares what it needs and leaves the layer below it to decide how that gets served. The snippets that follow are the load-bearing places where that happens.
+The ideas everything below rests on — prefill and decode, the KV cache, expert routing, quantization formats, why decode is bound by memory bandwidth — are developed in [a ten-chapter series under `docs/`](docs/00-intro.md) that reads like a short book. This section only needs the four abstractions the codebase is built around. Each one exists because a specific coupling would otherwise creep in, so each is stated here as the problem it removes:
 
-### A model is a signature
+1. **Model.** Without a contract, loading, scheduling and serving would branch on the architecture, and every new family would touch all three. So every model declares a signature — which input types it accepts, what it produces, which generation options it takes — and everything model-agnostic works from the signature alone. A language model streams text; an embedding model returns a vector in a stream of length one.
+2. **Capability.** A new modality should not rewrite the model that already works. A capability is an adapter on the input side of a `Model`: the image tower shipped today converts pixels into rows the text trunk already accepts, so the trunk keeps its interface and never sees a pixel. Another modality composes the same way without changing the model behind it.
+3. **Architecture.** Two families that look alike today diverge later, and a shared modeling layer would force them to diverge together. So each checkpoint family is one self-contained package whose module tree mirrors the checkpoint: property names are the checkpoint's own, and strict loading is the totality contract. Inside it:
+   - **Tokenizer.** The family's own tokenizer. Byte-level BPE comes from the engine; a family with another scheme, such as Gemma's SentencePiece-style BPE, ships its own.
+   - **Specific layers.** The blocks that make the family what it is: its attention, its MoE block, its normalization placement. They compose the shared layers below and never select an implementation.
+4. **Layer.** Decode is [memory-bandwidth-bound](docs/07-performance.md), so how a weight is stored decides which arithmetic can run at the hardware's limit — but the model should not know that. Architectures therefore declare shared arithmetic — `Route`, `GateUp`, `DownCombine` and the like — and each declaration binds one implementation once the checkpoint is loaded and weight formats are final:
+   - **Core modules.** Stock MLX implementations. They always build, accept every valid declaration and serve as the numerical reference.
+   - **[MSL kernels](docs/08-kernels.md).** Specialized Metal implementations. One binds only when it computes exactly the declared arithmetic; every declared property participates in that decision.
 
-```python
-class Model[I: ModelInput, O, Options](Protocol):
-    def accepts(self, input: ModelInput) -> TypeIs[I]: ...
-    def stream(self, input: I, options: Options) -> Iterator[O]: ...
-```
+The numbers mark where each abstraction sits:
 
-The intuition is that a model is a function, and its signature tells you what the function reads and what it writes. The signature is two sets of content types, $\mathsf{Input}$ and $\mathsf{Output}$, where a content type is one of six modalities (text, image, audio, video, document, vector) paired with a media type. The whole contract fits in one arrow:
+<p align="center">
+  <img src="docs/abstractions.svg" alt="Numbered to match the list: a capability (2) adapts content for the Model contract (1); a checkpoint-shaped architecture (3) implements that Model and declares shared layers (4), which bind a core module or an MSL kernel after weights load" width="740">
+</p>
 
-$$\mathsf{model} : \mathsf{Input} \times \mathsf{Options} \longrightarrow \mathsf{Stream}(\mathsf{Output})$$
-
-In words: give the model data of the types in $\mathsf{Input}$, plus generation options, and it gives back a stream of data of the types in $\mathsf{Output}$. That arrow is `stream` in the snippet, and `accepts` checks whether a piece of data belongs to the left side.
-
-A capability is a smaller function that ends where the model begins. It takes one type $a$ that the model does not read and turns it into something the model does:
-
-$$\mathsf{capability} : a \longrightarrow \mathsf{Input}, \qquad a \notin \mathsf{Input}$$
-
-Placing it in front of the model widens the left side of the arrow and changes nothing on the right:
-
-$$\mathsf{model} \circ \mathsf{capability} : (\mathsf{Input} \cup \lbrace a \rbrace) \times \mathsf{Options} \longrightarrow \mathsf{Stream}(\mathsf{Output})$$
-
-The one capability shipping today is an image tower placed ahead of a text trunk, converting pixels into rows the trunk reads like any other, and the trunk never learns images exist. Audio, video and document front-ends will come as the same construction: each one is a new $a$ composed in front, with the model untouched.
-
-A language model is one way of filling the arrow in: both sets hold only text, and the function inside is next-token prediction, called once per token to produce the stream. An embedding model is the same arrow with a vector on the right and a stream of length one. Everything the engine does above the arrow, loading, scheduling, serving, works on the arrow and never on the filling.
-
-### The model declares the arithmetic it needs
-
-```python
-route = Route(self.gate.weight, experts=self.experts, k=self.k, normalize=self.norm_topk)
-gate_up = GateUp(switch.gate_up_proj, hidden=self.hidden, inner=switch.inner)
-down = DownCombine(switch.down_proj, hidden=self.hidden, inner=switch.inner)
-```
-
-That is `qwen3_moe` asking for its routing, its two expert gemvs and its routed sum. No Metal kernel is named, no quantization format is mentioned, and the same three lines appear in families with nothing else in common. Resolution happens once, at the first single-token step, when the weights are loaded and the leaves' formats are final.
-
-### Choosing the best kernel
+When a layer resolves its implementation, it hands each candidate everything that affects the result: the weight with its [quantization format](docs/06-quantization.md), the geometry and the operation that follows. A candidate accepts only when it computes exactly what was declared; an NVFP4 weight (a 4-bit floating-point group format) feeding a [gated projection](docs/04-ffn-moe.md) binds the kernel written for that exact combination, and the core module accepts whatever remains. The strictness is the point: a kernel that almost matches would silently run another model's arithmetic and still produce plausible text, so declining is the safety mechanism.
 
 <p align="center">
   <img src="docs/kernel-strategy.svg" alt="A Qmv call over an NVFP4 leaf with a gate epilogue binds GatedNvfp4Qmv, the one strategy in core/kernels/qmv/ that computes exactly that projection" width="740">
 </p>
 
-A model calls a primitive such as `Qmv` handing it everything that affects the result: the weight with its quantization format, the logical shape, and the epilogue that follows the projection. Every strategy under the primitive implements that same operation for one specialization, and its `build` reads the declaration and returns an instance only when it computes exactly what was declared, down to each knob; an NVFP4 weight with a gate epilogue binds `GatedNvfp4Qmv`, and the same weight without the epilogue would bind `Nvfp4Qmv` instead. Candidates are tried in order of preference and `DefaultQmv` accepts everything, so the choice is made once, at construction, and always lands on something correct. The strictness is the point: a kernel that almost matches would silently run another model's arithmetic and still produce plausible text, and declining is how a strategy avoids that.
+You do not need to know what `Nvfp4Qmv` or `SoftplusQmv` do in detail; what matters is that they are the same function optimized for different contexts. mlx-omnia has two jobs here: let a developer define custom implementations of an operation, as well as define the selection rules for a loaded checkpoint.
 
-### Prefill and decode are different programs
+This is what makes the engine flexible without a modeling framework in the middle. Qwen3 MoE and Laguna XS 2.1 declare the same three operations for their expert MLPs — [routing, then the two halves of the expert projection](docs/04-ffn-moe.md) — and the declarations are identical; the checkpoint decides the rest. Qwen3's 4-bit affine weights bind the affine kernels, Laguna's NVFP4 experts and sigmoid routing bind the set below, and the single-token step is [three GPU dispatches](docs/08-kernels.md) either way.
 
-```python
-def step(self, h: mx.array, residual: mx.array) -> mx.array:
-    """T=1: routing, both expert gemvs, the routed sum and the residual join in
-    three dispatches."""
-    route, gate_up, down = self._kernels()
-    chosen, weights = route(h.reshape(-1), logits=self.gate(h).reshape(-1))
-    act = gate_up(h.reshape(-1), chosen)
-    return down(act, chosen, weights, residual.reshape(-1)).reshape(1, 1, self.hidden)
+<p align="center">
+  <img src="docs/laguna-xs-moe.svg" alt="Laguna XS's single-token step flows through Route, GateUp and DownCombine; dotted lines show each stage bound at load to SigmoidTopkRoute, Nvfp4PackedGateUp and Nvfp4PackedDownCombine, one dispatch per stage" width="740">
+</p>
 
-def __call__(self, x: mx.array) -> mx.array:
-    chosen, weights = self.route(x)
-    if x.shape[-2] * self.k >= SORTED_GATHER_MIN:
-        routed = sorted_gather(x, chosen, k=self.k, hidden=self.hidden, apply=apply)
-```
+## The book
 
-Decode reads one row per step and is limited by memory bandwidth, so the whole MoE block collapses into three dispatches and nothing on that path syncs with the host or grows with the context. Prefill is limited by compute instead, so above a token threshold the same block sorts tokens by expert and gathers them, which is worth its cost only in bulk. The ceiling for decode comes from the checkpoint's own active bytes per token, and results are reported against it: gpt-oss 20B in MXFP4 decodes at 118.8 tok/s, 89.9% of that ceiling.
+`docs/` holds the long-form explanation: ten chapters, each taking one primitive that appears across architectures and answering what problem it solves, what the naive form is, what the code actually does and what breaks if you get it wrong. Start at the [introduction](docs/00-intro.md); if you only want to know why decode is slow, the short path is 01 → 02 → 07.
 
-### Weights are reorganized once, at load
-
-```python
-return prepare_weights(
-    config,
-    load_shards(directory),
-    [
-        lambda weights: fuse_qkv(weights, layers),
-        lambda weights: interleave_gate_up(weights, layers),
-    ],
-    dtype,
-)
-```
-
-qkv is concatenated, gate and up are interleaved by row, and the experts are stacked for gather matmuls. The cost is paid once so that every step afterwards reads memory in fewer, larger pieces.
-
-### A speedup is a number, and it has to survive the numerics
-
-```python
-assert relative_diff(activations.logits, golden["logits"]) < floor(golden, "logits")
-```
-
-`floor` is three times the noise the fixture itself measured for that tensor, so the checkpoint decides the tolerance and the implementation lives with it. The comparison runs over the full logits, because a cache bug can preserve the greedy pick while already producing a different distribution. On top of that, `omnia-bench` runs A and B interleaved in one process behind a thermal gate, and an optimization only lands when the gain survives that comparison and the parity tests stay green.
+| | | |
+| --- | --- | --- |
+| [01](docs/01-foundations.md) | Foundations | tokens, the decoder stack, prefill and decode |
+| [02](docs/02-attention.md) | Attention | heads, masks, and the KV cache |
+| [03](docs/03-positional.md) | Position | RoPE and what happens past the trained context |
+| [04](docs/04-ffn-moe.md) | FFN and MoE | SwiGLU, routing, conditional compute |
+| [05](docs/05-linear-state.md) | Linear state | recurrent mixers and hybrid trunks |
+| [06](docs/06-quantization.md) | Quantization | group formats, packing, mixed precision |
+| [07](docs/07-performance.md) | Performance | the bandwidth ceiling and how a number is earned |
+| [08](docs/08-kernels.md) | Kernels | when a Metal kernel pays, and what fusing costs |
+| [09](docs/09-serving.md) | Serving | residency, queueing, prefix reuse, jobs |
 
 ## Contributing
 
-The distribution is one package with four siblings inside it. `mlx_omnia` itself only re-exports the engine's public API, so none of the four is the package the others live in.
+The distribution contains four sibling packages. `mlx_omnia` only re-exports the engine's public API; none of the four contains the others.
 
 | module | what it does |
 | --- | --- |
 | `mlx_omnia.engine` | Holds the model packages, the checkpoint loading, the generation pipeline, the Metal kernels and the quantization. |
 | `mlx_omnia.server` | A FastAPI server that speaks the OpenAI, Anthropic and Gemini APIs, streaming included, behind a global FCFS queue. |
 | `mlx_omnia.cli` | An HTTP client for the server. It depends only on httpx. |
-| `mlx_omnia.bench` | The measurement instrument (`omnia-bench`). It runs a thermal gate, teacher forcing and interleaved rounds, and prints a dominance verdict. It is engine-agnostic, and omnia and mlx-lm are optional adapters under it. |
+| `mlx_omnia.bench` | The measurement instrument (`omnia-bench`). It runs a thermal gate, teacher forcing and interleaved rounds, and prints a dominance verdict — [chapter 07](docs/07-performance.md) explains each of those and why a number without them does not count. It is engine-agnostic, and omnia and mlx-lm are optional adapters under it. |
 
 Keeping them as siblings is what makes the boundaries checkable, because `lint-imports` can then forbid the harness a single name, `mlx_omnia.engine`, which covers whatever the engine grows next.
 
-The app is not one of the four. It lives in `app/` as a SwiftUI menu bar panel with its own SwiftPM package, and it reaches the daemon over HTTP like any other client, which is what lets it be written in another language.
+The app lives separately in `app/` as a SwiftUI menu bar panel with its own SwiftPM package. It reaches the daemon over HTTP like any other client, which allows it to use another language.
 
 Inside the engine:
 

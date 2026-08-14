@@ -1,4 +1,4 @@
-# 08 — Kernels
+# 08: Kernels
 
 When writing Metal by hand pays, what fusing actually buys, what it costs numerically, and the shape the code takes so that models never mention a kernel.
 
@@ -13,11 +13,11 @@ class MetalKernel[Input, Output](nn.Module):
     def __init__(self, *, name, source, header="", launch=None) -> None: ...
 ```
 
-`Input` and `Output` are named tuples of `int`, `float` or `mx.array`; the field names become the parameter names in the Metal source, encoding and decoding are derived from the type arguments, and the compiled kernel is cached on first call. So the Python side of a kernel is a type declaration and a body, not a pile of buffer plumbing.
+`Input` and `Output` are named tuples of `int`, `float` or `mx.array`. Their fields become parameter names in the Metal source, while encoding and decoding come from the type arguments. The first call caches the compiled kernel. Python only declares the types and body; the wrapper handles buffer plumbing.
 
 ## Why fuse at all
 
-Two reasons, and they are different.
+Fusion saves dispatch overhead and memory traffic.
 
 **Dispatch overhead.** A decode step is a long serial chain of tiny kernels. Each launch has fixed cost, and at one row there is not enough work to hide the next launch's setup. Removing a dispatch removes that cost on every layer, on every token, forever. This is usually the larger effect.
 
@@ -27,7 +27,7 @@ Both are decode-side arguments. In prefill, the kernels are large enough that la
 
 ## What is worth fusing
 
-The pattern is: a short chain of cheap element-wise or reduction work sitting between two memory-bound operations, on the decode path.
+Good fusion targets are short chains of cheap element-wise or reduction work between two memory-bound decode operations.
 
 Looking at what exists here, by directory:
 
@@ -47,50 +47,50 @@ Looking at what exists here, by directory:
 
 Two of those are worth calling out as instances of general ideas:
 
-- **`attention/`'s widest kernel swallows the norm, the rotation, the softmax *and* the cache write.** It can do that only because the cache is a ring with a fixed shape (chapter 02) — a data-structure decision made to enable a kernel.
-- **`lm_head/`'s primitive is the greedy *step*, `x -> token id`, not a logits row.** Choosing the right primitive is what lets it skip reading most of the head's weight. And the docstring is explicit that sampling is *not* this primitive: logprobs, temperature, top-p, penalties and speculative acceptance all read logits the pruned chain never computes. Picking a narrow primitive is a design act; being honest about what falls outside it is the other half.
+- **`attention/`'s widest kernel swallows the norm, the rotation, the softmax *and* the cache write.** It can do that only because the cache is a ring with a fixed shape (chapter 02): a data-structure decision made to enable a kernel.
+- **`lm_head/` uses the greedy *step*, `x -> token id`, as its primitive.** That boundary lets it skip reading most of the head's weight. Sampling falls outside the primitive because logprobs, temperature, top-p, penalties and speculative acceptance all need logits that the pruned chain never computes.
 
 ## The shape: facade, strategies, total delegator
 
 Every kernel directory has the same structure, and it is worth stating as a pattern because it solves a real problem.
 
-The problem: a fused kernel is valid only for particular shapes, dtypes and quantization formats. If models branch on those conditions, then every model file contains kernel knowledge, and adding a format means editing every model.
+A fused kernel supports specific shapes, dtypes and quantization formats. Branching on those conditions inside models would spread kernel knowledge across every model file and make a new format require edits throughout the tree.
 
 The pattern:
 
 - **One module per specialization**, each with a `build` classmethod that returns an instance if the declaration admits it and `None` otherwise.
 - **A `default.py` that accepts everything** and runs the operation in stock ops.
-- **A delegator** that tries the builds in preference order at *construction* time. Since the default accepts everything, resolution never fails — the delegator is **total**.
+- **A delegator** that tries the builds in preference order at *construction* time. Since the default accepts everything, resolution never fails: the delegator is **total**.
 
-So a model declares what it has — a leaf, its geometry, its activation, its norm gains — and calls the facade like any other layer. It never names a kernel, never names a format, never branches. Adding a specialization is a new module plus a registration, and every family that already declares the primitive picks it up.
+A model declares its leaf, geometry, activation and norm gains, then calls the facade like any other layer. Kernel names, formats and dispatch branches stay outside the model. Adding a specialization takes one module and one registration; every family that already declares the primitive picks it up.
 
 Two properties of this that are easy to lose:
 
 - **Resolution happens after load**, not at `__init__` of the model, because the leaf's quantization format is only final once the weights are in. The MoE code resolves lazily on the first `T=1` step and memoizes.
-- **The default is the parity reference.** It is not a degraded mode; it is the definition of what the fused path must reproduce.
+- **The default is the parity reference.** It defines what the fused path must reproduce and remains a fully supported implementation.
 
 ## What fusing costs
 
-A fused kernel is not the same arithmetic as the chain it replaces, and pretending otherwise is how a fusion ships a bug.
+A fused kernel can change the arithmetic order of the chain it replaces. Treating it as identical allows numerical bugs through review.
 
-**Different transcendental implementations.** Metal's `exp` is not MLX's `exp`. A fused softmax lands a few ULP away from the op chain. That is fine — if the tolerance was measured and not assumed.
+**Different transcendental implementations.** Metal and MLX implement `exp` differently, so a fused softmax lands a few ULP from the op chain. This is acceptable under a measured tolerance.
 
 **Different accumulation order.** A reduction that accumulates in a different order produces a different float. Renormalizing `k` routing weights by summing them in the opposite order is a real, reproducible difference.
 
-**Discrete decisions can flip.** This is the one that actually breaks things. A tie or near-tie resolved on a rounding difference changes *which* expert runs, and the output diverges — not slightly, but into a different continuation. Fusing the router's gemv into the routing kernel was rejected for exactly this: the recomputed logits round differently and flip the selection often enough to matter.
+**Discrete decisions can flip.** A rounding difference on a tie or near-tie changes *which* expert runs, sending the output into a different continuation. Fusing the router's gemv into the routing kernel was rejected for this reason: recomputed logits flip the selection often enough to matter.
 
-The discipline that follows: for anything with a discrete outcome, the test is **bit-exact agreement on the decision**, with a separate measured bound on the continuous part. And every new numerical path gets a mutation test — break it, confirm the test fails, revert.
+Anything with a discrete outcome requires **bit-exact agreement on the decision**, plus a separate measured bound on continuous values. Every new numerical path also gets a mutation test: break it, confirm the test fails, revert.
 
 ## When not to write one
 
 The recorded dead ends are more informative than the wins, because they say where the intuition is wrong:
 
 - **`gather_qmm` beats a naive gather-gemv** by a wide margin. The library's routed matmul is well-tuned; a hand-written replacement starts far behind.
-- **Fusing the router gemv into routing** — correct-looking, and it changes the output.
-- **Reimplementing what `argpartition` decides via a stable sort** — ties move.
-- **Bigger command buffers** — neutral.
-- **The tensor accelerator for sorted-MoE prefill at few rows per expert** — several distinct structures all tie or lose to `gather_qmm`; the accelerator only pays from many more rows per expert.
-- **`mx.compile` beyond the single-token MLP** — neutral, and the gain it appeared to give elsewhere was interpreter overhead, not GPU work.
+- **Fusing the router gemv into routing**: correct-looking, and it changes the output.
+- **Reimplementing what `argpartition` decides via a stable sort**: ties move.
+- **Bigger command buffers**: neutral.
+- **The tensor accelerator for sorted-MoE prefill at few rows per expert**: several distinct structures all tie or lose to `gather_qmm`; the accelerator only pays from many more rows per expert.
+- **`mx.compile` beyond the single-token MLP**: neutral, and the gain it appeared to give elsewhere was interpreter overhead, not GPU work.
 
 The pattern across all six: the win was assumed from the shape of the computation rather than measured, and the library was already doing better than the assumption. Each dead end is recorded with the instruction to **re-measure before retrying**, because a dead end is a fact about one machine and one library version, not a theorem.
 

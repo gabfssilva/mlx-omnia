@@ -1,0 +1,93 @@
+<svg viewBox="0 0 760 420" fill="none" xmlns="http://www.w3.org/2000/svg" font-family="ui-monospace, SFMono-Regular, Menlo, Consolas, monospace">
+  <style>
+    .card    { fill: #f6f8fa; stroke: #d0d7de; }
+    .win     { fill: #dafbe1; stroke: #1a7f37; }
+    .sep     { stroke: #d0d7de; }
+    .txt     { fill: #1f2328; }
+    .sub     { fill: #656d76; }
+    .accent  { fill: #1a7f37; }
+    .line    { stroke: #656d76; }
+    .winline { stroke: #1a7f37; }
+    .tri     { fill: #ffffff; stroke: #656d76; }
+    .badge   { fill: #ffffff; stroke: #1a7f37; }
+    @media (prefers-color-scheme: dark) {
+      .card    { fill: #161b22; stroke: #30363d; }
+      .win     { fill: #12261e; stroke: #3fb950; }
+      .sep     { stroke: #30363d; }
+      .txt     { fill: #e6edf3; }
+      .sub     { fill: #8b949e; }
+      .accent  { fill: #3fb950; }
+      .line    { stroke: #8b949e; }
+      .winline { stroke: #3fb950; }
+      .tri     { fill: #0d1117; stroke: #8b949e; }
+      .badge   { fill: #0d1117; stroke: #3fb950; }
+    }
+  </style>
+  <defs>
+    <marker id="arrow" viewBox="0 0 8 8" refX="7" refY="4" markerWidth="7" markerHeight="7" orient="auto-start-reverse">
+      <path d="M 0 0 L 8 4 L 0 8 z" class="accent"/>
+    </marker>
+    <marker id="realize" viewBox="0 0 12 10" refX="11" refY="5" markerWidth="12" markerHeight="10" orient="auto">
+      <path d="M 1 1 L 11 5 L 1 9 z" stroke-width="1" class="tri"/>
+    </marker>
+  </defs>
+
+  <text x="24" y="22" font-size="11" class="sub">the contracts every model package uses</text>
+
+  <text x="24" y="71" font-size="12" class="sub">content a</text>
+  <path d="M 82 67 H 116" stroke-width="1.5" class="winline" marker-end="url(#arrow)"/>
+
+  <rect x="124" y="38" width="208" height="92" rx="10" class="card"/>
+  <text x="228" y="62" font-size="11" text-anchor="middle" class="sub">composition</text>
+  <text x="228" y="82" font-size="13" font-weight="600" text-anchor="middle" class="txt">Capability</text>
+  <line x1="124" y1="92" x2="332" y2="92" class="sep"/>
+  <text x="228" y="114" font-size="12" text-anchor="middle" class="txt">a → Input</text>
+
+  <path d="M 332 84 H 382" stroke-width="1.5" class="winline" marker-end="url(#arrow)"/>
+  <text x="357" y="72" font-size="11" text-anchor="middle" class="sub">adapts</text>
+
+  <rect x="390" y="38" width="248" height="92" rx="10" class="win"/>
+  <text x="514" y="62" font-size="11" text-anchor="middle" class="accent">public contract</text>
+  <text x="514" y="82" font-size="13" font-weight="600" text-anchor="middle" class="txt">Model[I, O, Options]</text>
+  <line x1="390" y1="92" x2="638" y2="92" class="sep"/>
+  <text x="514" y="114" font-size="12" text-anchor="middle" class="txt">stream(I, Options) → Iterator[O]</text>
+
+  <path d="M 638 84 H 698" stroke-width="1.5" class="winline" marker-end="url(#arrow)"/>
+  <text x="706" y="71" font-size="12" class="sub">O…</text>
+
+  <rect x="124" y="210" width="208" height="96" rx="10" class="card"/>
+  <text x="228" y="234" font-size="11" text-anchor="middle" class="sub">checkpoint-shaped package</text>
+  <text x="228" y="254" font-size="13" font-weight="600" text-anchor="middle" class="txt">Architecture</text>
+  <line x1="124" y1="264" x2="332" y2="264" class="sep"/>
+  <text x="228" y="285" font-size="12" text-anchor="middle" class="txt">weights + forward</text>
+
+  <path d="M 228 210 V 142 H 456 V 132" stroke-width="1.2" stroke-dasharray="5 4" class="line" marker-end="url(#realize)"/>
+  <text x="244" y="160" font-size="11" class="sub">implements structurally</text>
+
+  <rect x="390" y="210" width="248" height="96" rx="10" class="card"/>
+  <text x="514" y="234" font-size="11" text-anchor="middle" class="sub">shared operation</text>
+  <text x="514" y="254" font-size="13" font-weight="600" text-anchor="middle" class="txt">Layer</text>
+  <line x1="390" y1="264" x2="638" y2="264" class="sep"/>
+  <text x="514" y="285" font-size="12" text-anchor="middle" class="txt">leaf + geometry + epilogue</text>
+
+  <path d="M 332 258 H 382" stroke-width="1.5" class="winline" marker-end="url(#arrow)"/>
+  <text x="357" y="246" font-size="11" text-anchor="middle" class="sub">declares</text>
+
+  <rect x="390" y="348" width="248" height="58" rx="10" class="win"/>
+  <text x="408" y="372" font-size="13" font-weight="600" class="txt">Core module or MSL kernel</text>
+  <text x="408" y="391" font-size="11" class="accent">stock MLX or specialized Metal</text>
+
+  <path d="M 514 306 V 340" stroke-width="1.5" class="winline" marker-end="url(#arrow)"/>
+  <text x="526" y="329" font-size="11" class="sub">binds after load</text>
+
+  <circle cx="390" cy="38" r="11" stroke-width="1.5" class="badge"/>
+  <text x="390" y="42" font-size="11" font-weight="600" text-anchor="middle" class="accent">1</text>
+  <circle cx="124" cy="38" r="11" stroke-width="1.5" class="badge"/>
+  <text x="124" y="42" font-size="11" font-weight="600" text-anchor="middle" class="accent">2</text>
+  <circle cx="124" cy="210" r="11" stroke-width="1.5" class="badge"/>
+  <text x="124" y="214" font-size="11" font-weight="600" text-anchor="middle" class="accent">3</text>
+  <circle cx="390" cy="210" r="11" stroke-width="1.5" class="badge"/>
+  <text x="390" y="214" font-size="11" font-weight="600" text-anchor="middle" class="accent">4</text>
+  <circle cx="390" cy="348" r="11" stroke-width="1.5" class="badge"/>
+  <text x="390" y="352" font-size="11" font-weight="600" text-anchor="middle" class="accent">4</text>
+</svg>

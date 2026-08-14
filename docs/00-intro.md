@@ -1,31 +1,31 @@
-# 00 — Introduction
+# 00: Introduction
 
-What this book is, what it is not, and the order to read it in.
+What this book covers and the order to read it in.
 
 ## What this is
 
-Omnia runs large language models on Apple Silicon, in Python, on raw MLX. Everything between a checkpoint on disk and a token on a socket is written here: the tokenizer, the model graph, the KV cache, the quantized matmuls, a handful of Metal kernels, and an HTTP server that keeps models resident and requests in a queue.
+mlx-omnia runs large language models on Apple Silicon, in Python, on raw MLX. Everything between a checkpoint on disk and a token on a socket is written here: the tokenizer, the model graph, the KV cache, the quantized matmuls, a handful of Metal kernels, and an HTTP server that keeps models resident and requests in a queue.
 
-These chapters explain the *ideas* that code implements. Each one takes a primitive that appears in dozens of architectures — attention, rotary position, a routed MLP, a group quantizer, a bandwidth ceiling — and answers four questions in the same order:
+These chapters explain the *ideas* implemented by the code. Each takes one primitive that appears across architectures, such as attention, rotary position or routed MLPs, and answers the same four questions:
 
 1. What problem does it solve?
 2. What is the naive form, in the smallest arithmetic that says it?
 3. What does the code actually do, and where does it disagree with the naive form?
 4. What breaks if you get it wrong?
 
-The audience is someone who can read Python and wants to understand inference from the inside, not someone looking for an API reference.
+The book assumes the reader can read Python and wants to understand inference from the inside. API reference material remains outside its scope.
 
-## What this is not
+## Scope
 
-**No numbers, no status.** There are no throughput figures, no tolerances, no "as of today" in these chapters. Measurements age; mechanisms do not. Everything measured lives in the ledger — one log per architecture, with its recon, its port notes and one entry per benched round — and in `MIGRATION.md`. If a chapter here and a ledger entry disagree about a number, the ledger is right, because the ledger is where numbers are allowed to live.
+**Numbers and status live elsewhere.** These chapters omit throughput figures, tolerances and dated status. Measurements age; mechanisms last longer. The ledger holds one log per architecture with its recon, port notes and benchmark rounds. `MIGRATION.md` carries migration status. If a chapter and the ledger disagree about a number, the ledger wins.
 
-**No architecture trivia.** "Qwen3.5 stacks its shared expert as the row after the last expert" is a fact about one checkpoint, and it belongs in that checkpoint's log. What belongs here is the general shape it is an instance of: an expert stack can hold rows that routing never chooses, and the decode step reads them anyway.
+**Architecture-specific facts stay in the ledger.** "Qwen3.5 stacks its shared expert as the row after the last expert" belongs in that checkpoint's log. The chapter covers the general shape: an expert stack can hold rows that routing never chooses, and the decode step reads them anyway.
 
-**Not a tutorial you run.** There are no exercises. Read a chapter with the file it names open beside it.
+**This is a reading guide.** There are no exercises. Read each chapter with the file it names open beside it.
 
 ## Reading order
 
-The chapters are numbered because they build on each other, but only loosely — 03 through 06 are independent of one another once 02 is done.
+The chapters build on one another loosely. After 02, chapters 03 through 06 are independent.
 
 | | | |
 | --- | --- | --- |
@@ -43,10 +43,10 @@ A shorter path, if you only want to know why decode is slow: 01 → 02 → 07.
 
 ## Conventions
 
-**Paths.** Unqualified paths are relative to `packages/mlx_omnia/src/mlx_omnia/` — so `core/cache.py` means `packages/mlx_omnia/src/mlx_omnia/core/cache.py`. Anything outside that package is written from the repository root: `packages/mlx_omnia-server/…`, `bench/…`, `docs/…`.
+**Paths.** Unqualified paths are relative to `packages/mlx_omnia/src/mlx_omnia/`. For example, `core/cache.py` means `packages/mlx_omnia/src/mlx_omnia/core/cache.py`. Paths outside that package start at the repository root: `packages/mlx_omnia-server/…`, `bench/…`, `docs/…`.
 
-**Shapes.** Tensors are written in the order the code uses them. `[B, H, T, D]` is batch, heads, sequence positions, head dimension — the layout `mx.fast.scaled_dot_product_attention` expects. `T` is the number of *query* rows in the current call: `T` is the prompt length during prefill and `1` during decode, and a surprising amount of this book is about that difference.
+**Shapes.** Tensors follow the order used by the code. `[B, H, T, D]` means batch, heads, sequence positions and head dimension, matching the layout expected by `mx.fast.scaled_dot_product_attention`. `T` is the number of *query* rows in the current call: the prompt length during prefill and `1` during decode. Much of this book follows from that difference.
 
-**Two regimes.** Nearly every performance statement is conditional on which of the two phases you are in. Prefill processes many positions at once and is limited by arithmetic; decode processes one position at a time and is limited by how fast weights can be read out of memory. When a chapter says "this is free", it means free in one of the two — ask which.
+**Two regimes.** Nearly every performance statement depends on the current phase. Prefill processes many positions at once and is limited by arithmetic. Decode processes one position at a time and is limited by memory bandwidth. When a chapter calls something free, the claim applies to one of these regimes; check which one.
 
-**The reference is code, not prose.** The authoritative description of an architecture is its `transformers` modeling file, read as source. Papers describe intent; the modeling file describes what the released weights were trained against, including the parts that look like bugs. Where Omnia deviates from it, the deviation is written down at the point of deviation.
+**Code is authoritative.** Read the architecture's `transformers` modeling file as source. Papers describe intent; the modeling file describes what the released weights were trained against, including the parts that look like bugs. Where mlx-omnia deviates from it, the deviation is written down at the point of deviation.

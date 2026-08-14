@@ -65,28 +65,28 @@
   <g opacity="0.45">
     <rect x="430" y="33" width="300" height="52" rx="10" class="card"/>
     <text x="448" y="54" font-size="13" class="txt">TernaryQmv</text>
-    <text x="448" y="73" font-size="11" class="sub">build(leaf, …) → Self | None</text>
+    <text x="448" y="73" font-size="11" class="sub">__call__(x, gate) → array</text>
 
     <rect x="430" y="95" width="300" height="52" rx="10" class="card"/>
     <text x="448" y="116" font-size="13" class="txt">Nvfp4Qmv</text>
-    <text x="448" y="135" font-size="11" class="sub">build(leaf, …) → Self | None</text>
+    <text x="448" y="135" font-size="11" class="sub">__call__(x, gate) → array</text>
 
     <rect x="430" y="157" width="300" height="52" rx="10" class="card"/>
     <text x="448" y="178" font-size="13" class="txt">SoftplusQmv</text>
-    <text x="448" y="197" font-size="11" class="sub">build(leaf, …) → Self | None</text>
+    <text x="448" y="197" font-size="11" class="sub">__call__(x, gate) → array</text>
   </g>
 
   <rect x="430" y="219" width="300" height="52" rx="10" class="win"/>
   <text x="448" y="240" font-size="13" font-weight="600" class="txt">GatedNvfp4Qmv</text>
-  <text x="448" y="259" font-size="11" class="accent">build(leaf, …) → self ✓</text>
+  <text x="448" y="259" font-size="11" class="accent">__call__(x, gate) → array ✓</text>
 
   <g opacity="0.45">
     <rect x="430" y="281" width="300" height="52" rx="10" class="card"/>
     <text x="448" y="302" font-size="13" class="txt">Int8Qmv</text>
-    <text x="448" y="321" font-size="11" class="sub">build(leaf, …) → Self | None</text>
+    <text x="448" y="321" font-size="11" class="sub">__call__(x, gate) → array</text>
 
     <rect x="430" y="343" width="300" height="52" rx="10" class="card"/>
     <text x="448" y="364" font-size="13" class="txt">DefaultQmv</text>
-    <text x="448" y="383" font-size="11" class="sub">build(leaf, …) → Self | None</text>
+    <text x="448" y="383" font-size="11" class="sub">__call__(x, gate) → array</text>
   </g>
 </svg>
