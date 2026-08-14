@@ -241,6 +241,16 @@ def router_tournament(
     return out[0].reshape(shape), out[1].reshape(shape)
 
 
+def ordinal_keys(scores: mx.array) -> mx.array:
+    """The tournament's remapping in ops, for a caller that already has the biased
+    scores: ascending unsigned order over the keys is descending routing score. The
+    kernel derives it from `-(score + bias)`, so the negation happens here and the bit
+    transform is `router_key_ordinal`'s monotone IEEE one."""
+    bits = mx.view(-scores.astype(mx.float32), mx.uint32)
+    negative = (bits & 0x80000000) != 0
+    return mx.where(negative, ~bits, bits ^ 0x80000000).astype(mx.uint32)
+
+
 @dataclass(frozen=True)
 class OrdinalRoute:
     """Sigmoid scoring, selection by a bitonic tournament over ordinal keys.
