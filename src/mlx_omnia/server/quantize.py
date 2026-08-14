@@ -284,6 +284,26 @@ def _admissible(request: PlanRequest) -> None:
         )
 
 
+def _native_refusal(source: str, directory: Path) -> str | None:
+    """Why a checkpoint quantized natively takes no plan, or `None` when the source is
+    the dense file it claims to be.
+
+    DeepSeek ships V4 as I8 codes with F8 scales and a sliver of bfloat16 norms, and
+    nothing in its config says `quantization` — so it passes the already-quantized gate,
+    `weights_dtype` truthfully answers BF16 for the sliver, and the dense baseline gets
+    priced at bfloat16: five hundred GB of fiction against 155 on disk, and an
+    `entry_bytes` below zero. The majority of the bytes is what tells this checkpoint
+    apart, and there is nothing here to pack either — the packing reads float weights,
+    not somebody else's codes."""
+    carrier = catalog.stored_carrier(directory)
+    if carrier is None or carrier in _DTYPES:
+        return None
+    return (
+        f"{source!r} keeps its weights as {carrier} codes — quantized natively, though "
+        "its config does not say so — and a dense plan has no price against them"
+    )
+
+
 def _drafter_refusal(source: str, config: Mapping[str, object], method: str) -> str | None:
     """Why a drafter takes `rtn` and nothing else, or `None` when the pair is fine.
 
@@ -549,7 +569,9 @@ def _quantize(source: str, repo: str, selection: ByPath, request: QuantizeReques
         # checkpoint, let alone start packing it.
         job.report(Progress(message=f"reading {source}"))
         checkpoint = task.source(source, local_files_only=True)
-        refusal = _drafter_refusal(source, checkpoint.config, request.method)
+        refusal = _native_refusal(source, checkpoint.directory) or _drafter_refusal(
+            source, checkpoint.config, request.method
+        )
         if refusal is not None:
             raise ValueError(refusal)
         plan = expand_plan(checkpoint.pending.model, selection)
@@ -717,6 +739,9 @@ def price(request: PlanRequest) -> PricedPlan:
         ) from error
     if "quantization" in resolved.config:
         raise HTTPException(status_code=409, detail=f"{request.source!r} is already quantized")
+    refusal = _native_refusal(request.source, resolved.directory)
+    if refusal is not None:
+        raise HTTPException(status_code=409, detail=refusal)
     refusal = _drafter_refusal(request.source, resolved.config, request.method)
     if refusal is not None:
         raise HTTPException(status_code=409, detail=refusal)

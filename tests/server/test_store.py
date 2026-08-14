@@ -269,13 +269,15 @@ def test_two_stores_writing_from_threads_keep_every_row(tmp_path: Path) -> None:
     assert counts == sorted(counts)
 
 
-def test_the_database_sits_beside_the_app_config(
+def test_the_database_sits_where_macos_keeps_what_a_user_backs_up(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
-    """`XDG_CONFIG_HOME` overrides the `~/.config` base."""
-    monkeypatch.setenv("XDG_CONFIG_HOME", str(tmp_path))
-
-    assert default_path() == tmp_path / "mlx_omnia" / "server.db"
+    """Bench history and job rows are the user's own measurements, so Application Support
+    and not the log directory. `OMNIA_STATE_DIR` is the override, and what tests point at a
+    temp path so a run never touches the real database."""
+    assert default_path().parent == Path.home() / "Library" / "Application Support" / "mlx-omnia"
+    monkeypatch.setenv("OMNIA_STATE_DIR", str(tmp_path))
+    assert default_path() == tmp_path / "server.db"
 
 
 def speed_run(

@@ -7,7 +7,7 @@ from collections.abc import Callable
 
 import uvicorn
 
-from mlx_omnia import LanguageModel, ModelInput, load
+from mlx_omnia import LanguageModel, ModelInput, load, paths
 from mlx_omnia.server import auth, config, features
 from mlx_omnia.server.app import create_app
 from mlx_omnia.server.engine import Engine
@@ -79,6 +79,10 @@ def main() -> None:
     # out of it per decision, and the middleware the api key per request, so a PATCH has to
     # reach the same file they all read. Before `create_app` because refusing to come up off
     # the loopback without a key has to happen before anything is served.
+    # Before the first `Store()`, which would otherwise create an empty database beside the
+    # one holding the user's bench history and leave it stranded at the old address.
+    if (former := paths.adopt_former_state()) is not None:
+        print(f"moved state from {former} to {paths.state_dir()}")
     store = Store()
     auth.check_bind(args.host, store)
     if args.parent_pid is not None:

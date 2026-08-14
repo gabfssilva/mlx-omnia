@@ -180,6 +180,13 @@ def _moe_checkpoint(directory: Path, *, bits: int | None) -> Path:
     return directory
 
 
+def _index(directory: Path) -> None:
+    """What the scan needs beside the weights to call a directory a model."""
+    (directory / "model.safetensors.index.json").write_text(
+        json.dumps({"weight_map": {"weight.0": "model.safetensors"}})
+    )
+
+
 def _glm_checkpoint(directory: Path) -> int:
     """The tiny glm4_moe on disk, plus the MTP block GLM ships one layer past the trunk and
     the loader drops. Answers with the bytes of that block, which is what the headers price
@@ -913,3 +920,181 @@ def test_the_model_route_carries_the_cache_facts(caches: tuple[Path, Path]) -> N
     assert body
     for entry in body:
         assert {"kv_bytes_per_token", "attention_window", "vocab_size", "shape"} <= set(entry)
+
+
+SEEING = "house/with-eyes"
+
+SEEING_CONFIG: dict[str, object] = {
+    "model_type": "qwen3_5",
+    "image_token_id": 100,
+    "vision_start_token_id": 101,
+    "vision_end_token_id": 102,
+    "vision_config": {
+        "depth": 2,
+        "hidden_size": 64,
+        "patch_size": 16,
+        "spatial_merge_size": 2,
+        "num_heads": 2,
+        "intermediate_size": 128,
+        "out_hidden_size": 64,
+        "in_channels": 3,
+        "temporal_patch_size": 2,
+        "num_position_embeddings": 64,
+        "deepstack_visual_indexes": [],
+        "hidden_act": "gelu_pytorch_tanh",
+    },
+    "text_config": {
+        "model_type": "qwen3_5",
+        "hidden_size": 64,
+        "num_hidden_layers": 2,
+        "num_attention_heads": 4,
+        "num_key_value_heads": 2,
+        "head_dim": 16,
+        "vocab_size": 128,
+        "rms_norm_eps": 1e-6,
+        "max_position_embeddings": 128,
+        "layer_types": ["full_attention", "linear_attention"],
+        "linear_num_key_heads": 2,
+        "linear_num_value_heads": 2,
+        "linear_key_head_dim": 16,
+        "linear_value_head_dim": 16,
+        "linear_conv_kernel_dim": 4,
+        "rope_parameters": {
+            "rope_type": "default",
+            "rope_theta": 10000.0,
+            "partial_rotary_factor": 0.25,
+            "mrope_section": [8, 4, 4],
+        },
+    },
+}
+"""A checkpoint of a family that has eyes. Every field is one the family's own config mirror
+requires — the scan does not read a single one of them, but `sight` parses the mirror, and a
+config it cannot parse is a model this catalog reports as taking no image."""
+
+PROCESSOR = {
+    "patch_size": 16,
+    "temporal_patch_size": 2,
+    "merge_size": 2,
+    "size": {"shortest_edge": 65536, "longest_edge": 16777216},
+    "image_mean": [0.5, 0.5, 0.5],
+    "image_std": [0.5, 0.5, 0.5],
+}
+"""qwen3.5's real geometry: patches of 16 folded 2x2, and an area window wide enough that
+neither bound moves the sizes below."""
+
+
+def _seeing(hub: Path, *, processor: bool = True) -> None:
+    snapshot = _installed(hub, SEEING, SEEING_CONFIG)
+    if processor:
+        (snapshot / "preprocessor_config.json").write_text(json.dumps(PROCESSOR))
+
+
+def test_a_checkpoint_with_a_tower_says_it_takes_an_image(caches: tuple[Path, Path]) -> None:
+    hub, _ = caches
+    _seeing(hub)
+    _installed(hub, QUANTIZED)
+
+    assert {entry.id: entry.sees for entry in catalog.scan()} == {SEEING: True, QUANTIZED: False}
+
+
+def test_the_same_tower_without_its_processor_takes_none(caches: tuple[Path, Path]) -> None:
+    """The truth is per checkpoint and not per architecture: the config declares the tower,
+    the file that says how to cut an image for it never landed, and the model the loader
+    builds refuses pictures. Reported on the family's name it would be offered one."""
+    hub, _ = caches
+    _seeing(hub, processor=False)
+
+    assert [entry.sees for entry in catalog.scan()] == [False]
+
+
+def test_an_image_is_priced_before_it_is_sent(caches: tuple[Path, Path]) -> None:
+    hub, _ = caches
+    _seeing(hub)
+
+    body = _client().get(f"/admin/models/{SEEING}/image", params={"height": 712, "width": 1236})
+
+    assert body.status_code == 200, body.text
+    # 1236x712 rounded to the patch block is 1248x704 — 78x44 patches, folded 2x2.
+    assert body.json() == {"height": 704, "width": 1248, "tokens": 858}
+
+
+def test_a_model_that_takes_no_image_says_so_rather_than_pricing_one(
+    caches: tuple[Path, Path],
+) -> None:
+    hub, _ = caches
+    _installed(hub, QUANTIZED)
+
+    refusal = _client().get(f"/admin/models/{QUANTIZED}/image", params={"height": 8, "width": 8})
+
+    assert refusal.status_code == 409, refusal.text
+    assert "takes no image" in refusal.json()["detail"]
+
+
+def test_an_image_with_no_size_is_refused(caches: tuple[Path, Path]) -> None:
+    hub, _ = caches
+    _seeing(hub)
+    client = _client()
+
+    size = {"height": 8, "width": 8}
+    flat = client.get(f"/admin/models/{SEEING}/image", params={**size, "height": 0})
+    assert flat.status_code == 422
+    assert client.get(f"/admin/models/{SEEING}/image").status_code == 422
+    assert client.get("/admin/models/house/nobody/image", params=size).status_code == 404
+
+
+# ── the blueprint ────────────────────────────────────────────────────────
+
+
+def test_the_blueprint_traces_the_step_without_loading_the_checkpoint(
+    caches: tuple[Path, Path],
+) -> None:
+    """The route builds the tree to answer, and building it reads no weight. What that has to
+    hold is both halves: the graph arrives, and MLX's live footprint does not move — a route
+    that quietly loaded 17 GB to draw a picture would answer the same and cost the machine
+    the model."""
+    hub, _ = caches
+    directory = _moe_checkpoint(_repository(hub, MOE_TINY) / "snapshots" / "head", bits=4)
+    _index(directory)
+    _main(hub, MOE_TINY, "head")
+    client = _client()
+
+    mx.clear_cache()
+    before = mx.get_active_memory()
+    answer = client.get(f"/admin/models/{quote(MOE_TINY, safe='')}/blueprint")
+    assert answer.status_code == 200, answer.json()
+    assert mx.get_active_memory() - before < 4096, "the route read a tensor"
+
+    drawn = answer.json()
+    assert [node["role"] for node in drawn["spine"]][:2] == ["embedding", "stack"]
+    (block,) = drawn["blocks"]
+    assert block["layers"] == list(range(TINY.num_hidden_layers))
+    # The wiring, which is the thing no config carries: the block's input is one side of the
+    # first sum, and the norm before the mixer reads the same input.
+    edges = {(edge["source"], edge["target"]) for edge in block["edges"] if edge["observed"]}
+    # One join and not two: this architecture's step hands the residual to the routed mixer
+    # and adds it in there, so only the attention sum is a `+` of its own. Which is the sort
+    # of thing the drawing exists to show and no config says.
+    (join,) = [node["id"] for node in block["nodes"] if node["role"] == "join"]
+    assert ("in", "input_layernorm") in edges
+    assert ("in", join) in edges
+    assert (join, "mlp") in edges
+    # And the kernel the routed mixer resolved to, which is what a dense tree would not have
+    # picked: the route decides on the config, and it had one to read.
+    routed = [node for node in block["nodes"] if node["kernels"]]
+    assert routed, "no operation reported which implementation ran"
+    assert any("Route" in name for node in routed for name in node["kernels"])
+
+
+def test_an_architecture_with_no_loader_is_refused_rather_than_drawn(
+    caches: tuple[Path, Path],
+) -> None:
+    hub, _ = caches
+    directory = _moe_checkpoint(_repository(hub, MOE_TINY) / "snapshots" / "head", bits=4)
+    _index(directory)
+    (directory / "config.json").write_text(json.dumps({**asdict(TINY), "model_type": "qwen9"}))
+    _main(hub, MOE_TINY, "head")
+
+    answer = _client().get(f"/admin/models/{quote(MOE_TINY, safe='')}/blueprint")
+
+    assert answer.status_code == 409
+    assert "qwen9" in answer.json()["detail"]

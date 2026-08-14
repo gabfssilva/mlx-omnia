@@ -5,10 +5,10 @@ Raw `sqlite3` from the stdlib and nothing above it. Each consumer reads and writ
 rows of one table; an ORM would add a mapping layer to keep in sync with the schema
 without removing a single line of the SQL below.
 
-The file is `~/.config/mlx_omnia/server.db`, honouring `XDG_CONFIG_HOME` — the directory
-the app already writes `app.json` into. Under XDG's reading, bench history and jobs are
-state rather than configuration; one directory holding everything a user backs up or
-deletes is worth more here than the classification.
+The file is `~/Library/Application Support/mlx-omnia/server.db`, where macOS puts what a
+user backs up — bench history and job rows are measurements of theirs, not a cache.
+`mlx_omnia.paths` owns the location; logs are a separate directory because they are the
+part a user deletes.
 
 Every call opens and closes its own connection. The daemon writes from threads (the job
 worker runs under `to_thread`) and a sqlite3 connection does not travel between them;
@@ -16,7 +16,6 @@ WAL plus the busy timeout is what makes a second writer — another thread, or a
 process — wait instead of fail.
 """
 
-import os
 import sqlite3
 import time
 from collections.abc import Callable, Generator, Mapping
@@ -25,16 +24,16 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import Literal
 
+from mlx_omnia import paths
+
 _BUSY_SECONDS = 5.0
 
 JobState = Literal["pending", "running", "ok", "error", "cancelled"]
 
 
 def default_path() -> Path:
-    """`~/.config/mlx_omnia/server.db`, honoring `XDG_CONFIG_HOME`."""
-    root = os.environ.get("XDG_CONFIG_HOME")
-    base = Path(root) if root else Path.home() / ".config"
-    return base / "mlx_omnia" / "server.db"
+    """`~/Library/Application Support/mlx-omnia/server.db`, or under `OMNIA_STATE_DIR`."""
+    return paths.server_db()
 
 
 @dataclass(frozen=True)

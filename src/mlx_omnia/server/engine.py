@@ -1003,6 +1003,18 @@ class Engine:
         entry.kv_cache = KvCompression(applied=True)
         return model
 
+    @property
+    def prefix_bytes(self) -> int:
+        """What the resident tries hold between them, out of `prefix_cache_bytes`. Zero
+        before any request has been served: the budget is built on the first one."""
+        return 0 if self._prefixes is None else self._prefixes.nbytes
+
+    def discard_prefixes(self) -> None:
+        """Hand the memory tier back. The models keep their tries — the objects go on living
+        on them — and what goes is what those tries were holding."""
+        if self._prefixes is not None:
+            self._prefixes.discard()
+
     def _budget(self) -> Budget | int:
         """The shared ceiling, rebuilt when the config moved it. Rebuilt and not adjusted:
         `prefix_cache` reads identity to decide whether the trie it holds is still the right

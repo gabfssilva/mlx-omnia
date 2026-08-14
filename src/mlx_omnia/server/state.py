@@ -15,12 +15,14 @@ direction a ceiling forgives.
 
 import ctypes
 from dataclasses import dataclass
-from typing import Annotated
+from typing import Annotated, Literal
 
 import mlx.core as mx
 from fastapi import APIRouter, Depends, Request
 
+from mlx_omnia.server import prefixes
 from mlx_omnia.server.engine import Engine, KvCompression
+from mlx_omnia.server.events import announce
 from mlx_omnia.server.store import Store
 
 _MACH_TASK_BASIC_INFO = 20
@@ -97,6 +99,11 @@ class State:
     """`max(MLX's active memory, the process' resident size, the accumulator)`, the
     accumulator being the sum of `models[*].weights_bytes`."""
     kv_bytes: int
+    prefix_memory_bytes: int
+    """What the resident tries hold of the conversations they have already read, over every
+    model — the memory tier of the same cache `prefix_disk_bytes` reports the other floor of.
+    Inside `resident_bytes` rather than beside it: the trie's arrays are live allocations both
+    meters already see."""
     prefix_disk_bytes: int
     """What the conversations spilled to disk weigh, over every model. Beside the memory
     figures because it is the same question asked of the other resource, and reported at all
@@ -144,5 +151,29 @@ async def state(engine: EngineDep, store: StoreDep) -> State:
         queue=Queue(running=engine.running, waiting=engine.waiting, reserved=engine.reserved),
         resident_bytes=max(mx.get_active_memory(), footprint_bytes(), accumulator),
         kv_bytes=sum(model.kv_bytes for model in models),
+        prefix_memory_bytes=engine.prefix_bytes,
         prefix_disk_bytes=store.prefix_bytes(),
     )
+
+
+Tier = Literal["memory", "disk"]
+
+
+@router.delete("/admin/prefixes/{tier}", status_code=204)
+async def clear_prefixes(tier: Tier, engine: EngineDep, store: StoreDep, request: Request) -> None:
+    """Hand one floor of the prefix cache back.
+
+    Here and not in `prefixes`, which owns the disk half: the engine imports that module, so
+    it cannot import the engine back, and the memory half is the engine's to release. This is
+    also where both figures are reported from, which is the other half of the same screen.
+
+    The memory tier is discarded and never drained: a clear that spilled would answer "free
+    this memory" by handing the disk tier what was just freed. The disk tier goes through
+    `forget` per model, so the row, the file and the model's directory leave together.
+    """
+    if tier == "memory":
+        engine.discard_prefixes()
+    else:
+        for model_id in {entry.model for entry in store.prefix_files()}:
+            prefixes.forget(store, model_id)
+    announce(request, "state")

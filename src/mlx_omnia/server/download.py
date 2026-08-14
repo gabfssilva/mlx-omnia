@@ -68,7 +68,18 @@ from mlx_omnia.server.jobs import (
 
 _STAGING = ".incomplete"
 _VARIANTS = "mlx-community"
-_PATTERNS = ("*.json", "*.safetensors", "*.jinja", "*.txt", "tokenizer.model", "*.tiktoken")
+_PATTERNS = (
+    "*.json",
+    "*.safetensors",
+    "*.jinja",
+    "*.txt",
+    "tokenizer.model",
+    "*.tiktoken",
+    # The one file here the loader never opens. It is what the repository says about itself
+    # — the licence it is under, what it was made from, what it is for — and a client that
+    # shows it has nowhere else to read it from once the weights are on this disk.
+    "README.md",
+)
 _REPORT_SECONDS = 0.25
 
 HUB = HfApi()
@@ -153,9 +164,9 @@ else:
 
 
 def _wanted(info: ModelInfo) -> list[tuple[str, int]]:
-    """The file set the loader reads — config, tokenizer, index and shards — and nothing in
-    a subfolder: `original/` in a Llama-shaped repository is a second copy of the weights in
-    a format nothing here opens."""
+    """The file set the loader reads — config, tokenizer, index and shards — plus the card,
+    and nothing in a subfolder: `original/` in a Llama-shaped repository is a second copy of
+    the weights in a format nothing here opens."""
     return [
         (sibling.rfilename, sibling.size or 0)
         for sibling in info.siblings or []

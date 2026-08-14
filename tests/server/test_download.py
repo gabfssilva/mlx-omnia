@@ -56,13 +56,21 @@ FILES: dict[str, bytes] = {
     SHARDS[0]: b"\0" * 4096,
     SHARDS[1]: b"\0" * 4096,
     "tokenizer.json": b"{}",
+    # Not read by the loader and fetched anyway: it is the only place the model card exists
+    # once the repository is on this disk.
+    "README.md": b"# a model card",
     # What the loader never opens, and what a download must therefore not pay for.
     "pytorch_model.bin": b"\1" * 8192,
     "original/consolidated.safetensors": b"\1" * 8192,
-    "README.md": b"# a model card",
 }
 
-WANTED = ("config.json", "model.safetensors.index.json", *SHARDS, "tokenizer.json")
+WANTED = (
+    "config.json",
+    "model.safetensors.index.json",
+    *SHARDS,
+    "tokenizer.json",
+    "README.md",
+)
 TOTAL = sum(len(FILES[name]) for name in WANTED)
 
 

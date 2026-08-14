@@ -65,7 +65,7 @@ def test_a_daemon_started_with_parent_pid_stops_when_that_pid_is_killed(
 ) -> None:
     """The whole path, through the console script's own argument parsing: a real daemon
     answering on a real port, its owner SIGKILLed so nothing can be forwarded to it, and the
-    daemon gone on its own. `XDG_CONFIG_HOME` so the boot does not touch the user's db.
+    daemon gone on its own. `OMNIA_STATE_DIR` so the boot does not touch the user's db.
     """
     port = free_port()
     daemon = subprocess.Popen(
@@ -78,7 +78,7 @@ def test_a_daemon_started_with_parent_pid_stops_when_that_pid_is_killed(
             "--parent-pid",
             str(owner.pid),
         ],
-        env={**os.environ, "XDG_CONFIG_HOME": str(tmp_path)},
+        env={**os.environ, "OMNIA_STATE_DIR": str(tmp_path)},
     )
     try:
         health = f"http://127.0.0.1:{port}/admin/health"

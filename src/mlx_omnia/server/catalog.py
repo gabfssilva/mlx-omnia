@@ -41,8 +41,17 @@ import huggingface_hub.constants
 from fastapi import APIRouter, Depends, HTTPException, Request
 from fastapi.responses import FileResponse, PlainTextResponse
 
-from mlx_omnia.engine.checkpoint import QuantizationJson, SamplingDefaults, sampling_defaults
+from mlx_omnia.engine.checkpoint import (
+    ImageCost,
+    QuantizationJson,
+    SamplingDefaults,
+    Sight,
+    sampling_defaults,
+)
 from mlx_omnia.engine.footprint import expert_slots
+from mlx_omnia.engine.graph import Graph
+from mlx_omnia.engine.graph import blueprint as trace_blueprint
+from mlx_omnia.engine.task import architectures, sight
 from mlx_omnia.engine.task import source as checkpoint_source
 from mlx_omnia.server.engine import Engine
 from mlx_omnia.server.store import Store
@@ -153,6 +162,14 @@ class CatalogEntry:
     a fine-tune's print is identical to its base's."""
     resident: bool = False
     """Filled by the handler from the engine, not by the scan."""
+    supported: bool = False
+    """Whether this engine has a loader for the architecture — what a client may offer to
+    run. The static half of the answer: a tokenizer can still refuse at load time."""
+    sees: bool = False
+    """Whether a turn may carry an image. Per checkpoint and not per architecture: the same
+    family ships text-only conversions, and two of the ported families carry VL in the name
+    with the tower dropped at load. A client that offered a picture on the name would have it
+    refused after the send; `/image` is where the cost of one is asked."""
 
 
 def _label(bits: int, mode: str) -> str:
@@ -198,6 +215,21 @@ def _tensors(directory: Path) -> list[tuple[str, _TensorJson, int]] | None:
         except (ValueError, KeyError):
             return None
     return found
+
+
+def stored_carrier(directory: Path) -> str | None:
+    """The dtype carrying most of the shards' bytes. For a dense checkpoint it is the
+    float `weights_dtype` also answers; for one quantized natively — I8 or U32 codes
+    beside a sliver of float scales, and nothing in the config saying so — it is the
+    codes' dtype, which is how a caller tells a checkpoint that only *looks* dense from
+    one that is."""
+    tensors = _tensors(directory)
+    if not tensors:
+        return None
+    weighed: dict[str, int] = {}
+    for _, entry, size in tensors:
+        weighed[entry["dtype"]] = weighed.get(entry["dtype"], 0) + size
+    return max(weighed.items(), key=lambda pair: pair[1])[0]
 
 
 def weights_dtype(directory: Path) -> str | None:
@@ -517,7 +549,20 @@ def _build(model_id: str, directory: Path, store: Path, stamp: _Stamp) -> Catalo
         attention_window=_attention_window(_shape(config)),
         vocab_size=_shape(config).get("vocab_size"),
         shape=_print(config),
+        supported=architecture in architectures(),
+        sees=_sight(architecture, directory) is not None,
     )
+
+
+def _sight(architecture: str, directory: Path) -> Sight | None:
+    """The engine's answer, and a listing that survives it not having one. A family reads
+    its own config mirror to tell whether it has eyes, and a checkpoint that mirror refuses
+    is a checkpoint this catalog still has to list — with no picture offered over it, which
+    is what `None` says."""
+    try:
+        return sight(architecture, directory)
+    except Exception:  # an unreadable config is a model that takes no image
+        return None
 
 
 def _entry(model_id: str, directory: Path, store: Path) -> CatalogEntry | None:
@@ -657,6 +702,25 @@ class CheckpointFile:
     for the bytes, not the link."""
 
 
+@router.get("/admin/models/{model_id:path}/image")
+def image(model_id: str, height: int, width: int) -> ImageCost:
+    """What one image of this size would cost this checkpoint, before it is sent: the size
+    the tower actually reads, and the rows that reserves in the prompt.
+
+    The arithmetic stays here because it is the family's and not the dialect's — one resizes
+    to a multiple of its patch block under a cap on area, the next under a cap on rows, the
+    third does not resize at all and tiles. A client that reimplemented any of them would be
+    a second opinion about a number the engine is the only authority on.
+    """
+    entry = _find(model_id)
+    if height <= 0 or width <= 0:
+        raise HTTPException(status_code=422, detail="an image has a positive height and width")
+    eyes = _sight(entry.architecture, entry.directory)
+    if eyes is None:
+        raise HTTPException(status_code=409, detail=f"{model_id!r} takes no image")
+    return eyes(height, width)
+
+
 @router.get("/admin/models/{model_id:path}/card", response_class=PlainTextResponse)
 def card(model_id: str) -> str:
     """The checkpoint's README, raw — rendering it is the client's job."""
@@ -677,6 +741,40 @@ def files(model_id: str) -> list[CheckpointFile]:
         ),
         key=lambda file: file.name,
     )
+
+
+@lru_cache(maxsize=16)
+def _blueprint(directory: Path) -> Graph:
+    """Cached per checkpoint, because the tree a directory builds does not change while the
+    files under it do not. The build itself reads no weight — see `dormant` — so the cost is
+    the shard headers and one uncomputed forward, 0.3 to 0.5 s on the checkpoints here."""
+    return trace_blueprint(directory)
+
+
+@router.get("/admin/models/{model_id:path}/blueprint")
+def blueprint(model_id: str) -> Graph:
+    """What this checkpoint's decode step is made of: the trunk, one graph per kind of block,
+    and the kernel each declared operation resolved to.
+
+    Recorded off the tree the loader builds rather than read off the config, because the
+    wiring is not in the files: nothing on disk says whether two mixers run side by side or
+    one after the other. Nothing is loaded to answer it — a resident model and one that has
+    never been loaded give the same graph, which is why this asks the disk and not the
+    engine's residency.
+    """
+    entry = _find(model_id)
+    if not entry.supported:
+        raise HTTPException(
+            status_code=409, detail=f"no loader for {entry.architecture}: nothing to trace"
+        )
+    try:
+        return _blueprint(entry.directory)
+    # Broad on purpose: a family's loader raises whatever its own transformation raises, and
+    # what the reader needs is the sentence, not the class.
+    except Exception as trouble:
+        raise HTTPException(
+            status_code=409, detail=f"{model_id!r} does not build: {trouble}"
+        ) from trouble
 
 
 @router.get("/admin/models/{model_id:path}/assets/{asset:path}")

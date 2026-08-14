@@ -38,7 +38,7 @@ from mlx_omnia.server import engine as engine_module
 from mlx_omnia.server import state
 from mlx_omnia.server.engine import Engine, Job, tree
 from mlx_omnia.server.state import router
-from mlx_omnia.server.store import Store
+from mlx_omnia.server.store import PrefixCacheFile, Store
 
 _KV_BYTES = 32 * 1024 * 1024
 
@@ -185,20 +185,31 @@ async def drain(job: Job) -> None:
         pass
 
 
-async def read(engine: Engine, store: Store | None = None) -> dict[str, object]:
+def mounted(engine: Engine, store: Store | None) -> FastAPI:
     app = FastAPI()
     app.state.engine = engine
     # The route reports what the spilled conversations weigh, which is a row count and lives
     # in the database. In memory for every test that is not about it.
     app.state.store = _SPARE if store is None else store
     app.include_router(router)
-    transport = httpx.ASGITransport(app=app)
+    return app
+
+
+async def read(engine: Engine, store: Store | None = None) -> dict[str, object]:
+    transport = httpx.ASGITransport(app=mounted(engine, store))
     async with httpx.AsyncClient(transport=transport, base_url="http://state") as client:
         response = await asyncio.wait_for(client.get("/admin/state"), 30)
     assert response.status_code == 200, response.text
     body = response.json()
     assert isinstance(body, dict)
     return body
+
+
+async def clear(engine: Engine, store: Store, tier: str) -> None:
+    transport = httpx.ASGITransport(app=mounted(engine, store))
+    async with httpx.AsyncClient(transport=transport, base_url="http://state") as client:
+        response = await asyncio.wait_for(client.delete(f"/admin/prefixes/{tier}"), 30)
+    assert response.status_code == 204, response.text
 
 
 def models_of(body: dict[str, object]) -> list[dict[str, object]]:
@@ -259,6 +270,71 @@ def test_a_hot_trie_is_live_memory_the_admission_reads(tmp_path: Path) -> None:
 
     held, gone = asyncio.run(run())
     assert held - gone >= _WIDE_TRIE_BYTES, "the trie's buffers were never live memory"
+
+
+def test_the_memory_tier_is_reported_and_clearing_it_hands_it_back(tmp_path: Path) -> None:
+    """The two numbers the Server screen's prefix rows read, and the button beside them. The
+    trie is filled by a request, because that is the only thing that fills one."""
+
+    async def run() -> tuple[int, int]:
+        store = Store(tmp_path / "server.db")
+        store.set_config({"prefix_cache_bytes": str(4 * _WIDE_TRIE_BYTES)})
+        engine = Engine(lambda _: wide(), store)
+        engine.start()
+        try:
+            await drain(await engine.submit("w", Text("hi"), GenerationOptions(max_tokens=2)))
+            held = await read(engine, store)
+            await clear(engine, store, "memory")
+            emptied = await read(engine, store)
+            return _int(held["prefix_memory_bytes"]), _int(emptied["prefix_memory_bytes"])
+        finally:
+            engine.stop()
+
+    held, emptied = asyncio.run(run())
+    assert held >= _WIDE_TRIE_BYTES, "the trie the request filled was never reported"
+    assert emptied == 0
+
+
+def test_clearing_the_disk_tier_takes_the_rows_and_the_files(tmp_path: Path) -> None:
+    """The floor that survives a restart, and the one thirty models pile up on. Nothing is
+    generated here: what the route has to get right is that the row and the file leave
+    together, and `prefixes.forget` is what it leans on to do it."""
+
+    async def run() -> tuple[int, int, bool]:
+        store = Store(tmp_path / "disk.db")
+        spilled = tmp_path / "w" / "cache.safetensors"
+        spilled.parent.mkdir(parents=True)
+        spilled.write_bytes(b"x" * 64)
+        store.save_prefix_file(
+            PrefixCacheFile(
+                key="k",
+                model="w",
+                path=str(spilled),
+                ids=b"\x01\x02",
+                tokens=2,
+                bytes=64,
+                created_at=time.time(),
+                used_at=time.time(),
+            )
+        )
+        engine = Engine(lambda _: tiny(), store)
+        held = await read(engine, store)
+        await clear(engine, store, "disk")
+        emptied = await read(engine, store)
+        return (
+            _int(held["prefix_disk_bytes"]),
+            _int(emptied["prefix_disk_bytes"]),
+            spilled.exists(),
+        )
+
+    held, emptied, left = asyncio.run(run())
+    assert (held, emptied) == (64, 0)
+    assert not left, "the row went and the file stayed"
+
+
+def _int(value: object) -> int:
+    assert isinstance(value, int)
+    return value
 
 
 def test_a_generation_leaves_the_model_with_kv_and_a_recent_last_use() -> None:

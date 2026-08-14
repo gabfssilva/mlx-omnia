@@ -1218,6 +1218,38 @@ def test_pricing_refuses_what_the_job_refuses_and_starts_nothing(
     assert client.get("/admin/jobs").json() == [], "pricing a plan started a job"
 
 
+def test_a_checkpoint_quantized_natively_is_refused_with_its_codes_named(
+    client: TestClient, tmp_path: Path, caches: Path
+) -> None:
+    """DeepSeek ships V4 as I8 codes beside a sliver of bfloat16 norms, and nothing in its
+    config says `quantization` — so it passes the already-quantized gate, `weights_dtype`
+    truthfully answers BF16 for the sliver, and a dense baseline priced at bfloat16
+    outweighs the file itself: `entry_bytes` lands below zero. The majority of the bytes is
+    what tells this checkpoint apart, and it refuses the plan and the job alike."""
+    directory = tmp_path / "native"
+    directory.mkdir(parents=True)
+    (directory / "config.json").write_text(json.dumps({"model_type": "tiny", "hidden_size": 64}))
+    (directory / "tokenizer.json").write_text("{}")
+    mx.save_safetensors(
+        str(directory / "model.safetensors"),
+        {
+            **{
+                f"{leaf.path}.weight": mx.zeros(leaf.shape, dtype=mx.int8)
+                for leaf in inventory(_Tiny())
+            },
+            "norm.weight": mx.ones((64,), dtype=mx.bfloat16),
+        },
+    )
+
+    priced = client.post("/admin/quantizations/plan", json={"source": str(directory)})
+    assert priced.status_code == 409, priced.text
+    assert "I8" in priced.json()["detail"]
+
+    ended = wait_for(client, start(client, source=str(directory), repo=REPO), "error")
+    assert isinstance(ended["error"], str) and "I8" in ended["error"]
+    assert not (catalog.HUB_CACHE / "models--local--tiny-4bit").exists()
+
+
 def test_an_entry_that_is_already_quantized_is_not_priced_again(
     client: TestClient, source: Path
 ) -> None:
