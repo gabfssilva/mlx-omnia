@@ -3,7 +3,7 @@
 A model block declares its routing — scoring, correction bias, renormalization, scale,
 softcap, a shared slot, a hash table — and `Route` binds the specialization that
 declaration admits, or none, at construction time. The model never names a kernel; a new
-kernel is a new module here, registered in `_BUILDS`, and every family engages it.
+kernel is a new module here, registered in `_STRATEGIES`, and every family engages it.
 
 The gates are arithmetic, not availability: a strategy builds only when it computes the
 declared chain exactly. `sigmoid_topk.py` additionally fuses the router gemv, so it reads
@@ -22,6 +22,7 @@ module-path imports.
 
 import mlx.core as mx
 
+from mlx_omnia.engine.core.kernels.resolve import resolve
 from mlx_omnia.engine.core.kernels.route.bias_topk import BiasTopkRoute
 from mlx_omnia.engine.core.kernels.route.default import DefaultRoute
 from mlx_omnia.engine.core.kernels.route.kernel import RouteStrategy, Routing, Scoring
@@ -43,15 +44,15 @@ __all__ = [
     "SoftmaxTopkRoute",
 ]
 
-# Order is preference: the first build that returns an instance wins; the default
-# accepts everything, so resolution never fails.
-_BUILDS = (
-    SigmoidTopkRoute.build,
-    OrdinalRoute.build,
-    SoftmaxTopkRoute.build,
-    BiasTopkRoute.build,
-    SigmoidWideRoute.build,
-    DefaultRoute.build,
+# Order is preference: the first strategy that builds wins; the default accepts
+# everything, so resolution never fails.
+_STRATEGIES = (
+    SigmoidTopkRoute,
+    OrdinalRoute,
+    SoftmaxTopkRoute,
+    BiasTopkRoute,
+    SigmoidWideRoute,
+    DefaultRoute,
 )
 
 
@@ -85,11 +86,7 @@ class Route:
             shared=shared,
             hash_table=hash_table,
         )
-        self.strategy: RouteStrategy = next(
-            built
-            for build in _BUILDS
-            if (built := build(gate, routing=self.routing)) is not None
-        )
+        self.strategy: RouteStrategy = resolve(_STRATEGIES, gate, routing=self.routing)
 
     def __call__(
         self,

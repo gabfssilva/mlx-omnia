@@ -23,6 +23,7 @@ from mlx_omnia.engine.core.kernels.down_combine.kernel import DownCombineStrateg
 from mlx_omnia.engine.core.kernels.down_combine.mxfp4 import Mxfp4DownCombine
 from mlx_omnia.engine.core.kernels.down_combine.nvfp4 import Nvfp4DownCombine
 from mlx_omnia.engine.core.kernels.down_combine.nvfp4_packed import Nvfp4PackedDownCombine
+from mlx_omnia.engine.core.kernels.resolve import resolve
 from mlx_omnia.engine.core.layers import QuantizedSwitchLinear, SwitchLinear
 
 __all__ = [
@@ -37,15 +38,15 @@ __all__ = [
     "Nvfp4PackedDownCombine",
 ]
 
-# Order is preference: the first build that returns an instance wins; the default
-# accepts everything, so resolution never fails.
-_BUILDS = (
-    Nvfp4PackedDownCombine.build,
-    Nvfp4DownCombine.build,
-    Mxfp4DownCombine.build,
-    AffineDownCombine.build,
-    DenseDownCombine.build,
-    DefaultDownCombine.build,
+# Order is preference: the first strategy that builds wins; the default accepts
+# everything, so resolution never fails.
+_STRATEGIES = (
+    Nvfp4PackedDownCombine,
+    Nvfp4DownCombine,
+    Mxfp4DownCombine,
+    AffineDownCombine,
+    DenseDownCombine,
+    DefaultDownCombine,
 )
 
 
@@ -63,15 +64,14 @@ class DownCombine:
         shared: nn.Linear | nn.QuantizedLinear | None = None,
         layout: Layout = "interleaved",
     ) -> None:
-        self.strategy: DownCombineStrategy = next(
-            built
-            for build in _BUILDS
-            if (
-                built := build(
-                    leaf, hidden=hidden, inner=inner, bias=bias, shared=shared, layout=layout
-                )
-            )
-            is not None
+        self.strategy: DownCombineStrategy = resolve(
+            _STRATEGIES,
+            leaf,
+            hidden=hidden,
+            inner=inner,
+            bias=bias,
+            shared=shared,
+            layout=layout,
         )
 
     def __call__(

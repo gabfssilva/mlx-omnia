@@ -12,12 +12,13 @@ import mlx.core as mx
 from mlx_omnia.engine.core.kernels.conv_mix.default import DefaultConvMix
 from mlx_omnia.engine.core.kernels.conv_mix.fused import FusedConvMix
 from mlx_omnia.engine.core.kernels.conv_mix.kernel import ConvMixStrategy
+from mlx_omnia.engine.core.kernels.resolve import resolve
 
 __all__ = ["ConvMix", "ConvMixStrategy", "DefaultConvMix", "FusedConvMix"]
 
-# Order is preference: the first build that returns an instance wins; the default
-# accepts everything, so resolution never fails.
-_BUILDS = (FusedConvMix.build, DefaultConvMix.build)
+# Order is preference: the first strategy that builds wins; the default accepts
+# everything, so resolution never fails.
+_STRATEGIES = (FusedConvMix, DefaultConvMix)
 
 
 class ConvMix:
@@ -32,15 +33,12 @@ class ConvMix:
         proj_bias: mx.array | None = None,
         conv_bias: mx.array | None = None,
     ) -> None:
-        self.strategy: ConvMixStrategy = next(
-            built
-            for build in _BUILDS
-            if (
-                built := build(
-                    hidden=hidden, kernel=kernel, proj_bias=proj_bias, conv_bias=conv_bias
-                )
-            )
-            is not None
+        self.strategy: ConvMixStrategy = resolve(
+            _STRATEGIES,
+            hidden=hidden,
+            kernel=kernel,
+            proj_bias=proj_bias,
+            conv_bias=conv_bias,
         )
 
     def __call__(

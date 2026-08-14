@@ -130,6 +130,23 @@ def test_attention_nvfp4_decode_projection_matches_stock(model: Laguna) -> None:
 
 
 @requires_checkpoint(REPO, REVISION)
+def test_sparse_moe_b2_matches_independent_packed_steps(model: Laguna) -> None:
+    moe = next(
+        layer.mlp for layer in model.model.layers if isinstance(layer.mlp, LagunaSparseMoe)
+    )
+    hidden = mx.random.normal((2, 1, model.config.hidden_size)).astype(mx.bfloat16)
+    residual = mx.random.normal(hidden.shape).astype(mx.bfloat16)
+
+    expected = mx.concatenate(
+        [moe.step(hidden[index : index + 1], residual[index : index + 1]) for index in range(2)]
+    )
+    actual = moe.batch_step(hidden, residual)
+    mx.eval(expected, actual)
+
+    assert relative_diff(actual, expected) < 2.0**-6
+
+
+@requires_checkpoint(REPO, REVISION)
 def test_lm_head_pruner_preserves_argmax(model: Laguna) -> None:
     assert isinstance(model.lm_head, nn.Linear)
     assert not isinstance(model.lm_head, nn.QuantizedLinear)

@@ -233,7 +233,8 @@ class Metrics:
     def __init__(self) -> None:
         self._requests: deque[Sample] = deque(maxlen=_HISTORY)
         self._totals: dict[str, _Totals] = {}
-        self._live: _Live | None = None
+        self._live: dict[int, _Live] = {}
+        self._serial = 0
         self.watchers: set[asyncio.Queue[Snapshot]] = set()
         self.on_change: Callable[[], None] = _nothing
         """Raised wherever `_publish` fans out: the two edges, and the beat between them.
@@ -247,15 +248,21 @@ class Metrics:
         meter: Meter,
         bytes_per_token: int | None,
         load_seconds: float | None = None,
-    ) -> None:
+    ) -> int:
         """The request reached the gate. `bytes_per_token` is the model's, taken once at
         load: walking a 30B's tree per request would cost more than the request."""
-        self._live = _Live(model, meter, bytes_per_token, time.time(), load_seconds)
+        self._serial += 1
+        self._live[self._serial] = _Live(
+            model, meter, bytes_per_token, time.time(), load_seconds
+        )
         self._publish()
+        return self._serial
 
-    def end(self, state: RequestState) -> None:
-        live = self._live
-        assert live is not None, "end() without begin()"
+    def end(self, state: RequestState, key: int | None = None) -> None:
+        if key is None:
+            assert len(self._live) == 1, "end() without one unambiguous begin()"
+            key = next(iter(self._live))
+        live = self._live.pop(key)
         meter = live.meter
         totals = self._totals.setdefault(live.model, _Totals())
         totals.requests += 1
@@ -271,7 +278,6 @@ class Metrics:
             totals.decode_seconds += decode
             totals.decode_tokens += meter.completion_tokens - 1
         self._requests.append(_measure(live, state))
-        self._live = None
         self._publish()
 
     def beat(self) -> None:
@@ -281,12 +287,16 @@ class Metrics:
         rate and acceptance all land between the two. Without a beat a reader watching a
         generation is shown its totals once it is over.
         """
-        if self._live is not None:
+        if self._live:
             self._publish()
 
     def snapshot(self) -> Snapshot:
         return Snapshot(
-            live=None if self._live is None else _measure(self._live, "running"),
+            live=(
+                None
+                if not self._live
+                else _measure(self._live[max(self._live)], "running")
+            ),
             requests=list(reversed(self._requests)),
             models=[_aggregate(model, totals) for model, totals in self._totals.items()],
         )

@@ -136,6 +136,22 @@ def test_matches_gather_qmm() -> None:
     assert_matches(fused, swiglu_reference(x, leaf, selected(keys)))
 
 
+def test_small_row_batch_matches_gather_qmm() -> None:
+    leaf = paired_leaf(seed=9)
+    strategy = build(leaf)
+    assert strategy is not None
+    x = mx.random.normal((2, HIDDEN)).astype(mx.bfloat16)
+    keys = [shuffled_keys(seed=10), shuffled_keys(seed=11)]
+
+    fused = strategy(x, mx.array(keys, dtype=mx.uint32))
+    expected = mx.stack(
+        [swiglu_reference(x[index], leaf, selected(keys[index])) for index in range(2)]
+    )
+
+    assert fused.shape == (2, TOPK, INNER)
+    assert_matches(fused, expected)
+
+
 def test_ties_resolve_to_the_lower_expert_index() -> None:
     leaf = paired_leaf(seed=2)
     strategy = build(leaf)

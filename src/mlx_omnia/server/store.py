@@ -59,6 +59,7 @@ class ModelSettings:
 
     model: str
     features: str = "{}"
+    max_concurrent_requests: int | None = None
 
 
 @dataclass(frozen=True)
@@ -557,6 +558,10 @@ CREATE INDEX prefix_cache_lru ON prefix_cache(used_at);
 CREATE INDEX prefix_cache_model ON prefix_cache(model, tokens DESC);
 """
 
+_SCHEMA_V8 = """
+ALTER TABLE model_settings ADD COLUMN max_concurrent_requests INTEGER;
+"""
+
 _MIGRATIONS: tuple[str, ...] = (
     _SCHEMA_V1,
     _SCHEMA_V2,
@@ -565,6 +570,7 @@ _MIGRATIONS: tuple[str, ...] = (
     _SCHEMA_V5,
     _SCHEMA_V6,
     _SCHEMA_V7,
+    _SCHEMA_V8,
 )
 
 SCHEMA_VERSION = len(_MIGRATIONS)
@@ -589,6 +595,10 @@ def _integer(value: object) -> int:
     if not isinstance(value, int):
         raise TypeError(f"expected INTEGER, got {value!r}")
     return value
+
+
+def _optional_integer(value: object) -> int | None:
+    return None if value is None else _integer(value)
 
 
 def _text(value: object) -> str:
@@ -998,15 +1008,22 @@ class Store:
         the caller should not have to tell the two apart."""
         with self._connect() as connection:
             row: tuple[object, ...] | None = connection.execute(
-                "SELECT model, features FROM model_settings WHERE model = ?", (model,)
+                "SELECT model, features, max_concurrent_requests"
+                " FROM model_settings WHERE model = ?",
+                (model,),
             ).fetchone()
-        return ModelSettings(model) if row is None else ModelSettings(_text(row[0]), _text(row[1]))
+        return (
+            ModelSettings(model)
+            if row is None
+            else ModelSettings(_text(row[0]), _text(row[1]), _optional_integer(row[2]))
+        )
 
     def save_model_settings(self, settings: ModelSettings) -> None:
         with self._connect() as connection:
             connection.execute(
-                "INSERT OR REPLACE INTO model_settings (model, features) VALUES (?, ?)",
-                (settings.model, settings.features),
+                "INSERT OR REPLACE INTO model_settings"
+                " (model, features, max_concurrent_requests) VALUES (?, ?, ?)",
+                (settings.model, settings.features, settings.max_concurrent_requests),
             )
 
     def delete_profile(self, model: str, name: str) -> bool:

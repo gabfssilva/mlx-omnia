@@ -14,6 +14,7 @@ from mlx_omnia.server.store import (
     SCHEMA_VERSION,
     Bench,
     JobRecord,
+    ModelSettings,
     Profile,
     QualityResult,
     ReferenceCache,
@@ -325,10 +326,18 @@ def test_the_benchmark_migration_takes_a_file_at_the_previous_head(tmp_path: Pat
     database = Store(path)
 
     assert user_version(path) == SCHEMA_VERSION
-    assert SCHEMA_VERSION == 7
+    assert SCHEMA_VERSION == 8
     assert database.config() == {"port": "8642"}
     assert {"benchmark_runs", "benchmark_speed", "benchmark_datasets"} <= table_names(path)
     assert "prefix_cache" in table_names(path)
+
+
+def test_model_settings_keep_the_concurrency_override(tmp_path: Path) -> None:
+    database = Store(tmp_path / "server.db")
+
+    database.save_model_settings(ModelSettings("m", max_concurrent_requests=3))
+
+    assert database.model_settings("m").max_concurrent_requests == 3
 
 
 def test_the_features_migration_leaves_a_profile_written_before_it_unchanged(

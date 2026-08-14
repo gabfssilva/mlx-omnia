@@ -142,3 +142,16 @@ def test_output_shape_follows_the_input() -> None:
     x = mx.random.normal((KDIM,)).astype(mx.bfloat16)
 
     assert nvfp4_qmv(x, weight, scales, bank).shape == (ROWS,)
+
+
+@pytest.mark.parametrize("batch", [2, 4])
+def test_small_row_batch_matches_quantized_matmul(batch: int) -> None:
+    weight = codes(ROWS, KDIM, seed=8)
+    scales = fitting_plane(ROWS, KDIM // GROUP, seed=9)
+    bank = lane_major_scales(scales)
+    x = mx.random.normal((batch, 1, KDIM)).astype(mx.bfloat16)
+
+    ours = nvfp4_qmv(x, weight, scales, bank)
+
+    assert ours.shape == (batch, 1, ROWS)
+    assert relative_diff(ours, reference(x, weight, scales)) < BF16_FLOOR

@@ -11,12 +11,13 @@ import mlx.core as mx
 from mlx_omnia.engine.core.kernels.conv_step.default import DefaultConvStep
 from mlx_omnia.engine.core.kernels.conv_step.fused import FusedConvStep
 from mlx_omnia.engine.core.kernels.conv_step.kernel import ConvStepStrategy
+from mlx_omnia.engine.core.kernels.resolve import resolve
 
 __all__ = ["ConvStep", "ConvStepStrategy", "DefaultConvStep", "FusedConvStep"]
 
-# Order is preference: the first build that returns an instance wins; the default
-# accepts everything, so resolution never fails.
-_BUILDS = (FusedConvStep.build, DefaultConvStep.build)
+# Order is preference: the first strategy that builds wins; the default accepts
+# everything, so resolution never fails.
+_STRATEGIES = (FusedConvStep, DefaultConvStep)
 
 
 class ConvStep:
@@ -31,13 +32,12 @@ class ConvStep:
         conv_dim: int,
         kernel: int,
     ) -> None:
-        self.strategy: ConvStepStrategy = next(
-            built
-            for build in _BUILDS
-            if (
-                built := build(taps=taps, bias=bias, conv_dim=conv_dim, kernel=kernel)
-            )
-            is not None
+        self.strategy: ConvStepStrategy = resolve(
+            _STRATEGIES,
+            taps=taps,
+            bias=bias,
+            conv_dim=conv_dim,
+            kernel=kernel,
         )
 
     def __call__(self, x: mx.array, window: mx.array) -> tuple[mx.array, mx.array]:

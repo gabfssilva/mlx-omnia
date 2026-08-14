@@ -19,10 +19,9 @@ change starts counting:
 - `restart` — the process fixed it when it came up. The port is the whole of this one: `main`
   reads it here when no `--port` says otherwise, and the socket is bound before anything is
   served.
-- `inert` — kept, and acted on by nothing, which the note beside it has to say. Two fields:
-  `max_concurrent_requests`, whose queue serializes generation at effective depth 1 (decision
-  4, `engine.running` is 0 or 1) until continuous batching (A15); and `catalog_directory`,
-  which a restart would not honour either — the scan reads `catalog.HUB_CACHE` while the
+- `inert` — kept, and acted on by nothing, which the note beside it has to say.
+  `catalog_directory` is of this kind: a restart would not honour it either — the scan reads
+  `catalog.HUB_CACHE` while the
   loader resolves through `huggingface_hub`'s own constant, fixed from the environment at
   import. An API answering `applied` or `restart` for either would be telling the user the
   opposite of what happens while taking the value in silence.
@@ -170,7 +169,7 @@ class ConfigPatch(BaseModel):
 _EFFECTS: dict[str, Effect] = {
     "memory_limit_bytes": "applied",
     "idle_ttl_seconds": "applied",
-    "max_concurrent_requests": "inert",
+    "max_concurrent_requests": "applied",
     # Read per request in `Engine.submit` and carried into the model, which rebuilds its trie
     # when the number moves — so a PATCH counts for the next request on a model already up.
     "prefix_cache_bytes": "applied",
@@ -191,11 +190,6 @@ _NOTES: dict[str, str] = {
         " `catalog.HUB_CACHE` while the loader resolves a checkpoint through"
         " `huggingface_hub`'s own constant, which is fixed from the environment at import."
         " Pointing this elsewhere would list checkpoints the daemon then cannot open."
-    ),
-    "max_concurrent_requests": (
-        "Kept, not honoured: the FCFS queue serializes generation at effective depth 1, so"
-        " two requests take turns whatever this says. It starts counting with continuous"
-        " batching."
     ),
 }
 

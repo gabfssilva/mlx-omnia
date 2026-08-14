@@ -11,6 +11,7 @@ import mlx.core as mx
 from mlx_omnia.engine.core.kernels.hyper_connection.default import DefaultHyperConnection
 from mlx_omnia.engine.core.kernels.hyper_connection.fused import FusedHyperConnection
 from mlx_omnia.engine.core.kernels.hyper_connection.kernel import HyperConnectionStrategy
+from mlx_omnia.engine.core.kernels.resolve import resolve
 
 __all__ = [
     "DefaultHyperConnection",
@@ -19,9 +20,9 @@ __all__ = [
     "HyperConnectionStrategy",
 ]
 
-# Order is preference: the first build that returns an instance wins; the default
-# accepts everything, so resolution never fails.
-_BUILDS = (FusedHyperConnection.build, DefaultHyperConnection.build)
+# Order is preference: the first strategy that builds wins; the default accepts
+# everything, so resolution never fails.
+_STRATEGIES = (FusedHyperConnection, DefaultHyperConnection)
 
 
 class HyperConnection:
@@ -31,19 +32,13 @@ class HyperConnection:
     def __init__(
         self, *, hc_mult: int, hidden: int, iters: int, eps: float, norm_eps: float
     ) -> None:
-        self.strategy: HyperConnectionStrategy = next(
-            built
-            for build in _BUILDS
-            if (
-                built := build(
-                    hc_mult=hc_mult,
-                    hidden=hidden,
-                    iters=iters,
-                    eps=eps,
-                    norm_eps=norm_eps,
-                )
-            )
-            is not None
+        self.strategy: HyperConnectionStrategy = resolve(
+            _STRATEGIES,
+            hc_mult=hc_mult,
+            hidden=hidden,
+            iters=iters,
+            eps=eps,
+            norm_eps=norm_eps,
         )
 
     def __call__(

@@ -1,8 +1,25 @@
+import SwiftUI
 import XCTest
 @testable import OmniaPanel
 
 @MainActor
 final class ChatTests: XCTestCase {
+    func testTranscriptTracksWhetherItsScrollIsAtTheEnd() {
+        let body = String(reflecting: Transcript(app: AppModel(), openHistory: {}).body)
+
+        XCTAssertTrue(body.contains("ScrollGeometry"))
+    }
+
+    func testExpandedThinkingControlsItsOwnScrollPosition() {
+        var turn = Turn(role: "assistant")
+        turn.reasoning = "Reasoning"
+
+        let body = String(reflecting: Thinking(turn: turn).body)
+
+        XCTAssertTrue(body.contains("ScrollView"))
+        XCTAssertTrue(body.contains("ScrollViewReader"))
+    }
+
     func testLoadReceiptBelongsOnlyToPrecedingUserTurn() {
         var answer = Turn(role: "assistant")
         answer.timings = Timings(

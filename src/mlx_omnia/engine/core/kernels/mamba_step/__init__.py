@@ -12,12 +12,13 @@ import mlx.core as mx
 from mlx_omnia.engine.core.kernels.mamba_step.default import DefaultMambaStep
 from mlx_omnia.engine.core.kernels.mamba_step.fused import FusedMambaStep
 from mlx_omnia.engine.core.kernels.mamba_step.kernel import MambaStepStrategy
+from mlx_omnia.engine.core.kernels.resolve import resolve
 
 __all__ = ["DefaultMambaStep", "FusedMambaStep", "MambaStep", "MambaStepStrategy"]
 
-# Order is preference: the first build that returns an instance wins; the default
-# accepts everything, so resolution never fails.
-_BUILDS = (FusedMambaStep.build, DefaultMambaStep.build)
+# Order is preference: the first strategy that builds wins; the default accepts
+# everything, so resolution never fails.
+_STRATEGIES = (FusedMambaStep, DefaultMambaStep)
 
 
 class MambaStep:
@@ -43,29 +44,23 @@ class MambaStep:
         state_size: int,
         time_step_limit: tuple[float, float],
     ) -> None:
-        self.strategy: MambaStepStrategy = next(
-            built
-            for build in _BUILDS
-            if (
-                built := build(
-                    taps=taps,
-                    conv_bias=conv_bias,
-                    A_log=A_log,
-                    D=D,
-                    dt_bias=dt_bias,
-                    norm_weight=norm_weight,
-                    eps=eps,
-                    inner=inner,
-                    conv_dim=conv_dim,
-                    kernel=kernel,
-                    heads=heads,
-                    head_dim=head_dim,
-                    groups=groups,
-                    state_size=state_size,
-                    time_step_limit=time_step_limit,
-                )
-            )
-            is not None
+        self.strategy: MambaStepStrategy = resolve(
+            _STRATEGIES,
+            taps=taps,
+            conv_bias=conv_bias,
+            A_log=A_log,
+            D=D,
+            dt_bias=dt_bias,
+            norm_weight=norm_weight,
+            eps=eps,
+            inner=inner,
+            conv_dim=conv_dim,
+            kernel=kernel,
+            heads=heads,
+            head_dim=head_dim,
+            groups=groups,
+            state_size=state_size,
+            time_step_limit=time_step_limit,
         )
 
     def __call__(

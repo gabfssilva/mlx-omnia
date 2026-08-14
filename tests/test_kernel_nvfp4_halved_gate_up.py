@@ -85,6 +85,19 @@ def test_matches_gather_qmm() -> None:
     assert_matches(fused, swiglu_reference(x, weight, scales))
 
 
+def test_small_row_batch_matches_gather_qmm() -> None:
+    weight, scales = quantized_paired((2 * INNER, HIDDEN), seed=6)
+    halved = halve_gate_up_scales(scales)
+    assert halved is not None
+    x = mx.random.normal((2, HIDDEN)).astype(mx.bfloat16)
+
+    fused = nvfp4_halved_gate_up(x, weight, halved)
+    expected = mx.stack([swiglu_reference(row, weight, scales) for row in x])
+
+    assert fused.shape == (2, INNER)
+    assert_matches(fused, expected)
+
+
 def test_patch_header_restores_the_two_unequal_spans() -> None:
     """Gate row 0 and up row 0 are the spans mlx's quantizer writes twice; their odd byte
     lives in the header and lane 1 of each reads it from there."""

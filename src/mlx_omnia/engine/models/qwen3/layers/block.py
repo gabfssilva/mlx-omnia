@@ -1,7 +1,7 @@
 import mlx.core as mx
 import mlx.nn as nn
 
-from mlx_omnia.engine.core.cache import KVCache
+from mlx_omnia.engine.core.attend import KVStore
 from mlx_omnia.engine.core.kernels.add_norm import AddRmsNorm
 from mlx_omnia.engine.core.layers import SwiGLU
 from mlx_omnia.engine.models.qwen3.config import Qwen3Config, Qwen3MoEConfig
@@ -18,7 +18,7 @@ class Qwen3Block(nn.Module):
         self.input_layernorm = nn.RMSNorm(config.hidden_size, eps=config.rms_norm_eps)
         self.post_attention_layernorm = nn.RMSNorm(config.hidden_size, eps=config.rms_norm_eps)
 
-    def __call__(self, x: mx.array, cache: KVCache) -> mx.array:
+    def __call__(self, x: mx.array, cache: KVStore) -> mx.array:
         attended = x + self.self_attn(self.input_layernorm(x), cache)
         return attended + self.mlp(self.post_attention_layernorm(attended))
 
@@ -33,9 +33,9 @@ class Qwen3MoEBlock(nn.Module):
         self.eps = config.rms_norm_eps
         self._add_norm: AddRmsNorm | None = None
 
-    def __call__(self, x: mx.array, cache: KVCache) -> mx.array:
+    def __call__(self, x: mx.array, cache: KVStore) -> mx.array:
         attended, h = self._join(x, cache)
-        if x.shape[1] == 1:
+        if x.shape[0] == 1 and x.shape[1] == 1:
             return self.mlp.step(h, attended)
         return attended + self.mlp(h)
 
@@ -48,9 +48,9 @@ class Qwen3MoEBlock(nn.Module):
             self._add_norm = add_norm
         return add_norm
 
-    def _join(self, x: mx.array, cache: KVCache) -> tuple[mx.array, mx.array]:
+    def _join(self, x: mx.array, cache: KVStore) -> tuple[mx.array, mx.array]:
         """(x + attention, its post-norm). At T=1 one kernel does the pair."""
-        if flags.ADD_RMS_NORM_KERNEL and x.shape[1] == 1:
+        if flags.ADD_RMS_NORM_KERNEL and x.shape[0] == 1 and x.shape[1] == 1:
             normed = mx.fast.rms_norm(x, self.input_layernorm.weight, self.eps)
             return self._kernels()(x, self.self_attn(normed, cache))
         attended = x + self.self_attn(self.input_layernorm(x), cache)

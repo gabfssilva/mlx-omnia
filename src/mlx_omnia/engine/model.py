@@ -184,17 +184,19 @@ class CompositeModel[N: ModelInput, O, Options]:
         capability = self._capabilities.get(input.content_type)
         return capability is not None and capability.accepts(input)
 
-    def stream(self, input: ModelInput, options: Options) -> Iterator[O]:
+    def prepare(self, input: ModelInput) -> N:
+        """Resolve native input directly or through one registered capability."""
         if self.model.accepts(input):
-            return self.model.stream(input, options)
-
+            return input
         if not isinstance(input, AtomicInput):
             raise UnsupportedInput(input)
         capability = self._capabilities.get(input.content_type)
         if capability is None or not capability.accepts(input):
             raise UnsupportedInput(input)
-
         prepared = capability.prepare(input)
         if not self.model.accepts(prepared):
             raise InvalidCapabilityOutput(capability.input_type, prepared.content_type)
-        return self.model.stream(prepared, options)
+        return prepared
+
+    def stream(self, input: ModelInput, options: Options) -> Iterator[O]:
+        return self.model.stream(self.prepare(input), options)

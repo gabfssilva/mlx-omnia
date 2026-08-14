@@ -11,9 +11,8 @@ sides construct their arm the same way and only the code under test differs. The
 is a constraint worth stating: the baseline ref has to be source-compatible with this
 environment, because `build` can only call an API that both sides have.
 
-A round is rejected and retried once when the loaded clock dropped below the floor while it
-ran. Twice is not a usable session — the machine is throttling under something this bench does
-not control, and a number taken there is not comparable to one taken cool.
+A round is rejected and retried when the loaded clock dropped below the floor while it ran,
+up to the configured retry limit. Only a round measured at or above the floor is kept.
 """
 
 import importlib
@@ -40,6 +39,7 @@ class Payload(TypedDict):
     runs: int
     gated: bool
     floor_mhz: int
+    max_throttled_retries: int
     out: str
 
 
@@ -80,9 +80,11 @@ def measure(arm: Arm, payload: Payload) -> Result:
     clocks = Clocks(path) if path is not None else None
     samples: list[Sample] = []
     measured: list[int | None] = []
+    max_retries = max(1, payload["max_throttled_retries"])
     try:
         for index in range(payload["runs"]):
-            for attempt in (1, 2):
+            retries = 0
+            while True:
                 gate.wait()
                 start = time.time()
                 sample = arm.timed(prompt, script)
@@ -92,12 +94,13 @@ def measure(arm: Arm, payload: Payload) -> Result:
                     samples.append(sample)
                     measured.append(mhz)
                     break
-                if attempt == 2:
+                if retries >= max_retries:
                     raise Throttled(
-                        f"round {index + 1} throttled twice (min loaded clock {mhz} MHz <"
-                        f" {payload['floor_mhz']}); not a usable session"
+                        f"round {index + 1} throttled {retries + 1} times"
+                        f" (min loaded clock {mhz} MHz < {payload['floor_mhz']})"
                     )
-                stderr(f"round {index + 1} throttled ({mhz} MHz), one gated retry")
+                retries += 1
+                stderr(f"round {index + 1} throttled ({mhz} MHz), retrying after gate")
     finally:
         if clocks is not None:
             clocks.stop()

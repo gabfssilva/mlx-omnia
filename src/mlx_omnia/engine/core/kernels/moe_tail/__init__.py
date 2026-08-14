@@ -12,6 +12,7 @@ import mlx.core as mx
 from mlx_omnia.engine.core.kernels.moe_tail.default import DefaultMoeTail
 from mlx_omnia.engine.core.kernels.moe_tail.kernel import MoeTailStrategy
 from mlx_omnia.engine.core.kernels.moe_tail.sorted import SortedMoeTail
+from mlx_omnia.engine.core.kernels.resolve import resolve
 
 __all__ = [
     "DefaultMoeTail",
@@ -20,9 +21,9 @@ __all__ = [
     "SortedMoeTail",
 ]
 
-# Order is preference: the first build that returns an instance wins; the default
-# accepts everything, so resolution never fails.
-_BUILDS = (SortedMoeTail.build, DefaultMoeTail.build)
+# Order is preference: the first strategy that builds wins; the default accepts
+# everything, so resolution never fails.
+_STRATEGIES = (SortedMoeTail, DefaultMoeTail)
 
 
 class MoeTail:
@@ -30,9 +31,7 @@ class MoeTail:
     `MoeTailStrategy`."""
 
     def __init__(self, *, hidden: int) -> None:
-        self.strategy: MoeTailStrategy = next(
-            built for build in _BUILDS if (built := build(hidden=hidden)) is not None
-        )
+        self.strategy: MoeTailStrategy = resolve(_STRATEGIES, hidden=hidden)
 
     def __call__(
         self,

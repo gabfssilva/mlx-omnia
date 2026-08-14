@@ -1,4 +1,5 @@
-from collections.abc import Collection, Iterable, Iterator
+import codecs
+from collections.abc import Collection, Iterable, Iterator, Sequence
 from dataclasses import dataclass, field
 from itertools import chain
 from typing import Any, Protocol, TypeIs, runtime_checkable
@@ -6,7 +7,15 @@ from typing import Any, Protocol, TypeIs, runtime_checkable
 import mlx.core as mx
 import mlx.nn as nn
 
-from mlx_omnia.engine.core.cache import LayerCache
+from mlx_omnia.engine.batching import (
+    BatchModel,
+    BatchSequence,
+    prepare_batch_sequence,
+)
+from mlx_omnia.engine.batching import (
+    step as batch_step,
+)
+from mlx_omnia.engine.core.cache import KVCache, LayerCache
 from mlx_omnia.engine.core.prompt_cache import Budget, PromptCache, Spill
 from mlx_omnia.engine.generate import (
     BlockOutputs,
@@ -30,7 +39,7 @@ from mlx_omnia.engine.model import (
     ModelSignature,
     Wrapping,
 )
-from mlx_omnia.engine.parsers import REASONING, Parser, Segment, opened
+from mlx_omnia.engine.parsers import FALLBACK, REASONING, Parser, Segment, Segmenter, opened
 from mlx_omnia.engine.speculative import Chained, Speculable, Step
 
 TEXT = ContentType(Modality.TEXT, "text/plain")
@@ -294,6 +303,51 @@ def prefix_cache[C: LayerCache](
     return PromptCache(budget, spill)
 
 
+@dataclass
+class TextBatch:
+    """Incremental text and parser state for one batched generation."""
+
+    state: BatchSequence
+    tokenizer: Tokenizer
+    decoder: codecs.IncrementalDecoder
+    segmenter: Segmenter
+    prefix: PromptCache[KVCache] | None = None
+    closed: bool = False
+
+    def push(self, token: int) -> tuple[Segment, ...]:
+        piece = self.decoder.decode(self.tokenizer.decode_bytes([token]))
+        return () if not piece else self.segmenter.push(piece)
+
+    def finish(self) -> tuple[Segment, ...]:
+        if self.closed:
+            return ()
+        self.closed = True
+        tail = self.decoder.decode(b"", final=True)
+        pieces = (*(() if not tail else self.segmenter.push(tail)), *self.segmenter.flush())
+        if self.prefix is not None:
+            mx.eval([tensor for layer in self.state.cache for tensor in layer.tensors])
+            self.prefix.insert(
+                self.state.tokens,
+                self.state.cache,
+                role="assistant",
+                nbytes=sum(layer.nbytes for layer in self.state.cache),
+            )
+        if self.state.meter is not None:
+            self.state.meter.kept_prefix = self.prefix is not None
+        return pieces
+
+
+@runtime_checkable
+class ContinuousLanguageModel(Protocol):
+    def can_batch(self, options: GenerationOptions) -> bool: ...
+
+    def prepare_batch(
+        self, input: ModelInput, options: GenerationOptions
+    ) -> TextBatch | None: ...
+
+    def step_batch(self, sequences: Sequence[TextBatch]) -> list[tuple[Segment, ...]]: ...
+
+
 class TextLanguageModel[C: LayerCache]:
     def __init__(
         self,
@@ -315,6 +369,7 @@ class TextLanguageModel[C: LayerCache]:
         weigh it: with an MTP head the two are one checkpoint on disk and still two trees
         here, and only one of them is under `self.model`."""
         self._block: int | None = None
+        self.batch_prefix: PromptCache[KVCache] | None = None
 
     @property
     def native_signature(self) -> ModelSignature:
@@ -376,6 +431,80 @@ class TextLanguageModel[C: LayerCache]:
         # `-1`: the step conditions on the trunk's last block, and `block_outputs` indexes the
         # list Python's way. A trunk that grows a layer still taps the right one.
         return Chained(self.model, drafter, block=self._block, tap=-1)
+
+    def can_batch(self, options: GenerationOptions) -> bool:
+        return (
+            isinstance(self.model, BatchModel)
+            and self._proposer(options) is None
+            and options.reasoning_budget is None
+        )
+
+    def prepare_batch(self, input: ModelInput, options: GenerationOptions) -> TextBatch | None:
+        """Prepare a text request for continuous batching when its trunk supports it."""
+        model = self.model
+        if (
+            not isinstance(input, Text)
+            or not isinstance(model, BatchModel)
+            or not self.can_batch(options)
+        ):
+            return None
+        prompt = input.read()
+        encoded = list(self.tokenizer.encode(prompt))
+        budget = options.max_tokens
+        if options.context_limit is not None:
+            budget = min(budget, max(0, options.context_limit - len(encoded)))
+        self.batch_prefix = prefix_cache(
+            self.batch_prefix, options.prefix_budget, options.prefix_spill
+        )
+        cache = model.make_cache()
+        reuse = (
+            None
+            if self.batch_prefix is None
+            else self.batch_prefix.take(encoded, into=cache)
+        )
+        if reuse is not None:
+            cache = reuse.caches
+        state = prepare_batch_sequence(
+            model,
+            encoded,
+            max_tokens=budget,
+            sampler=options.sampler,
+            stop=self.stop if options.stop is None else options.stop,
+            penalty=options.penalty,
+            constraint=options.constraint,
+            meter=options.meter,
+            cache=cache,
+            reused=0 if reuse is None else reuse.length,
+        )
+        return TextBatch(
+            state,
+            self.tokenizer,
+            codecs.getincrementaldecoder("utf-8")("replace"),
+            Segmenter(FALLBACK if input.parser is None else input.parser, prompt=prompt),
+            self.batch_prefix,
+        )
+
+    def step_batch(self, sequences: Sequence[TextBatch]) -> list[tuple[Segment, ...]]:
+        """Advance text requests through one shared decode forward."""
+        model = self.model
+        if not isinstance(model, BatchModel):
+            raise TypeError(f"{type(model).__name__} does not support continuous batching")
+        active = [index for index, sequence in enumerate(sequences) if not sequence.state.finished]
+        tokens: list[int | None] = [None] * len(sequences)
+        advanced = (
+            batch_step(model, [sequences[index].state for index in active])
+            if active
+            else []
+        )
+        for index, token in zip(active, advanced, strict=True):
+            tokens[index] = token
+        return [
+            (
+                *(() if token is None else sequence.push(token)),
+                *(() if not sequence.state.finished else sequence.finish()),
+            )
+            for sequence, token in zip(sequences, tokens, strict=True)
+        ]
 
     def stream(self, input: Text, options: GenerationOptions) -> Iterator[Segment]:
         self.prefix = prefix_cache(self.prefix, options.prefix_budget, options.prefix_spill)

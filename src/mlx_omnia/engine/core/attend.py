@@ -18,6 +18,8 @@ import mlx.core as mx
 
 from mlx_omnia.engine.core.cache import FixedKVCache, KVCache, RingKVCache
 
+__all__ = ["Attending", "AttentionMask", "KVStore", "attend"]
+
 type AttentionMask = mx.array | str | None
 
 type Storing = KVCache | FixedKVCache | RingKVCache
@@ -34,6 +36,8 @@ class Attending(Protocol):
     the new rows land in.
     """
 
+    offset: int | mx.array
+
     def attend(
         self,
         queries: mx.array,
@@ -45,8 +49,11 @@ class Attending(Protocol):
     ) -> mx.array: ...
 
 
+type KVStore = Storing | Attending
+
+
 def attend(
-    cache: Storing | Attending | None,
+    cache: KVStore | None,
     queries: mx.array,
     *,
     keys: mx.array,

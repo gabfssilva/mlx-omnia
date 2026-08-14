@@ -26,6 +26,7 @@ from mlx_omnia.bench.gate import Cool
 from mlx_omnia.bench.paired import Side, git, git_root, paired, worktree
 from mlx_omnia.bench.prompt import BENCH_PROMPT, tile
 from mlx_omnia.bench.report import Calibration, stderr
+from mlx_omnia.engine.batching import BatchModel
 
 CALIBRATION = Path.home() / ".cache/mlx_omnia/selfpair.json"
 """Still the file the script this replaced wrote: renaming it would throw away every stored
@@ -192,9 +193,35 @@ def run_paired(args: argparse.Namespace) -> None:
             floor=args.floor,
             gated=_gated(args),
             floor_mhz=args.floor_mhz,
+            max_throttled_retries=args.max_throttled_retries,
             calibration=Calibration(CALIBRATION),
             key=f"{args.model}@{commit[:12]}",
         )
+    print(result.render())
+    if args.json is not None:
+        Path(args.json).write_text(json.dumps(result.as_dict(), indent=2))
+
+
+def run_concurrency(args: argparse.Namespace) -> None:
+    known = omnia.resolve(args.model)
+    ids = _prompt(known, args.prompt_tokens, args.tokens)
+    model = omnia.loaded(
+        known.repo,
+        patterns=known.patterns,
+        dtype=known.dtype,
+        tokens=args.tokens,
+    ).model
+    if not isinstance(model, BatchModel):
+        raise ValueError(f"{args.model} does not support continuous batching")
+    gate = default_gate() if _gated(args) else Cool(None)
+    result = omnia.measure_concurrency(
+        model,
+        ids,
+        concurrencies=args.concurrencies,
+        tokens=args.tokens,
+        runs=args.runs,
+        gate=gate,
+    )
     print(result.render())
     if args.json is not None:
         Path(args.json).write_text(json.dumps(result.as_dict(), indent=2))
@@ -231,7 +258,17 @@ def parser() -> argparse.ArgumentParser:
     two.add_argument(
         "--floor-mhz", type=int, default=int(os.environ.get("OMNIA_GPU_MIN_MHZ", 1300))
     )
+    two.add_argument("--max-throttled-retries", type=int, default=20)
     two.set_defaults(run=run_paired)
+
+    concurrent = commands.add_parser(
+        "concurrency", help="continuous batching at multiple concurrent request counts"
+    )
+    shared(concurrent)
+    concurrent.add_argument(
+        "--concurrencies", type=int, nargs="+", default=[1, 2, 4, 8]
+    )
+    concurrent.set_defaults(run=run_concurrency)
 
     # No `--against` and no `--json`: both arms are this engine, and what this prints beyond
     # the comparison — the mask and accept microseconds — has no place in the shared shape.

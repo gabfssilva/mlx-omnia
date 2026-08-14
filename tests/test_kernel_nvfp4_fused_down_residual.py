@@ -151,6 +151,30 @@ def test_matches_gather_qmm_composition() -> None:
     assert_matches(fused, combine_reference(routed, unrouted, weights[:TOPK], residual))
 
 
+def test_small_row_batch_matches_gather_qmm_composition() -> None:
+    leaf = paired_leaf(seed=8)
+    shared = paired_shared(seed=9)
+    strategy = build(leaf, shared)
+    assert strategy is not None
+    rows = [inputs(seed=10 + index, experts=[0, 2, 5, 7]) for index in range(2)]
+    act = mx.stack([row[0] for row in rows])
+    chosen = mx.stack([row[1] for row in rows])
+    weights = mx.stack([row[2] for row in rows])
+    residual = mx.stack([row[3] for row in rows])
+
+    fused = strategy(act, chosen, weights, residual)
+    expected = []
+    for row_act, row_chosen, row_weights, row_residual in rows:
+        routed = down_reference(row_act[:TOPK], leaf, row_chosen[:TOPK]).astype(mx.bfloat16)
+        unrouted = shared_reference(row_act[TOPK], shared).astype(mx.bfloat16)
+        expected.append(
+            combine_reference(routed, unrouted, row_weights[:TOPK], row_residual)
+        )
+
+    assert fused.shape == (2, HIDDEN)
+    assert_matches(fused, mx.stack(expected))
+
+
 def test_patch_header_restores_the_first_span() -> None:
     """Row 0 of the first expert is the one span mlx's quantizer writes twice; its odd byte
     lives in the header, for the routed plane and the unrouted one alike."""

@@ -17,6 +17,7 @@ import mlx.core as mx
 from mlx_omnia.engine.core.kernels.lm_head.argmax import ArgmaxGreedyHead
 from mlx_omnia.engine.core.kernels.lm_head.default import DefaultGreedyHead
 from mlx_omnia.engine.core.kernels.lm_head.kernel import GreedyHeadStrategy, HeadProjection
+from mlx_omnia.engine.core.kernels.resolve import resolve
 
 __all__ = [
     "ArgmaxGreedyHead",
@@ -26,9 +27,9 @@ __all__ = [
     "HeadProjection",
 ]
 
-# Order is preference: the first build that returns an instance wins; the default
-# accepts everything, so resolution never fails.
-_BUILDS = (ArgmaxGreedyHead.build, DefaultGreedyHead.build)
+# Order is preference: the first strategy that builds wins; the default accepts
+# everything, so resolution never fails.
+_STRATEGIES = (ArgmaxGreedyHead, DefaultGreedyHead)
 
 
 class GreedyHead:
@@ -42,10 +43,11 @@ class GreedyHead:
         weight: mx.array | None = None,
         refine: bool = True,
     ) -> None:
-        self.strategy: GreedyHeadStrategy = next(
-            built
-            for build in _BUILDS
-            if (built := build(projection, weight=weight, refine=refine)) is not None
+        self.strategy: GreedyHeadStrategy = resolve(
+            _STRATEGIES,
+            projection,
+            weight=weight,
+            refine=refine,
         )
 
     def __call__(self, x: mx.array) -> mx.array:

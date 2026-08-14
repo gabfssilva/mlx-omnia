@@ -32,20 +32,25 @@ _BITS = 8
 _SOURCE = """
 constexpr uint K=(uint)AXIS,GS=(uint)GROUP,V=8;
 constexpr uint BK=V*32,R=4,NS=2,KG=K/GS,SS=GS/V;
+constexpr uint OUT=(uint)OUT_VEC;
 uint tile=threadgroup_position_in_grid.x;
 uint sg=simdgroup_index_in_threadgroup;
 uint lane=thread_index_in_simdgroup;
-uint orow=tile*(NS*R)+sg*R;
+uint rows_per_tile=NS*R;
+uint tiles_per_input=OUT/rows_per_tile;
+uint input_row=tile/tiles_per_input;
+uint orow=(tile%tiles_per_input)*rows_per_tile+sg*R;
 const device uint8_t* ws=(const device uint8_t*)packed_codes+orow*K+lane*V;
 const device bfloat* sc=scales+orow*KG+lane/SS;
 const device bfloat* bs=biases+orow*KG+lane/SS;
 thread float x[V];
 thread float r[R]={0.0f,0.0f,0.0f,0.0f};
 uint col=lane*V;
+const device bfloat* xp=input+input_row*K;
 for(uint k=0;k<K;k+=BK){
     float sum=0.0f;
     for(uint i=0;i<V;++i){
-        x[i]=float(input[col+i]);
+        x[i]=float(xp[col+i]);
         sum+=x[i];
     }
     for(uint row=0;row<R;++row){
@@ -67,7 +72,7 @@ for(uint row=0;row<R;++row){
             float lo=metal::min(l,0.0f);
             g=(metal::isinf(lo)||metal::isinf(hi))?hi:hi+log1p(metal::exp(lo-hi));
         }
-        gate_values[orow+row]=bfloat(g);
+        gate_values[input_row*OUT+orow+row]=bfloat(g);
     }
 }
 """
@@ -111,14 +116,15 @@ def gate_softplus(
     as [..., rows] bf16."""
     kdim = weight.shape[-1] * 4
     rows = weight.shape[-2]
-    assert x.size == kdim
+    input_rows = x.size // kdim
+    assert x.shape[-1] == kdim
     assert scales.dtype == mx.bfloat16 and biases.dtype == mx.bfloat16
     assert gate_softplus_applies(kdim, rows, group_size=group_size, bits=_BITS)
     assert scales.shape == (rows, kdim // group_size) and biases.shape == scales.shape
     return _KERNEL(
         inputs=[x, weight, scales, biases],
-        template=[("AXIS", kdim), ("GROUP", group_size)],
-        grid=((rows // _ROWS_PER_THREADGROUP) * 64, 1, 1),
+        template=[("AXIS", kdim), ("GROUP", group_size), ("OUT_VEC", rows)],
+        grid=(input_rows * (rows // _ROWS_PER_THREADGROUP) * 64, 1, 1),
         threadgroup=(64, 1, 1),
         output_shapes=[(*x.shape[:-1], rows)],
         output_dtypes=[mx.bfloat16],

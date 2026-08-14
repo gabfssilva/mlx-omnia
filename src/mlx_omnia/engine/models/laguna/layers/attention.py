@@ -1,11 +1,15 @@
 import math
+import weakref
 from typing import NamedTuple
 
 import mlx.core as mx
 import mlx.nn as nn
 
+from mlx_omnia.engine.core.attend import Attending, KVStore, attend
 from mlx_omnia.engine.core.kernels.attention import AttentionCache, AttentionStep
+from mlx_omnia.engine.core.kernels.attention.default import rotate
 from mlx_omnia.engine.core.kernels.qmv import Qmv
+from mlx_omnia.engine.core.layers import split_qkv
 from mlx_omnia.engine.models.laguna.config import SLIDING, LagunaConfig, LagunaYaRNScaling
 
 
@@ -56,26 +60,55 @@ class LagunaAttention(nn.Module):
         self,
         x: mx.array,
         mask: mx.array | str | None,
-        cache: AttentionCache,
+        cache: KVStore,
     ) -> mx.array:
+        batch = x.shape[0]
         length = x.shape[1]
+        solo = batch == 1 and not isinstance(cache, Attending)
         width = self._queries
         kv_width = self._key_values
         projected = self._project_qkv(x) if length == 1 else self.qkv_proj(x)
-        attended = self._attention(cache)(
-            projected[..., :width],
-            projected[..., width : width + kv_width],
-            projected[..., width + kv_width :],
-            mask,
-        )
-        output = attended.transpose(0, 2, 1, 3).reshape(1, length, width)
+        if solo:
+            attended = self._attention(cache)(
+                projected[..., :width],
+                projected[..., width : width + kv_width],
+                projected[..., width + kv_width :],
+                mask,
+            )
+        else:
+            queries, keys, values = split_qkv(
+                projected,
+                heads=self.heads,
+                kv_heads=self.kv_heads,
+                head_dim=self.head_dim,
+            )
+            queries = self._rotate(self.q_norm(queries), cache.offset)
+            keys = self._rotate(self.k_norm(keys), cache.offset)
+            attended = attend(
+                cache,
+                queries,
+                keys=keys,
+                values=values,
+                scale=self.scale,
+                mask=mask,
+            )
+        output = attended.transpose(0, 2, 1, 3).reshape(batch, length, width)
         gate = self._gate(x, output.dtype)
         if length == 1:
             return self._kernels().out(output, gate)
-        gated = (output.reshape(1, length, self.heads, self.head_dim) * gate[..., None]).reshape(
-            1, length, width
-        )
+        heads = output.reshape(batch, length, self.heads, self.head_dim)
+        gated = (heads * gate[..., None]).reshape(batch, length, width)
         return self.o_proj(gated)
+
+    def _rotate(self, x: mx.array, offset: int | mx.array) -> mx.array:
+        return rotate(
+            x,
+            rotary_pairs=self._rotary_dim // 2,
+            freqs=self._freqs,
+            base=self._base,
+            mscale=self._mscale,
+            offset=offset,
+        )
 
     def _kernels(self) -> _Kernels:
         """Resolved once, at the first T=1 step — after load, when the leaves' formats
@@ -141,20 +174,22 @@ class LagunaAttention(nn.Module):
         deep, is more interpreter work than the op it saves. The table is the same trick
         the reference tree calls a rope angle atlas.
         """
-        atlas = _ATLASES.get(id(self))
+        key = id(self)
+        atlas = _ATLASES.get(key) if _ATLAS_OWNERS.get(key) is self else None
         if atlas is None:
             atlas = _angle_atlas(
                 _ATLAS_ROWS, self._rotary_dim, self._freqs, self._base
             )
             mx.eval(atlas)
-            _ATLASES[id(self)] = atlas
+            _ATLASES[key] = atlas
+            _ATLAS_OWNERS[key] = self
         if isinstance(offset, int):
             if offset >= atlas.shape[0]:
                 atlas = _angle_atlas(
                     offset + 1, self._rotary_dim, self._freqs, self._base
                 )
                 mx.eval(atlas)
-                _ATLASES[id(self)] = atlas
+                _ATLASES[key] = atlas
             return atlas[offset]
         return mx.take(atlas, offset, axis=0).reshape(-1)
 
@@ -192,6 +227,7 @@ _ATLAS_ROWS = 4096
 # Kept off the module: assigning an mx.array to an nn.Module attribute enrolls it in the
 # parameter tree, and this table is derived state, not a weight.
 _ATLASES: dict[int, mx.array] = {}
+_ATLAS_OWNERS: weakref.WeakValueDictionary[int, LagunaAttention] = weakref.WeakValueDictionary()
 
 
 def _angle_atlas(rows: int, rotary_dim: int, freqs: mx.array | None, base: float) -> mx.array:

@@ -55,7 +55,10 @@ uint simd_lid = thread_index_in_simdgroup;
 
 
 
-uint out_row = tile * (num_simdgroups * results_per_simdgroup) +
+uint rows_per_tile = num_simdgroups * results_per_simdgroup;
+uint tiles_per_input = out_vec_size / rows_per_tile;
+uint input_row = tile / tiles_per_input;
+uint out_row = (tile % tiles_per_input) * rows_per_tile +
     simd_gid * results_per_simdgroup;
 const device uint32_t* ws =
     (const device uint32_t*)weight_codes +
@@ -67,14 +70,16 @@ const device uint8_t* bs = scale_bases + out_row;
 const device uint8_t* sc = weight_scales +
     out_row * in_vec_size_g + simd_lid;
 uint nsh = 0;
-const device bfloat* xp = attention_output + simd_lid * values_per_thread;
+const device bfloat* xp = attention_output + input_row * in_vec_size +
+    simd_lid * values_per_thread;
+const device bfloat* gp = gate_values + input_row * gate_heads;
 
 thread float x_thread[values_per_thread];
 thread float result[results_per_simdgroup] = {0.0f, 0.0f, 0.0f, 0.0f};
 
 uint column = simd_lid * values_per_thread;
 for (uint k = 0; k < in_vec_size; k += block_size) {
-    float g=float(gate_values[column>>head_shift]);
+    float g=float(gp[column>>head_shift]);
 for(uint i=0;i<values_per_thread;++i)
     x_thread[i]=float(bfloat(float(xp[i])*g));
 
@@ -138,7 +143,7 @@ nsh ^= 4;
 for (uint row = 0; row < results_per_simdgroup; ++row) {
     result[row] = simd_sum(result[row] * 4194304.0f);
     if (simd_lid == 0) {
-        projected[out_row + row] = bfloat(result[row]);
+        projected[input_row * out_vec_size + out_row + row] = bfloat(result[row]);
     }
 }
 """
@@ -196,8 +201,10 @@ def gated_nvfp4_qmv(
     """
     kdim = weight.shape[-1] * 8
     rows = weight.shape[-2]
-    heads = gate.size
-    assert x.dtype == mx.bfloat16 and gate.dtype == mx.bfloat16 and x.size == kdim
+    heads = gate.shape[-1]
+    input_rows = x.size // kdim
+    assert x.dtype == mx.bfloat16 and gate.dtype == mx.bfloat16 and x.shape[-1] == kdim
+    assert gate.shape[:-1] == x.shape[:-1]
     assert gated_nvfp4_qmv_applies(kdim, rows, heads, group_size=_GROUP_SIZE, bits=_BITS)
     assert scales.shape == (rows, kdim // _GROUP_SIZE)
     assert bank.nibbles.shape == (rows, kdim // (4 * _GROUP_SIZE))
@@ -210,7 +217,7 @@ def gated_nvfp4_qmv(
             ("HEADS", heads),
             ("HEAD_SHIFT", (kdim // heads).bit_length() - 1),
         ],
-        grid=((rows // _ROWS_PER_THREADGROUP) * 64, 1, 1),
+        grid=(input_rows * (rows // _ROWS_PER_THREADGROUP) * 64, 1, 1),
         threadgroup=(64, 1, 1),
         output_shapes=[(*x.shape[:-1], rows)],
         output_dtypes=[mx.bfloat16],

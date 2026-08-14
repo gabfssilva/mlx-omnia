@@ -7,6 +7,7 @@ from mlx_omnia.engine.core.kernels.down_combine import DownCombine, Nvfp4PackedD
 from mlx_omnia.engine.core.kernels.gate_up import GateUp, Nvfp4PackedGateUp, OrdinalRouting
 from mlx_omnia.engine.core.kernels.mlp.nvfp4 import halve_gate_up_scales, nvfp4_halved_gate_up
 from mlx_omnia.engine.core.kernels.route import DefaultRoute, OrdinalRoute, Route
+from mlx_omnia.engine.core.kernels.route.ordinal import router_tournament
 from mlx_omnia.engine.core.layers import SORTED_GATHER_MIN, SwiGLU, SwitchGLU, sorted_gather
 from mlx_omnia.engine.models.laguna.config import LagunaConfig
 
@@ -173,10 +174,37 @@ class LagunaSparseMoe(nn.Module):
         )
         return kernels.down(act, slots, gains, residual.reshape(-1)).reshape(1, 1, self.hidden)
 
+    def batch_step(self, h: mx.array, residual: mx.array) -> mx.array:
+        kernels = self._kernels()
+        if not kernels.packed:
+            return residual + self(h)
+        shared_scales = kernels.shared_scales
+        assert shared_scales is not None
+        logits = self.gate(h).astype(mx.float32)
+        chosen, weights = router_tournament(
+            logits, self.e_score_correction_bias, self.k
+        )
+        keys = _ordinal_keys(mx.sigmoid(logits) + self.e_score_correction_bias)
+        routed = kernels.gate_up(h, keys)
+        shared = nvfp4_halved_gate_up(
+            h, self.shared_expert.gate_up_proj.weight, shared_scales
+        )
+        act = mx.concatenate([routed, shared[..., None, :]], axis=-2)
+        spare = mx.zeros((*chosen.shape[:-1], 1), dtype=mx.uint32)
+        slots = mx.concatenate([chosen.astype(mx.uint32), spare], axis=-1)
+        gains = mx.concatenate(
+            [
+                weights * self.scaling,
+                mx.ones((*weights.shape[:-1], 1), dtype=weights.dtype),
+            ],
+            axis=-1,
+        )
+        return kernels.down(act, slots, gains, residual)
+
     def __call__(self, x: mx.array) -> mx.array:
         chosen, weights = self.route(x)
-        length = x.shape[-2]
-        if length * self.k >= SORTED_GATHER_MIN:
+        tokens = x.size // self.hidden
+        if tokens * self.k >= SORTED_GATHER_MIN:
 
             def apply(tokens: mx.array, experts: mx.array) -> mx.array:
                 return self.switch_mlp(tokens, experts, sorted_indices=True)

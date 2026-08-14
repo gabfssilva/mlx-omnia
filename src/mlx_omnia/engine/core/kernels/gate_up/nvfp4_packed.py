@@ -97,6 +97,9 @@ constexpr uint scale_tile_bytes = (input_width / block_width) * scale_kblock_byt
 constexpr uint packed_expert_bytes = (output_width / 4) * scale_tile_bytes;
 
 uint group = threadgroup_position_in_grid.x;
+uint groups_per_input = routed_experts * (output_width / 2);
+uint input_row = group / groups_per_input;
+group %= groups_per_input;
 uint expert_slot = group % routed_experts;
 uint tile = group / routed_experts;
 uint simd_group = simdgroup_index_in_threadgroup;
@@ -104,7 +107,7 @@ uint lane = thread_index_in_simdgroup;
 uint logical_row = tile * 2 + simd_group;
 thread uint top8_keys[keys_per_lane];
     for (uint j = 0; j < keys_per_lane; ++j) {
-        top8_keys[j] = router_keys[lane + 32u * j];
+        top8_keys[j] = router_keys[input_row * expert_count + lane + 32u * j];
     }
     uint top8_mask = 0u;
     uint top8_winner = 0u;
@@ -146,7 +149,7 @@ uint8_t up_sb;
 for (uint block = 0; block < input_width; block += block_width) {
     const device vec<bfloat, 4>* input_vectors =
         (const device vec<bfloat, 4>*) (
-            input + block + lane * values_per_lane);
+            input + input_row * input_width + block + lane * values_per_lane);
     for (uint i = 0; i < values_per_lane / 4; ++i) {
         const vec<bfloat, 4> values = input_vectors[i];
         input_values[4 * i] = values[0];
@@ -192,7 +195,8 @@ if (lane == 0) {
     bfloat y = bfloat(1) / denominator;
     bfloat sigmoid = gate < bfloat(0) ? y : bfloat(1) - y;
     bfloat silu = bfloat(gate * sigmoid);
-    activated[expert_slot * output_width + logical_row] =
+    activated[input_row * routed_experts * output_width +
+        expert_slot * output_width + logical_row] =
         bfloat(silu * up);
 }
 """
@@ -317,8 +321,9 @@ class Nvfp4PackedGateUp:
         hidden = self.weight.shape[2] * 8
         inner = self.weight.shape[1] // 2
         experts = self.weight.shape[0]
-        assert row.dtype == mx.bfloat16 and row.size == hidden
-        assert chosen.dtype == mx.uint32 and chosen.size == experts
+        input_rows = row.size // hidden
+        assert row.dtype == mx.bfloat16 and row.shape[-1] == hidden
+        assert chosen.dtype == mx.uint32 and chosen.shape == (*row.shape[:-1], experts)
         assert self.packed_scales.size == SCALE_PATCH_BYTES + experts * 2 * inner * (hidden // 32)
         return _KERNEL(
             inputs=[row, self.weight, self.packed_scales, chosen],
@@ -329,8 +334,8 @@ class Nvfp4PackedGateUp:
                 ("EXPERTS", experts),
                 ("PATCH", SCALE_PATCH_BYTES),
             ],
-            grid=(self.top_k * (inner // 2) * 64, 1, 1),
+            grid=(input_rows * self.top_k * (inner // 2) * 64, 1, 1),
             threadgroup=(64, 1, 1),
-            output_shapes=[(self.top_k, inner)],
+            output_shapes=[(*row.shape[:-1], self.top_k, inner)],
             output_dtypes=[mx.bfloat16],
         )[0]

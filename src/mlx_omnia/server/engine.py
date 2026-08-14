@@ -1,10 +1,9 @@
-"""Resident models plus the global FCFS generation queue.
+"""Resident models plus the global FCFS generation scheduler.
 
-MLX enqueues on a single GPU stream and the decode loop is CPU-hot: requests must
-not call generate() concurrently. The gate serializes generation — one worker task
-consumes the queue and runs each job to completion (or cancellation) before the
-next. Model loading happens outside the gate: a cold load of a 30B is seconds, and
-holding the gate through it would make every resident model wait on it.
+One worker owns a dedicated MLX thread. Compatible requests for the same model share decode
+steps up to the configured concurrency; incompatible requests and transitions between models
+remain FCFS. Model loading uses the same thread so MLX arrays and caches never migrate between
+thread-local streams.
 
 Nothing is resident at boot. A request names its model and that is what loads it, and
 nothing but the memory limit takes it away again: a load that would cross the ceiling
@@ -16,9 +15,12 @@ import asyncio
 import json
 import threading
 import time
+from collections import deque
 from collections.abc import AsyncIterator, Callable, Collection, Mapping, Sequence
+from concurrent.futures import ThreadPoolExecutor
 from contextlib import asynccontextmanager, suppress
 from dataclasses import dataclass, field, replace
+from functools import partial
 from types import MappingProxyType
 from typing import NoReturn, NotRequired, Protocol, TypedDict, runtime_checkable
 
@@ -31,8 +33,8 @@ from mlx_omnia.engine.core.prompt_cache import Budget
 from mlx_omnia.engine.footprint import active_bytes_per_token, checkpoint_bytes, resident_bytes
 from mlx_omnia.engine.generate import Constraint, Meter
 from mlx_omnia.engine.grammar import Grammar, Vocabulary
-from mlx_omnia.engine.language import tokenizer_of
-from mlx_omnia.engine.model import Wrapping
+from mlx_omnia.engine.language import ContinuousLanguageModel, TextBatch, tokenizer_of
+from mlx_omnia.engine.model import CompositeModel, Wrapping
 from mlx_omnia.engine.parsers import Segment, ToolFamily
 from mlx_omnia.engine.quant.quantization import Quantization
 from mlx_omnia.engine.quantizing import Quantizing, admits
@@ -137,6 +139,7 @@ class _Settings:
     prefix_budget: int
     disk_budget: int
     not_resident: str
+    concurrency: int
 
 
 def _config(store: Store) -> _Settings:
@@ -152,6 +155,7 @@ def _config(store: Store) -> _Settings:
         prefix_budget=config.prefix_cache_bytes,
         disk_budget=config.prefix_disk_bytes,
         not_resident=config.not_resident,
+        concurrency=config.max_concurrent_requests,
     )
 
 
@@ -445,6 +449,8 @@ class Job:
     `cancel()` every response ends in — the `finally` of the SSE generator — cannot rewrite
     a job that already finished."""
     error: str | None = None
+    metrics_key: int | None = None
+    batch_limit: int | None = None
 
     def cancel(self) -> None:
         self.cancelled.set()
@@ -500,9 +506,11 @@ class Engine:
         """Counts completed cold loads. Read from the decode thread to find out whether a
         model landed while this request was running — a plain int, written on the loop."""
         self._queue: asyncio.Queue[Job | _Release] = asyncio.Queue()
+        self._model_thread = ThreadPoolExecutor(max_workers=1, thread_name_prefix="omnia-model")
+        self._pending: deque[Job | _Release] = deque()
         self._worker: asyncio.Task[None] | None = None
         self._sweeper: asyncio.Task[None] | None = None
-        self._current: Job | None = None
+        self._current: list[Job] = []
         self._changed = asyncio.Event()
         """Set when a model lands and when a lease is let go — the two ways the next expiry
         can move earlier than the one the sweep went to sleep on."""
@@ -539,13 +547,11 @@ class Engine:
 
     @property
     def running(self) -> int:
-        """0 or 1: decision 4 fixes the effective depth at one, because two models
-        generating at once contend for the same GPU and the same bandwidth."""
-        return 0 if self._current is None else 1
+        return len(self._current)
 
     @property
     def waiting(self) -> int:
-        return self._queue.qsize()
+        return self._queue.qsize() + len(self._pending)
 
     @property
     def reserved(self) -> bool:
@@ -567,10 +573,18 @@ class Engine:
         if self._worker is not None:
             self._worker.cancel()
             self._worker = None
-        if self._current is not None:
-            self._current.cancel()
-            self._current.chunks.put_nowait(None)
-            self._current = None
+        for job in self._current:
+            job.cancel()
+            job.chunks.put_nowait(None)
+        self._current.clear()
+        while self._pending:
+            queued = self._pending.popleft()
+            if isinstance(queued, _Release):
+                queued.model = None
+                queued.done.set()
+                continue
+            queued.state = "cancelled"
+            queued.chunks.put_nowait(None)
         while not self._queue.empty():
             queued = self._queue.get_nowait()
             if isinstance(queued, _Release):
@@ -597,6 +611,7 @@ class Engine:
             if spill is not None:
                 spill.flush(_SPILL_JOIN_SECONDS)
         self._spills.clear()
+        self._model_thread.shutdown(wait=False, cancel_futures=True)
 
     async def resolve(self, model_id: str) -> LanguageModel[ModelInput]:
         """Loads the model if it is not resident. Concurrent callers share one load.
@@ -650,7 +665,9 @@ class Engine:
         """
         async with self._admission:
             await self._admit(model_id)
-            return await asyncio.to_thread(self._loader, model_id)
+            return await asyncio.get_running_loop().run_in_executor(
+                self._model_thread, self._loader, model_id
+            )
 
     async def _admit(self, model_id: str) -> None:
         """Makes room for what is about to be loaded, or says the room cannot exist.
@@ -866,7 +883,7 @@ class Engine:
         # What was already queued when the reservation was taken is still somebody's
         # request, and it is measured against nothing: let the worker finish it before the
         # first round starts.
-        while self._current is not None or not self._queue.empty():
+        while self._current or self._pending or not self._queue.empty():
             await asyncio.sleep(0.01)
         return token
 
@@ -898,6 +915,7 @@ class Engine:
         input: ModelInput,
         options: GenerationOptions,
         reservation: object | None = None,
+        batch_limit: int | None = None,
     ) -> Job:
         """Raises `UnsupportedInput` before queueing: a model that cannot take this input
         never becomes a job, so the caller answers with a client error instead of the
@@ -948,6 +966,7 @@ class Engine:
             asyncio.get_running_loop(),
             lease=entry,
             load_seconds=loaded,
+            batch_limit=batch_limit,
         )
         await self._queue.put(job)
         self.on_change()
@@ -993,7 +1012,9 @@ class Engine:
         holder, trunk = found
         key = (model_id, policy)
         if key not in self._quantizable:
-            self._quantizable[key] = await asyncio.to_thread(_verdict, model_id, trunk, policy)
+            self._quantizable[key] = await asyncio.get_running_loop().run_in_executor(
+                self._model_thread, partial(_verdict, model_id, trunk, policy)
+            )
         refusal = self._quantizable[key]
         if refusal is not None:
             _refuse(model_id, entry, refusal)
@@ -1059,9 +1080,22 @@ class Engine:
         self._spills[model_id] = (ceiling, spill)
         return spill
 
+    def _concurrency(self, job: Job) -> int:
+        if job.batch_limit is not None:
+            return job.batch_limit
+        if self._store is None:
+            return 1
+        global_limit = _config(self._store).concurrency
+        override = self._store.model_settings(job.model_id).max_concurrent_requests
+        return global_limit if override is None else min(global_limit, override)
+
     async def _run(self) -> None:
         while True:
-            item = await self._queue.get()
+            item = (
+                self._pending.popleft()
+                if self._pending
+                else await self._queue.get()
+            )
             if isinstance(item, _Release):
                 item.model = None
                 # Back to the system rather than into MLX's own buffer cache: what an unload
@@ -1070,42 +1104,189 @@ class Engine:
                 mx.clear_cache()
                 item.done.set()
                 continue
-            job = item
-            self._current = job
+            jobs = [item]
+            batcher = self._batcher(item)
+            concurrency = self._concurrency(item)
+            if concurrency <= 1:
+                batcher = None
+            if batcher is not None:
+                await asyncio.sleep(0)
+                while len(jobs) < concurrency:
+                    try:
+                        candidate = self._queue.get_nowait()
+                    except asyncio.QueueEmpty:
+                        break
+                    if (
+                        isinstance(candidate, Job)
+                        and candidate.model is item.model
+                        and self._batcher(candidate) is batcher
+                    ):
+                        jobs.append(candidate)
+                        continue
+                    self._pending.append(candidate)
+                    break
+            self._current = jobs.copy()
             self.on_change()
-            entry = self._residency.get(job.model_id)
-            # Both ends of the record are taken here rather than in `_decode`: the meter is
-            # written from the decode thread, but nothing about publishing it belongs there.
-            self._metrics.begin(
-                job.model_id,
-                job.meter,
-                None if entry is None else entry.active_bytes,
-                job.load_seconds,
-            )
+            for job in jobs:
+                entry = self._residency.get(job.model_id)
+                job.metrics_key = self._metrics.begin(
+                    job.model_id,
+                    job.meter,
+                    None if entry is None else entry.active_bytes,
+                    job.load_seconds,
+                )
             try:
-                if job.cancelled.is_set():
-                    job.state = "cancelled"
-                    job.chunks.put_nowait(None)
+                active = [job for job in jobs if not job.cancelled.is_set()]
+                for job in jobs:
+                    if job not in active:
+                        job.state = "cancelled"
+                        job.chunks.put_nowait(None)
+                if batcher is not None and active:
+                    await self._decode_batch(batcher, active, jobs)
                 else:
-                    await asyncio.to_thread(self._decode, job)
+                    for job in active:
+                        await asyncio.get_running_loop().run_in_executor(
+                            self._model_thread, self._decode, job
+                        )
             except Exception as error:
-                job.error = f"{type(error).__name__}: {error}"
-                job.state = "error"
-                job.chunks.put_nowait(None)
+                for job in jobs:
+                    if job.state not in ("completed", "cancelled"):
+                        job.error = f"{type(error).__name__}: {error}"
+                        job.state = "error"
+                        job.chunks.put_nowait(None)
             finally:
-                self._current = None
-                self._metrics.end(job.state)
-                if job.lease is not None:
-                    # The record `submit` took it from, not a fresh lookup by id: see `Job`.
-                    # A record an unload has already dropped is nobody's now, and giving the
-                    # lease back to it costs nothing.
-                    job.lease.leases -= 1
+                self._current.clear()
+                for job in jobs:
+                    self._metrics.end(job.state, job.metrics_key)
+                    if job.lease is not None:
+                        job.lease.leases -= 1
                 self._changed.set()
                 self.on_change()
-                # The loop suspends on the next `get` with this frame alive, and a local
-                # still naming the finished job keeps its model reachable past an unload —
-                # the `_Release` riding the queue rebinds `item`, never `job`.
-                del item, job
+                del active, item, job, jobs
+
+    @staticmethod
+    def _batcher(job: Job) -> ContinuousLanguageModel | None:
+        model = job.model
+        if not isinstance(model, CompositeModel):
+            return None
+        return (
+            model.model
+            if isinstance(model.model, ContinuousLanguageModel)
+            and model.model.can_batch(job.options)
+            else None
+        )
+
+    @staticmethod
+    def _prepare_batched(model: ContinuousLanguageModel, job: Job) -> TextBatch:
+        assert isinstance(job.model, CompositeModel)
+        state = model.prepare_batch(
+            job.model.prepare(job.input), replace(job.options, meter=job.meter)
+        )
+        if state is None:
+            raise TypeError("request became incompatible with continuous batching")
+        return state
+
+    def _next_batched(
+        self, model: ContinuousLanguageModel, exemplar: Job
+    ) -> Job | None:
+        if self._pending:
+            candidate = self._pending[0]
+            if (
+                isinstance(candidate, Job)
+                and candidate.model is exemplar.model
+                and self._batcher(candidate) is model
+            ):
+                self._pending.popleft()
+                return candidate
+            return None
+        try:
+            candidate = self._queue.get_nowait()
+        except asyncio.QueueEmpty:
+            return None
+        if (
+            isinstance(candidate, Job)
+            and candidate.model is exemplar.model
+            and self._batcher(candidate) is model
+        ):
+            return candidate
+        self._pending.append(candidate)
+        return None
+
+    async def _decode_batch(
+        self, model: ContinuousLanguageModel, initial: Sequence[Job], all_jobs: list[Job]
+    ) -> None:
+        prepared: list[tuple[Job, TextBatch]] = []
+        peak = 0
+        for job in initial:
+            state = await asyncio.get_running_loop().run_in_executor(
+                self._model_thread, partial(self._prepare_batched, model, job)
+            )
+            job.state = "running"
+            prepared.append((job, state))
+        entry = self._residency.get(initial[0].model_id)
+        try:
+            while prepared:
+                current = sum(
+                    layer.nbytes
+                    for _, state in prepared
+                    for layer in state.state.cache
+                )
+                peak = max(peak, current)
+                if entry is not None:
+                    entry.kv_bytes = current
+                active: list[tuple[Job, TextBatch]] = []
+                for job, state in prepared:
+                    if job.cancelled.is_set():
+                        job.state = "cancelled"
+                        job.loop.call_soon_threadsafe(job.chunks.put_nowait, None)
+                    else:
+                        active.append((job, state))
+                if not active:
+                    break
+                segments = await asyncio.get_running_loop().run_in_executor(
+                    self._model_thread,
+                    partial(model.step_batch, [state for _, state in active]),
+                )
+                prepared = []
+                for (job, state), pieces in zip(active, segments, strict=True):
+                    for piece in pieces:
+                        if piece.channel != "header":
+                            job.chunks.put_nowait(piece)
+                    if state.state.finished:
+                        job.state = "completed"
+                        job.chunks.put_nowait(None)
+                    else:
+                        prepared.append((job, state))
+                await asyncio.sleep(0)
+                concurrency = self._concurrency(initial[0])
+                while len(prepared) < concurrency:
+                    joining = self._next_batched(model, initial[0])
+                    if joining is None:
+                        break
+                    all_jobs.append(joining)
+                    self._current.append(joining)
+                    entry = self._residency.get(joining.model_id)
+                    joining.metrics_key = self._metrics.begin(
+                        joining.model_id,
+                        joining.meter,
+                        None if entry is None else entry.active_bytes,
+                        joining.load_seconds,
+                    )
+                    if joining.cancelled.is_set():
+                        joining.state = "cancelled"
+                        joining.chunks.put_nowait(None)
+                        continue
+                    state = await asyncio.get_running_loop().run_in_executor(
+                        self._model_thread,
+                        partial(self._prepare_batched, model, joining),
+                    )
+                    joining.state = "running"
+                    prepared.append((joining, state))
+                    self.on_change()
+        finally:
+            if entry is not None:
+                entry.kv_bytes = peak
+                entry.last_used = time.time()
 
     def _decode(self, job: Job) -> None:
         """The meter rides in the options because the counts live behind `stream`: the

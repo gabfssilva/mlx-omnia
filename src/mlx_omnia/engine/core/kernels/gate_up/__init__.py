@@ -3,7 +3,7 @@
 A model block declares the primitive — activation, clamp, projection bias — and
 `GateUp` binds the specialization the leaf's quantization format admits for that
 declaration, or none, at construction time. The model never names a format; a new
-format is a new module here, registered in `_BUILDS`, and every family engages it.
+format is a new module here, registered in `_STRATEGIES`, and every family engages it.
 
 The resolution table is (format x activation): affine serves silu (with the optional
 clamp-before-activation order), nvfp4 serves unclamped silu, mxfp4 serves only
@@ -35,6 +35,7 @@ from mlx_omnia.engine.core.kernels.gate_up.kernel import (
 from mlx_omnia.engine.core.kernels.gate_up.mxfp4 import Mxfp4GateUp
 from mlx_omnia.engine.core.kernels.gate_up.nvfp4 import Nvfp4GateUp
 from mlx_omnia.engine.core.kernels.gate_up.nvfp4_packed import Nvfp4PackedGateUp
+from mlx_omnia.engine.core.kernels.resolve import resolve
 from mlx_omnia.engine.core.layers import QuantizedSwitchLinear, SwitchLinear
 
 __all__ = [
@@ -51,15 +52,15 @@ __all__ = [
     "OrdinalRouting",
 ]
 
-# Order is preference: the first build that returns an instance wins; the default
-# accepts everything, so resolution never fails.
-_BUILDS = (
-    Nvfp4PackedGateUp.build,
-    Nvfp4GateUp.build,
-    Mxfp4GateUp.build,
-    AffineGateUp.build,
-    DenseGateUp.build,
-    DefaultGateUp.build,
+# Order is preference: the first strategy that builds wins; the default accepts
+# everything, so resolution never fails.
+_STRATEGIES = (
+    Nvfp4PackedGateUp,
+    Nvfp4GateUp,
+    Mxfp4GateUp,
+    AffineGateUp,
+    DenseGateUp,
+    DefaultGateUp,
 )
 
 
@@ -80,23 +81,17 @@ class GateUp:
         routing: OrdinalRouting | None = None,
         shared: nn.Linear | nn.QuantizedLinear | None = None,
     ) -> None:
-        self.strategy: GateUpStrategy = next(
-            built
-            for build in _BUILDS
-            if (
-                built := build(
-                    leaf,
-                    hidden=hidden,
-                    inner=inner,
-                    activation=activation,
-                    limit=limit,
-                    bias=bias,
-                    layout=layout,
-                    routing=routing,
-                    shared=shared,
-                )
-            )
-            is not None
+        self.strategy: GateUpStrategy = resolve(
+            _STRATEGIES,
+            leaf,
+            hidden=hidden,
+            inner=inner,
+            activation=activation,
+            limit=limit,
+            bias=bias,
+            layout=layout,
+            routing=routing,
+            shared=shared,
         )
 
     def __call__(self, row: mx.array, chosen: mx.array) -> mx.array:

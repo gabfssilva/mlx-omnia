@@ -356,6 +356,7 @@ struct ProfileView: Decodable {
 struct SettingsView: Decodable {
     let model: String
     let features: Features
+    let maxConcurrentRequests: Int?
     let available: [String]
     let mtpAvailable: Bool
     let unavailableReason: String?
@@ -563,6 +564,7 @@ struct ProfileBody: Encodable {
 
 struct SettingsBody: Encodable {
     var features: Features
+    var maxConcurrentRequests: Int? = nil
 }
 
 struct PullBody: Encodable {

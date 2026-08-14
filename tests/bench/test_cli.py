@@ -13,6 +13,15 @@ def test_every_battery_is_reachable_from_the_command_line() -> None:
     parsed = cli.parser().parse_args(["constrained", "qwen3"])
     assert parsed.run is cli.run_constrained
     assert (parsed.model, parsed.tokens, parsed.runs) == ("qwen3", 128, 5)
+    concurrent = cli.parser().parse_args(["concurrency", "qwen3"])
+    assert concurrent.run is cli.run_concurrency
+    assert concurrent.concurrencies == [1, 2, 4, 8]
+    paired = cli.parser().parse_args(["paired", "qwen3"])
+    assert paired.max_throttled_retries == 20
+    configured = cli.parser().parse_args(
+        ["paired", "qwen3", "--max-throttled-retries", "7"]
+    )
+    assert configured.max_throttled_retries == 7
     for battery in ("interleaved", "paired"):
         assert cli.parser().parse_args([battery, "qwen3"]).run is not None
 

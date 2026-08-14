@@ -32,12 +32,12 @@ def split_qkv(
     fused: mx.array, *, heads: int, kv_heads: int, head_dim: int
 ) -> tuple[mx.array, mx.array, mx.array]:
     """A qkv projection fused on the output axis, split back into per-head
-    `[1, heads, length, head_dim]` — the layout SDPA and rope both want."""
+    `[batch, heads, length, head_dim]` — the layout SDPA and rope both want."""
     length = fused.shape[1]
     query_width = heads * head_dim
     kv_width = kv_heads * head_dim
     q, k, v = (
-        part.reshape(1, length, count, head_dim).transpose(0, 2, 1, 3)
+        part.reshape(-1, length, count, head_dim).transpose(0, 2, 1, 3)
         for part, count in zip(
             mx.split(fused, [query_width, query_width + kv_width], axis=-1),
             (heads, kv_heads, kv_heads),
@@ -108,21 +108,21 @@ def sorted_gather(
     hidden: int,
     apply: Callable[[mx.array, mx.array], mx.array],
 ) -> mx.array:
-    """The routed MLP over `[1, T, hidden]` with the rows grouped by expert, so the
+    """The routed MLP over `[..., T, hidden]` with the rows grouped by expert, so the
     gather streams each expert's weight once instead of once per token. A pure
     reorder: `apply` sees the same pairs, and the unsort puts them back before
-    anything is summed. Returns `[1, T, k, hidden]`, unweighted."""
-    length = x.shape[-2]
+    anything is summed. Returns `[..., T, k, hidden]`, unweighted."""
+    tokens_count = x.size // hidden
     flat = chosen.reshape(-1)
     order = mx.argsort(flat)
-    tokens = x.reshape(length, 1, hidden)[order // k]
+    tokens = x.reshape(tokens_count, 1, hidden)[order // k]
     out = apply(tokens, flat[order])
     # The unsort needs argsort(order), and order is a permutation: its inverse is the
     # scatter inverse[order] = arange — one indexed write instead of a second sort.
     inverse = mx.put_along_axis(
         mx.zeros_like(order), order, mx.arange(order.size, dtype=order.dtype), axis=0
     )
-    return out[inverse].reshape(1, length, k, hidden)
+    return out[inverse].reshape(*x.shape[:-1], k, hidden)
 
 
 class SwitchLinear(nn.Module):

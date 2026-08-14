@@ -4,7 +4,7 @@ The purest kernel-as-layer case — the facade behaves like calling the leaf. A 
 declares the primitive (the leaf, its logical shape, and the epilogue: nothing, a
 per-head gate product, or softplus) and `Qmv` binds the specialization the leaf's
 quantization format admits for that declaration, or none, at construction time. The
-model never names a format; a new format is a new module here, registered in `_BUILDS`,
+model never names a format; a new format is a new module here, registered in `_STRATEGIES`,
 and every family engages it.
 
 The resolution table is (format x epilogue): ternary serves the bare projection off a
@@ -29,6 +29,7 @@ from mlx_omnia.engine.core.kernels.qmv.kernel import Epilogue, QmvLeaf, QmvStrat
 from mlx_omnia.engine.core.kernels.qmv.nvfp4 import Nvfp4Qmv
 from mlx_omnia.engine.core.kernels.qmv.softplus import SoftplusQmv
 from mlx_omnia.engine.core.kernels.qmv.ternary import TernaryQmv
+from mlx_omnia.engine.core.kernels.resolve import resolve
 
 __all__ = [
     "DefaultQmv",
@@ -44,15 +45,15 @@ __all__ = [
     "TernaryQmv",
 ]
 
-# Order is preference: the first build that returns an instance wins; the default
-# accepts everything, so resolution never fails.
-_BUILDS = (
-    TernaryQmv.build,
-    GatedNvfp4Qmv.build,
-    Nvfp4Qmv.build,
-    SoftplusQmv.build,
-    Int8Qmv.build,
-    DefaultQmv.build,
+# Order is preference: the first strategy that builds wins; the default accepts
+# everything, so resolution never fails.
+_STRATEGIES = (
+    TernaryQmv,
+    GatedNvfp4Qmv,
+    Nvfp4Qmv,
+    SoftplusQmv,
+    Int8Qmv,
+    DefaultQmv,
 )
 
 
@@ -68,11 +69,13 @@ class Qmv:
         epilogue: Epilogue = "none",
         heads: int | None = None,
     ) -> None:
-        self.strategy: QmvStrategy = next(
-            built
-            for build in _BUILDS
-            if (built := build(leaf, kdim=kdim, rows=rows, epilogue=epilogue, heads=heads))
-            is not None
+        self.strategy: QmvStrategy = resolve(
+            _STRATEGIES,
+            leaf,
+            kdim=kdim,
+            rows=rows,
+            epilogue=epilogue,
+            heads=heads,
         )
 
     def __call__(self, x: mx.array, gate: mx.array | None = None) -> mx.array:

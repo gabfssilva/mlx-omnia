@@ -19,6 +19,7 @@ from mlx_omnia.engine.core.kernels.gated_delta.fused import (
     gated_delta_applies,
 )
 from mlx_omnia.engine.core.kernels.gated_delta.kernel import GatedDeltaStrategy
+from mlx_omnia.engine.core.kernels.resolve import resolve
 
 __all__ = [
     "DefaultGatedDelta",
@@ -30,9 +31,9 @@ __all__ = [
     "gated_delta_applies",
 ]
 
-# Order is preference: the first build that returns an instance wins; the default
-# accepts everything, so resolution never fails.
-_BUILDS = (FusedGatedDelta.build, DefaultGatedDelta.build)
+# Order is preference: the first strategy that builds wins; the default accepts
+# everything, so resolution never fails.
+_STRATEGIES = (FusedGatedDelta, DefaultGatedDelta)
 
 
 class GatedDelta:
@@ -48,19 +49,13 @@ class GatedDelta:
         value_dim: int,
         enabled: bool = True,
     ) -> None:
-        self.strategy: GatedDeltaStrategy = next(
-            built
-            for build in _BUILDS
-            if (
-                built := build(
-                    key_dim=key_dim,
-                    key_heads=key_heads,
-                    value_heads=value_heads,
-                    value_dim=value_dim,
-                    enabled=enabled,
-                )
-            )
-            is not None
+        self.strategy: GatedDeltaStrategy = resolve(
+            _STRATEGIES,
+            key_dim=key_dim,
+            key_heads=key_heads,
+            value_heads=value_heads,
+            value_dim=value_dim,
+            enabled=enabled,
         )
 
     def __call__(

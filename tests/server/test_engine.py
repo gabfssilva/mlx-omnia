@@ -1,12 +1,14 @@
 import asyncio
 import gc
 import json
+import threading
 import time
 import weakref
-from collections.abc import Iterator
+from collections.abc import Iterator, Sequence
 from pathlib import Path
 from typing import TypeIs
 
+import mlx.core as mx
 import pytest
 
 from mlx_omnia import (
@@ -18,14 +20,20 @@ from mlx_omnia import (
     ModelInput,
     ModelSignature,
     Text,
+    TextLanguageModel,
     UnsupportedInput,
 )
+from mlx_omnia.engine.batching import BatchedKVCache
+from mlx_omnia.engine.core.attend import KVStore
+from mlx_omnia.engine.core.cache import KVCache
 from mlx_omnia.engine.core.prompt_cache import Budget
 from mlx_omnia.engine.grammar import GrammarRefused
+from mlx_omnia.engine.models.qwen3.config import Qwen3Config
+from mlx_omnia.engine.models.qwen3.model import Qwen3
 from mlx_omnia.engine.parsers import Segment
 from mlx_omnia.server import Engine, catalog
 from mlx_omnia.server.engine import Job, NotConstrainable, NotResident
-from mlx_omnia.server.store import Store
+from mlx_omnia.server.store import ModelSettings, Store
 
 
 class FakeLanguageModel:
@@ -141,6 +149,222 @@ def test_a_job_that_runs_to_the_end_is_completed() -> None:
             engine.stop()
 
     assert asyncio.run(run()).state == "completed"
+
+
+class BatchCountingTrunk:
+    continuous_batching = True
+
+    def __init__(self) -> None:
+        self.batch_sizes: list[int] = []
+        self.batched_steps = 0
+
+    def make_cache(self) -> list[KVCache]:
+        return [KVCache()]
+
+    def __call__(self, ids: mx.array, cache: Sequence[KVStore]) -> mx.array:
+        self.batch_sizes.append(ids.shape[0])
+        if isinstance(cache[0], BatchedKVCache):
+            self.batched_steps += 1
+        return -mx.abs(mx.arange(128) - (ids + 1)[..., None]).astype(mx.float32)
+
+
+class AsciiTokenizer:
+    def encode(self, text: str | Iterator[str]) -> Iterator[int]:
+        whole = text if isinstance(text, str) else "".join(text)
+        return iter(whole.encode())
+
+    def decode_bytes(self, ids: list[int]) -> bytes:
+        return bytes(ids)
+
+
+class BlockingBatchTrunk:
+    continuous_batching = True
+
+    def __init__(self) -> None:
+        self.inner: Qwen3 | None = None
+        self.entered = threading.Event()
+        self.release = threading.Event()
+
+    def _model(self) -> Qwen3:
+        if self.inner is None:
+            self.inner = Qwen3(
+                Qwen3Config(
+                    hidden_size=16,
+                    num_hidden_layers=2,
+                    num_attention_heads=2,
+                    num_key_value_heads=1,
+                    head_dim=8,
+                    vocab_size=128,
+                    rms_norm_eps=1e-6,
+                    rope_theta=10_000,
+                    intermediate_size=32,
+                )
+            )
+        return self.inner
+
+    def make_cache(self) -> list[KVCache]:
+        return self._model().make_cache()
+
+    def __call__(self, ids: mx.array, cache: Sequence[KVStore]) -> mx.array:
+        if ids.shape[0] == 2:
+            self.entered.set()
+            assert self.release.wait(5), "test did not release the batched step"
+        return self._model()(ids, cache)
+
+
+def test_compatible_requests_share_decode_forwards(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    monkeypatch.setattr(catalog, "HUB_CACHE", tmp_path / "hub")
+    monkeypatch.setattr(catalog, "QUANTIZED_CACHE", tmp_path / "quantized")
+
+    async def run() -> tuple[list[Segment], list[Segment], list[int]]:
+        store = Store(tmp_path / "server.db")
+        store.set_config({"max_concurrent_requests": "2", "prefix_cache_bytes": "0"})
+        trunk = BatchCountingTrunk()
+        engine = Engine(
+            lambda _: CompositeModel(TextLanguageModel(trunk, AsciiTokenizer()), []), store
+        )
+        engine.start()
+        try:
+            first, second = await asyncio.gather(
+                engine.submit("fake", Text("A"), GenerationOptions(max_tokens=2)),
+                engine.submit("fake", Text("E"), GenerationOptions(max_tokens=2)),
+            )
+            one, two = await asyncio.gather(drain(first), drain(second))
+            return one, two, trunk.batch_sizes
+        finally:
+            engine.stop()
+
+    first, second, batches = asyncio.run(run())
+    assert first == [Segment("content", "B"), Segment("content", "C")]
+    assert second == [Segment("content", "F"), Segment("content", "G")]
+    assert batches == [1, 1, 2, 2]
+
+
+def test_a_request_joins_a_batch_that_is_already_decoding(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    monkeypatch.setattr(catalog, "HUB_CACHE", tmp_path / "hub")
+    monkeypatch.setattr(catalog, "QUANTIZED_CACHE", tmp_path / "quantized")
+
+    async def run() -> tuple[list[Segment], list[Segment], list[int]]:
+        store = Store(tmp_path / "server.db")
+        store.set_config({"max_concurrent_requests": "2", "prefix_cache_bytes": "0"})
+        trunk = BatchCountingTrunk()
+        engine = Engine(
+            lambda _: CompositeModel(TextLanguageModel(trunk, AsciiTokenizer()), []), store
+        )
+        engine.start()
+        try:
+            first = await engine.submit("fake", Text("A"), GenerationOptions(max_tokens=4))
+            head = await piece(first)
+            second = await engine.submit("fake", Text("E"), GenerationOptions(max_tokens=2))
+            one, two = await asyncio.gather(drain(first), drain(second))
+            return ([] if head is None else [head, *one]), two, trunk.batch_sizes
+        finally:
+            engine.stop()
+
+    first, second, batches = asyncio.run(run())
+    assert first == [Segment("content", letter) for letter in "BCDE"]
+    assert second == [Segment("content", letter) for letter in "FG"]
+    assert 2 in batches
+
+
+def test_cancelling_one_batched_request_does_not_change_the_other(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    monkeypatch.setattr(catalog, "HUB_CACHE", tmp_path / "hub")
+    monkeypatch.setattr(catalog, "QUANTIZED_CACHE", tmp_path / "quantized")
+
+    async def run() -> tuple[Job, list[Segment]]:
+        store = Store(tmp_path / "server.db")
+        store.set_config({"max_concurrent_requests": "2", "prefix_cache_bytes": "0"})
+        trunk = BatchCountingTrunk()
+        engine = Engine(
+            lambda _: CompositeModel(TextLanguageModel(trunk, AsciiTokenizer()), []), store
+        )
+        engine.start()
+        try:
+            cancelled, survivor = await asyncio.gather(
+                engine.submit("fake", Text("A"), GenerationOptions(max_tokens=8)),
+                engine.submit("fake", Text("E"), GenerationOptions(max_tokens=4)),
+            )
+            assert await piece(cancelled) == Segment("content", "B")
+            cancelled.cancel()
+            await drain(cancelled)
+            return cancelled, await drain(survivor)
+        finally:
+            engine.stop()
+
+    cancelled, survivor = asyncio.run(run())
+    assert cancelled.state == "cancelled"
+    assert survivor == [Segment("content", letter) for letter in "FGHI"]
+
+
+def test_the_model_concurrency_override_caps_the_global_limit(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    monkeypatch.setattr(catalog, "HUB_CACHE", tmp_path / "hub")
+    monkeypatch.setattr(catalog, "QUANTIZED_CACHE", tmp_path / "quantized")
+
+    async def run() -> tuple[list[int], int]:
+        store = Store(tmp_path / "server.db")
+        store.set_config({"max_concurrent_requests": "2", "prefix_cache_bytes": "0"})
+        store.save_model_settings(ModelSettings("fake", max_concurrent_requests=1))
+        trunk = BatchCountingTrunk()
+        engine = Engine(
+            lambda _: CompositeModel(TextLanguageModel(trunk, AsciiTokenizer()), []), store
+        )
+        engine.start()
+        try:
+            first, second = await asyncio.gather(
+                engine.submit("fake", Text("A"), GenerationOptions(max_tokens=2)),
+                engine.submit("fake", Text("E"), GenerationOptions(max_tokens=2)),
+            )
+            await asyncio.gather(drain(first), drain(second))
+            return trunk.batch_sizes, trunk.batched_steps
+        finally:
+            engine.stop()
+
+    assert asyncio.run(run()) == ([1, 1, 1, 1, 1, 1], 0)
+
+
+def test_running_and_kv_bytes_report_the_active_batch(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    monkeypatch.setattr(catalog, "HUB_CACHE", tmp_path / "hub")
+    monkeypatch.setattr(catalog, "QUANTIZED_CACHE", tmp_path / "quantized")
+
+    async def run() -> tuple[int, int]:
+        store = Store(tmp_path / "server.db")
+        store.set_config({"max_concurrent_requests": "2", "prefix_cache_bytes": "0"})
+        trunk = BlockingBatchTrunk()
+        engine = Engine(
+            lambda _: CompositeModel(TextLanguageModel(trunk, AsciiTokenizer()), []), store
+        )
+        try:
+            first, second = await asyncio.gather(
+                engine.submit("fake", Text("A"), GenerationOptions(max_tokens=1)),
+                engine.submit("fake", Text("E"), GenerationOptions(max_tokens=1)),
+            )
+            engine.start()
+            assert await asyncio.to_thread(trunk.entered.wait, 5), (
+                first.state,
+                first.error,
+                second.state,
+                second.error,
+            )
+            running = engine.running
+            kv_bytes = engine.residency["fake"].kv_bytes
+            trunk.release.set()
+            await asyncio.gather(drain(first), drain(second))
+            return running, kv_bytes
+        finally:
+            trunk.release.set()
+            engine.stop()
+
+    assert asyncio.run(run()) == (2, 65_536)
 
 
 def test_a_client_that_walks_away_leaves_a_cancelled_job() -> None:

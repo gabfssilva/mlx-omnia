@@ -179,8 +179,8 @@ struct TuningSheet: View {
     }
 }
 
-/// One sampling knob: the name, the rail, and what it is set to — or `unset`, which is not
-/// a value but the absence of one, and means the daemon's own preset decides.
+/// One sampling knob: its name and an optional numeric override. An empty field means the
+/// daemon's own preset decides.
 struct Knob: View {
     @Environment(\.tokens) private var t
     let name: String
@@ -189,29 +189,46 @@ struct Knob: View {
     let low: Double
     let high: Double
 
-    private var current: Double? {
-        if let value { return value.wrappedValue }
-        return whole?.wrappedValue.map(Double.init)
-    }
-
     var body: some View {
         HStack(spacing: 10) {
             Text(name).sans(12, t.fg2).frame(width: 78, alignment: .leading)
-            Rail(fraction: current.map { ($0 - low) / (high - low) }) { part in
-                let picked = low + part * (high - low)
-                if let value { value.wrappedValue = (picked * 100).rounded() / 100 }
-                if let whole { whole.wrappedValue = Int(picked.rounded()) }
+            Group {
+                if let value {
+                    TextField(
+                        "unset",
+                        value: limited(value),
+                        format: .number.precision(.fractionLength(0...2))
+                    )
+                } else if let whole {
+                    TextField("unset", value: limited(whole), format: .number)
+                }
             }
-            Text(reading).mono(11.5, current == nil ? t.fg3 : t.fg)
-                .frame(width: 44, alignment: .trailing)
+            .textFieldStyle(.plain)
+            .font(.system(size: 11.5, design: .monospaced))
+            .multilineTextAlignment(.trailing)
+            .padding(.horizontal, 10)
+            .frame(height: 28)
+            .background(t.field)
+            .overlay(RoundedRectangle(cornerRadius: 8).strokeBorder(t.hair2, lineWidth: 1))
+            .clipShape(RoundedRectangle(cornerRadius: 8))
         }
         .padding(.vertical, 8)
         .overlay(alignment: .top) { Rectangle().fill(t.hair).frame(height: 1) }
     }
 
-    private var reading: String {
-        guard let current else { return "unset" }
-        return whole == nil ? String(format: "%.2f", current) : String(Int(current))
+    private func limited(_ binding: Binding<Double?>) -> Binding<Double?> {
+        Binding(
+            get: { binding.wrappedValue },
+            set: { binding.wrappedValue = $0.map { min(max($0, low), high) } }
+        )
+    }
+
+    private func limited(_ binding: Binding<Int?>) -> Binding<Int?> {
+        let range = Int(low)...Int(high)
+        return Binding(
+            get: { binding.wrappedValue },
+            set: { binding.wrappedValue = $0.map { min(max($0, range.lowerBound), range.upperBound) } }
+        )
     }
 }
 

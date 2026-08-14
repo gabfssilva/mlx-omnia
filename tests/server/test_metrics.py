@@ -566,3 +566,20 @@ def test_the_beat_republishes_a_running_request_and_nothing_else() -> None:
     after = len(raised)
     register.beat()
     assert len(raised) == after
+
+
+def test_concurrent_requests_end_against_their_own_meters() -> None:
+    register = Metrics()
+    first = Meter(prompt_tokens=2, completion_tokens=3)
+    second = Meter(prompt_tokens=5, completion_tokens=7)
+    first_key = register.begin("m", first, None)
+    second_key = register.begin("m", second, None)
+
+    register.end("completed", first_key)
+    register.end("cancelled", second_key)
+
+    requests = register.snapshot().requests
+    assert [(request.state, request.completion_tokens) for request in requests] == [
+        ("cancelled", 7),
+        ("completed", 3),
+    ]

@@ -499,6 +499,9 @@ private struct Configure: View {
                 SettingRow(label: "Speculation", first: true) {
                     choices(settings)
                 }
+                SettingRow(label: "Batch limit") {
+                    batchChoices(settings)
+                }
                 if let reason = settings.unavailableReason {
                     Text(reason).mono(10.5, t.fg3)
                         .lineLimit(1)
@@ -570,13 +573,40 @@ private struct Configure: View {
             .onTapGesture(perform: pick)
     }
 
+    @ViewBuilder
+    private func batchChoices(_ settings: SettingsView) -> some View {
+        FlowRow(spacing: 6) {
+            option("global", on: settings.maxConcurrentRequests == nil) {
+                chooseBatch(nil, settings)
+            }
+            ForEach([1, 2, 4, 8], id: \.self) { limit in
+                option("\(limit)", on: settings.maxConcurrentRequests == limit) {
+                    chooseBatch(limit, settings)
+                }
+            }
+        }
+    }
+
     private func choose(_ kind: String?, _ drafter: String?) {
         app.act {
             let body = SettingsBody(
                 features: Features(
                     speculation: kind == nil
                         ? nil : SpeculationSetting(kind: kind, drafter: drafter, blockSize: nil)
-                )
+                ),
+                maxConcurrentRequests: settings?.maxConcurrentRequests
+            )
+            settings = try await Client.send(
+                "PUT", "/admin/models/\(Client.at(entry.id))/settings", body: body
+            )
+        }
+    }
+
+    private func chooseBatch(_ limit: Int?, _ current: SettingsView) {
+        app.act {
+            let body = SettingsBody(
+                features: current.features,
+                maxConcurrentRequests: limit
             )
             settings = try await Client.send(
                 "PUT", "/admin/models/\(Client.at(entry.id))/settings", body: body

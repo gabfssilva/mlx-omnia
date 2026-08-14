@@ -1,8 +1,10 @@
+from collections.abc import Sequence
 from typing import NamedTuple
 
 import mlx.core as mx
 import mlx.nn as nn
 
+from mlx_omnia.engine.core.attend import KVStore
 from mlx_omnia.engine.core.cache import KVCache
 from mlx_omnia.engine.models.qwen3.config import Qwen3Config, Qwen3MoEConfig
 from mlx_omnia.engine.models.qwen3.layers.block import Qwen3Block, Qwen3MoEBlock
@@ -24,6 +26,8 @@ class Qwen3Activations(NamedTuple):
 
 
 class Qwen3(nn.Module):
+    continuous_batching = True
+
     def __init__(self, config: Qwen3Config) -> None:
         super().__init__()
         self.config = config
@@ -39,7 +43,9 @@ class Qwen3(nn.Module):
             return self.model.embed_tokens.as_linear(normed)
         return self.lm_head(normed)
 
-    def activations(self, ids: mx.array, cache: list[KVCache] | None = None) -> Qwen3Activations:
+    def activations(
+        self, ids: mx.array, cache: Sequence[KVStore] | None = None
+    ) -> Qwen3Activations:
         cache = cache if cache is not None else self.make_cache()
         x = self.model.embed_tokens(ids)
         embeddings = x
@@ -50,7 +56,7 @@ class Qwen3(nn.Module):
         normed = self.model.norm(x)
         return Qwen3Activations(embeddings, blocks, normed, self.head(normed))
 
-    def __call__(self, ids: mx.array, cache: list[KVCache] | None = None) -> mx.array:
+    def __call__(self, ids: mx.array, cache: Sequence[KVStore] | None = None) -> mx.array:
         return self.activations(ids, cache).logits
 
 
@@ -68,6 +74,8 @@ class Qwen3MoEActivations(NamedTuple):
 
 
 class Qwen3MoE(nn.Module):
+    continuous_batching = True
+
     def __init__(self, config: Qwen3MoEConfig) -> None:
         super().__init__()
         self.config = config
@@ -78,7 +86,9 @@ class Qwen3MoE(nn.Module):
     def make_cache(self) -> list[KVCache]:
         return [KVCache() for _ in self.model.layers]
 
-    def activations(self, ids: mx.array, cache: list[KVCache] | None = None) -> Qwen3MoEActivations:
+    def activations(
+        self, ids: mx.array, cache: Sequence[KVStore] | None = None
+    ) -> Qwen3MoEActivations:
         cache = cache if cache is not None else self.make_cache()
         x = self.model.embed_tokens(ids)
         blocks: list[mx.array] = []
@@ -92,5 +102,5 @@ class Qwen3MoE(nn.Module):
             logits = self.lm_head(normed)
         return Qwen3MoEActivations(blocks, logits)
 
-    def __call__(self, ids: mx.array, cache: list[KVCache] | None = None) -> mx.array:
+    def __call__(self, ids: mx.array, cache: Sequence[KVStore] | None = None) -> mx.array:
         return self.activations(ids, cache).logits

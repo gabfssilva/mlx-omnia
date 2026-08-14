@@ -54,15 +54,18 @@ constexpr uint scale_expert_bytes =
     output_width * routed_scale_row_bytes;
 
 uint tile = threadgroup_position_in_grid.x;
+uint tiles_per_input = output_width / outputs_per_simd;
+uint input_row = tile / tiles_per_input;
+tile %= tiles_per_input;
 uint slot = simdgroup_index_in_threadgroup;
 uint lane = thread_index_in_simdgroup;
 uint first_row = tile * outputs_per_simd;
 bool is_shared = slot == shared_slot;
-uint expert = is_shared ? 0 : uint(indices[slot]);
+uint expert = is_shared ? 0 : uint(indices[input_row * routed_experts + slot]);
 
 const device bfloat* expert_input = is_shared
-    ? shared_activated
-    : routed_activated + slot * input_width;
+    ? shared_activated + input_row * input_width
+    : routed_activated + (input_row * routed_experts + slot) * input_width;
 const device uint8_t* expert_weight = is_shared
     ? (const device uint8_t*)shared_down_weight
     : (const device uint8_t*)routed_down_weight +
@@ -126,7 +129,7 @@ if (slot == 0 && lane < outputs_per_simd) {
          routed_slot < routed_experts;
          ++routed_slot) {
         bfloat route_weight =
-            bfloat(router_weights[routed_slot]);
+            bfloat(router_weights[input_row * routed_experts + routed_slot]);
         bfloat product = bfloat(
             down_outputs[
                 routed_slot * outputs_per_simd + lane
@@ -138,8 +141,8 @@ if (slot == 0 && lane < outputs_per_simd) {
     bfloat shared =
         down_outputs[shared_slot * outputs_per_simd + lane];
     bfloat r2 = bfloat(routed + shared);
-    output[first_row + lane] =
-        bfloat(residual[first_row + lane] + r2);
+    output[input_row * output_width + first_row + lane] =
+        bfloat(residual[input_row * output_width + first_row + lane] + r2);
 }
 """
 
@@ -227,21 +230,28 @@ class Nvfp4PackedDownCombine:
         down projection joins the sum unweighted."""
         hidden = self.weight.shape[1]
         inner = self.weight.shape[2] * 8
-        top_k = chosen.shape[0] - 1
+        top_k = chosen.shape[-1] - 1
+        input_rows = residual.size // hidden
         assert applies(hidden, inner, top_k)
-        assert act.dtype == mx.bfloat16 and act.size == (top_k + 1) * inner
-        assert residual.dtype == mx.bfloat16 and residual.size == hidden
+        assert act.dtype == mx.bfloat16 and act.shape == (*residual.shape[:-1], top_k + 1, inner)
+        assert residual.dtype == mx.bfloat16 and residual.shape[-1] == hidden
         assert chosen.dtype == mx.uint32
-        rows = act.reshape(top_k + 1, inner)
+        assert chosen.shape == (*residual.shape[:-1], top_k + 1)
+        assert weights.shape == chosen.shape
+        rows = act.reshape(*residual.shape[:-1], top_k + 1, inner)
+        routed_rows = mx.contiguous(rows[..., :top_k, :])
+        routed_chosen = mx.contiguous(chosen[..., :top_k])
+        routed_weights = mx.contiguous(weights[..., :top_k].astype(mx.float32))
+        shared_rows = mx.contiguous(rows[..., top_k, :])
         threads = (top_k + 1) * 32
         return _KERNEL(
             inputs=[
-                rows[:top_k],
+                routed_rows,
                 self.weight,
                 self.scales,
-                chosen[:top_k],
-                weights[:top_k].astype(mx.float32),
-                rows[top_k],
+                routed_chosen,
+                routed_weights,
+                shared_rows,
                 self.shared_weight,
                 self.shared_scales,
                 residual,
@@ -253,8 +263,8 @@ class Nvfp4PackedDownCombine:
                 ("TOPK", top_k),
                 ("PATCH", SCALE_PATCH_BYTES),
             ],
-            grid=(hidden // 4 * threads, 1, 1),
+            grid=(input_rows * hidden // 4 * threads, 1, 1),
             threadgroup=(threads, 1, 1),
-            output_shapes=[(hidden,)],
+            output_shapes=[(*residual.shape[:-1], hidden)],
             output_dtypes=[mx.bfloat16],
         )[0]

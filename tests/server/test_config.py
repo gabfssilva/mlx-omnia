@@ -244,18 +244,14 @@ def test_patching_the_port_answers_restart_and_the_daemon_stays_on_the_port_it_b
             httpx.get(f"http://127.0.0.1:{moved}/admin/config", timeout=10)
 
 
-def test_max_concurrent_requests_is_kept_and_the_answer_says_it_changes_nothing(
+def test_max_concurrent_requests_is_applied_to_the_scheduler(
     client: TestClient, store: Store
 ) -> None:
-    """The gate serializes generation at effective depth 1 (decision 4), so raising this
-    number does nothing until continuous batching. Taking the value and reporting it as
-    applied would be the API contradicting the screen that set it."""
     entry = setting(patch(client, max_concurrent_requests=8), "max_concurrent_requests")
-    note = entry["note"]
 
     assert entry["value"] == 8
-    assert entry["effect"] == "inert"
-    assert isinstance(note, str) and "batching" in note, "the answer does not say why"
+    assert entry["effect"] == "applied"
+    assert entry["note"] is None
     assert store.config() == {"max_concurrent_requests": "8"}
 
 

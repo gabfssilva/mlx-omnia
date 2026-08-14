@@ -167,6 +167,7 @@ def run_side(
     *,
     gated: bool,
     floor_mhz: int,
+    max_throttled_retries: int,
     log: Callable[[str], None],
 ) -> tuple[list[Sample], list[int], list[int]]:
     log(f"--- {side.label}: {side.tree or 'this environment'}")
@@ -185,6 +186,7 @@ def run_side(
                     "runs": runs,
                     "gated": gated,
                     "floor_mhz": floor_mhz,
+                    "max_throttled_retries": max_throttled_retries,
                     "out": str(out),
                 }
             )
@@ -197,7 +199,8 @@ def run_side(
                 ours + ([existing] if existing else [])
             )
         done = subprocess.run(
-            [sys.executable, "-m", "mlx_omnia.bench.worker", str(payload)], env=environment
+            [sys.executable, str(Path(__file__).with_name("worker.py")), str(payload)],
+            env=environment,
         )
         if done.returncode != 0:
             raise RuntimeError(f"the {side.label} side failed (its message is above)")
@@ -225,6 +228,7 @@ def paired(
     floor: float = 0.95,
     gated: bool = True,
     floor_mhz: int = 1300,
+    max_throttled_retries: int = 20,
     calibration: Calibration | None = None,
     key: str | None = None,
     log: Callable[[str], None] = stderr,
@@ -235,10 +239,24 @@ def paired(
     if baseline.label == candidate.label:
         raise ValueError(f"both sides are labelled {baseline.label!r}")
     base_samples, base_stream, base_clocks = run_side(
-        baseline, prompt, None, runs, gated=gated, floor_mhz=floor_mhz, log=log
+        baseline,
+        prompt,
+        None,
+        runs,
+        gated=gated,
+        floor_mhz=floor_mhz,
+        max_throttled_retries=max_throttled_retries,
+        log=log,
     )
     cand_samples, cand_stream, cand_clocks = run_side(
-        candidate, prompt, base_stream, runs, gated=gated, floor_mhz=floor_mhz, log=log
+        candidate,
+        prompt,
+        base_stream,
+        runs,
+        gated=gated,
+        floor_mhz=floor_mhz,
+        max_throttled_retries=max_throttled_retries,
+        log=log,
     )
     drift = None
     if calibration is not None and key is not None:

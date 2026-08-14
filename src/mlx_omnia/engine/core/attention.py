@@ -7,8 +7,8 @@ from typing import Literal, NamedTuple, NotRequired, Protocol, TypedDict
 import mlx.core as mx
 import mlx.nn as nn
 
-from mlx_omnia.engine.core.attend import attend
-from mlx_omnia.engine.core.cache import FixedKVCache, KVCache, LayerCache, RingKVCache
+from mlx_omnia.engine.core.attend import KVStore, attend
+from mlx_omnia.engine.core.cache import KVCache, LayerCache
 from mlx_omnia.engine.core.kernels.qkv_rope import QkvRope
 from mlx_omnia.engine.core.layers import SwiGLU, split_qkv
 from mlx_omnia.engine.core.masks import causal_mask
@@ -40,7 +40,6 @@ __all__ = [
 
 type AttentionMask = mx.array | str | None
 type Position = int | mx.array
-type KVStore = KVCache | FixedKVCache | RingKVCache
 type FusedProjectionName = Literal["qkv_proj", "query_key_value", "c_attn", "fused_proj"]
 type OutputProjectionName = Literal["o_proj", "out_proj", "dense", "c_proj"]
 

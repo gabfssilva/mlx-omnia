@@ -29,6 +29,7 @@ from mlx_omnia.engine.core.kernels.attention.kernel import (
 )
 from mlx_omnia.engine.core.kernels.attention.sink import SinkAttentionStep
 from mlx_omnia.engine.core.kernels.attention.sliding import SlidingAttentionStep
+from mlx_omnia.engine.core.kernels.resolve import resolve
 
 __all__ = [
     "Angles",
@@ -41,13 +42,13 @@ __all__ = [
     "SlidingAttentionStep",
 ]
 
-# Order is preference: the first build that returns an instance wins; the default
-# accepts everything, so resolution never fails.
-_BUILDS = (
-    SlidingAttentionStep.build,
-    FullAttentionStep.build,
-    SinkAttentionStep.build,
-    DefaultAttentionStep.build,
+# Order is preference: the first strategy that builds wins; the default accepts
+# everything, so resolution never fails.
+_STRATEGIES = (
+    SlidingAttentionStep,
+    FullAttentionStep,
+    SinkAttentionStep,
+    DefaultAttentionStep,
 )
 
 
@@ -80,29 +81,23 @@ class AttentionStep:
         base: float = 0.0,
         sinks: mx.array | None = None,
     ) -> None:
-        self.strategy: AttentionStepStrategy = next(
-            built
-            for build in _BUILDS
-            if (
-                built := build(
-                    cache,
-                    heads=heads,
-                    kv_heads=kv_heads,
-                    head_dim=head_dim,
-                    scale=scale,
-                    dtype=dtype,
-                    query_weight=query_weight,
-                    key_weight=key_weight,
-                    eps=eps,
-                    rotary_pairs=rotary_pairs,
-                    mscale=mscale,
-                    angles=angles,
-                    freqs=freqs,
-                    base=base,
-                    sinks=sinks,
-                )
-            )
-            is not None
+        self.strategy: AttentionStepStrategy = resolve(
+            _STRATEGIES,
+            cache,
+            heads=heads,
+            kv_heads=kv_heads,
+            head_dim=head_dim,
+            scale=scale,
+            dtype=dtype,
+            query_weight=query_weight,
+            key_weight=key_weight,
+            eps=eps,
+            rotary_pairs=rotary_pairs,
+            mscale=mscale,
+            angles=angles,
+            freqs=freqs,
+            base=base,
+            sinks=sinks,
         )
 
     def __call__(

@@ -3,8 +3,8 @@ from typing import NamedTuple
 import mlx.core as mx
 import mlx.nn as nn
 
+from mlx_omnia.engine.core.attend import KVStore
 from mlx_omnia.engine.core.kernels.add_norm import AddRmsNorm
-from mlx_omnia.engine.core.kernels.attention import AttentionCache
 from mlx_omnia.engine.core.kernels.mlp import Mlp
 from mlx_omnia.engine.core.kernels.route.residual import (
     residual_rms_router,
@@ -50,12 +50,12 @@ class LagunaBlock(nn.Module):
         self,
         x: mx.array,
         mask: mx.array | str | None,
-        cache: AttentionCache,
+        cache: KVStore,
     ) -> mx.array:
         branch = self.self_attn(self.input_layernorm(x), mask, cache)
         kernels = self._kernels()
         mlp = self.mlp
-        step = x.shape[1] == 1
+        step = x.shape[0] == 1 and x.shape[1] == 1
         router_logits: mx.array | None = None
         router_keys: mx.array | None = None
         if step and kernels.router is not None:
@@ -72,6 +72,8 @@ class LagunaBlock(nn.Module):
             attended, h = kernels.add_norm(x, branch)
         if step and isinstance(mlp, LagunaSparseMoe) and mlp.step_applies():
             return mlp.step(h, attended, router_logits, router_keys)
+        if x.shape[1] == 1 and isinstance(mlp, LagunaSparseMoe):
+            return mlp.batch_step(h, attended)
         if step and kernels.mlp is not None:
             return kernels.mlp(h.reshape(-1), attended.reshape(-1)).reshape(attended.shape)
         return attended + mlp(h)

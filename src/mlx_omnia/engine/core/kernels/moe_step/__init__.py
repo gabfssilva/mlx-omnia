@@ -11,13 +11,14 @@ import mlx.core as mx
 from mlx_omnia.engine.core.kernels.moe_step.default import DefaultMoeStep, SharedPair
 from mlx_omnia.engine.core.kernels.moe_step.kernel import MoeStepStrategy
 from mlx_omnia.engine.core.kernels.moe_step.nvfp4 import Nvfp4MoeStep
+from mlx_omnia.engine.core.kernels.resolve import resolve
 from mlx_omnia.engine.core.layers import QuantizedSwitchLinear, SwitchLinear
 
 __all__ = ["DefaultMoeStep", "MoeStep", "MoeStepStrategy", "Nvfp4MoeStep", "SharedPair"]
 
-# Order is preference: the first build that returns an instance wins; the default
-# accepts everything, so resolution never fails.
-_BUILDS = (Nvfp4MoeStep.build, DefaultMoeStep.build)
+# Order is preference: the first strategy that builds wins; the default accepts
+# everything, so resolution never fails.
+_STRATEGIES = (Nvfp4MoeStep, DefaultMoeStep)
 
 
 class MoeStep:
@@ -33,13 +34,13 @@ class MoeStep:
         inner: int,
         shared: SharedPair | None = None,
     ) -> None:
-        self.strategy: MoeStepStrategy = next(
-            built
-            for build in _BUILDS
-            if (
-                built := build(fc1=fc1, fc2=fc2, hidden=hidden, inner=inner, shared=shared)
-            )
-            is not None
+        self.strategy: MoeStepStrategy = resolve(
+            _STRATEGIES,
+            fc1=fc1,
+            fc2=fc2,
+            hidden=hidden,
+            inner=inner,
+            shared=shared,
         )
 
     def __call__(self, x: mx.array, chosen: mx.array, weights: mx.array) -> mx.array:

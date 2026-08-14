@@ -3,7 +3,7 @@
 A model block declares the primitive — the leaf and its activation — and `Mlp` binds
 the specialization that leaf's weight format admits, or none, at construction time.
 The model never names a format; a new format is a new module here, registered in
-`_BUILDS`, and every family engages it.
+`_STRATEGIES`, and every family engages it.
 
 The resolution table is (format x activation): the bf16 dense kernels serve silu in
 two dispatches, gate‖up + SwiGLU then down + residual; the nvfp4 kernel serves the
@@ -18,6 +18,7 @@ from mlx_omnia.engine.core.kernels.mlp.default import DefaultMlp
 from mlx_omnia.engine.core.kernels.mlp.dense import DenseMlp
 from mlx_omnia.engine.core.kernels.mlp.kernel import Activation, MlpStrategy
 from mlx_omnia.engine.core.kernels.mlp.nvfp4 import Nvfp4Mlp
+from mlx_omnia.engine.core.kernels.resolve import resolve
 from mlx_omnia.engine.core.layers import SwiGLU
 
 __all__ = [
@@ -29,9 +30,9 @@ __all__ = [
     "Nvfp4Mlp",
 ]
 
-# Order is preference: the first build that returns an instance wins; the default
-# accepts everything, so resolution never fails.
-_BUILDS = (Nvfp4Mlp.build, DenseMlp.build, DefaultMlp.build)
+# Order is preference: the first strategy that builds wins; the default accepts
+# everything, so resolution never fails.
+_STRATEGIES = (Nvfp4Mlp, DenseMlp, DefaultMlp)
 
 
 class Mlp:
@@ -45,11 +46,12 @@ class Mlp:
         inner: int,
         activation: Activation = "silu",
     ) -> None:
-        self.strategy: MlpStrategy = next(
-            built
-            for build in _BUILDS
-            if (built := build(leaf, hidden=hidden, inner=inner, activation=activation))
-            is not None
+        self.strategy: MlpStrategy = resolve(
+            _STRATEGIES,
+            leaf,
+            hidden=hidden,
+            inner=inner,
+            activation=activation,
         )
 
     def __call__(self, row: mx.array, residual: mx.array) -> mx.array:

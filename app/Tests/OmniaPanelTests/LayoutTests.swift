@@ -1,4 +1,5 @@
 import XCTest
+import SwiftUI
 @testable import OmniaPanel
 
 final class LayoutTests: XCTestCase {
@@ -9,6 +10,20 @@ final class LayoutTests: XCTestCase {
 
     func testPanelUsesCompactHeight() {
         XCTAssertEqual(Panel.height, 620)
+    }
+
+    @MainActor
+    func testTuningKnobUsesNumericInput() {
+        let knob = Knob(
+            name: "temperature",
+            value: .constant(nil),
+            low: 0,
+            high: 2
+        )
+        let body = String(reflecting: knob.body)
+
+        XCTAssertTrue(body.contains("TextField"))
+        XCTAssertFalse(body.contains("Rail"))
     }
 
 }

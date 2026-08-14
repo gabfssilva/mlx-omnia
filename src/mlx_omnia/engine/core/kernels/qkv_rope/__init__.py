@@ -3,7 +3,7 @@
 An attention block declares the prologue — the projection, the head geometry, the
 per-head norm weights, and how the rotary is described — and `QkvRope` binds the
 fusion that declaration admits, or none, at construction time. The model never names a
-kernel; a new fusion is a new module here, registered in `_BUILDS`, and every family
+kernel; a new fusion is a new module here, registered in `_STRATEGIES`, and every family
 engages it.
 
 The resolution table is (rotary description x projection shape): `angles` plus
@@ -31,6 +31,7 @@ from mlx_omnia.engine.core.kernels.qkv_rope.kernel import (
 )
 from mlx_omnia.engine.core.kernels.qkv_rope.qk_norm_rope import QkNormRope
 from mlx_omnia.engine.core.kernels.qkv_rope.segmented import SegmentedQkv
+from mlx_omnia.engine.core.kernels.resolve import resolve
 
 __all__ = [
     "Angles",
@@ -45,13 +46,13 @@ __all__ = [
     "SegmentedQkv",
 ]
 
-# Order is preference: the first build that returns an instance wins; the default
-# accepts everything, so resolution never fails.
-_BUILDS = (
-    QkNormRope.build,
-    RopeEpilogue.build,
-    SegmentedQkv.build,
-    DefaultQkvRope.build,
+# Order is preference: the first strategy that builds wins; the default accepts
+# everything, so resolution never fails.
+_STRATEGIES = (
+    QkNormRope,
+    RopeEpilogue,
+    SegmentedQkv,
+    DefaultQkvRope,
 )
 
 
@@ -76,27 +77,21 @@ class QkvRope:
         mscale: float = 1.0,
         segments: tuple[Leaf, Leaf, Leaf] | None = None,
     ) -> None:
-        self.strategy: QkvRopeStrategy = next(
-            built
-            for build in _BUILDS
-            if (
-                built := build(
-                    projection,
-                    heads=heads,
-                    kv_heads=kv_heads,
-                    head_dim=head_dim,
-                    rope=rope,
-                    eps=eps,
-                    q_norm=q_norm,
-                    k_norm=k_norm,
-                    base=base,
-                    angles=angles,
-                    rotary_pairs=rotary_pairs,
-                    mscale=mscale,
-                    segments=segments,
-                )
-            )
-            is not None
+        self.strategy: QkvRopeStrategy = resolve(
+            _STRATEGIES,
+            projection,
+            heads=heads,
+            kv_heads=kv_heads,
+            head_dim=head_dim,
+            rope=rope,
+            eps=eps,
+            q_norm=q_norm,
+            k_norm=k_norm,
+            base=base,
+            angles=angles,
+            rotary_pairs=rotary_pairs,
+            mscale=mscale,
+            segments=segments,
         )
 
     def __call__(

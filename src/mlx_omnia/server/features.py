@@ -347,6 +347,7 @@ class SettingsView(BaseModel):
 
     model: str
     features: Features
+    max_concurrent_requests: int | None = None
     available: list[str]
     mtp_available: bool = False
     """Whether this checkpoint carries an MTP head this engine can build. Read from the
@@ -359,6 +360,7 @@ class SettingsBody(BaseModel):
     model_config = ConfigDict(extra="forbid")
 
     features: Features = Features()
+    max_concurrent_requests: int | None = Field(default=None, ge=1)
 
 
 def _store(request: Request) -> Store:
@@ -379,11 +381,14 @@ EngineDep = Annotated[Engine, Depends(_engine)]
 router = APIRouter()
 
 
-def _view(model_id: str, features: Features) -> SettingsView:
+def _view(
+    model_id: str, features: Features, max_concurrent_requests: int | None = None
+) -> SettingsView:
     found = availability(model_id)
     return SettingsView(
         model=model_id,
         features=features,
+        max_concurrent_requests=max_concurrent_requests,
         available=found.drafters,
         mtp_available=found.mtp,
         unavailable_reason=found.reason,
@@ -392,7 +397,8 @@ def _view(model_id: str, features: Features) -> SettingsView:
 
 @router.get("/admin/models/{model_id:path}/settings")
 def settings(model_id: str, store: StoreDep) -> SettingsView:
-    return _view(model_id, parse(store.model_settings(model_id).features))
+    saved = store.model_settings(model_id)
+    return _view(model_id, parse(saved.features), saved.max_concurrent_requests)
 
 
 def declared_block_size(directory: Path) -> int | None:
@@ -416,8 +422,10 @@ async def save(
     request pays the cold load, which is the price of the answer the switch promises. A
     generation already running is not interrupted (`Engine.unload`).
     """
+    previous = store.model_settings(model_id).features
     view = await asyncio.to_thread(_save, model_id, body, store)
-    await engine.unload(model_id)
+    if body.features.model_dump_json(exclude_none=True) != previous:
+        await engine.unload(model_id)
     return view
 
 
@@ -467,6 +475,10 @@ def _save(model_id: str, body: SettingsBody, store: Store) -> SettingsView:
                 detail=f"{named!r} writes {block} ids a round, not {speculation.block_size}",
             )
     store.save_model_settings(
-        ModelSettings(model_id, body.features.model_dump_json(exclude_none=True))
+        ModelSettings(
+            model_id,
+            body.features.model_dump_json(exclude_none=True),
+            body.max_concurrent_requests,
+        )
     )
-    return _view(model_id, body.features)
+    return _view(model_id, body.features, body.max_concurrent_requests)

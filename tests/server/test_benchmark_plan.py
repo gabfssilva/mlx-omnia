@@ -94,19 +94,16 @@ def test_turning_the_skip_off_moves_the_already_measured_back_into_the_shapes(
 def test_an_estimate_with_no_history_and_no_ceiling_is_absent(tmp_path: Path) -> None:
     """`null` rather than a guessed number: a bar drawn from an invented total is worse
     than no bar."""
-    with stand(tmp_path, [(MODEL, SMALL)]) as house:
+    with stand(tmp_path, [(MODEL, SMALL), (BIG, {"model_type": "unknown"})]) as house:
         drawn = plan(house.client, {**SPEED_BODY, "models": [MODEL]})
 
         assert len(drawn["shapes"]) == 1
         # This checkpoint is priced, so there is a ceiling to fall back on.
         assert drawn["estimate_seconds"] is not None and drawn["estimate_seconds"] > 0
 
-        refused = plan(
-            house.client,
-            {**SPEED_BODY, "models": [MODEL], "concurrencies": [8]},
-        )
-        assert refused["shapes"] == []
-        assert refused["estimate_seconds"] is None
+        unpriced = plan(house.client, {**SPEED_BODY, "models": [BIG]})
+        assert len(unpriced["shapes"]) == 1
+        assert unpriced["estimate_seconds"] is None
 
 
 def test_a_fidelity_pair_of_two_vocabularies_is_skipped_before_anything_loads(

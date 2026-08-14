@@ -133,6 +133,8 @@ struct Transcript: View {
     @Bindable var app: AppModel
     let openHistory: () -> Void
 
+    @State private var following = true
+
     var body: some View {
         let chat = app.chat
         // The daemon republishes the request it is serving twice a second, and that is where
@@ -177,15 +179,25 @@ struct Transcript: View {
                 .padding(.bottom, 10)
             }
             .scrollIndicators(.never)
-            // Only while one is being written: a conversation read back out of the store is
-            // opened at its head, and the same handler fires when its turns land. Unanimated
-            // — the transcript is painted at a fixed rate, and an ease that takes longer than
-            // the gap between two paints is restarted before it has arrived anywhere.
+            // Only while one is being written and the reader is at its end: a conversation
+            // read back out of the store is opened at its head, and the same handler fires
+            // when its turns land. Unanimated — the transcript is painted at a fixed rate,
+            // and an ease that takes longer than the gap between two paints is restarted
+            // before it has arrived anywhere.
             .onChange(of: chat.turns.last) { _, _ in
-                guard chat.streaming else { return }
+                guard chat.streaming, following else { return }
                 rail.scrollTo(Self.foot, anchor: .bottom)
             }
+            .onChange(of: following) {
+                if following { rail.scrollTo(Self.foot, anchor: .bottom) }
+            }
             .onChange(of: chat.session) { _, _ in rail.scrollTo(Self.head, anchor: .top) }
+            .onScrollGeometryChange(for: Bool.self) { geometry in
+                geometry.contentOffset.y + geometry.containerSize.height
+                    >= geometry.contentSize.height - 8
+            } action: { _, atEnd in
+                following = atEnd
+            }
         }
         .background(t.surface)
     }
@@ -270,28 +282,56 @@ struct Thinking: View {
     let turn: Turn
 
     @State private var opened = false
+    @State private var following = true
 
     private var thinking: Bool { turn.writing && turn.text.isEmpty }
 
     var body: some View {
-        VStack(alignment: .leading, spacing: 6) {
+        VStack(alignment: .leading, spacing: 0) {
             HStack(spacing: 6) {
                 Text(opened ? "▾" : "▸").sans(9, t.fg3)
                 Text(label).sans(11.5, t.fg3)
             }
+            .frame(maxWidth: .infinity, alignment: .leading)
+            .padding(.horizontal, 10)
+            .padding(.vertical, 7)
             .contentShape(Rectangle())
-            .onTapGesture { opened.toggle() }
+            .onTapGesture {
+                if !opened { following = true }
+                opened.toggle()
+            }
 
             if opened {
-                // The same renderer the answer gets: a model that numbers its steps and
-                // quotes code while it thinks wrote markdown, whichever channel it went out on.
-                Prose(text: turn.reasoning, size: 11.5, tone: t.fg2)
-                    .padding(.leading, 9)
-                    .overlay(alignment: .leading) {
-                        Rectangle().fill(t.hair2).frame(width: 1.5)
+                ScrollViewReader { rail in
+                    ScrollView {
+                        // The same renderer the answer gets: a model that numbers its steps and
+                        // quotes code while it thinks wrote markdown, whichever channel it went out on.
+                        Prose(text: turn.reasoning, size: 11.5, tone: t.fg2)
+                            .frame(maxWidth: .infinity, alignment: .leading)
+                            .padding(10)
+                        Color.clear.frame(height: 1).id(Self.foot)
                     }
+                    .onAppear { rail.scrollTo(Self.foot, anchor: .bottom) }
+                    .onChange(of: turn.reasoning) {
+                        if following { rail.scrollTo(Self.foot, anchor: .bottom) }
+                    }
+                    .onChange(of: following) {
+                        if following { rail.scrollTo(Self.foot, anchor: .bottom) }
+                    }
+                    .onScrollGeometryChange(for: Bool.self) { geometry in
+                        geometry.contentOffset.y + geometry.containerSize.height
+                            >= geometry.contentSize.height - 8
+                    } action: { _, atEnd in
+                        following = atEnd
+                    }
+                }
+                .frame(maxHeight: 220)
+                .overlay(alignment: .top) { Rectangle().fill(t.hair).frame(height: 1) }
             }
         }
+        .background(t.elev)
+        .overlay(RoundedRectangle(cornerRadius: 10).strokeBorder(t.hair, lineWidth: 1))
+        .clipShape(RoundedRectangle(cornerRadius: 10))
         .padding(.bottom, 8)
     }
 
@@ -300,6 +340,8 @@ struct Thinking: View {
         guard let spent = turn.thoughtFor else { return "Thought" }
         return String(format: "Thought for %.1fs", spent)
     }
+
+    private static let foot = "thinking-end"
 }
 
 /// A call, as the model wrote it. Nothing here runs it: the panel is not an agent, and what

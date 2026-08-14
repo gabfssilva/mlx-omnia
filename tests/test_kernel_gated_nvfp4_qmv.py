@@ -12,6 +12,7 @@ The floor is the bf16 epilogue -- see `test_kernel_nvfp4_qmv` for the derivation
 """
 
 import mlx.core as mx
+import pytest
 from conftest import relative_diff
 
 from mlx_omnia.engine.core.kernels.qmv.gated_nvfp4 import gated_nvfp4_qmv, gated_nvfp4_qmv_applies
@@ -176,3 +177,23 @@ def test_gate_reaches_one_head_only() -> None:
     shifted = (mx.arange(HEADS) == live + 1).astype(mx.bfloat16).reshape(1, 1, HEADS)
     off_by_one = gated_nvfp4_qmv(x, shifted, weight, scales, bank)
     assert relative_diff(ours, off_by_one) > BF16_FLOOR
+
+
+@pytest.mark.parametrize("batch", [2, 4])
+def test_small_row_batch_matches_the_chain(batch: int) -> None:
+    weight = codes(ROWS, KDIM, seed=6)
+    scales = fitting_plane(ROWS, KDIM // GROUP, seed=7)
+    bank = lane_major_scales(scales)
+    x = mx.random.normal((batch, 1, KDIM)).astype(mx.bfloat16)
+    gate = mx.random.uniform(shape=(batch, 1, HEADS)).astype(mx.bfloat16)
+
+    ours = gated_nvfp4_qmv(x, gate, weight, scales, bank)
+
+    assert ours.shape == (batch, 1, ROWS)
+    expected = mx.concatenate(
+        [
+            reference(x[index : index + 1], gate[index : index + 1], weight, scales)
+            for index in range(batch)
+        ]
+    )
+    assert relative_diff(ours, expected) < BF16_FLOOR

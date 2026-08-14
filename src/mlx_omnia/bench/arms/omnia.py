@@ -6,6 +6,8 @@ pieces left reachable — the tree, the drafter, the acceptance counter — whic
 needs to report a speculative round against its own ceiling.
 """
 
+import statistics
+import time
 from collections.abc import Callable, Iterator, Sequence
 from dataclasses import dataclass
 
@@ -16,6 +18,8 @@ from mlx_omnia import greedy, stream_ids, tree
 from mlx_omnia.bench.arm import Arm, TokenId, arm
 from mlx_omnia.bench.arms.hub import cached, snapshot
 from mlx_omnia.bench.forcing import forced
+from mlx_omnia.bench.gate import Gate
+from mlx_omnia.engine.batching import BatchModel, prepare_batch_sequence, step
 from mlx_omnia.engine.bpe import ByteLevelBPE
 from mlx_omnia.engine.footprint import SUSTAINED_GBS, Routed, active_bytes_per_token
 from mlx_omnia.engine.speculative import Acceptance
@@ -26,16 +30,147 @@ __all__ = [
     "SUSTAINED_GBS",
     "Acceptance",
     "Built",
+    "ConcurrencyRow",
+    "ConcurrencySweep",
     "Known",
     "active_bytes_per_token",
     "build",
     "drafter",
     "loaded",
+    "measure_concurrency",
     "over",
     "resolve",
     "sparse",
     "tokenizer",
 ]
+
+
+@dataclass(frozen=True, slots=True)
+class ConcurrencyRow:
+    concurrency: int
+    ttft_ms: float
+    aggregate_tps: float
+    per_request_tps: float
+    speedup: float
+    efficiency: float
+    samples: tuple[float, ...]
+    temperatures: tuple[float, ...]
+    kv_bytes: tuple[int, ...]
+
+
+@dataclass(frozen=True, slots=True)
+class ConcurrencySweep:
+    rows: tuple[ConcurrencyRow, ...]
+
+    def render(self) -> str:
+        lines = [" C   TTFT ms   aggregate tok/s   per request   vs CB C1   efficiency"]
+        lines.extend(
+            f"{row.concurrency:>2}   {row.ttft_ms:>7.1f}   {row.aggregate_tps:>15.1f}   "
+            f"{row.per_request_tps:>11.1f}   {row.speedup:>6.3f}x   "
+            f"{row.efficiency * 100:>8.1f}%   "
+            f"(min {min(row.samples):.1f}, max {max(row.samples):.1f}, n={len(row.samples)}, "
+            f"KV {statistics.median(row.kv_bytes) / 1024**2:.1f} MiB)"
+            for row in self.rows
+        )
+        return "\n".join(lines)
+
+    def as_dict(self) -> dict[str, object]:
+        return {
+            "rows": [
+                {
+                    "concurrency": row.concurrency,
+                    "ttft_ms": row.ttft_ms,
+                    "aggregate_tps": row.aggregate_tps,
+                    "per_request_tps": row.per_request_tps,
+                    "speedup": row.speedup,
+                    "efficiency": row.efficiency,
+                    "samples": list(row.samples),
+                    "temperatures": list(row.temperatures),
+                    "kv_bytes": list(row.kv_bytes),
+                }
+                for row in self.rows
+            ]
+        }
+
+
+def measure_concurrency(
+    model: BatchModel,
+    prompt: Sequence[int],
+    *,
+    concurrencies: Sequence[int],
+    tokens: int,
+    runs: int,
+    gate: Gate,
+) -> ConcurrencySweep:
+    if tokens < 2:
+        raise ValueError(f"tokens must be at least 2, got {tokens}")
+    if runs < 1:
+        raise ValueError(f"runs must be positive, got {runs}")
+    counts = tuple(dict.fromkeys(concurrencies))
+    if 1 not in counts or any(count < 1 for count in counts):
+        raise ValueError("concurrencies must be positive and include 1")
+
+    measured: list[
+        tuple[int, float, tuple[float, ...], tuple[float, ...], tuple[int, ...]]
+    ] = []
+    for concurrency in counts:
+        ttfts: list[float] = []
+        rates: list[float] = []
+        temperatures: list[float] = []
+        kv_bytes: list[int] = []
+        for _ in range(runs):
+            temperature = gate.wait()
+            if temperature is not None:
+                temperatures.append(temperature)
+            started = time.perf_counter()
+            sequences = [
+                prepare_batch_sequence(model, prompt, max_tokens=tokens, sampler=greedy)
+                for _ in range(concurrency)
+            ]
+            active = sequences
+            step(model, active)
+            first = time.perf_counter()
+            active = [sequence for sequence in active if not sequence.finished]
+            while active:
+                step(model, active)
+                active = [sequence for sequence in active if not sequence.finished]
+            ended = time.perf_counter()
+            ttfts.append(first - started)
+            rates.append(concurrency * (tokens - 1) / (ended - first))
+            kv_bytes.append(
+                sum(layer.nbytes for sequence in sequences for layer in sequence.cache)
+            )
+        measured.append(
+            (
+                concurrency,
+                statistics.median(ttfts),
+                tuple(rates),
+                tuple(temperatures),
+                tuple(kv_bytes),
+            )
+        )
+
+    baseline = next(
+        statistics.median(rates)
+        for concurrency, _, rates, _, _ in measured
+        if concurrency == 1
+    )
+    return ConcurrencySweep(
+        tuple(
+            ConcurrencyRow(
+                concurrency,
+                ttft * 1000,
+                statistics.median(rates),
+                statistics.median(rates) / concurrency,
+                statistics.median(rates) / baseline,
+                statistics.median(rates) / (baseline * concurrency),
+                rates,
+                temperatures,
+                kv_bytes,
+            )
+            for concurrency, ttft, rates, temperatures, kv_bytes in measured
+        )
+    )
 
 DTYPES = {"float16": mx.float16, "bfloat16": mx.bfloat16, "float32": mx.float32}
 

@@ -105,6 +105,7 @@ static inline float nvfp4_tail_qdot(
 
 _SOURCE = """
 constexpr uint axis_size = (uint)AXIS;
+constexpr uint out_vec_size = (uint)OUT_VEC;
 constexpr uint num_simdgroups = 2;
 constexpr uint values_per_thread = 16;
 constexpr uint block_size = 512;
@@ -115,7 +116,9 @@ constexpr uint blocks_per_row = in_vec_size_g / 32;
 uint tile = threadgroup_position_in_grid.x;
 uint simd_gid = simdgroup_index_in_threadgroup;
 uint simd_lid = thread_index_in_simdgroup;
-uint out_row = tile * num_simdgroups + simd_gid;
+uint tiles_per_input = out_vec_size / num_simdgroups;
+uint input_row = tile / tiles_per_input;
+uint out_row = (tile % tiles_per_input) * num_simdgroups + simd_gid;
 
 const device uint8_t* ws = (const device uint8_t*)weight_codes +
     out_row * in_vec_size_w + simd_lid * 8;
@@ -144,9 +147,10 @@ thread float x_thread[values_per_thread];
 thread float result = 0.0f;
 
 uint column = simd_lid * values_per_thread;
+const device bfloat* input = normalized + input_row * axis_size;
 for (uint k = 0; k < axis_size; k += block_size) {
     for (uint i = 0; i < values_per_thread; ++i) {
-        x_thread[i] = float(normalized[column + i]);
+        x_thread[i] = float(input[column + i]);
     }
     result += nvfp4_tail_qdot(
         ws, x_thread, nvfp4_tail_scale(sb[k / block_size]));
@@ -156,7 +160,7 @@ for (uint k = 0; k < axis_size; k += block_size) {
 
 result = simd_sum(result * 4194304.0f);
 if (simd_lid == 0) {
-    projected[out_row] = bfloat(result);
+    projected[input_row * out_vec_size + out_row] = bfloat(result);
 }
 """
 
@@ -205,15 +209,16 @@ def nvfp4_qmv(
     """
     kdim = weight.shape[-1] * 8
     rows = weight.shape[-2]
-    assert x.dtype == mx.bfloat16 and x.size == kdim
+    input_rows = x.size // kdim
+    assert x.dtype == mx.bfloat16 and x.shape[-1] == kdim
     assert nvfp4_qmv_applies(kdim, rows, group_size=_GROUP_SIZE, bits=_BITS)
     assert scales.shape == (rows, kdim // _GROUP_SIZE)
     assert bank.nibbles.shape == (rows, kdim // (4 * _GROUP_SIZE))
     assert bank.bases.shape == (rows,)
     return _KERNEL(
         inputs=[x, weight, bank.nibbles, bank.bases, scales],
-        template=[("AXIS", kdim)],
-        grid=((rows // 2) * 64, 1, 1),
+        template=[("AXIS", kdim), ("OUT_VEC", rows)],
+        grid=(input_rows * (rows // 2) * 64, 1, 1),
         threadgroup=(64, 1, 1),
         output_shapes=[(*x.shape[:-1], rows)],
         output_dtypes=[mx.bfloat16],

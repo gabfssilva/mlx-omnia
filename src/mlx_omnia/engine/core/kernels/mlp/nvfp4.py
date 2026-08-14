@@ -36,6 +36,9 @@ constexpr uint block_width = 512;
 constexpr uint values_per_lane = 16;
 
 uint tile = threadgroup_position_in_grid.x;
+uint tiles_per_input = output_width / 2;
+uint input_row = tile / tiles_per_input;
+tile %= tiles_per_input;
 uint simd_group = simdgroup_index_in_threadgroup;
 uint lane = thread_index_in_simdgroup;
 uint row = tile * 2 + simd_group;
@@ -58,7 +61,7 @@ thread float input_values[values_per_lane];
 for (uint block = 0; block < input_width; block += block_width) {
     const device vec<bfloat, 4>* input_vectors =
         (const device vec<bfloat, 4>*) (
-            input + block + lane * values_per_lane);
+            input + input_row * input_width + block + lane * values_per_lane);
     for (uint i = 0; i < values_per_lane / 4; ++i) {
         const vec<bfloat, 4> values = input_vectors[i];
         input_values[4 * i] = values[0];
@@ -89,7 +92,7 @@ if (lane == 0) {
     bfloat y = bfloat(1) / denominator;
     bfloat sigmoid = gate < bfloat(0) ? y : bfloat(1) - y;
     bfloat silu = bfloat(gate * sigmoid);
-    activated[row] = bfloat(silu * up);
+    activated[input_row * output_width + row] = bfloat(silu * up);
 }
 """
 
@@ -128,16 +131,17 @@ def nvfp4_halved_gate_up(
     hidden = fused_weight.shape[1] * 8
     inner = fused_weight.shape[0] // 2
     assert nvfp4_halved_gate_up_applies(hidden, inner)
-    assert x.dtype == mx.bfloat16 and x.size == hidden
+    input_rows = x.size // hidden
+    assert x.dtype == mx.bfloat16 and x.shape[-1] == hidden
     assert fused_weight.dtype == mx.uint32
     assert fused_scales.dtype == mx.uint8 and fused_scales.ndim == 1
     assert fused_scales.size == SCALE_PATCH_BYTES + 2 * inner * (hidden // 32)
     return _KERNEL(
         inputs=[x, fused_weight, fused_scales],
         template=[("HIDDEN", hidden), ("INNER", inner), ("PATCH", SCALE_PATCH_BYTES)],
-        grid=((inner // 2) * 64, 1, 1),
+        grid=(input_rows * (inner // 2) * 64, 1, 1),
         threadgroup=(64, 1, 1),
-        output_shapes=[(inner,)],
+        output_shapes=[(*x.shape[:-1], inner)],
         output_dtypes=[mx.bfloat16],
     )[0]
 

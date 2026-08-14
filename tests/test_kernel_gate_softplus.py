@@ -94,3 +94,14 @@ def test_output_shape_follows_the_input() -> None:
     x = mx.random.normal((KDIM,)).astype(mx.bfloat16)
 
     assert gate_softplus(x, weight, scales, biases).shape == (ROWS,)
+
+
+@pytest.mark.parametrize("batch", [2, 4])
+def test_small_row_batch_matches_the_chain(batch: int) -> None:
+    weight, scales, biases = packed(ROWS, KDIM, seed=29)
+    x = mx.random.normal((batch, 1, KDIM)).astype(mx.bfloat16)
+
+    ours = gate_softplus(x, weight, scales, biases)
+
+    assert ours.shape == (batch, 1, ROWS)
+    assert relative_diff(ours, reference(x, weight, scales, biases)) < BF16_FLOOR

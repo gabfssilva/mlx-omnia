@@ -15,6 +15,7 @@ functions the mixers call directly — `ssm_step`, `ssm_attn`, `ssm_update`,
 
 import mlx.core as mx
 
+from mlx_omnia.engine.core.kernels.resolve import resolve
 from mlx_omnia.engine.core.kernels.ssm.chunked import ssm_applies, ssm_attn, ssm_step, ssm_update
 from mlx_omnia.engine.core.kernels.ssm.default import DefaultSsm, ssm_step_ref
 from mlx_omnia.engine.core.kernels.ssm.fused import FusedSsm
@@ -33,9 +34,9 @@ __all__ = [
     "ssm_update",
 ]
 
-# Order is preference: the first build that returns an instance wins; the default
-# accepts everything, so resolution never fails.
-_BUILDS = (FusedSsm.build, DefaultSsm.build)
+# Order is preference: the first strategy that builds wins; the default accepts
+# everything, so resolution never fails.
+_STRATEGIES = (FusedSsm, DefaultSsm)
 
 
 class Ssm:
@@ -54,22 +55,16 @@ class Ssm:
         time_step_limit: tuple[float, float] = (0.0, float("inf")),
         step: int = 256,
     ) -> None:
-        self.strategy: SsmStrategy = next(
-            built
-            for build in _BUILDS
-            if (
-                built := build(
-                    A_log=A_log,
-                    D=D,
-                    dt_bias=dt_bias,
-                    d_state=d_state,
-                    heads=heads,
-                    groups=groups,
-                    time_step_limit=time_step_limit,
-                    step=step,
-                )
-            )
-            is not None
+        self.strategy: SsmStrategy = resolve(
+            _STRATEGIES,
+            A_log=A_log,
+            D=D,
+            dt_bias=dt_bias,
+            d_state=d_state,
+            heads=heads,
+            groups=groups,
+            time_step_limit=time_step_limit,
+            step=step,
         )
 
     def __call__(

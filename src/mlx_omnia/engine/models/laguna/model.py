@@ -1,10 +1,12 @@
-from collections.abc import Callable
+from collections.abc import Callable, Sequence
 from typing import NamedTuple
 
 import mlx.core as mx
 import mlx.nn as nn
 
+from mlx_omnia.engine.batching import batch
 from mlx_omnia.engine.checkpoint import wire_resident
+from mlx_omnia.engine.core.attend import KVStore
 from mlx_omnia.engine.core.cache import FixedKVCache, KVCache, RingKVCache
 from mlx_omnia.engine.core.kernels.attention.sdpa import SCALED_DOT_PRODUCT_ATTENTION
 from mlx_omnia.engine.core.kernels.lm_head.argmax import (
@@ -27,10 +29,29 @@ class LagunaActivations(NamedTuple):
     logits: mx.array
 
 
+type LagunaCache = KVCache | FixedKVCache | RingKVCache
+
+
+class _BatchBucket(NamedTuple):
+    slots: tuple[tuple[LagunaCache, ...], ...]
+    decode: Callable[[mx.array], mx.array]
+
+
+class _SingleBucket(NamedTuple):
+    slots: tuple[LagunaCache, ...]
+    decode: Callable[[mx.array], mx.array]
+
+
 @uses(SCALED_DOT_PRODUCT_ATTENTION)
 class Laguna(nn.Module):
+    continuous_batching = True
+
     def __init__(self, config: LagunaConfig) -> None:
         super().__init__()
+        object.__setattr__(self, "_single_decodes", {})
+        object.__setattr__(self, "_single_greedy_decodes", {})
+        object.__setattr__(self, "_batch_decodes", {})
+        object.__setattr__(self, "_batch_greedy_decodes", {})
         self.config = config
         self.model = LagunaTrunk(config)
         if not config.tie_word_embeddings:
@@ -57,6 +78,254 @@ class Laguna(nn.Module):
     ) -> Callable[[mx.array], mx.array]:
         return self._compile_decode(cache, capacity, argmax_only=True)
 
+    def single_decode(
+        self,
+        ids: mx.array,
+        cache: list[LagunaCache],
+        *,
+        capacity: int,
+    ) -> mx.array:
+        bucket = self._single_bucket(cache, capacity, greedy=False)
+        return bucket.decode(ids)
+
+    def single_greedy(
+        self,
+        ids: mx.array,
+        cache: list[LagunaCache],
+        *,
+        capacity: int,
+    ) -> mx.array:
+        bucket = self._single_bucket(cache, capacity, greedy=True)
+        return mx.argmax(bucket.decode(ids), axis=-1)
+
+    def prepare_single_greedy(
+        self,
+        cache: list[LagunaCache],
+        *,
+        capacity: int,
+    ) -> Callable[[mx.array], mx.array]:
+        decode = self._compile_decode(cache, capacity, argmax_only=True)
+
+        def greedy_decode(ids: mx.array) -> mx.array:
+            return mx.argmax(decode(ids), axis=-1)[0]
+
+        return greedy_decode
+
+    def _single_bucket(
+        self,
+        cache: list[LagunaCache],
+        capacity: int,
+        *,
+        greedy: bool,
+    ) -> _SingleBucket:
+        decodes: dict[tuple[int, int], _SingleBucket] = (
+            self._single_greedy_decodes if greedy else self._single_decodes
+        )
+        key = (id(cache), capacity)
+        bucket = decodes.get(key)
+        if bucket is not None and all(
+            source is target for source, target in zip(cache, bucket.slots, strict=True)
+        ):
+            return bucket
+        decodes.clear()
+        decode = self._compile_decode(cache, capacity, argmax_only=greedy)
+        bucket = _SingleBucket(tuple(cache), decode)
+        decodes[key] = bucket
+        return bucket
+
+    def compile_batch_decode(
+        self,
+        caches: Sequence[list[KVCache | FixedKVCache | RingKVCache]],
+        capacity: int = 4096,
+    ) -> Callable[[mx.array], mx.array]:
+        return self._compile_batch_forward(caches, capacity, project_head=True)
+
+    def _compile_batch_forward(
+        self,
+        caches: Sequence[list[KVCache | FixedKVCache | RingKVCache]],
+        capacity: int,
+        *,
+        project_head: bool,
+    ) -> Callable[[mx.array], mx.array]:
+        if len(caches) not in (2, 4):
+            raise ValueError(f"compiled batch size must be 2 or 4, got {len(caches)}")
+        if any(len(sequence) != len(self.config.layer_types) for sequence in caches):
+            raise ValueError("batch decode cache count does not match the model")
+        offsets = [sequence[0].rows for sequence in caches]
+        if max(offsets) >= capacity:
+            raise ValueError(
+                f"prompt length {max(offsets)} does not fit compiled capacity {capacity}"
+            )
+        slots = self._make_batch_slots(caches, capacity)
+        stores = batch(slots)
+        state = [
+            layer.state
+            for sequence in slots
+            for layer in sequence
+            if isinstance(layer, (FixedKVCache, RingKVCache))
+        ]
+
+        for block in self.model.layers:
+            block.self_attn._angles(max(offsets))
+            block.self_attn._kernels()
+            block._kernels()
+            if isinstance(block.mlp, LagunaSparseMoe):
+                block.mlp.step_applies()
+        wire_resident()
+        for sequence, slot in zip(caches, slots, strict=True):
+            sequence[:] = slot
+
+        def forward(ids: mx.array) -> mx.array:
+            x = self.model.embed_tokens(ids)
+            for block, layer_cache in zip(self.model.layers, stores, strict=True):
+                x = block(x, None, layer_cache)
+            normed = self.model.norm(x)
+            if not project_head:
+                return normed
+            if self.config.tie_word_embeddings:
+                return self.model.embed_tokens.as_linear(normed)
+            return self.lm_head(normed)
+
+        return mx.compile(forward, inputs=[_ATLASES, state], outputs=state)
+
+    def _make_batch_slots(
+        self,
+        caches: Sequence[list[LagunaCache]],
+        capacity: int,
+    ) -> list[list[FixedKVCache | RingKVCache]]:
+        slots: list[list[FixedKVCache | RingKVCache]] = []
+        for sequence in caches:
+            slot: list[FixedKVCache | RingKVCache] = []
+            for source, kind in zip(sequence, self.config.layer_types, strict=True):
+                if kind == SLIDING:
+                    if isinstance(source, KVCache):
+                        target = RingKVCache.promote(source, self.config.sliding_window)
+                    elif isinstance(source, RingKVCache):
+                        keys, values = source.fetch()
+                        target = RingKVCache(self.config.sliding_window)
+                        target.restore(
+                            source.rows,
+                            {
+                                "keys": keys + mx.zeros_like(keys),
+                                "values": values + mx.zeros_like(values),
+                            },
+                        )
+                        target_keys, target_values = target.fetch()
+                        target.state = [
+                            target_keys,
+                            target_values,
+                            mx.array([source.rows], dtype=mx.int32),
+                        ]
+                    else:
+                        raise TypeError("sliding layer requires a growing or ring KV cache")
+                else:
+                    if isinstance(source, RingKVCache):
+                        raise TypeError("full layer cannot be restored from a ring KV cache")
+                    keys, values = source.fetch()
+                    rows = source.rows
+                    shape = list(keys.shape)
+                    shape[2] = capacity
+                    fixed_keys = mx.zeros(shape, dtype=keys.dtype)
+                    fixed_values = mx.zeros(shape, dtype=values.dtype)
+                    fixed_keys[..., :rows, :] = keys[..., :rows, :]
+                    fixed_values[..., :rows, :] = values[..., :rows, :]
+                    target = FixedKVCache(fixed_keys, fixed_values, rows)
+                slot.append(target)
+            slots.append(slot)
+        mx.eval(*(tensor for slot in slots for layer in slot for tensor in layer.tensors))
+        return slots
+
+    def batch_decode(
+        self,
+        ids: mx.array,
+        caches: Sequence[list[KVCache | FixedKVCache | RingKVCache]],
+        *,
+        capacity: int,
+    ) -> mx.array:
+        key = (len(caches), capacity)
+        decodes: dict[tuple[int, int], _BatchBucket] = self._batch_decodes
+        bucket = decodes.get(key)
+        if bucket is None:
+            decode = self.compile_batch_decode(caches, capacity)
+            bucket = _BatchBucket(tuple(tuple(sequence) for sequence in caches), decode)
+            decodes[key] = bucket
+        else:
+            self._load_batch_slots(caches, bucket.slots)
+        return bucket.decode(ids)
+
+    def batch_greedy(
+        self,
+        ids: mx.array,
+        caches: Sequence[list[KVCache | FixedKVCache | RingKVCache]],
+        *,
+        capacity: int,
+    ) -> tuple[mx.array, ...]:
+        key = (len(caches), capacity)
+        decodes: dict[tuple[int, int], _BatchBucket] = self._batch_greedy_decodes
+        bucket = decodes.get(key)
+        if bucket is None:
+            decode = self._compile_batch_forward(caches, capacity, project_head=False)
+            bucket = _BatchBucket(tuple(tuple(sequence) for sequence in caches), decode)
+            decodes[key] = bucket
+        else:
+            self._load_batch_slots(caches, bucket.slots)
+        hidden = bucket.decode(ids)[:, -1, :]
+        planes = self._head_planes()
+        if planes is None:
+            logits = (
+                self.model.embed_tokens.as_linear(hidden)
+                if self.config.tie_word_embeddings
+                else self.lm_head(hidden)
+            )
+            tokens = mx.argmax(logits, axis=-1)
+            return tuple(tokens[index] for index in range(hidden.shape[0]))
+        return tuple(
+            mx.argmax(lm_head_argmax_row(hidden[index], self.lm_head.weight, planes))
+            for index in range(hidden.shape[0])
+        )
+
+    @staticmethod
+    def _load_batch_slots(
+        caches: Sequence[list[LagunaCache]],
+        slots: tuple[tuple[LagunaCache, ...], ...],
+    ) -> None:
+        if all(
+            all(source is target for source, target in zip(sequence, slot, strict=True))
+            for sequence, slot in zip(caches, slots, strict=True)
+        ):
+            return
+        snapshots: list[tuple[int, mx.array, mx.array]] = []
+        for sequence, slot in zip(caches, slots, strict=True):
+            for source, target in zip(sequence, slot, strict=True):
+                if isinstance(target, RingKVCache) and isinstance(source, KVCache):
+                    source = RingKVCache.promote(source, target.window)
+                keys, values = source.fetch()
+                copied_keys = keys + mx.zeros_like(keys)
+                copied_values = values + mx.zeros_like(values)
+                snapshots.append((source.rows, copied_keys, copied_values))
+        mx.eval(*(array for _, keys, values in snapshots for array in (keys, values)))
+
+        index = 0
+        for sequence, slot in zip(caches, slots, strict=True):
+            for target in slot:
+                rows, keys, values = snapshots[index]
+                index += 1
+                if isinstance(target, FixedKVCache):
+                    target.restore(
+                        rows,
+                        {"keys": keys[..., :rows, :], "values": values[..., :rows, :]},
+                    )
+                elif isinstance(target, RingKVCache):
+                    assert target.state is not None
+                    target.state[0] = keys
+                    target.state[1] = values
+                    target.state[2] = mx.array([rows], dtype=mx.int32)
+                    target.offset = rows
+                else:
+                    raise TypeError(f"compiled slot cannot use {type(target).__name__}")
+            sequence[:] = slot
+        mx.eval(*(tensor for slot in slots for layer in slot for tensor in layer.tensors))
+
     def _compile_decode(
         self,
         cache: list[KVCache | FixedKVCache | RingKVCache],
@@ -64,17 +333,12 @@ class Laguna(nn.Module):
         *,
         argmax_only: bool,
     ) -> Callable[[mx.array], mx.array]:
-        if not cache or not all(isinstance(layer, KVCache) for layer in cache):
-            raise ValueError("decode compilation requires a completed growing KV cache")
-        offset = cache[0].offset
+        if len(cache) != len(self.config.layer_types):
+            raise ValueError("decode cache count does not match the model")
+        offset = cache[0].rows
         if offset >= capacity:
             raise ValueError(f"prompt length {offset} does not fit compiled capacity {capacity}")
-        promoted = [
-            RingKVCache.promote(layer, self.config.sliding_window)
-            if kind == SLIDING
-            else FixedKVCache.promote(layer, capacity)
-            for layer, kind in zip(cache, self.config.layer_types, strict=True)
-        ]
+        promoted = self._make_batch_slots([cache], capacity)[0]
         cache[:] = promoted
         state = [layer.state for layer in promoted]
 
@@ -116,14 +380,14 @@ class Laguna(nn.Module):
     def activations(
         self,
         ids: mx.array,
-        cache: list[KVCache | FixedKVCache | RingKVCache] | None = None,
+        cache: Sequence[KVStore] | None = None,
     ) -> LagunaActivations:
         return self._activations(ids, cache, project_head=True)
 
     def _activations(
         self,
         ids: mx.array,
-        cache: list[KVCache | FixedKVCache | RingKVCache] | None,
+        cache: Sequence[KVStore] | None,
         *,
         project_head: bool,
     ) -> LagunaActivations:
@@ -188,7 +452,7 @@ class Laguna(nn.Module):
         )
 
     def __call__(
-        self, ids: mx.array, cache: list[KVCache | FixedKVCache | RingKVCache] | None = None
+        self, ids: mx.array, cache: Sequence[KVStore] | None = None
     ) -> mx.array:
         return self.activations(ids, cache).logits
 
@@ -202,13 +466,19 @@ class Laguna(nn.Module):
             return None
         return (mx.arange(ring.window) <= ring.position).reshape(1, 1, 1, ring.window)
 
-    def _sliding_mask(self, length: int, offset: int) -> mx.array | str | None:
+    def _sliding_mask(self, length: int, offset: int | mx.array) -> mx.array | str | None:
         """The band `rows >= columns and rows < columns + window`, built only where
         it is not already something cheaper. No key is old enough for the window to
         cut while `offset + length <= window`, so the band *is* the causal mask there
         — and at T=1 the single row is causal by construction, leaving `columns >
         offset - window`."""
         window = self.config.sliding_window
+        if isinstance(offset, mx.array):
+            keys = int(mx.max(offset).item()) + length
+            columns = mx.arange(keys)[None, None, None, :]
+            rows = offset[:, None] + mx.arange(length)[None, :]
+            positions = rows[:, None, :, None]
+            return (positions >= columns) & (positions < columns + window)
         keys = offset + length
         if keys <= window:
             return None if length == 1 else "causal"

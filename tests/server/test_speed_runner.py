@@ -54,6 +54,8 @@ gets any room are what turns a shape from tight into impossible."""
 
 BF16_WINDOWED = replace(BF16, attention_window=8192)
 
+MOE = replace(DENSE, weight_bytes=2 * GIGABYTE, checkpoint_bytes=17 * GIGABYTE)
+
 
 def test_the_key_names_the_shape_and_never_the_model() -> None:
     shape = SpeedShape(context=4096, generate=256, concurrency=4)
@@ -91,16 +93,15 @@ def test_the_options_are_greedy_only_where_the_temperature_is_zero() -> None:
     assert Sampling(repetition_penalty=1.1).options(8).penalty is not None
 
 
-def test_more_than_one_stream_is_refused_until_the_scheduler_lands() -> None:
-    """With the queue serialising generation the aggregate would be the scheduler's
-    number. A row that says so beats a number that lies."""
-    refused = speed.refusal(
-        SpeedShape(context=4096, generate=256, concurrency=4), DENSE, 120 * GIGABYTE
+def test_more_than_one_stream_reaches_the_memory_admission_check() -> None:
+    assert (
+        speed.refusal(
+            SpeedShape(context=4096, generate=256, concurrency=4),
+            DENSE,
+            120 * GIGABYTE,
+        )
+        is None
     )
-
-    assert refused is not None
-    assert refused.reason == "concurrency_unsupported"
-    assert refused.detail is not None and "45.3" in refused.detail
 
 
 def test_a_cache_that_does_not_fit_is_a_refusal_with_both_numbers() -> None:
@@ -274,6 +275,16 @@ def test_the_recorded_ceiling_is_the_one_the_fraction_divides_by(
     assert taken.result.decode_tps is not None and taken.result.ceiling_tps is not None
     assert taken.result.ceiling_fraction == pytest.approx(
         taken.result.decode_tps / taken.result.ceiling_tps
+    )
+
+
+def test_a_concurrent_moe_ceiling_uses_the_dense_weight_bound() -> None:
+    shape = SpeedShape(context=512, generate=64, concurrency=4)
+    kv = speed.kv_step_bytes(shape, MOE)
+    assert kv is not None
+
+    assert speed.ceiling_tps(shape, MOE) == pytest.approx(
+        4 * speed.BANDWIDTH_GBS * 1e9 / (MOE.checkpoint_bytes + kv)
     )
 
 

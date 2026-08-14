@@ -85,16 +85,14 @@ def test_a_shape_that_does_not_fit_is_recorded_and_not_raised(tmp_path: Path) ->
         assert row["speed"]["context"] == 131072
 
 
-def test_more_than_one_stream_is_recorded_as_not_run(tmp_path: Path) -> None:
-    """Not silently dropped: the row is what says the shape was asked for and why it did
-    not produce a number."""
+def test_more_than_one_stream_is_measured(tmp_path: Path) -> None:
     with stand(tmp_path, [(MODEL, SMALL)]) as house:
         job_id = start(house.client, {**SPEED_BODY, "models": [MODEL], "concurrencies": [1, 4]})
         wait_for(house.client, job_id, "ok")
 
         rows = house.client.get("/admin/benchmarks/runs").json()
         states = {row["speed"]["concurrency"]: row["reason"] for row in rows}
-        assert states == {1: None, 4: "concurrency_unsupported"}
+        assert states == {1: None, 4: None}
 
 
 def test_a_value_outside_the_fixed_sets_is_refused_by_name(tmp_path: Path) -> None:

@@ -172,6 +172,22 @@ def test_the_switch_survives_the_settings_route_sharing_admin_models(
     assert client.get(f"/admin/models/{TARGET}/settings").json()["model"] == TARGET
 
 
+def test_the_model_concurrency_override_is_stored(client: TestClient, hub: Path) -> None:
+    installed(hub, TARGET, "muse_glimmer")
+
+    response = client.put(
+        f"/admin/models/{TARGET}/settings",
+        json={"max_concurrent_requests": 3},
+    )
+
+    assert response.status_code == 200, response.text
+    assert response.json()["max_concurrent_requests"] == 3
+    assert (
+        client.get(f"/admin/models/{TARGET}/settings").json()["max_concurrent_requests"]
+        == 3
+    )
+
+
 def on(block_size: int | None = None) -> str:
     paired = Speculation(kind="dflash", drafter=DRAFTER, block_size=block_size)
     return Features(speculation=paired).model_dump_json()

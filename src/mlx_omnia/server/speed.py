@@ -17,13 +17,8 @@ the fraction, so the division can be checked instead of believed: change the wei
 and the ceiling moves, and a percentage that rose because its denominator shrank is not a
 gain.
 
-Concurrency above one is not measured here, and the reason is the queue rather than this
-module. `Engine._run` serialises generation at depth one, so four streams through it are
-four generations end to end: the aggregate would be the scheduler's number and not the
-model's. Until the step scheduler lands (task 45.3) a shape with more than one stream is
-recorded as `not_run` with `concurrency_unsupported` — a row that says so, rather than a
-number that lies. `stream_source` is in the key from the start so the two families of
-number can never be read as one.
+Concurrent shapes submit all streams together through the engine scheduler. `stream_source`
+is in the key so a queue-driven number and a different source can never be read as one.
 """
 
 import asyncio
@@ -54,6 +49,7 @@ from mlx_omnia.bench.gate import Macmon, find_macmon
 from mlx_omnia.engine.footprint import checkpoint_bytes
 from mlx_omnia.server.catalog import CatalogEntry
 from mlx_omnia.server.engine import Engine
+from mlx_omnia.server.engine import Job as GenerationJob
 from mlx_omnia.server.jobs import Cancelled, Job, Progress
 from mlx_omnia.server.store import PageCache, RunState, SpeedResult, StreamSource
 
@@ -261,19 +257,27 @@ def kv_peak_bytes(shape: SpeedShape, facts: ModelFacts) -> int | None:
     )
 
 
+def batch_weight_bytes(shape: SpeedShape, facts: ModelFacts) -> int | None:
+    if facts.weight_bytes is None:
+        return None
+    if shape.concurrency == 1:
+        return facts.weight_bytes
+    return max(facts.weight_bytes, facts.checkpoint_bytes)
+
+
 def ceiling_tps(shape: SpeedShape, facts: ModelFacts) -> float | None:
     """Tokens per second the bandwidth allows for this shape.
 
     The batch reads the weights once and each stream's cache separately, and produces one
-    token per stream per step — so the streams multiply the numerator and only the cache
-    term of the denominator. Charging the weights once is exact for a dense checkpoint and
-    optimistic for a mixture, where more streams reach more experts; nothing measures more
-    than one stream yet, and when 45.3 lands this is the line that has to learn it.
+    token per stream per step. For concurrent shapes the weight term uses the dense
+    checkpoint bound: conservative for a mixture whose rows may route to different experts,
+    and equal to the active term for a dense checkpoint.
     """
     kv = kv_step_bytes(shape, facts)
-    if facts.weight_bytes is None or kv is None:
+    weight = batch_weight_bytes(shape, facts)
+    if weight is None or kv is None:
         return None
-    step = facts.weight_bytes + kv
+    step = weight + kv
     return None if step <= 0 else shape.concurrency * BANDWIDTH_GBS * 1e9 / step
 
 
@@ -290,14 +294,6 @@ class Refusal:
 
 def refusal(shape: SpeedShape, facts: ModelFacts, budget_bytes: int) -> Refusal | None:
     """Everything that can be decided before a single byte is loaded."""
-    if shape.concurrency > 1:
-        return Refusal(
-            reason="concurrency_unsupported",
-            detail=(
-                "the queue serialises generation, so streams above one would measure the"
-                " scheduler and not the model — task 45.3 is what unblocks this"
-            ),
-        )
     peak = kv_peak_bytes(shape, facts)
     if peak is None:
         return None
@@ -381,6 +377,12 @@ class Round:
     decode_tps: float
 
 
+@dataclass(frozen=True)
+class ConcurrentRound:
+    streams: tuple[Round, ...]
+    decode_tps: float
+
+
 def prompt_of(context: int) -> str:
     """Filler long enough that the tokenizer lands near `context`. What the row keeps is
     the count the meter actually saw, never this estimate: the chat template adds tokens
@@ -447,6 +449,78 @@ def _drain(
     )
 
 
+def _drain_many(
+    job: Job,
+    engine: Engine,
+    model: str,
+    prompt: str,
+    generate: int,
+    concurrency: int,
+    reservation: object | None,
+    sampling: Sampling = GREEDY,
+) -> ConcurrentRound:
+    async def run() -> list[GenerationJob]:
+        generations = await asyncio.gather(
+            *(
+                engine.submit(
+                    model,
+                    Text(prompt),
+                    sampling.options(generate),
+                    reservation,
+                    concurrency,
+                )
+                for _ in range(concurrency)
+            )
+        )
+
+        async def pull(generation: GenerationJob) -> None:
+            while await generation.chunks.get() is not None:
+                if job.cancelled.is_set():
+                    generation.cancel()
+
+        await asyncio.gather(*(pull(generation) for generation in generations))
+        return list(generations)
+
+    future = asyncio.run_coroutine_threadsafe(run(), job.loop)
+    while True:
+        try:
+            generations = future.result(_TICK)
+            break
+        except TimeoutError:
+            assert job.loop.is_running(), "the loop stopped while the benchmark was running"
+            if job.cancelled.is_set():
+                future.cancel()
+    if job.cancelled.is_set():
+        raise Cancelled(job.id)
+    rounds: list[Round] = []
+    first_tokens: list[float] = []
+    last_tokens: list[float] = []
+    decoded = 0
+    for generation in generations:
+        if generation.error is not None:
+            raise RuntimeError(generation.error)
+        meter = generation.meter
+        rate, ttft = meter.tokens_per_second, meter.ttft
+        if rate is None or ttft is None:
+            raise RuntimeError(
+                f"{model!r} generated {meter.completion_tokens} token(s): no rate to measure"
+            )
+        assert meter.first_token is not None and meter.last_token is not None
+        first_tokens.append(meter.first_token)
+        last_tokens.append(meter.last_token)
+        decoded += meter.completion_tokens - 1
+        rounds.append(
+            Round(
+                prompt_tokens=meter.prompt_tokens,
+                completion_tokens=meter.completion_tokens,
+                ttft_ms=ttft * 1000,
+                decode_tps=rate,
+            )
+        )
+    elapsed = max(last_tokens) - min(first_tokens)
+    return ConcurrentRound(tuple(rounds), decoded / elapsed)
+
+
 def percentile(values: Sequence[float], fraction: float) -> float:
     """Nearest-rank, over whatever number of samples there is. `statistics.quantiles` needs
     two points and interpolates between them; with eight rounds the p95 of an interpolation
@@ -478,7 +552,7 @@ def empty_result(shape: SpeedShape, facts: ModelFacts, refused: Refusal | None) 
         stream_source=shape.stream_source,
         page_cache=shape.page_cache,
         gate_c=shape.gate_c,
-        step_weight_bytes=facts.weight_bytes,
+        step_weight_bytes=batch_weight_bytes(shape, facts),
         step_kv_bytes=kv_step_bytes(shape, facts),
         ceiling_tps=ceiling_tps(shape, facts),
         per_round="[]"
@@ -536,30 +610,45 @@ def measure(
     _drain(job, engine, model, _FILLER, 2, reservation)
     load_s = time.perf_counter() - started
 
-    def generation(stage: str) -> Round:
+    def generation(stage: str) -> ConcurrentRound:
         job.report(frames.frame(stage))
         # Only where there is a gate to wait for: reading the sensor is a subprocess, and
         # paying it per round to record nothing is a round slower than the one it measures.
         if shape.gate_c is not None:
             wait_cool(job, tool, shape.gate_c, frames)
-        return _drain(job, engine, model, prompt, shape.generate, reservation, shape.sampling)
+        return _drain_many(
+            job,
+            engine,
+            model,
+            prompt,
+            shape.generate,
+            shape.concurrency,
+            reservation,
+            shape.sampling,
+        )
 
     if warm_up:
         generation("warm-up")
     kept = [generation(f"round {index + 1} of {shape.rounds}") for index in range(shape.rounds)]
 
     decode = statistics.median(entry.decode_tps for entry in kept)
-    prompt_tokens = statistics.median(entry.prompt_tokens for entry in kept)
-    # Percentiles over the rounds, which is what there is while one stream is all that runs.
-    # With a batched step they become percentiles over the streams of a round, and the
-    # column keeps its meaning: the slowest reader, not the average one.
-    ttfts = [entry.ttft_ms for entry in kept]
+    prompt_tokens = statistics.median(
+        stream.prompt_tokens for entry in kept for stream in entry.streams
+    )
+    ttfts = [stream.ttft_ms for entry in kept for stream in entry.streams]
     resident = engine.residency.get(model)
     # The engine's own walk over the loaded tree beats the estimate off the headers: a
     # checkpoint ships blocks the loader drops and tensors it fuses, and the headers cannot
     # know which.
     active = None if resident is None else resident.active_bytes
-    weight_bytes = facts.weight_bytes if active is None else active
+    measured = facts.weight_bytes if active is None else active
+    weight_bytes = (
+        None
+        if measured is None
+        else measured
+        if shape.concurrency == 1
+        else max(measured, facts.checkpoint_bytes)
+    )
     measured_facts = ModelFacts(
         weight_bytes=weight_bytes,
         kv_bytes_per_token=facts.kv_bytes_per_token,
@@ -590,12 +679,15 @@ def measure(
         per_round=json.dumps(
             [
                 {
-                    "prompt_tokens": round.prompt_tokens,
-                    "completion_tokens": round.completion_tokens,
-                    "ttft_ms": round.ttft_ms,
-                    "decode_tps": round.decode_tps,
+                    "round": round_index,
+                    "stream": stream_index,
+                    "prompt_tokens": stream.prompt_tokens,
+                    "completion_tokens": stream.completion_tokens,
+                    "ttft_ms": stream.ttft_ms,
+                    "decode_tps": stream.decode_tps,
                 }
-                for round in kept
+                for round_index, round in enumerate(kept, 1)
+                for stream_index, stream in enumerate(round.streams, 1)
             ]
         ),
     )
