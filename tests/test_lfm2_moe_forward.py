@@ -10,7 +10,6 @@ from pathlib import Path
 import mlx.core as mx
 import numpy as np
 import pytest
-from conftest import checkpoint_dir, floor, load_golden, relative_diff, requires_checkpoint
 from mlx_omnia.engine.core.kernels.moe_gemv_dense import moe_dense_down
 
 from mlx_omnia import KVCache, stream_ids
@@ -24,6 +23,7 @@ from mlx_omnia.engine.models.lfm2.layers.conv import LFM2Conv
 from mlx_omnia.engine.models.lfm2.layers.experts import LFM2SparseMLP
 from mlx_omnia.engine.models.lfm2.moe import CHECKPOINT, LFM2MoE
 from mlx_omnia.engine.models.lfm2.moe.model import LFM2MoEActivations
+from tests.conftest import checkpoint_dir, floor, load_golden, relative_diff, requires_checkpoint
 
 FIXTURE = Path(__file__).parent / "fixtures" / "lfm2_moe_forward.safetensors"
 REPO = "LiquidAI/LFM2.5-8B-A1B"

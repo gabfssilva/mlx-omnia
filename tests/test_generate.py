@@ -4,7 +4,6 @@ from pathlib import Path
 
 import mlx.core as mx
 import pytest
-from conftest import load_golden, relative_diff
 from huggingface_hub import hf_hub_download, snapshot_download
 
 from mlx_omnia import GPT2, GPT2Tokenizer, KVCache, sampler, stream_generate, stream_ids, top_k
@@ -13,6 +12,7 @@ from mlx_omnia.engine.core.prompt_cache import PromptCache
 from mlx_omnia.engine.generate import Meter, _boundary
 from mlx_omnia.engine.models.gpt2 import CHECKPOINT
 from mlx_omnia.engine.speculative import SpeculationRefused
+from tests.conftest import load_golden, relative_diff
 
 FIXTURE = Path(__file__).parent / "fixtures" / "gpt2_forward.safetensors"
 

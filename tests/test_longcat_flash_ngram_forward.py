@@ -18,18 +18,18 @@ from pathlib import Path
 import mlx.core as mx
 import numpy as np
 import pytest
-from conftest import (
-    assert_greedy_modulo_ties,
-    checkpoint_dir,
-    load_golden,
-    relative_diff,
-    requires_checkpoint,
-)
 
 from mlx_omnia import stream_ids
 from mlx_omnia.engine.models.longcat_flash_ngram import (
     CHECKPOINT,
     LongcatFlashNgram,
+)
+from tests.conftest import (
+    assert_greedy_modulo_ties,
+    checkpoint_dir,
+    load_golden,
+    relative_diff,
+    requires_checkpoint,
 )
 
 FIXTURE = Path(__file__).parent / "fixtures" / "longcat_flash_ngram_mlxlm.safetensors"

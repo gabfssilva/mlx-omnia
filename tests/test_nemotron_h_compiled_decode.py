@@ -11,11 +11,11 @@ import dataclasses
 
 import mlx.core as mx
 import pytest
-from test_nemotron_h_mtp import PROMPT, _config, _spread
 
 import mlx_omnia.engine.models.nemotron_h.model as model_module
 from mlx_omnia.engine.core.cache import FixedDeltaCache, FixedKVCache
 from mlx_omnia.engine.models.nemotron_h.model import NemotronH
+from tests.test_nemotron_h_mtp import PROMPT, _config, _spread
 
 TOKENS = [0, 1, 2, 3, 2, 1, 0, 3]
 

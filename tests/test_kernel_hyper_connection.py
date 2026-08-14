@@ -18,7 +18,6 @@ the input dtype.
 
 import mlx.core as mx
 import pytest
-from conftest import relative_diff
 
 from mlx_omnia.engine.core.kernels.hyper_connection import (
     DefaultHyperConnection,
@@ -27,6 +26,7 @@ from mlx_omnia.engine.core.kernels.hyper_connection import (
 )
 from mlx_omnia.engine.core.kernels.hyper_connection.fused import _EXPAND_EMIT_SOURCE, _SOURCE
 from mlx_omnia.engine.core.mxcompat import metal_kernel, softmax
+from tests.conftest import relative_diff
 
 HC, D = 4, 4096
 ITERS, EPS, NEPS = 20, 1e-6, 1e-6

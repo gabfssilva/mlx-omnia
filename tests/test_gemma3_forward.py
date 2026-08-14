@@ -11,11 +11,11 @@ from pathlib import Path
 import mlx.core as mx
 import numpy as np
 import pytest
-from conftest import floor, load_golden, relative_diff
 from huggingface_hub import snapshot_download
 
 from mlx_omnia import KVCache, stream_ids
 from mlx_omnia.engine.models.gemma3 import CHECKPOINT, Gemma3, Gemma3Activations
+from tests.conftest import floor, load_golden, relative_diff
 
 FIXTURE = Path(__file__).parent / "fixtures" / "gemma3_forward.safetensors"
 N_LAYER = 18

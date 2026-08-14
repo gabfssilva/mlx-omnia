@@ -13,11 +13,11 @@ from pathlib import Path
 import mlx.core as mx
 import mlx.nn as nn
 import pytest
-from conftest import checkpoint_dir, relative_diff, requires_checkpoint
 
 from mlx_omnia import stream_ids
 from mlx_omnia.engine.models.laguna import CHECKPOINT, Laguna
 from mlx_omnia.engine.models.laguna.layers.moe import LagunaSparseMoe
+from tests.conftest import checkpoint_dir, relative_diff, requires_checkpoint
 
 FIXTURE = Path(__file__).parent / "fixtures" / "laguna_xs_mlxfast_golden.json"
 REPO = "poolside/Laguna-XS-2.1-NVFP4-mlx"

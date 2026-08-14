@@ -12,12 +12,12 @@ from typing import TYPE_CHECKING
 
 import mlx.core as mx
 import numpy as np
-from conftest import relative_diff
 
 from mlx_omnia.engine.core.kernels.qkv_rope.epilogue import _KERNEL, _SOURCE, rope_epilogue
 from mlx_omnia.engine.core.mxcompat import metal_kernel
 from mlx_omnia.engine.models.qwen3.config import Qwen3MoEConfig
 from mlx_omnia.engine.models.qwen3.layers.attention import Qwen3Attention
+from tests.conftest import relative_diff
 
 if TYPE_CHECKING:
     from mlx_omnia.engine.core.mxcompat import MetalKernel

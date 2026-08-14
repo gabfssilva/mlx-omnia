@@ -14,11 +14,11 @@ from pathlib import Path
 import mlx.core as mx
 import numpy as np
 import pytest
-from conftest import checkpoint_dir, load_golden, relative_diff, requires_checkpoint
 
 from mlx_omnia.engine.core.kernels.conv_mix import ConvMix, DefaultConvMix, FusedConvMix
 from mlx_omnia.engine.core.kernels.conv_mix import fused as cm
 from mlx_omnia.engine.core.mxcompat import metal_kernel
+from tests.conftest import checkpoint_dir, load_golden, relative_diff, requires_checkpoint
 
 HIDDEN = 2048
 KERNEL = 3

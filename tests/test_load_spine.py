@@ -3,9 +3,9 @@ from dataclasses import dataclass
 import mlx.core as mx
 import mlx.nn as nn
 import pytest
-from conftest import relative_diff
 
 from mlx_omnia.engine.checkpoint import fuse_qkv, load_checkpoint
+from tests.conftest import relative_diff
 
 _ATTENTION = "model.layers.0.self_attn."
 

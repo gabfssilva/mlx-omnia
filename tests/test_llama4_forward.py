@@ -16,18 +16,18 @@ from pathlib import Path
 import mlx.core as mx
 import numpy as np
 import pytest
-from conftest import (
+
+from mlx_omnia import KVCache, stream_ids
+from mlx_omnia.engine.models.llama4 import CHECKPOINT, Llama4
+from mlx_omnia.engine.models.llama4.layers.attention import Llama4Attention
+from mlx_omnia.engine.models.llama4.layers.block import Llama4Block
+from tests.conftest import (
     assert_greedy_modulo_ties,
     checkpoint_dir,
     load_golden,
     relative_diff,
     requires_checkpoint,
 )
-
-from mlx_omnia import KVCache, stream_ids
-from mlx_omnia.engine.models.llama4 import CHECKPOINT, Llama4
-from mlx_omnia.engine.models.llama4.layers.attention import Llama4Attention
-from mlx_omnia.engine.models.llama4.layers.block import Llama4Block
 
 FIXTURE = Path(__file__).parent / "fixtures" / "llama4_mlxlm.safetensors"
 REPO = "mlx-community/Llama-4-Scout-17B-16E-Instruct-4bit"

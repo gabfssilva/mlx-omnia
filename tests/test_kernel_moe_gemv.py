@@ -30,7 +30,6 @@ a per-leaf quantization plan produces and what the spare slot of both kernels de
 import mlx.core as mx
 import numpy as np
 import pytest
-from conftest import relative_diff
 
 from mlx_omnia.engine.core.kernels.down_combine.affine import _SOURCE as _DOWN_SOURCE
 from mlx_omnia.engine.core.kernels.down_combine.affine import AffineDownCombine
@@ -40,6 +39,7 @@ from mlx_omnia.engine.core.kernels.gate_up.affine import HEADER as _HEADER
 from mlx_omnia.engine.core.kernels.gate_up.affine import AffineGateUp
 from mlx_omnia.engine.core.kernels.gate_up.affine import applies as gate_up_applies
 from mlx_omnia.engine.core.mxcompat import metal_kernel
+from tests.conftest import relative_diff
 
 
 def moe_gemv_applies(hidden: int, inner: int, gate_group: int, down_group: int) -> bool:

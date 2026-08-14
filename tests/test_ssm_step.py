@@ -12,11 +12,11 @@ from typing import TYPE_CHECKING
 import mlx.core as mx
 import numpy as np
 import pytest
-from conftest import relative_diff
 
 from mlx_omnia.engine.core.kernels.ssm import ssm_step_ref
 from mlx_omnia.engine.core.kernels.ssm.step import _KERNEL, _SOURCE, ssm_step, ssm_step_applies
 from mlx_omnia.engine.core.mxcompat import metal_kernel
+from tests.conftest import relative_diff
 
 if TYPE_CHECKING:
     from mlx_omnia.engine.core.mxcompat import MetalKernel

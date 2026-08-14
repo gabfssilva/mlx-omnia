@@ -15,17 +15,17 @@ from pathlib import Path
 import mlx.core as mx
 import numpy as np
 import pytest
-from conftest import (
+
+from mlx_omnia import KVCache, stream_ids
+from mlx_omnia.engine.models.hy3 import CHECKPOINT, Hy3
+from mlx_omnia.engine.models.hy3.layers.moe import Hy3SparseMoe
+from tests.conftest import (
     assert_greedy_modulo_ties,
     checkpoint_dir,
     load_golden,
     relative_diff,
     requires_checkpoint,
 )
-
-from mlx_omnia import KVCache, stream_ids
-from mlx_omnia.engine.models.hy3 import CHECKPOINT, Hy3
-from mlx_omnia.engine.models.hy3.layers.moe import Hy3SparseMoe
 
 FIXTURE = Path(__file__).parent / "fixtures" / "hy3_transformers.safetensors"
 REPO = "tencent/Hy3"

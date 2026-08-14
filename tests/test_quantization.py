@@ -4,7 +4,6 @@ from pathlib import Path
 import mlx.core as mx
 import mlx.nn as nn
 import pytest
-from conftest import relative_diff
 from mlx.utils import tree_flatten
 
 import mlx_omnia.engine.quant.quantization as quantization
@@ -35,6 +34,7 @@ from mlx_omnia.engine.quant.quantization import (
     plan_cost,
     quantize_weights,
 )
+from tests.conftest import relative_diff
 
 
 def test_affine_rtn_matches_mlx_packing_bit_for_bit() -> None:

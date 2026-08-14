@@ -21,7 +21,6 @@ metric rather than bitwise — the kernel's exponential is Metal's.
 import mlx.core as mx
 import numpy as np
 import pytest
-from conftest import relative_diff
 
 from mlx_omnia.engine.core.kernels.route.ordinal import (
     _SOURCE,
@@ -30,6 +29,7 @@ from mlx_omnia.engine.core.kernels.route.ordinal import (
     router_tournament_applies,
 )
 from mlx_omnia.engine.core.mxcompat import metal_kernel
+from tests.conftest import relative_diff
 
 EXPERTS = 256
 TOPK = 8

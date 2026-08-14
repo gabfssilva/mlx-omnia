@@ -8,11 +8,11 @@ factor of two, not a rounding difference, and shows up far above the fp32 floor.
 
 import mlx.core as mx
 import pytest
-from conftest import relative_diff
 
 from mlx_omnia.engine.core.kernels.down_combine.nvfp4 import Nvfp4DownCombine
 from mlx_omnia.engine.core.kernels.gate_up.nvfp4 import Nvfp4GateUp
 from mlx_omnia.engine.core.kernels.gate_up.nvfp4 import applies as nvfp4_moe_applies
+from tests.conftest import relative_diff
 
 EXPERTS = 8
 ACTIVE = 4

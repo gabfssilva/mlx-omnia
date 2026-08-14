@@ -2,10 +2,10 @@ from pathlib import Path
 
 import mlx.core as mx
 import pytest
-from conftest import floor, load_golden, relative_diff
 from huggingface_hub import snapshot_download
 
 from mlx_omnia.engine.models.gpt2 import CHECKPOINT, GPT2, GPT2Activations
+from tests.conftest import floor, load_golden, relative_diff
 
 FIXTURE = Path(__file__).parent / "fixtures" / "gpt2_forward.safetensors"
 

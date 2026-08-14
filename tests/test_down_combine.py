@@ -9,7 +9,6 @@ carries its own width and group — and only a mode with no decoder there falls 
 
 import mlx.core as mx
 import mlx.nn as nn
-from conftest import relative_diff
 
 from mlx_omnia.engine.core.kernels.down_combine import (
     AffineDownCombine,
@@ -19,6 +18,7 @@ from mlx_omnia.engine.core.kernels.down_combine import (
     Nvfp4DownCombine,
 )
 from mlx_omnia.engine.core.layers import QuantizedSwitchLinear, SwitchLinear
+from tests.conftest import relative_diff
 
 EXPERTS = 8
 ACTIVE = 4

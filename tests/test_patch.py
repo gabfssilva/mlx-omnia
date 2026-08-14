@@ -8,10 +8,10 @@ original comes back on exit.
 """
 
 import mlx.core as mx
-from conftest import relative_diff
 
 from mlx_omnia.engine.core.kernels.qmv.int8 import QUANTIZED_MATMUL
 from mlx_omnia.engine.core.patch import Patch, patched, uses
+from tests.conftest import relative_diff
 
 
 def packed(rows: int, kdim: int, bits: int = 8, group_size: int = 32):

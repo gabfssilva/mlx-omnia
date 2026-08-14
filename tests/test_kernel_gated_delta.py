@@ -17,7 +17,6 @@ import mlx.core as mx
 import mlx.nn as nn
 import numpy as np
 import pytest
-from conftest import relative_diff
 
 from mlx_omnia.engine.core.kernels.gated_delta import (
     DefaultGatedDelta,
@@ -30,6 +29,7 @@ from mlx_omnia.engine.core.kernels.gated_delta import (
 from mlx_omnia.engine.core.kernels.gated_delta.fused import _KERNEL, _SOURCE
 from mlx_omnia.engine.core.layers import l2norm
 from mlx_omnia.engine.core.mxcompat import metal_kernel
+from tests.conftest import relative_diff
 
 if TYPE_CHECKING:
     from mlx_omnia.engine.core.mxcompat import MetalKernel

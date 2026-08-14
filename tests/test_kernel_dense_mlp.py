@@ -13,7 +13,6 @@ only when they straddle a tie.
 """
 
 import mlx.core as mx
-from conftest import relative_diff
 
 from mlx_omnia.engine.core.kernels.mlp import DefaultMlp, Mlp
 from mlx_omnia.engine.core.kernels.mlp.dense import (
@@ -24,6 +23,7 @@ from mlx_omnia.engine.core.kernels.mlp.dense import (
     dense_gate_up_swiglu_applies,
 )
 from mlx_omnia.engine.core.layers import SwiGLU
+from tests.conftest import relative_diff
 
 HIDDEN = 256
 INNER = 512

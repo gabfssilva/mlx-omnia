@@ -10,16 +10,16 @@ from pathlib import Path
 import mlx.core as mx
 import numpy as np
 import pytest
-from conftest import (
+
+from mlx_omnia import KVCache, stream_ids
+from mlx_omnia.engine.models.step3p7 import CHECKPOINT, Step3p7, Step3p7MoE
+from tests.conftest import (
     assert_greedy_modulo_ties,
     checkpoint_dir,
     load_golden,
     relative_diff,
     requires_checkpoint,
 )
-
-from mlx_omnia import KVCache, stream_ids
-from mlx_omnia.engine.models.step3p7 import CHECKPOINT, Step3p7, Step3p7MoE
 
 FIXTURE = Path(__file__).parent / "fixtures" / "step3p7_mlxlm.safetensors"
 REPO = "stepfun-ai/Step-3.7-Flash"

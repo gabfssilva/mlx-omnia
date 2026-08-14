@@ -11,7 +11,6 @@ from pathlib import Path
 
 import numpy as np
 import pytest
-from conftest import checkpoint_dir, requires_checkpoint
 
 from mlx_omnia.engine.checkpoint import ImageCost, _blind, stop_tokens
 from mlx_omnia.engine.models.muse_glimmer import CHECKPOINT as MUSE_GLIMMER
@@ -28,6 +27,7 @@ from mlx_omnia.engine.processors.step3p7 import (
     Step3p7Processor,
 )
 from mlx_omnia.engine.task import _MODEL_SPECS, sight
+from tests.conftest import checkpoint_dir, requires_checkpoint
 
 QWEN35_VISION = "mlx-community/Qwen3.5-0.8B-bf16"
 QWEN3_TEXT = "mlx-community/Qwen3-0.6B-4bit"

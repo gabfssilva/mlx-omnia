@@ -4,7 +4,6 @@ from pathlib import Path
 
 import mlx.core as mx
 import mlx.nn as nn
-from conftest import relative_diff
 
 from mlx_omnia.engine.checkpoint import load_checkpoint, save_quantized
 from mlx_omnia.engine.quant.quantization import (
@@ -15,6 +14,7 @@ from mlx_omnia.engine.quant.quantization import (
     inventory,
     quantize_weights,
 )
+from tests.conftest import relative_diff
 
 _COARSE = Affine(group_size=32, bits=4)
 _FINE = Affine(group_size=32, bits=8)

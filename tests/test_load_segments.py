@@ -6,10 +6,10 @@ from dataclasses import dataclass
 
 import mlx.core as mx
 import mlx.nn as nn
-from conftest import relative_diff
 
 from mlx_omnia.engine.checkpoint import fuse_qkv, load_checkpoint
 from mlx_omnia.engine.core.layers import SegmentedQKV
+from tests.conftest import relative_diff
 
 _ATTENTION = "model.layers.0.self_attn."
 _HIDDEN = 128

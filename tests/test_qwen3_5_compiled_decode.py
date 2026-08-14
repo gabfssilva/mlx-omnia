@@ -11,7 +11,6 @@ bf16 against ids the eager path produces.
 
 import mlx.core as mx
 import pytest
-from conftest import checkpoint_dir, relative_diff, requires_checkpoint
 from mlx.utils import tree_flatten, tree_unflatten
 
 import mlx_omnia.engine.models.qwen3_5.layers.moe as moe_module
@@ -24,6 +23,7 @@ from mlx_omnia.engine.models.qwen3_5.config import (
     Qwen35TextConfig,
 )
 from mlx_omnia.engine.models.qwen3_5.model import Qwen35
+from tests.conftest import checkpoint_dir, relative_diff, requires_checkpoint
 
 REPO = "mlx-community/Qwen3.5-0.8B-bf16"
 PROMPT = [3, 1, 0, 2, 1, 3, 2, 0, 1, 2]

@@ -20,7 +20,6 @@ from typing import TYPE_CHECKING
 
 import mlx.core as mx
 import numpy as np
-from conftest import relative_diff
 
 from mlx_omnia.engine.core.kernels.qkv_rope.qk_norm_rope import (
     _OUTPUTS,
@@ -34,6 +33,7 @@ from mlx_omnia.engine.core.kernels.qkv_rope.qk_norm_rope import (
     qk_norm_rope_prefill_scaled_applies,
 )
 from mlx_omnia.engine.core.mxcompat import metal_kernel
+from tests.conftest import relative_diff
 
 if TYPE_CHECKING:
     from mlx_omnia.engine.core.mxcompat import MetalKernel

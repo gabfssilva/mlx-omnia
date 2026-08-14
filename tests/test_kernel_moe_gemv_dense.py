@@ -11,7 +11,6 @@ with 8 experts (a full-width fp32 pair of stacks is 1.4 GB); the bf16 case carri
 import mlx.core as mx
 import numpy as np
 import pytest
-from conftest import relative_diff
 from mlx_omnia.engine.core.kernels.moe_gemv_dense import (
     _DOWN_SOURCE,
     _GATE_UP_SOURCE,
@@ -22,6 +21,7 @@ from mlx_omnia.engine.core.kernels.moe_gemv_dense import (
 )
 
 from mlx_omnia.engine.core.mxcompat import gather_mm, metal_kernel
+from tests.conftest import relative_diff
 
 HIDDEN, INNER, EXPERTS, TOPK = 2048, 1792, 32, 4
 

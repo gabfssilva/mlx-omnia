@@ -7,7 +7,6 @@ from typing import TypeIs
 import mlx.core as mx
 import mlx.nn as nn
 import pytest
-from conftest import relative_diff
 
 import mlx_omnia
 import mlx_omnia.engine.task as task
@@ -30,6 +29,7 @@ from mlx_omnia.engine.quant.quantization import (
     inventory,
     quantize_weights,
 )
+from tests.conftest import relative_diff
 
 _COARSE = Affine(group_size=64, bits=4)
 _FINE = Affine(group_size=64, bits=8)

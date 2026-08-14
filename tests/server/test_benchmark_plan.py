@@ -4,10 +4,10 @@ they do not there are two answers to "does this fit"."""
 
 from pathlib import Path
 
-from benchmark_stand import HUGE, SMALL, SPEED_BODY, WINDOWED, stand, wait_for
 from fastapi.testclient import TestClient
 
 from mlx_omnia.server import benchmarks
+from tests.server.benchmark_stand import HUGE, SMALL, SPEED_BODY, WINDOWED, stand, wait_for
 
 MODEL = "house/small"
 BIG = "house/huge"

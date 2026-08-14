@@ -21,7 +21,6 @@ safe to sweep.
 import mlx.core as mx
 import numpy as np
 import pytest
-from conftest import relative_diff
 
 from mlx_omnia.engine.core.kernels.add_norm.rows import _NORM_SOURCE, RowsAddRmsNorm
 from mlx_omnia.engine.core.kernels.add_norm.rows import applies as residual_rms_norm_applies
@@ -32,6 +31,7 @@ from mlx_omnia.engine.core.kernels.route.residual import (
     residual_rms_router_applies,
 )
 from mlx_omnia.engine.core.mxcompat import metal_kernel
+from tests.conftest import relative_diff
 
 EPS = 1e-6
 ROWS_PER_GROUP = [1, 2, 4, 8, 16, 32, 64]

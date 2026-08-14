@@ -19,6 +19,29 @@ FP32_EPS = 2.0**-23
 HUB = Path.home() / ".cache/huggingface/hub"
 
 
+def pytest_generate_tests(metafunc: pytest.Metafunc) -> None:
+    """Parametrizes the shared parity spine's `layer` off the module's own `N_LAYER`:
+    the spine is defined once (`parity/definition.py`), so it cannot carry a
+    `@parametrize` whose range differs per model. Suites that still parametrize
+    `layer` with their own mark are left alone."""
+    if "layer" not in metafunc.fixturenames:
+        return
+    marked = any(
+        "layer" in str(mark.args[0] if mark.args else mark.kwargs.get("argnames", ""))
+        for mark in metafunc.definition.iter_markers("parametrize")
+    )
+    if marked:
+        return
+    # Inside a describe block `metafunc.module` is pytest-describe's synthetic module;
+    # the first Module in the chain is the file itself.
+    module = next(
+        node for node in metafunc.definition.listchain() if isinstance(node, pytest.Module)
+    )
+    layers = module.obj.N_LAYER
+    assert isinstance(layers, int)
+    metafunc.parametrize("layer", range(layers))
+
+
 def relative_diff(ours: mx.array, reference: mx.array) -> float:
     """The house metric, in fp32: max|a - b| / max|b|.
 

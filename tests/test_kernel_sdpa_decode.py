@@ -15,9 +15,9 @@ import math
 
 import mlx.core as mx
 import pytest
-from conftest import relative_diff
 
 from mlx_omnia.engine.core.kernels.attention.sdpa import sdpa_decode, sdpa_decode_applies
+from tests.conftest import relative_diff
 
 HEAD_DIM = 128
 SCALE = 1 / math.sqrt(HEAD_DIM)

@@ -12,11 +12,11 @@ inside the routing weights.
 
 import mlx.core as mx
 import mlx.nn as nn
-from conftest import relative_diff
 
 from mlx_omnia.engine.core.kernels.down_combine import DownCombine, Nvfp4PackedDownCombine
 from mlx_omnia.engine.core.kernels.down_combine.nvfp4_packed import applies, halve_down_scales
 from mlx_omnia.engine.core.layers import QuantizedSwitchLinear, SwitchLinear
+from tests.conftest import relative_diff
 
 HIDDEN = 64
 INNER = 512

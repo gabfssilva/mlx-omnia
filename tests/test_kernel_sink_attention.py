@@ -17,7 +17,6 @@ import math
 
 import mlx.core as mx
 import pytest
-from conftest import relative_diff
 
 import mlx_omnia.engine.core.kernels.attention.sink as sa
 from mlx_omnia.engine.core.cache import KVCache
@@ -28,6 +27,7 @@ from mlx_omnia.engine.models.gpt_oss import (
     GPTOSSRoPEScaling,
     yarn_rope,
 )
+from tests.conftest import relative_diff
 
 CONFIG = GPTOSSConfig(
     hidden_size=2880,

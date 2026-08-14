@@ -8,9 +8,9 @@ different row.
 """
 
 import mlx.core as mx
-from conftest import relative_diff
 
 from mlx_omnia.engine.core.kernels.moe_tail import DefaultMoeTail, MoeTail, SortedMoeTail
+from tests.conftest import relative_diff
 
 TOKENS = 3
 TOPK = 4

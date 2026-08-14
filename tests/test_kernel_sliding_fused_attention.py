@@ -22,13 +22,13 @@ from string import Template
 
 import mlx.core as mx
 import pytest
-from conftest import relative_diff
 
 import mlx_omnia.engine.core.kernels.attention.sliding as sfa
 from mlx_omnia.engine.core.kernels.attention.sliding import (
     sliding_fused_attention,
     sliding_fused_attention_applies,
 )
+from tests.conftest import relative_diff
 
 HEAD_DIM = 128
 HEADS = 8

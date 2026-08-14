@@ -6,7 +6,6 @@ from pathlib import Path
 
 import mlx.core as mx
 import pytest
-from conftest import relative_diff
 from huggingface_hub import snapshot_download
 
 import mlx_omnia.engine.task  # noqa: F401  — imports every family, so LayerCache has every subclass
@@ -14,6 +13,7 @@ from mlx_omnia import GPT2, KVCache
 from mlx_omnia.engine.core.cache import LayerCache
 from mlx_omnia.engine.core.prefill import prefill
 from mlx_omnia.engine.models.gpt2 import CHECKPOINT
+from tests.conftest import relative_diff
 
 LENGTH = 512
 BLOCK = 64

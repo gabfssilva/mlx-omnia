@@ -10,11 +10,11 @@ from pathlib import Path
 import mlx.core as mx
 import numpy as np
 import pytest
-from conftest import assert_greedy_modulo_ties, floor, load_golden, relative_diff
 from huggingface_hub import snapshot_download
 
 from mlx_omnia import KVCache, stream_ids
 from mlx_omnia.engine.models.qwen2 import CHECKPOINT, Qwen2, Qwen2Activations
+from tests.conftest import assert_greedy_modulo_ties, floor, load_golden, relative_diff
 
 FIXTURE = Path(__file__).parent / "fixtures" / "qwen2_forward.safetensors"
 Q4_FIXTURE = Path(__file__).parent / "fixtures" / "qwen2_q4_mlxlm.safetensors"

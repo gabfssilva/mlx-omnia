@@ -13,12 +13,12 @@ The floor is the bf16 epilogue -- see `test_kernel_nvfp4_qmv` for the derivation
 
 import mlx.core as mx
 import pytest
-from conftest import relative_diff
 
 from mlx_omnia.engine.core.kernels.qmv.gated_nvfp4 import gated_nvfp4_qmv, gated_nvfp4_qmv_applies
 from mlx_omnia.engine.core.kernels.qmv.nvfp4 import nvfp4_qmv
 from mlx_omnia.engine.core.kernels.shared.nvfp4 import LaneMajorScales, lane_major_scales
 from mlx_omnia.engine.core.patch import original
+from tests.conftest import relative_diff
 
 KDIM = 2048
 ROWS = 512

@@ -18,10 +18,10 @@ fp32.
 import mlx.core as mx
 import numpy as np
 import pytest
-from conftest import relative_diff
 
 from mlx_omnia.engine.core.kernels.qmv.ternary import _SOURCE, bitlinear, bitlinear_applies
 from mlx_omnia.engine.core.mxcompat import metal_kernel
+from tests.conftest import relative_diff
 
 # (batch, in_features, out_features): a real q_proj shape (2560->2560) and a small
 # shape that exercises the dispatch without a long reduction.

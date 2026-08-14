@@ -12,7 +12,6 @@ from pathlib import Path
 
 import mlx.nn as nn
 import pytest
-from conftest import checkpoint_dir, requires_checkpoint
 from huggingface_hub import snapshot_download
 from mlx.utils import tree_flatten
 
@@ -31,6 +30,7 @@ from mlx_omnia.engine.models.qwen3.moe import CHECKPOINT as QWEN3_MOE
 from mlx_omnia.engine.models.qwen3.moe import Qwen3MoE
 from mlx_omnia.engine.models.qwen3_5 import CHECKPOINT as QWEN3_5
 from mlx_omnia.engine.models.qwen3_5 import Qwen35MoE, Qwen35RoPEParameters, Qwen35TextConfig
+from tests.conftest import checkpoint_dir, requires_checkpoint
 
 MOE_REPO = "mlx-community/Qwen3-30B-A3B-4bit"
 SHARED_REPO = "mlx-community/Qwen3.6-35B-A3B-4bit"

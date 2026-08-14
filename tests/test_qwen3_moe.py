@@ -11,13 +11,6 @@ import mlx.core as mx
 import mlx.nn as nn
 import numpy as np
 import pytest
-from conftest import (
-    assert_greedy_modulo_ties,
-    checkpoint_dir,
-    load_golden,
-    relative_diff,
-    requires_checkpoint,
-)
 
 from mlx_omnia import KVCache, stream_ids
 from mlx_omnia.engine.core.kernels.add_norm import AddRmsNorm
@@ -28,6 +21,13 @@ from mlx_omnia.engine.core.kernels.route.softmax_topk import softmax_topk, softm
 from mlx_omnia.engine.core.mxcompat import softmax
 from mlx_omnia.engine.models.qwen3.model import Qwen3MoE
 from mlx_omnia.engine.models.qwen3.moe import CHECKPOINT
+from tests.conftest import (
+    assert_greedy_modulo_ties,
+    checkpoint_dir,
+    load_golden,
+    relative_diff,
+    requires_checkpoint,
+)
 
 FIXTURE = Path(__file__).parent / "fixtures" / "qwen3_moe_mlxlm.safetensors"
 REPO = "mlx-community/Qwen3-30B-A3B-4bit"

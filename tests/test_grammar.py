@@ -12,7 +12,6 @@ from typing import TypedDict
 import mlx.core as mx
 import pytest
 from huggingface_hub import hf_hub_download
-from test_generate import ScriptedLM
 
 from mlx_omnia import GPT2Tokenizer, stream_ids
 from mlx_omnia.engine.grammar import (
@@ -22,6 +21,7 @@ from mlx_omnia.engine.grammar import (
     SchemaConstraint,
     Vocabulary,
 )
+from tests.test_generate import ScriptedLM
 
 
 class Entry(TypedDict):

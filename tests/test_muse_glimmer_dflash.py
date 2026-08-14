@@ -18,7 +18,6 @@ from dataclasses import replace
 import mlx.core as mx
 import mlx.nn as nn
 import pytest
-from conftest import checkpoint_dir, requires_checkpoint
 
 from mlx_omnia import (
     GenerationOptions,
@@ -43,6 +42,7 @@ from mlx_omnia.engine.models.muse_glimmer.dflash import (
 )
 from mlx_omnia.engine.models.muse_glimmer.model import MuseGlimmerLanguageModel
 from mlx_omnia.engine.speculative import Acceptance, Proposer, Speculable, SpeculationRefused
+from tests.conftest import checkpoint_dir, requires_checkpoint
 
 REPO = "local/Muse-Glimmer-30B-4bit"
 """The quantized target, not the bf16 one: this is the shape the pair actually decodes in

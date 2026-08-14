@@ -13,16 +13,16 @@ from pathlib import Path
 import mlx.core as mx
 import numpy as np
 import pytest
-from conftest import (
+
+from mlx_omnia import stream_ids
+from mlx_omnia.engine.models.qwen3_5 import CHECKPOINT, Qwen35
+from tests.conftest import (
     assert_greedy_modulo_ties,
     checkpoint_dir,
     load_golden,
     relative_diff,
     requires_checkpoint,
 )
-
-from mlx_omnia import stream_ids
-from mlx_omnia.engine.models.qwen3_5 import CHECKPOINT, Qwen35
 
 FIXTURE = Path(__file__).parent / "fixtures" / "qwen3_5_27b_mlxlm.safetensors"
 REPO = "mlx-community/Qwen3.6-27B-6bit"

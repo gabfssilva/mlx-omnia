@@ -5,9 +5,8 @@ import csv
 import io
 from pathlib import Path
 
-from benchmark_stand import SMALL, stand
-
 from mlx_omnia.server.store import Run, SpeedResult, Store
+from tests.server.benchmark_stand import SMALL, stand
 
 MODEL = "house/small"
 OTHER = "house/other"

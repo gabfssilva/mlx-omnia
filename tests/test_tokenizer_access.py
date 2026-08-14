@@ -12,7 +12,6 @@ from typing import TypeIs
 
 import mlx.core as mx
 import mlx.nn as nn
-from conftest import checkpoint_dir, requires_checkpoint
 
 from mlx_omnia import (
     TEXT,
@@ -30,6 +29,7 @@ from mlx_omnia import (
 )
 from mlx_omnia.engine.language import Prefill, tokenizer_of, trunk_of
 from mlx_omnia.engine.parsers import Segment
+from tests.conftest import checkpoint_dir, requires_checkpoint
 
 GEMMA = "google/gemma-3-270m"
 

@@ -19,12 +19,12 @@ near a rounding boundary.
 import random
 
 import mlx.core as mx
-from conftest import relative_diff
 
 from mlx_omnia.engine.core.kernels.gate_up import GateUp, Nvfp4PackedGateUp, OrdinalRouting
 from mlx_omnia.engine.core.kernels.gate_up.nvfp4_packed import applies
 from mlx_omnia.engine.core.kernels.shared.nvfp4 import halved_group32_scales
 from mlx_omnia.engine.core.layers import QuantizedSwitchLinear, SwitchLinear
+from tests.conftest import relative_diff
 
 HIDDEN = 512
 INNER = 32

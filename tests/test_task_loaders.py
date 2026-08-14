@@ -4,7 +4,6 @@ from pathlib import Path
 import mlx.core as mx
 import numpy as np
 import pytest
-from conftest import local_snapshot, relative_diff
 from huggingface_hub import snapshot_download
 
 import mlx_omnia.engine.task as task
@@ -23,6 +22,7 @@ from mlx_omnia.engine.models import gpt2, qwen3_5
 from mlx_omnia.engine.quant.quantization import Affine
 from mlx_omnia.engine.task import _MODEL_SPECS
 from mlx_omnia.engine.vision import Image
+from tests.conftest import local_snapshot, relative_diff
 
 HELLO: ChatMessage = {"role": "user", "content": "Capital of France?"}
 

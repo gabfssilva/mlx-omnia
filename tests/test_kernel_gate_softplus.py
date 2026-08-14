@@ -14,10 +14,10 @@ element is `2^-8` and two of them bound anything the fp32 orders can produce.
 import mlx.core as mx
 import mlx.nn as nn
 import pytest
-from conftest import relative_diff
 
 from mlx_omnia.engine.core.kernels.qmv.softplus import gate_softplus, gate_softplus_applies
 from mlx_omnia.engine.core.patch import original
+from tests.conftest import relative_diff
 
 KDIM = 2048
 ROWS = 64

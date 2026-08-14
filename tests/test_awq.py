@@ -2,7 +2,6 @@ import math
 
 import mlx.core as mx
 import mlx.nn as nn
-from conftest import relative_diff
 
 from mlx_omnia.engine.models.gpt2 import GPT2, GPT2Config
 from mlx_omnia.engine.models.qwen3 import Qwen3, Qwen3Config
@@ -21,6 +20,7 @@ from mlx_omnia.engine.quant.quantization import (
     infer_quantization,
     quantize_weights,
 )
+from tests.conftest import relative_diff
 
 _IN = 64
 _OUT = 32

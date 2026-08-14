@@ -13,13 +13,6 @@ from pathlib import Path
 import mlx.core as mx
 import numpy as np
 import pytest
-from conftest import (
-    assert_greedy_modulo_ties,
-    checkpoint_dir,
-    load_golden,
-    local_snapshot,
-    relative_diff,
-)
 
 from mlx_omnia import KVCache, stream_ids
 from mlx_omnia.engine.checkpoint import stop_tokens
@@ -29,6 +22,13 @@ from mlx_omnia.engine.core.kernels.down_combine import DownCombine
 from mlx_omnia.engine.core.layers import QuantizedSwitchLinear
 from mlx_omnia.engine.models.gpt_oss import CHECKPOINT, GPTOSS, GPTOSSConfig
 from mlx_omnia.engine.models.gpt_oss.layers import flags
+from tests.conftest import (
+    assert_greedy_modulo_ties,
+    checkpoint_dir,
+    load_golden,
+    local_snapshot,
+    relative_diff,
+)
 
 FIXTURE = Path(__file__).parent / "fixtures" / "gpt_oss_mlxlm.safetensors"
 REPO = "openai/gpt-oss-20b"

@@ -9,7 +9,6 @@ match exactly, not within a tolerance.
 
 import mlx.core as mx
 import pytest
-from conftest import relative_diff
 
 from mlx_omnia.engine.core.kernels.qmv.int8 import (
     gated_int8_qmv,
@@ -19,6 +18,7 @@ from mlx_omnia.engine.core.kernels.qmv.int8 import (
     norm_int8_qmv,
 )
 from mlx_omnia.engine.core.patch import original
+from tests.conftest import relative_diff
 
 GROUP = 32
 BITS = 8

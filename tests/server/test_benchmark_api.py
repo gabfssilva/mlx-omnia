@@ -4,7 +4,12 @@ makes any of the numbers worth keeping — that nothing else runs while it measu
 import asyncio
 from pathlib import Path
 
-from benchmark_stand import (
+from fastapi.testclient import TestClient
+
+from mlx_omnia import GenerationOptions, Text
+from mlx_omnia.server import benchmarks
+from mlx_omnia.server.engine import Engine
+from tests.server.benchmark_stand import (
     HUGE,
     SMALL,
     SPEED_BODY,
@@ -13,11 +18,6 @@ from benchmark_stand import (
     stand,
     wait_for,
 )
-from fastapi.testclient import TestClient
-
-from mlx_omnia import GenerationOptions, Text
-from mlx_omnia.server import benchmarks
-from mlx_omnia.server.engine import Engine
 
 MODEL = "house/small"
 OTHER = "house/other"

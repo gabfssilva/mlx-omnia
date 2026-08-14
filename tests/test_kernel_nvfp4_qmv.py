@@ -13,7 +13,6 @@ element is `2^-8` and anything the fp32 orders can produce stays under two of th
 
 import mlx.core as mx
 import pytest
-from conftest import relative_diff
 
 from mlx_omnia.engine.core.kernels.qmv.nvfp4 import nvfp4_qmv, nvfp4_qmv_applies
 from mlx_omnia.engine.core.kernels.shared.nvfp4 import (
@@ -22,6 +21,7 @@ from mlx_omnia.engine.core.kernels.shared.nvfp4 import (
     lane_major_scales,
 )
 from mlx_omnia.engine.core.patch import original
+from tests.conftest import relative_diff
 
 KDIM = 2048
 ROWS = 64

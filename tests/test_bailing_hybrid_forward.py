@@ -15,7 +15,6 @@ from pathlib import Path
 import mlx.core as mx
 import numpy as np
 import pytest
-from conftest import floor, load_golden, relative_diff
 
 from mlx_omnia import stream_ids
 from mlx_omnia.engine.core import cache_file
@@ -31,6 +30,7 @@ from mlx_omnia.engine.models.bailing_hybrid import (
 from mlx_omnia.engine.models.bailing_hybrid.layers.attention import BailingHybridLatentAttention
 from mlx_omnia.engine.models.bailing_hybrid.layers.kda import KimiDeltaAttention
 from mlx_omnia.engine.models.bailing_hybrid.layers.moe import LimitedSharedMLP, LimitedSwitchGLU
+from tests.conftest import floor, load_golden, relative_diff
 
 FIXTURES = Path(__file__).parent / "fixtures"
 FIXTURE = FIXTURES / "bailing_hybrid_forward.safetensors"

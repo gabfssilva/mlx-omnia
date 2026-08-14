@@ -14,19 +14,19 @@ import mlx.core as mx
 import mlx.nn as nn
 import numpy as np
 import pytest
-from conftest import (
-    assert_greedy_modulo_ties,
-    checkpoint_dir,
-    load_golden,
-    relative_diff,
-    requires_checkpoint,
-)
 
 from mlx_omnia import stream_ids
 from mlx_omnia.engine.core.cache import DeltaCache
 from mlx_omnia.engine.core.kernels.route import SoftmaxTopkRoute
 from mlx_omnia.engine.core.layers import QuantizedSwitchLinear
 from mlx_omnia.engine.models.qwen3_5 import CHECKPOINT, Qwen35, Qwen35MoE
+from tests.conftest import (
+    assert_greedy_modulo_ties,
+    checkpoint_dir,
+    load_golden,
+    relative_diff,
+    requires_checkpoint,
+)
 
 FIXTURE = Path(__file__).parent / "fixtures" / "qwen3_5_122b_mlxlm.safetensors"
 REPO = "mlx-community/Qwen3.5-122B-A10B-4bit"

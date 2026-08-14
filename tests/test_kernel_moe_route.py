@@ -30,7 +30,6 @@ import mlx.core as mx
 import mlx.nn as nn
 import numpy as np
 import pytest
-from conftest import relative_diff
 
 from mlx_omnia.engine.core.kernels.route import (
     BiasTopkRoute,
@@ -55,6 +54,7 @@ from mlx_omnia.engine.core.kernels.route.softmax_topk import (
     softplus_topk,
 )
 from mlx_omnia.engine.core.mxcompat import metal_kernel, softmax
+from tests.conftest import relative_diff
 
 SHAPES = [(32, 4), (128, 8), (256, 8)]
 SHARED_LOGIT = 1.5

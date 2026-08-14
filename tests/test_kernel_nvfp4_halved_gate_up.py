@@ -10,7 +10,6 @@ bytes, with the SwiGLU chain reproduced expression for expression in bf16.
 import mlx.core as mx
 import mlx.nn as nn
 import pytest
-from conftest import relative_diff
 
 from mlx_omnia.engine.core.kernels.mlp import DefaultMlp, Mlp
 from mlx_omnia.engine.core.kernels.mlp.nvfp4 import (
@@ -20,6 +19,7 @@ from mlx_omnia.engine.core.kernels.mlp.nvfp4 import (
     nvfp4_halved_gate_up_applies,
 )
 from mlx_omnia.engine.core.layers import SwiGLU
+from tests.conftest import relative_diff
 
 HIDDEN = 512
 INNER = 32

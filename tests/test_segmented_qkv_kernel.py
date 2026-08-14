@@ -7,11 +7,11 @@ reference is the fp32 dequantized matmul of its own leaves."""
 import mlx.core as mx
 import mlx.nn as nn
 import pytest
-from conftest import relative_diff
 
 from mlx_omnia.engine.core import layers
 from mlx_omnia.engine.core.kernels.qkv_rope.segmented import qkv_step
 from mlx_omnia.engine.core.layers import SegmentedQKV
+from tests.conftest import relative_diff
 
 _HIDDEN = 256
 _QUERIES = 16

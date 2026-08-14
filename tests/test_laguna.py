@@ -11,13 +11,6 @@ from pathlib import Path
 import mlx.core as mx
 import numpy as np
 import pytest
-from conftest import (
-    assert_greedy_modulo_ties,
-    checkpoint_dir,
-    load_golden,
-    relative_diff,
-    requires_checkpoint,
-)
 
 from mlx_omnia import KVCache, stream_ids
 from mlx_omnia.engine.batching import batch, prepare_batch_sequence, step
@@ -34,6 +27,13 @@ from mlx_omnia.engine.models.laguna.config import (
 )
 from mlx_omnia.engine.models.laguna.layers import attention as laguna_attention
 from mlx_omnia.engine.models.laguna.layers.moe import LagunaSparseMoe
+from tests.conftest import (
+    assert_greedy_modulo_ties,
+    checkpoint_dir,
+    load_golden,
+    relative_diff,
+    requires_checkpoint,
+)
 
 FIXTURE = Path(__file__).parent / "fixtures" / "laguna_mlxlm.safetensors"
 REPO = "local/Laguna-S-2.1-mlx-oQ3e-fast-gs128"

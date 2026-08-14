@@ -14,7 +14,6 @@ from typing import Any, TypeIs, cast
 
 import numpy as np
 import pytest
-from conftest import local_snapshot
 
 from mlx_omnia.engine.bpe import ByteLevelBPE
 from mlx_omnia.engine.chat import (
@@ -39,6 +38,7 @@ from mlx_omnia.engine.parsers import Parser, Segment
 from mlx_omnia.engine.parsers.qwen import PARSER as QWEN
 from mlx_omnia.engine.parsers.qwen_xml import PARSER as QWEN_XML
 from mlx_omnia.engine.vision import RGB_IMAGE, Image
+from tests.conftest import local_snapshot
 
 FIXTURE = Path(__file__).parent / "fixtures" / "chat_template.json"
 GOLDEN: dict[str, Any] = json.loads(FIXTURE.read_text(encoding="utf-8"))

@@ -18,7 +18,6 @@ T ulps + fp32 slack, the same bound ``test_kernel_moe_route`` uses.
 import mlx.core as mx
 import numpy as np
 import pytest
-from conftest import relative_diff
 
 from mlx_omnia.engine.core.kernels.route.bias_topk import (
     _SOURCE,
@@ -26,6 +25,7 @@ from mlx_omnia.engine.core.kernels.route.bias_topk import (
     softmax_bias_topk_applies,
 )
 from mlx_omnia.engine.core.mxcompat import metal_kernel, softmax
+from tests.conftest import relative_diff
 
 SHAPES = [(32, 4), (128, 8), (256, 8), (384, 12)]
 SCALE = 6.0

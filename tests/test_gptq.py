@@ -4,7 +4,6 @@ from pathlib import Path
 import mlx.core as mx
 import mlx.nn as nn
 import pytest
-from conftest import relative_diff
 
 from mlx_omnia.engine.checkpoint import load_checkpoint, save_quantized
 from mlx_omnia.engine.quant.calibration import BlockedForward, SecondMoment, collect
@@ -17,6 +16,7 @@ from mlx_omnia.engine.quant.gptq import (
     to_affine,
 )
 from mlx_omnia.engine.quant.quantization import Affine, AffineRTN, AffineWeight, QuantizationPlan
+from tests.conftest import relative_diff
 
 _CPU = mx.Device(mx.cpu)
 

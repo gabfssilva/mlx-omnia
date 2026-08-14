@@ -14,10 +14,10 @@ from pathlib import Path
 from typing import Protocol
 
 import pytest
-from conftest import checkpoint_dir, requires_checkpoint
 from transformers import AutoTokenizer
 
 from mlx_omnia.engine.bpe import ByteLevelBPE
+from tests.conftest import checkpoint_dir, requires_checkpoint
 
 CORPUS = [
     "",

@@ -16,7 +16,6 @@ chain is (the floor is what bf16 rounding costs, measured on the spot).
 import mlx.core as mx
 import mlx.nn as nn
 import pytest
-from conftest import relative_diff
 
 from mlx_omnia.engine.core.kernels.add_norm import (
     AddRmsNorm,
@@ -26,6 +25,7 @@ from mlx_omnia.engine.core.kernels.add_norm import (
 )
 from mlx_omnia.engine.core.kernels.add_norm import fused as fused_module
 from mlx_omnia.engine.core.kernels.add_norm import rows as rows_module
+from tests.conftest import relative_diff
 
 EPS = 1e-6
 HIDDENS = [1024, 2048, 4096, 2880]

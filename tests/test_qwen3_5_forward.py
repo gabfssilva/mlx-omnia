@@ -13,7 +13,6 @@ import mlx.core as mx
 import mlx.nn as nn
 import numpy as np
 import pytest
-from conftest import floor, load_golden, relative_diff
 from huggingface_hub import snapshot_download
 
 from mlx_omnia import stream_ids
@@ -29,6 +28,7 @@ from mlx_omnia.engine.models.qwen3_5 import CHECKPOINT, Qwen35, Qwen35Activation
 from mlx_omnia.engine.models.qwen3_5.layers import block, deltanet, flags
 from mlx_omnia.engine.models.qwen3_5.layers.block import Qwen35Block
 from mlx_omnia.engine.models.qwen3_5.layers.deltanet import l2norm
+from tests.conftest import floor, load_golden, relative_diff
 
 FIXTURE = Path(__file__).parent / "fixtures" / "qwen3_5_forward.safetensors"
 N_LAYER = 24

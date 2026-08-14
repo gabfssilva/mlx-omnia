@@ -19,11 +19,11 @@ from pathlib import Path
 import mlx.core as mx
 import numpy as np
 import pytest
-from conftest import floor, load_golden, relative_diff
 from huggingface_hub import snapshot_download
 
 from mlx_omnia.engine.models.falcon_h1 import CHECKPOINT, FalconH1, FalconH1Activations
 from mlx_omnia.engine.models.falcon_h1.layers.cache import FalconH1LayerCache
+from tests.conftest import floor, load_golden, relative_diff
 
 FIXTURE = Path(__file__).parent / "fixtures" / "falcon_h1_forward.safetensors"
 

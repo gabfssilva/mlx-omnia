@@ -6,7 +6,6 @@ every declaration resolves, the default serving whatever no kernel does.
 """
 
 import mlx.core as mx
-from conftest import relative_diff
 
 from mlx_omnia.engine.core.kernels.gate_up import (
     Activation,
@@ -17,6 +16,7 @@ from mlx_omnia.engine.core.kernels.gate_up import (
     Nvfp4GateUp,
 )
 from mlx_omnia.engine.core.layers import QuantizedSwitchLinear, SwitchLinear
+from tests.conftest import relative_diff
 
 EXPERTS = 8
 ACTIVE = 4
