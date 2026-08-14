@@ -3,8 +3,12 @@ import math
 import mlx.core as mx
 import mlx.nn as nn
 
-from mlx_omnia.engine.core.cache import DeltaCache
-from mlx_omnia.engine.core.kernels.gated_delta import GatedDelta, GatedDeltaStrategy
+from mlx_omnia.engine.core.cache import DeltaCache, FixedDeltaCache
+from mlx_omnia.engine.core.kernels.gated_delta import (
+    GatedDelta,
+    GatedDeltaStrategy,
+    gated_delta_trace,
+)
 from mlx_omnia.engine.models.qwen3_5.config import Qwen35TextConfig
 from mlx_omnia.engine.models.qwen3_5.layers import flags
 
@@ -91,6 +95,90 @@ class Qwen35DeltaNet(nn.Module):
             mixed = mixed + padded[:, j : j + length] * taps[:, j]
         cache.window = padded[:, length:]
         return mixed * mx.sigmoid(mixed)
+
+    def verify_rows(self, x: mx.array, cache: FixedDeltaCache) -> mx.array:
+        """`__call__` over a compiled verify's rows, with the pieces a slot-pick rewind
+        needs written to the cache's checkpoint slots (`Qwen35.compile_verify` extends
+        `graph` to five: window, state, per-row states, the round's conv rows, and the
+        window before the round).
+
+        The arithmetic is the batch path's exactly — the state after every row round-trips
+        through the same float32 buffers whichever route stores it, so the flag between
+        the trace kernel and the single-token walk is a measurement, not a semantic. Only
+        bookkeeping differs from `__call__`: the offset is the round's, moved python-side
+        by `verify`, and the state after *every* row is kept instead of only the last.
+        """
+        assert len(cache.graph) == 5, "the verify slots are the compiled round's to build"
+        config = self.config
+        length = x.shape[1]
+        heads = config.linear_num_value_heads
+        key_heads = config.linear_num_key_heads
+        fused = self.fused_proj(x)
+        splits = (
+            config.conv_dim,
+            config.conv_dim + config.value_dim,
+            config.conv_dim + config.value_dim + heads,
+        )
+        qkv, z, b, a = mx.split(fused, splits, axis=-1)
+
+        kernel = config.linear_conv_kernel_dim
+        window = cache.graph[0]
+        padded = mx.concatenate([window, qkv], axis=1)
+        taps = self.conv1d.weight
+        mixed = padded[:, :length] * taps[:, 0]
+        for j in range(1, kernel):
+            mixed = mixed + padded[:, j : j + length] * taps[:, j]
+        mixed = mixed * mx.sigmoid(mixed)
+        cache.graph[4] = window
+        cache.graph[3] = qkv[0]
+        cache.graph[0] = padded[:, length:]
+
+        q, k, v = mx.split(mixed, (config.key_dim, 2 * config.key_dim), axis=-1)
+        key_shape = (1, length, key_heads, config.linear_key_head_dim)
+        q, k = q.reshape(key_shape), k.reshape(key_shape)
+        v = v.reshape(1, length, heads, config.linear_value_head_dim)
+
+        dt = a.astype(mx.float32) + self.dt_bias.astype(mx.float32)
+        g = -mx.exp(self.A_log) * nn.softplus(dt)
+        scale = 1 / math.sqrt(config.linear_key_head_dim)
+        state = cache.graph[1]
+        q32 = l2norm(q, scale, dtype=mx.float32)
+        k32 = l2norm(k, dtype=mx.float32)
+        v32 = v.astype(mx.float32)
+        decay = mx.exp(g)
+        strength = mx.sigmoid(b).astype(mx.float32)
+
+        if flags.VERIFY_TRACE_KERNEL:
+            out, state, seq = gated_delta_trace(q32, k32, v32, decay, strength, state)
+            cache.graph[2] = seq[0]
+        else:
+            rule = self.rule()
+            outs: list[mx.array] = []
+            slots: list[mx.array] = []
+            for t in range(length):
+                step, state = rule(
+                    q32[:, t : t + 1],
+                    k32[:, t : t + 1],
+                    v32[:, t : t + 1],
+                    decay[:, t : t + 1],
+                    strength[:, t : t + 1],
+                    state,
+                )
+                outs.append(step)
+                slots.append(state)
+            out = mx.concatenate(outs, axis=1)
+            cache.graph[2] = mx.concatenate(slots, axis=0)
+        cache.graph[1] = state
+
+        out = out.astype(v.dtype)
+        lifted = out.astype(mx.float32)
+        normed = lifted * mx.rsqrt(
+            (lifted * lifted).mean(axis=-1, keepdims=True) + config.rms_norm_eps
+        )
+        gate = z.reshape(1, length, heads, config.linear_value_head_dim).astype(mx.float32)
+        gated = self.norm.weight * normed.astype(out.dtype)
+        gated = (gated * gate * mx.sigmoid(gate)).astype(x.dtype)
+        return self.out_proj(gated.reshape(1, length, config.value_dim))
 
     def __call__(self, x: mx.array, cache: DeltaCache) -> mx.array:
         config = self.config

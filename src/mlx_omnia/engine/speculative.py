@@ -310,7 +310,9 @@ class Chained[S: LayerCache]:
     does — which is why `settle` has nothing to do. That it is *allowed* to go is not
     obvious and is not deduced: it is the shape the acceptance above was measured in, an
     empty cache at every round's first step. Carrying the head's keys across rounds the way
-    vllm does is the untested variant, and it can only move speed.
+    vllm does is `Persistent`, and on Qwen3.8's head it measured worth it — this stays as
+    the shape for a head whose acceptance was measured empty, and as the compiled-chain
+    fast path a fresh fixed buffer makes possible.
 
     What crosses a round is one row: the target's own reading of the last position it kept,
     handed over by `absorb`. `taps` is the block that row comes from.
@@ -388,6 +390,98 @@ class Chained[S: LayerCache]:
     def settle(self, length: int) -> None:
         """Nothing: the chain's cache belonged to the round that just ended, and the row that
         crosses to the next one arrives through `absorb` already cut to what was kept."""
+
+
+class Persistent[S: LayerCache]:
+    """An MTP step as a proposer whose keys survive the round — vllm's own shape: the head
+    attends to the whole history, rotated at absolute positions, instead of to its round's
+    few rows alone. On Qwen3.8's head the history is worth real acceptance — 0.73 to 0.85
+    at depth one on the nvfp4 27B entry — which buys more than `Chained`'s compiled chain
+    saves in dispatch.
+
+    The drafter's cache holds one row per committed position, and every surviving row was
+    written from the *target's* hidden: a round's chained links append rows built from the
+    step's own guesses, and `settle` trims straight back past them. The accepted positions
+    re-enter on the next round's catch-up — the rows the round handed `absorb` — so a guess
+    never conditions anything beyond the round that made it.
+
+    Catch-up is one forward over every pair the cache is missing: pair *i* is *(the
+    target's hidden at i, the embedding of the committed token at i+1)*, it occupies cache
+    row *i*, and its last output row is the first proposal. That works only for a cache
+    that can trim, which an MTP step's KV can and a recurrent drafter's cannot —
+    `_must_rewind` refuses the rest.
+    """
+
+    def __init__(
+        self,
+        target: Speculable,
+        step: Step[S],
+        *,
+        block: int,
+        tap: int,
+    ) -> None:
+        if block < 2:
+            raise ValueError(f"a block of {block} proposes nothing")
+        if not isinstance(target, Speculable):
+            raise SpeculationRefused(
+                f"{type(target).__name__} does not lend its embedding table and its head "
+                "(`speculative.Speculable`), which is the whole of an MTP step's vocabulary"
+            )
+        self._target = target
+        self._step = step
+        self._width = block - 1
+        self._tap = tap
+        self._cache = step.make_cache()
+        _must_rewind(self._cache, "draft")
+        self._pending: mx.array | None = None
+        self._anchor = 0
+        """Rows of the cache built from the target's hidden — where `settle` trims to."""
+
+    @property
+    def taps(self) -> Sequence[int]:
+        return (self._tap,)
+
+    @property
+    def width(self) -> int:
+        return self._width
+
+    def absorb(self, features: mx.array) -> None:
+        """Every row is kept, not the last one: each is the hidden half of a pair the
+        cache does not have yet, and the next catch-up runs over all of them."""
+        self._pending = (
+            features
+            if self._pending is None
+            else mx.concatenate([self._pending, features], axis=1)
+        )
+
+    def propose(self, committed: Sequence[int]) -> mx.array:
+        assert self._pending is not None, "the round feeds the proposer before it asks"
+        offset = self._cache[0].offset
+        pairs = len(committed) - 1 - offset
+        assert pairs == self._pending.shape[1], (
+            f"the cache holds {offset} pairs and {self._pending.shape[1]} rows arrived: "
+            f"together they must reach position {len(committed) - 1} exactly"
+        )
+        tokens = mx.array(committed[offset + 1 :])[None]
+        out = self._step(self._target.raw_embed(tokens), self._pending, self._cache)
+        self._pending = None
+        self._anchor = offset + pairs
+        hidden = out[:, -1:, :]
+        token = mx.argmax(self._target.raw_logits(hidden)[:, -1, :], axis=-1)[None]
+        mx.async_eval(token)
+        proposals = [token[0]]
+        for _ in range(self._width - 1):
+            hidden = self._step(self._target.raw_embed(token), hidden, self._cache)
+            token = mx.argmax(self._target.raw_logits(hidden)[:, -1, :], axis=-1)[None]
+            mx.async_eval(token)
+            proposals.append(token[0])
+        return mx.concatenate(proposals)
+
+    def settle(self, length: int) -> None:
+        """Back past the round's guessed rows: only pairs built from the target's own
+        hidden stay, and the accepted positions return through the next `absorb`."""
+        for layer in self._cache:
+            layer.trim(self._anchor)
 
 
 def stream_speculative_ids[C: LayerCache, D: LayerCache](

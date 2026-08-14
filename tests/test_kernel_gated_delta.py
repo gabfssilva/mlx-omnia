@@ -105,6 +105,31 @@ def run(args: tuple[mx.array, ...]) -> tuple[mx.array, mx.array]:
     return y, state.transpose(0, 1, 3, 2)
 
 
+@pytest.mark.parametrize("shape", [SMALL, BROADCAST], ids=["ratio1", "ratio3"])
+def test_trace_variant_matches_the_plain_walk(shape: tuple[int, int, int, int]) -> None:
+    """`gated_delta_trace` is the same walk with per-token state stores: `y` and the final
+    state must be the plain kernel's bits, slot `T-1` must be `state_out`'s bits, and slot
+    `t` must be the state a walk of the first `t + 1` tokens ends in — the exactness the
+    compiled verify's slot-pick rewind stands on."""
+    from mlx_omnia.engine.core.kernels.gated_delta import gated_delta_trace
+
+    length = 4
+    inputs = Inputs(length, shape, mx.float32)
+    args = inputs.kernel_args()
+    y, state = gated_delta(*args)
+    traced_y, traced_state, seq = gated_delta_trace(*args)
+
+    assert mx.array_equal(y, traced_y)
+    assert mx.array_equal(state, traced_state)
+    assert mx.array_equal(seq[:, -1], state)
+    for kept in range(1, length):
+        q, k, v, g, beta, initial = args
+        _, prefix_state = gated_delta(
+            q[:, :kept], k[:, :kept], v[:, :kept], g[:, :kept], beta[:, :kept], initial
+        )
+        assert mx.array_equal(seq[:, kept - 1], prefix_state), f"slot {kept - 1}"
+
+
 def test_applies_predicate() -> None:
     hk, hv, dk, dv = BROADCAST
     assert gated_delta_applies(dk, hk, hv, dv)

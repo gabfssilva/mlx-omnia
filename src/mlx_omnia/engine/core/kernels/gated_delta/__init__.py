@@ -17,6 +17,7 @@ from mlx_omnia.engine.core.kernels.gated_delta.fused import (
     FusedGatedDelta,
     gated_delta,
     gated_delta_applies,
+    gated_delta_trace,
 )
 from mlx_omnia.engine.core.kernels.gated_delta.kernel import GatedDeltaStrategy
 from mlx_omnia.engine.core.kernels.resolve import resolve
@@ -29,6 +30,7 @@ __all__ = [
     "delta_rule",
     "gated_delta",
     "gated_delta_applies",
+    "gated_delta_trace",
 ]
 
 # Order is preference: the first strategy that builds wins; the default accepts

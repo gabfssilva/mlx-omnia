@@ -119,7 +119,10 @@ class Qwen35Attention(nn.Module):
         attended = mx.fast.scaled_dot_product_attention(
             q, keys, values,
             scale=1 / math.sqrt(config.head_dim),
-            mask=mask if length == 1 else "causal",
+            # An explicit mask wins at any length: the compiled verify feeds `rows` rows
+            # over a fixed buffer, where the fill mask is also the causal one. Without
+            # one the growing paths keep their answers — all rows at T=1, causal past it.
+            mask=mask if mask is not None else (None if length == 1 else "causal"),
         )
         attended = attended.transpose(0, 2, 1, 3).reshape(1, length, queries)
         return self.o_proj(attended * mx.sigmoid(gate))

@@ -11,7 +11,7 @@ Property names are the checkpoint's after the loader normalizes the two dialects
 each mixer are concatenated on the output axis into `fused_proj`, dict-side.
 """
 
-from mlx_omnia.engine.models.qwen3_5.checkpoint import CHECKPOINT
+from mlx_omnia.engine.models.qwen3_5.checkpoint import CHECKPOINT, MTP, load_mtp
 from mlx_omnia.engine.models.qwen3_5.config import (
     Qwen35Config,
     Qwen35RoPEParameters,
@@ -28,19 +28,23 @@ from mlx_omnia.engine.models.qwen3_5.model import (
     multimodal_prompt,
     stream_multimodal_ids,
 )
+from mlx_omnia.engine.models.qwen3_5.mtp import Qwen35MTP
 
 __all__ = [
     "CHECKPOINT",
+    "MTP",
     "MultimodalPrompt",
     "Qwen35",
     "Qwen35Activations",
     "Qwen35Config",
     "Qwen35Input",
     "Qwen35LanguageModel",
+    "Qwen35MTP",
     "Qwen35MoE",
     "Qwen35RoPEParameters",
     "Qwen35TextConfig",
     "decode_clock",
+    "load_mtp",
     "multimodal_prompt",
     "stream_multimodal_ids",
 ]

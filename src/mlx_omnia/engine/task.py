@@ -590,6 +590,7 @@ def load_drafter(directory: Path, dtype: mx.Dtype | None = None) -> nn.Module:
 
 _MTP_SPECS: dict[str, Drafter[nn.Module]] = {
     "nemotron_h": nemotron_h.MTP,
+    "qwen3_5": qwen3_5.MTP,
 }
 """Architectures whose *own* checkpoint carries a multi-token-prediction head.
 
