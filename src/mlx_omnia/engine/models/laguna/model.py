@@ -7,7 +7,7 @@ import mlx.nn as nn
 from mlx_omnia.engine.batching import batch
 from mlx_omnia.engine.checkpoint import wire_resident
 from mlx_omnia.engine.core.attend import KVStore
-from mlx_omnia.engine.core.cache import FixedKVCache, KVCache, RingKVCache
+from mlx_omnia.engine.core.cache import FixedKVCache, KVCache, RingKVCache, fit
 from mlx_omnia.engine.core.kernels.attention.sdpa import SCALED_DOT_PRODUCT_ATTENTION
 from mlx_omnia.engine.core.kernels.lm_head.argmax import (
     Int5Planes,
@@ -68,15 +68,22 @@ class Laguna(nn.Module):
         return [KVCache() for _ in self.config.layer_types]
 
     def compile_decode(
-        self, cache: list[KVCache | FixedKVCache | RingKVCache], capacity: int = 4096
+        self, cache: list[KVCache | FixedKVCache | RingKVCache], capacity: int | None = None
     ) -> Callable[[mx.array], mx.array]:
         """Promote a completed prefill cache and compile one-token forwards."""
-        return self._compile_decode(cache, capacity, argmax_only=False)
+        return self._compile_decode(cache, self._room(cache, capacity), argmax_only=False)
 
     def compile_greedy_decode(
-        self, cache: list[KVCache | FixedKVCache | RingKVCache], capacity: int = 4096
+        self, cache: list[KVCache | FixedKVCache | RingKVCache], capacity: int | None = None
     ) -> Callable[[mx.array], mx.array]:
-        return self._compile_decode(cache, capacity, argmax_only=True)
+        return self._compile_decode(cache, self._room(cache, capacity), argmax_only=True)
+
+    @staticmethod
+    def _room(cache: list[KVCache | FixedKVCache | RingKVCache], capacity: int | None) -> int:
+        """4096 unless the prompt outgrew it — a multi-turn conversation walks in past it —
+        and then the smallest fitting bucket, since the fixed buffer is read whole by every
+        step's attention."""
+        return capacity if capacity is not None else max(4096, fit(cache[0].rows))
 
     def single_decode(
         self,

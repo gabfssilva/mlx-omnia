@@ -185,6 +185,110 @@ def test_stream_ids_uses_greedy_compiled_decode_only_for_plain_greedy() -> None:
     assert model.compiled_calls == 4
 
 
+class _PromotedStand(KVCache):
+    """A fixed stand-in the way the real trunks promote: same rows, no rewind."""
+
+    @property
+    def is_trimmable(self) -> bool:
+        return False
+
+
+class PromotingScriptedLM(GreedyCompiledScriptedLM):
+    """Compiles the way the real trunks do: the growing layers are replaced in place by
+    stand-ins the trie cannot rewind, and whoever kept the old list objects holds the
+    prompt's rows and nothing the decode writes after."""
+
+    def __init__(self, ids: list[int], vocab: int) -> None:
+        super().__init__(ids, vocab)
+        self.abandoned: list[KVCache] | None = None
+
+    def compile_greedy_decode(self, cache: list[KVCache]) -> Callable[[mx.array], mx.array]:
+        self.abandoned = list(cache)
+        cache[:] = [_PromotedStand() for _ in cache]
+        return super().compile_greedy_decode(cache)
+
+
+def test_a_compiling_model_still_compiles_under_a_prefix() -> None:
+    """The gate this covers: a prefix used to force the eager step, which is where the app's
+    single-stream decode lost its compiled path."""
+    model = GreedyCompiledScriptedLM([1, 2, 3, 4], vocab=5)
+    trie = PromptCache[KVCache](budget=1 << 30)
+
+    assert list(stream_ids(model, [0], max_tokens=4, prefix=trie)) == [1, 2, 3, 4]
+
+    assert model.greedy_compiled_calls == 4
+    # Nothing was promoted, so the entry is the classic one: the whole turn.
+    reuse = trie.take([0, 1, 2, 3, 4, 0])
+    assert reuse is not None and reuse.length == 5
+
+
+def test_a_promotion_leaves_the_trie_the_prompt_and_the_growing_layers() -> None:
+    """The promoted shape cannot rewind and cannot be prefilled past, so the trie must get
+    the layers the promotion abandoned — standing on the prompt, still trimmable."""
+    model = PromotingScriptedLM([1, 2, 3, 4], vocab=5)
+    trie = PromptCache[KVCache](budget=1 << 30)
+    meter = Meter()
+    prompt = [0, 7]
+
+    assert list(stream_ids(model, prompt, max_tokens=4, prefix=trie, meter=meter)) == [1, 2, 3, 4]
+
+    assert model.greedy_compiled_calls == 4
+    assert meter.kept_prefix
+    reuse = trie.take([*prompt, 1, 2, 3, 4, 0])
+    assert reuse is not None
+    assert reuse.length == len(prompt)
+    assert model.abandoned is not None
+    assert reuse.caches == model.abandoned
+    assert all(layer.is_trimmable for layer in reuse.caches)
+
+
+class PartiallyPromotingLM:
+    """Two growing layers, rows written on every forward, and a compile that replaces only
+    the first: the second stays live in `cache` and takes the decode's rows, which is the
+    case the insert's trim exists for."""
+
+    def __init__(self, ids: list[int], vocab: int) -> None:
+        self.ids = ids
+        self.vocab = vocab
+        self.step = 0
+
+    def make_cache(self) -> list[KVCache]:
+        return [KVCache(), KVCache()]
+
+    def __call__(self, ids: mx.array, cache: list[KVCache] | None = None) -> mx.array:
+        assert cache is not None
+        rows = mx.ones((1, 1, ids.shape[1], 4), dtype=mx.float32)
+        for layer in cache:
+            layer.update_and_fetch(rows, rows)
+        token = self.ids[min(self.step, len(self.ids) - 1)]
+        self.step += 1
+        row = -mx.abs(mx.arange(self.vocab) - token).astype(mx.float32)
+        return mx.broadcast_to(row, (1, ids.shape[1], self.vocab))
+
+    def compile_greedy_decode(self, cache: list[KVCache]) -> Callable[[mx.array], mx.array]:
+        cache[0] = _PromotedStand()
+
+        def decode(ids: mx.array) -> mx.array:
+            return self(ids[None], cache)[:, -1, :]
+
+        return decode
+
+
+def test_a_partially_promoted_cache_is_trimmed_back_to_the_prompt() -> None:
+    """A layer the promotion left live carries the decode's rows past the prompt the entry
+    claims — stored untrimmed, the next reuse would append behind rows it never claimed."""
+    model = PartiallyPromotingLM([1, 2, 3, 4], vocab=5)
+    trie = PromptCache[KVCache](budget=1 << 30)
+    prompt = [0, 7, 7]
+
+    assert list(stream_ids(model, prompt, max_tokens=4, prefix=trie)) == [1, 2, 3, 4]
+
+    reuse = trie.take([*prompt, 1, 2, 3, 4, 0])
+    assert reuse is not None
+    assert reuse.length == len(prompt)
+    assert [layer.offset for layer in reuse.caches] == [len(prompt), len(prompt)]
+
+
 def test_stream_generate_flushes_partial_utf8(tokenizer: GPT2Tokenizer) -> None:
     ids = list(tokenizer.encode("ok 🤖🔥 done"))
     split = next((k for k in range(1, len(ids)) if "�" in tokenizer.decode(ids[:k])), None)

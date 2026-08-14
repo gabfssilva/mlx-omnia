@@ -549,6 +549,12 @@ def stream_ids[C: LayerCache, D: LayerCache](
     boundary: list[C] | None = None
     """Bound before the `try`, because the `finally` reads it and a forward that raises on
     the first block never reaches the line that fills it."""
+    standing: list[C] | None = None
+    """The growing layers as they stood at the end of the prompt, kept aside when a compile
+    below promotes `cache` in place. Promotion copies the rows into fixed buffers and never
+    writes these again, so holding them is the prompt's entry for free — the trie stores
+    this, rewindable, and never the promoted shape it cannot rewind."""
+    promoted = False
     owed: list[int] = []
     """The closer, between the step the budget armed on and the steps that feed it out."""
 
@@ -583,16 +589,33 @@ def stream_ids[C: LayerCache, D: LayerCache](
         # past the prompt. `KVCache` recovers by rewinding; recurrent state has nothing to
         # rewind to, so the boundary is taken while the cache is standing on it.
         boundary = None if prefix is None else _boundary(model, cache)
-        if prefix is None:
-            if (
-                sampler is greedy
-                and penalty is None
-                and constraint is None
-                and isinstance(model, CompiledGreedyDecode)
-            ):
-                decode = model.compile_greedy_decode(cache)
-            elif isinstance(model, CompiledDecode):
-                decode = model.compile_decode(cache)
+        compile_step: Callable[[list[C]], Callable[[mx.array], mx.array]] | None = None
+        if (
+            sampler is greedy
+            and penalty is None
+            and constraint is None
+            and isinstance(model, CompiledGreedyDecode)
+        ):
+            compile_step = model.compile_greedy_decode
+        elif isinstance(model, CompiledDecode):
+            compile_step = model.compile_decode
+        # With a prefix the compile is conditional on the trie having something to keep: a
+        # promotion hands the decode a shape the trie cannot rewind, so the prompt's state
+        # must stand somewhere else first — `boundary` for a trunk that cannot rewind at
+        # all, the pre-promotion layers for one that can. A trunk with neither stays on the
+        # eager step, which is the one whose cache the inserts below still describe.
+        if compile_step is not None and (
+            prefix is None
+            or boundary is not None
+            or all(layer.is_trimmable for layer in cache)
+        ):
+            before = list(cache)
+            decode = compile_step(cache)
+            promoted = prefix is not None and any(
+                source is not target for source, target in zip(before, cache, strict=True)
+            )
+            if promoted and boundary is None:
+                standing = before
         for emitted in range(max_tokens):
             # Free, step n+1 is queued before n is read back and the GPU never idles;
             # constrained, n+1's mask needs the value of n, so the queue waits behind the
@@ -645,14 +668,23 @@ def stream_ids[C: LayerCache, D: LayerCache](
             # on the way down — would otherwise meet `no Stream(gpu, 1) in current thread`.
             # The last steps are what this is really for: `advance` queues one the loop never
             # reads back, and its rows are in the cache all the same.
-            mx.eval([tensor for layer in cache for tensor in layer.tensors])
+            mx.eval(
+                [
+                    tensor
+                    for layers in (cache, standing if standing is not None else [])
+                    for layer in layers
+                    for tensor in layer.tensors
+                ]
+            )
         if meter is not None:
             # A trunk that neither rewinds nor stands still is one the entry below can never
             # be matched against: the next prompt would have to rewind into it, and it has no
             # answer for that. It is stored anyway — the byte count is honest either way —
             # but a caller reading zero reuse deserves to know which zero it is.
             meter.kept_prefix = prefix is not None and (
-                boundary is not None or all(layer.is_trimmable for layer in cache)
+                boundary is not None
+                or standing is not None
+                or all(layer.is_trimmable for layer in cache)
             )
         if prefix is not None and boundary is not None:
             # The prompt, as a `user` entry: it is where the conversation stopped being the
@@ -668,7 +700,19 @@ def stream_ids[C: LayerCache, D: LayerCache](
                 role="user",
                 nbytes=sum(layer.nbytes for layer in boundary),
             )
-        if prefix is not None:
+        if prefix is not None and standing is not None:
+            # The prompt's entry, out of the layers the promotion abandoned. The trim is for
+            # a promotion that replaced only some of them: a layer still live in `cache` had
+            # the decode's rows written into it, past the prompt this entry claims.
+            for layer in standing:
+                layer.trim(prompt_length)
+            prefix.insert(
+                prompt,
+                standing,
+                role="user",
+                nbytes=sum(layer.nbytes for layer in standing),
+            )
+        if prefix is not None and not promoted:
             # One entry, and an `assistant` one: what a generation leaves behind ends in ids
             # it wrote itself, which is the role the trie drains first. Cutting the prompt at
             # its role boundaries would take boundaries the render does not hand out here.

@@ -15,6 +15,9 @@ import mlx.nn as nn
 import pytest
 
 from mlx_omnia import stream_ids
+from mlx_omnia.engine.core.cache import LayerCache
+from mlx_omnia.engine.core.prompt_cache import PromptCache
+from mlx_omnia.engine.generate import Meter
 from mlx_omnia.engine.models.laguna import CHECKPOINT, Laguna
 from mlx_omnia.engine.models.laguna.layers.moe import LagunaSparseMoe
 from tests.conftest import checkpoint_dir, relative_diff, requires_checkpoint
@@ -101,6 +104,36 @@ def test_compiled_greedy_decode_matches_eager_across_sliding_window(
         mx.eval(compiled_logits)
 
     assert actual == expected
+
+
+@requires_checkpoint(REPO, REVISION)
+def test_prefix_reuse_compiles_and_the_next_turn_matches_a_cold_run(
+    model: Laguna, case: dict[str, list[int]]
+) -> None:
+    """The server's single-stream shape: greedy under a prefix trie, two turns. The first
+    turn must still match the golden with the trie in hand — the compile now runs under a
+    prefix — and the second must reuse the first prompt and reproduce a cold run id for id.
+    The entry the promotion leaves behind has to be the growing layers standing on the
+    prompt: a promoted ring stored instead cannot be prefilled past, and a mutation that
+    stores it fails here on the reuse."""
+    trie = PromptCache[LayerCache](budget=1 << 34)
+    prompt = case["prompt_tokens"]
+    first = list(stream_ids(model, prompt, max_tokens=24, prefix=trie))
+    assert first == case["expected_tokens"][:24]
+
+    second_prompt = [*prompt, *first, *prompt[:8]]
+    meter = Meter()
+    warm = list(stream_ids(model, second_prompt, max_tokens=8, prefix=trie, meter=meter))
+    cold = list(stream_ids(model, second_prompt, max_tokens=8))
+
+    assert warm == cold
+    assert meter.reused_tokens == len(prompt)
+    assert meter.kept_prefix
+
+    reuse = trie.take([*second_prompt, *warm, 0])
+    assert reuse is not None
+    assert reuse.length == len(second_prompt)
+    assert all(layer.is_trimmable for layer in reuse.caches)
 
 
 @requires_checkpoint(REPO, REVISION)
