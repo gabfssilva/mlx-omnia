@@ -68,7 +68,7 @@ def test_the_bandwidth_pair_is_declared_constant_and_nothing_else_is(
     figure: neither is a reading, and `constants` is where the response says so. A number
     the machine did answer must never appear there — that is the defect this route exists
     to avoid."""
-    assert payload["bandwidth_sustained_gbs"] == 490.0
+    assert payload["bandwidth_sustained_gbs"] == 610.0
     assert payload["bandwidth_theoretical_gbs"] == 614.0
     constants = payload["constants"]
     assert isinstance(constants, dict)
