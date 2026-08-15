@@ -17,9 +17,9 @@ The book assumes the reader can read Python and wants to understand inference fr
 
 ## Scope
 
-**Numbers and status live elsewhere.** These chapters omit throughput figures, tolerances and dated status. Measurements age; mechanisms last longer. The ledger holds one log per architecture with its recon, port notes and benchmark rounds. `MIGRATION.md` carries migration status. If a chapter and the ledger disagree about a number, the ledger wins.
+**Numbers and status live elsewhere.** These chapters omit throughput figures, tolerances and dated status. Measurements age; mechanisms last longer. Recon, port notes and benchmark rounds are kept per architecture, in a log outside this book, and that log is the authority whenever the two disagree about a number.
 
-**Architecture-specific facts stay in the ledger.** "Qwen3.5 stacks its shared expert as the row after the last expert" belongs in that checkpoint's log. The chapter covers the general shape: an expert stack can hold rows that routing never chooses, and the decode step reads them anyway.
+**Architecture-specific facts stay out of it.** "Qwen3.5 stacks its shared expert as the row after the last expert" belongs in that checkpoint's log. The chapter covers the general shape: an expert stack can hold rows that routing never chooses, and the decode step reads them anyway.
 
 **This is a reading guide.** There are no exercises. Read each chapter with the file it names open beside it.
 
@@ -43,7 +43,7 @@ A shorter path, if you only want to know why decode is slow: 01 → 02 → 07.
 
 ## Conventions
 
-**Paths.** Unqualified paths are relative to `packages/mlx_omnia/src/mlx_omnia/`. For example, `core/cache.py` means `packages/mlx_omnia/src/mlx_omnia/core/cache.py`. Paths outside that package start at the repository root: `packages/mlx_omnia-server/…`, `bench/…`, `docs/…`.
+**Paths.** Unqualified paths are relative to `src/mlx_omnia/engine/`. For example, `core/cache.py` means `src/mlx_omnia/engine/core/cache.py`. Chapter 09 is the exception: its unqualified paths are relative to `src/mlx_omnia/server/`, and the engine files it names are given in full. Anything outside both starts at the repository root: `src/mlx_omnia/bench/…`, `app/…`, `docs/…`.
 
 **Shapes.** Tensors follow the order used by the code. `[B, H, T, D]` means batch, heads, sequence positions and head dimension, matching the layout expected by `mx.fast.scaled_dot_product_attention`. `T` is the number of *query* rows in the current call: the prompt length during prefill and `1` during decode. Much of this book follows from that difference.
 

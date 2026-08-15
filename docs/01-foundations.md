@@ -45,7 +45,7 @@ out      = attended + self.mlp(self.post_attention_layernorm(attended))
 
 Both important properties come from the `x +`. Every block reads and writes one residual vector per position, so `hidden_size` stays constant through the trunk. During training, gradients reach layer 0 without passing through `L` multiplications; this allows a deep stack.
 
-Variations you will meet, all of them in the ledger's per-architecture logs:
+Variations you will meet, each recorded in the log of the architecture that has it:
 
 - **Sandwich norms**: each arm normed on the way in *and* on the way out.
 - **Zero-centred norms**: the learned scale is `1 + w` instead of `w`. Folded into the weights at load time in this codebase rather than computed per token, because `1 + w` per norm per layer per token is a real number of extra kernel launches.

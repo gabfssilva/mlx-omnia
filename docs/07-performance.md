@@ -27,7 +27,7 @@ This hardware upper bound provides the denominator for every measurement reporte
 
 The percentage controls for changes that make raw tok/s rise automatically, including narrower weights and smaller models. It states how much of the available bandwidth the implementation uses and whether the current format leaves room for an engineering gain.
 
-The corollary, from `CLAUDE.md`: **changing a weight format changes the ceiling.** Recompute `A` under the new format or the percentage rises for free.
+The corollary: **changing a weight format changes the ceiling.** Recompute `A` under the new format or the percentage rises for free.
 
 ## Counting active bytes
 
@@ -41,7 +41,7 @@ Two numbers the tensors cannot supply come from the module above the stack, thro
 
 The same file computes `resident_bytes` (what the loaded tree occupies) and `checkpoint_bytes` (summed straight from safetensors headers, with nothing mapped): the latter because admission control has to price a checkpoint *before* deciding to load it (chapter 09).
 
-The sustained-bandwidth constant lives in `footprint.SUSTAINED_GBS`. The repository currently carries a different figure in `CLAUDE.md`; reconcile the two before quoting a percentage, then keep a single source of truth.
+`BW` is the other half of the denominator, and it is a *measured* sustained rate rather than the advertised peak. It has to come from one place: two quoted percentages are only comparable when both divided by the same constant.
 
 ## The second cost in decode: dispatch
 
@@ -120,4 +120,4 @@ A faster result must also pass the following checks before landing:
 - The gain must survive the gate and the interleaving, not a single hot run.
 - Report the percentage of the physical ceiling alongside comparisons with baseline implementations.
 
-Rejected optimizations are recorded under "measured dead ends" in `CLAUDE.md` to prevent accidental repetition. Re-measure before retrying because each result applies to one machine and library version.
+A rejected optimization is worth as much as an accepted one, and is recorded with the measurement that rejected it, architecture-specific ones in that model's log. Re-measure before retrying: each result applies to one machine and one library version.

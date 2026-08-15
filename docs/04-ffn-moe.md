@@ -61,7 +61,7 @@ weights = mx.take_along_axis(probs, chosen, axis=-1)
 
 Two arithmetically equivalent implementations can order near-equal scores differently. The rounding difference then selects another expert, taking a discrete branch and producing a divergent output.
 
-`CLAUDE.md` records the measured consequence: recomputing router logits inside a fused kernel performs the same gemv mathematically, but flips enough near-tie selections to change output. Anything that reorders the comparison requires *bit-exact selection*. A small numerical bound cannot protect a discrete choice.
+The consequence is measured rather than hypothetical. Recomputing the router logits inside a fused kernel performs the same gemv mathematically and rounds differently; it flips the winning expert on roughly one token in eleven (`core/kernels/route/softmax_topk.py`), so the kernel takes its logits from the stock matmul and fuses only what follows. Anything that reorders the comparison requires *bit-exact selection*: a small numerical bound cannot protect a discrete choice.
 
 ## Running the experts
 
