@@ -17,6 +17,7 @@ from typing import Self
 
 import mlx.core as mx
 
+from mlx_omnia.engine.core.kernels.embed.kernel import EmbedStrategy
 from mlx_omnia.engine.core.mxcompat import metal_kernel
 
 _SOURCE = """
@@ -83,7 +84,7 @@ def applies(hidden: int, full_width: int, sliding_width: int, *, dtype: mx.Dtype
 
 
 @dataclass(frozen=True)
-class AtlasEmbed:
+class AtlasEmbed(EmbedStrategy):
     embedding: mx.array
     full_atlas: mx.array
     sliding_atlas: mx.array

@@ -7,11 +7,12 @@ delegator in `__init__.py` resolves which one serves a given norm leaf and
 declaration, once, at construction.
 """
 
-from typing import Protocol
+from typing import Protocol, runtime_checkable
 
 import mlx.core as mx
 
 
+@runtime_checkable
 class AddRmsNormStrategy(Protocol):
     """(x [..., hidden], projected [..., hidden]) -> (x + projected, its rms_norm)."""
 

@@ -16,12 +16,12 @@ answers is "when did this conversation last change", and a title is part of it.
 
 import time
 from dataclasses import dataclass
-from typing import Annotated
 from uuid import uuid4
 
-from fastapi import APIRouter, Depends, HTTPException, Request
+from fastapi import APIRouter, HTTPException
 from pydantic import BaseModel, ConfigDict, JsonValue, TypeAdapter
 
+from mlx_omnia.server.deps import StoreDep
 from mlx_omnia.server.store import Session, SessionSummary, Store
 
 _MESSAGES = TypeAdapter(list[JsonValue])
@@ -85,14 +85,6 @@ def _view(session: Session) -> SessionView:
         messages=_MESSAGES.validate_json(session.messages),
     )
 
-
-def _store(request: Request) -> Store:
-    store = request.app.state.store
-    assert isinstance(store, Store)
-    return store
-
-
-StoreDep = Annotated[Store, Depends(_store)]
 
 router = APIRouter()
 

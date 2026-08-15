@@ -12,11 +12,12 @@ from typing import Self
 import mlx.core as mx
 
 from mlx_omnia.engine.core.kernels.conv_step import ConvStep
+from mlx_omnia.engine.core.kernels.mamba_step.kernel import MambaStepStrategy
 from mlx_omnia.engine.core.kernels.ssm import Ssm
 
 
 @dataclass(frozen=True)
-class DefaultMambaStep:
+class DefaultMambaStep(MambaStepStrategy):
     conv: ConvStep
     scan: Ssm
     norm_weight: mx.array

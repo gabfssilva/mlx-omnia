@@ -10,9 +10,11 @@ from typing import Self
 
 import mlx.core as mx
 
+from mlx_omnia.engine.core.kernels.conv_step.kernel import ConvStepStrategy
+
 
 @dataclass(frozen=True)
-class DefaultConvStep:
+class DefaultConvStep(ConvStepStrategy):
     taps: mx.array
     bias: mx.array | None
 

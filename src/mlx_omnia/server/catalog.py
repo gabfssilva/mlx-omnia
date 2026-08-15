@@ -53,8 +53,8 @@ from mlx_omnia.engine.graph import Graph
 from mlx_omnia.engine.graph import blueprint as trace_blueprint
 from mlx_omnia.engine.task import architectures, sight
 from mlx_omnia.engine.task import source as checkpoint_source
+from mlx_omnia.server.deps import StoreDep
 from mlx_omnia.server.engine import Engine
-from mlx_omnia.server.store import Store
 
 HUB_CACHE = Path(huggingface_hub.constants.HF_HUB_CACHE)
 QUANTIZED_CACHE = Path.home() / ".cache" / "mlx_omnia" / "quantized"
@@ -415,7 +415,7 @@ def kv_head_width(model_id: str) -> int | None:
     counts key-value heads of. `None` when the config does not answer: an id this daemon does
     not list, or a checkpoint declaring its shape under names that are not transformers' own.
     """
-    entry = next((found for found in scan() if found.id == model_id), None)
+    entry = entry_of(model_id)
     if entry is None:
         return None
     config: _ConfigJson = json.loads((entry.directory / "config.json").read_text())
@@ -491,7 +491,7 @@ def stamp_of(model_id: str) -> str | None:
     scan does not list. What it is for is keying anything derived from a checkpoint's own
     numbers: a file written under an id and read back after a shard was replaced is the wrong
     answer, arriving without an error."""
-    entry = next((entry for entry in scan() if entry.id == model_id), None)
+    entry = entry_of(model_id)
     if entry is None:
         return None
     digest = hashlib.sha256()
@@ -616,6 +616,14 @@ def scan() -> list[CatalogEntry]:
     return sorted([*_hub(HUB_CACHE), *_quantized(QUANTIZED_CACHE)], key=lambda entry: entry.id)
 
 
+def entry_of(model_id: str) -> CatalogEntry | None:
+    """The scanned entry under an id, or `None` for an id the disk does not answer for.
+
+    Not cached, and deliberately: the scan behind it is what notices a checkpoint that
+    arrived or left, and every caller here wants this instant's answer."""
+    return next((entry for entry in scan() if entry.id == model_id), None)
+
+
 @lru_cache(maxsize=256)
 def context_of(model_id: str) -> int | None:
     """The `max_position_embeddings` the checkpoint declares, by id — what a dialect caps a
@@ -623,10 +631,8 @@ def context_of(model_id: str) -> int | None:
     double. Cached because it rides the request path and a checkpoint's context does not
     move; the scan behind it prices every entry, and the cache is what keeps that off every
     chat turn."""
-    for entry in scan():
-        if entry.id == model_id:
-            return entry.context
-    return None
+    entry = entry_of(model_id)
+    return None if entry is None else entry.context
 
 
 @lru_cache(maxsize=256)
@@ -635,10 +641,8 @@ def defaults_of(model_id: str) -> SamplingDefaults:
     request left out. Empty for an id the disk does not answer for — every test double, and
     a model deleted mid-request — which is the same thing as a checkpoint that declares
     nothing. Cached for the reason `context_of` is."""
-    for entry in scan():
-        if entry.id == model_id:
-            return entry.defaults
-    return SamplingDefaults()
+    entry = entry_of(model_id)
+    return SamplingDefaults() if entry is None else entry.defaults
 
 
 async def resident_models(request: Request) -> Mapping[str, int | None]:
@@ -652,16 +656,6 @@ async def resident_models(request: Request) -> Mapping[str, int | None]:
 
 Resident = Annotated[Mapping[str, int | None], Depends(resident_models)]
 
-
-def _store(request: Request) -> Store:
-    """The daemon's own database, off the app. Declared here rather than imported from
-    `profiles`: that module reads this one, and the cycle closes in either direction."""
-    store = request.app.state.store
-    assert isinstance(store, Store)
-    return store
-
-
-StoreDep = Annotated[Store, Depends(_store)]
 
 router = APIRouter()
 
@@ -682,10 +676,10 @@ def _loaded(entry: CatalogEntry, resident: Mapping[str, int | None]) -> CatalogE
 
 
 def _find(model_id: str) -> CatalogEntry:
-    for entry in scan():
-        if entry.id == model_id:
-            return entry
-    raise HTTPException(status_code=404, detail=f"{model_id!r} is not in the catalog")
+    entry = entry_of(model_id)
+    if entry is None:
+        raise HTTPException(status_code=404, detail=f"{model_id!r} is not in the catalog")
+    return entry
 
 
 @router.get("/admin/models")

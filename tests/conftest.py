@@ -21,9 +21,9 @@ HUB = Path.home() / ".cache/huggingface/hub"
 
 def pytest_generate_tests(metafunc: pytest.Metafunc) -> None:
     """Parametrizes the shared parity spine's `layer` off the module's own `N_LAYER`:
-    the spine is defined once (`parity/definition.py`), so it cannot carry a
-    `@parametrize` whose range differs per model. Suites that still parametrize
-    `layer` with their own mark are left alone."""
+    the spine is written once (inline in `tests/parity/test_qwen3.py`) and shared by
+    `@behaves_like`, so it cannot carry a `@parametrize` whose range differs per model.
+    Suites that parametrize `layer` with their own mark are left alone."""
     if "layer" not in metafunc.fixturenames:
         return
     marked = any(

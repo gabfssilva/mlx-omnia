@@ -17,7 +17,6 @@ import gc
 import json
 import math
 import threading
-import time
 from collections.abc import Iterator, Mapping
 from dataclasses import dataclass, field
 from pathlib import Path
@@ -55,6 +54,7 @@ from mlx_omnia.engine.quant.quantization import (
 )
 from mlx_omnia.server import catalog, jobs, quantize
 from mlx_omnia.server.store import Store
+from tests.server.polling import progress, view, wait_for
 
 REPO = "local/tiny-4bit"
 SOURCE_REPO = "tiny/dense"
@@ -484,38 +484,10 @@ def price(client: TestClient, **body: object) -> _PricedJson:
     return priced
 
 
-def view(client: TestClient, job_id: str) -> dict[str, object]:
-    response = client.get(f"/admin/jobs/{job_id}")
-    assert response.status_code == 200, response.text
-    payload = response.json()
-    assert isinstance(payload, dict)
-    return payload
-
-
-def wait_for(client: TestClient, job_id: str, state: str) -> dict[str, object]:
-    deadline = time.monotonic() + _DEADLINE
-    while True:
-        current = view(client, job_id)
-        if current["state"] == state:
-            return current
-        assert time.monotonic() < deadline, (
-            f"job stayed in {current['state']!r} ({current['error']!r}), wanted {state!r}"
-        )
-        time.sleep(0.01)
-
-
-def progress(current: Mapping[str, object]) -> tuple[float, float]:
-    frame = current["progress"]
-    assert isinstance(frame, dict)
-    completed, total = frame["completed"], frame["total"]
-    assert isinstance(completed, int | float) and isinstance(total, int | float)
-    return completed, total
-
-
 def _logits(loaded: LanguageModel[ModelInput]) -> mx.array:
     assert isinstance(loaded, CompositeModel)
     backend = loaded.model
-    assert isinstance(backend, _Backend)
+    assert isinstance(backend, _Backend | _TrunkBackend)
     return backend.model(_IDS)
 
 
@@ -773,13 +745,6 @@ def _calibration_of(entry_directory: Path) -> dict[str, object]:
     return block
 
 
-def _logits_of(loaded: LanguageModel[ModelInput]) -> mx.array:
-    assert isinstance(loaded, CompositeModel)
-    backend = loaded.model
-    assert isinstance(backend, _TrunkBackend)
-    return backend.model(_IDS)
-
-
 def _finish(client: TestClient, **body: object) -> Path:
     """A job run to its end, answering with the entry it wrote — by its repo id, because a
     test that compares two methods has two entries in the cache."""
@@ -806,7 +771,7 @@ def test_every_calibrated_method_records_the_pass_it_read_and_the_entry_still_lo
         assert calibration["corpus"] == "calibration-v1.txt"
         assert len(str(calibration["corpus_digest"])) == 64
         assert (calibration["sequences"], calibration["sequence_length"]) == (2, 64)
-        assert _logits_of(mlx_omnia.load(repo, local_files_only=True)).shape == (1, 5, _VOCAB)
+        assert _logits(mlx_omnia.load(repo, local_files_only=True)).shape == (1, 5, _VOCAB)
 
 
 def test_awq_takes_the_pairs_the_tree_admits_and_writes_no_trace_of_having_run(

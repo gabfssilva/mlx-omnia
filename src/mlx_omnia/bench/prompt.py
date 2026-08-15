@@ -6,7 +6,7 @@ distribution of tokens underneath. Repeating the text until the slice holds keep
 distribution; padding or truncating a different text does not.
 """
 
-from collections.abc import Callable, Sequence
+from collections.abc import Callable, Iterable
 from pathlib import Path
 
 BENCH_PROMPT = Path(__file__).parent / "bench_prompt.txt"
@@ -15,7 +15,7 @@ text as one taken from the repository."""
 
 
 def tile(
-    encode: Callable[[str], Sequence[int]],
+    encode: Callable[[str], Iterable[int]],
     text: str,
     target: int,
     *,

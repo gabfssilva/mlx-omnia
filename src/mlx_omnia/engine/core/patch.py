@@ -9,7 +9,7 @@ touching a single call site. Calls made inside mlx's own C++ never see the repla
 kernel against itself.
 """
 
-from collections.abc import Callable, Iterator
+from collections.abc import Callable, Generator
 from contextlib import ContextDecorator, ExitStack, contextmanager
 from dataclasses import dataclass
 from functools import wraps
@@ -87,9 +87,7 @@ class patched(ContextDecorator):
 _originals: dict[tuple[str, str], Callable[..., object]] = {}
 
 
-def _dispatch(
-    original: Callable[..., object], patch: Patch[..., object]
-) -> Callable[..., object]:
+def _dispatch(original: Callable[..., object], patch: Patch[..., object]) -> Callable[..., object]:
     def call(*args: object, **kwargs: object) -> object:
         if patch.applies(*args, **kwargs):
             return patch.replacement(*args, **kwargs)
@@ -99,7 +97,7 @@ def _dispatch(
 
 
 @contextmanager
-def _scoped(patch: Patch[..., object]) -> Iterator[None]:
+def _scoped(patch: Patch[..., object]) -> Generator[None]:
     previous = getattr(patch.module, patch.name)
     setattr(patch.module, patch.name, _dispatch(previous, patch))
     try:

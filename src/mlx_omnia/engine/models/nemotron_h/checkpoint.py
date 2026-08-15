@@ -81,7 +81,7 @@ def mtp_step(weights: dict[str, mx.array]) -> tuple[BlockKind, ...]:
                 edges[edge].add(index)
     if not kinds or sorted(kinds) != list(range(len(kinds))):
         raise ValueError(f"the MTP layers are not 0..n: {sorted(kinds)}")
-    step = tuple(kinds[index] for index in sorted(kinds))
+    step: tuple[BlockKind, ...] = tuple(kinds[index] for index in sorted(kinds))
     for edge, expected in (("enorm", 0), ("final_layernorm", len(step) - 1)):
         if edges[edge] != {expected}:
             raise ValueError(

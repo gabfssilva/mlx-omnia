@@ -8,11 +8,12 @@ routed_scaling) -> [tokens, hidden]. One module per strategy implements it; the
 at construction.
 """
 
-from typing import Protocol
+from typing import Protocol, runtime_checkable
 
 import mlx.core as mx
 
 
+@runtime_checkable
 class MoeTailStrategy(Protocol):
     """The combine that closes a sorted-MoE prefill step: `sorted_expert_outputs`
     [tokens*top_k, hidden] bf16 in expert-sorted order, read through `inverse_order`

@@ -33,6 +33,7 @@ from typing import Self
 
 import mlx.core as mx
 
+from mlx_omnia.engine.core.kernels.hyper_connection.kernel import HyperConnectionStrategy
 from mlx_omnia.engine.core.mxcompat import metal_kernel
 
 _SOURCE = """
@@ -271,7 +272,7 @@ def _tiles(hidden: int) -> int:
 
 
 @dataclass(frozen=True)
-class FusedHyperConnection:
+class FusedHyperConnection(HyperConnectionStrategy):
     iters: int
     eps: float
     norm_eps: float

@@ -129,7 +129,14 @@ class Qwen35MoE(nn.Module):
             if getattr(leaf, name, None) is not None
         )
 
-    def _kernels(self) -> tuple[Route, GateUp, DownCombine]:
+    def unresolve(self) -> None:
+        """Back to unresolved: a strategy built inside one trace holds that trace's
+        tracers, and neither path survives borrowing the other's."""
+        self._route = None
+        self._gate_up = None
+        self._down = None
+
+    def kernels(self) -> tuple[Route, GateUp, DownCombine]:
         """Resolved outside any trace, and re-resolved when a leaf is replaced.
 
         Not lazily inside the first traced step, which is where it used to happen: a
@@ -173,7 +180,7 @@ class Qwen35MoE(nn.Module):
         """Four dispatches for the whole sparse block at T=1: the shared expert rides
         along as the ninth slot, so routing, silu, weighting, the expert sum and the
         residual all stay inside the two gemv kernels."""
-        route, gate_up, down = self._kernels()
+        route, gate_up, down = self.kernels()
         chosen, weights = route(x.reshape(-1), logits=self.gate(x).reshape(-1))
         act = gate_up(x.reshape(-1), chosen)
         return down(act, chosen, weights, residual.reshape(-1)).reshape(1, 1, self.hidden)

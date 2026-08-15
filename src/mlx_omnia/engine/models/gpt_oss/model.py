@@ -5,7 +5,7 @@ import mlx.core as mx
 import mlx.nn as nn
 
 from mlx_omnia.engine.core.attend import AttentionMask, KVStore
-from mlx_omnia.engine.core.attention import ragged_mask
+from mlx_omnia.engine.core.attention import Spanned, ragged_mask
 from mlx_omnia.engine.core.cache import KVCache
 from mlx_omnia.engine.models.gpt_oss.config import GPTOSSConfig
 from mlx_omnia.engine.models.gpt_oss.layers.block import GPTOSSBlock
@@ -53,7 +53,8 @@ class GPTOSS(nn.Module):
         full: AttentionMask = None if length == 1 else "causal"
         sliding: AttentionMask = None
         if "sliding_attention" in self.config.layer_types:
-            sliding = self._sliding_mask(length, offset)
+            span = cache[0].span if isinstance(cache[0], Spanned) else None
+            sliding = self._sliding_mask(length, offset, span)
 
         blocks: list[mx.array] = []
         for block, kind, layer_cache in zip(
@@ -66,14 +67,16 @@ class GPTOSS(nn.Module):
     def __call__(self, ids: mx.array, cache: Sequence[KVStore] | None = None) -> mx.array:
         return self.activations(ids, cache).logits
 
-    def _sliding_mask(self, length: int, offset: int | mx.array) -> AttentionMask:
+    def _sliding_mask(
+        self, length: int, offset: int | mx.array, span: int | None
+    ) -> AttentionMask:
         """The band `rows >= columns and rows < columns + window`, built only where it is
         not already something cheaper. No key is old enough for the window to cut while
         `offset + length <= window`, so the band *is* the causal mask there — and at T=1
         the single row is causal by construction, leaving `columns > offset - window`."""
         window = self.config.sliding_window
         if isinstance(offset, mx.array):
-            return ragged_mask(length, offset, window)
+            return ragged_mask(length, offset, window, span=span)
         keys = offset + length
         if keys <= window:
             return None if length == 1 else "causal"

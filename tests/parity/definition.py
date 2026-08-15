@@ -1,17 +1,14 @@
-"""The spine every fp32 parity suite shares, as pytest-describe shared behaviors.
+"""The parity spine the forward suites share, written once.
 
-A model module opts in with `@behaves_like(...)` on its describe and supplies the
-fixtures the spine names: `model`, `golden` and `activations`. `layer` is parametrized
-by the `pytest_generate_tests` hook in `tests/conftest.py`, which reads the module's
-`N_LAYER`, so the per-layer floor stays one test per layer in the report.
-
-The spine holds only what is literally identical across suites. Anything a model does
-differently — embeddings within a floor instead of exact, a bf16 stepwise tolerance,
-every mutation — belongs in the model's own describes, next to the fixtures.
+A suite pulls the blocks in with `@behaves_like(...)` and supplies the fixtures they name —
+`model`, `golden`, `activations`. `layer` is nobody's fixture: the conftest hook parametrizes
+it over the module's own `N_LAYER`, so one spine serves models of different depths. What
+stays in each suite is its delta — the internals, the mutations, and any floor that is not
+the fixture's own.
 """
 
 from collections.abc import Sequence
-from typing import Protocol
+from typing import Protocol, runtime_checkable
 
 import mlx.core as mx
 import numpy as np
@@ -22,6 +19,7 @@ from mlx_omnia.engine.generate import CausalLM
 from tests.conftest import floor, relative_diff
 
 
+@runtime_checkable
 class TrunkActivations(Protocol):
     """What `model.activations(ids)` hands back, at the depths the fixtures name."""
 
@@ -35,7 +33,7 @@ class TrunkActivations(Protocol):
     def logits(self) -> mx.array: ...
 
 
-def a_parity_trunk():
+def a_parity_trunk() -> None:
     """Trunk activations against the fixture, each tensor under its own measured floor."""
 
     def it_holds_each_block_within_floor(
@@ -63,7 +61,7 @@ def a_parity_trunk():
         assert mx.array_equal(ours, theirs).item()
 
 
-def an_exact_embedding_lookup():
+def an_exact_embedding_lookup() -> None:
     """For fp32 suites whose bf16 checkpoint upcasts losslessly: the lookup is a gather,
     no arithmetic yet, so equality is exact rather than floored."""
 
@@ -73,7 +71,7 @@ def an_exact_embedding_lookup():
         assert relative_diff(activations.embeddings, golden["embeddings"]) == 0
 
 
-def a_faithful_cache():
+def a_faithful_cache() -> None:
     """A wrong cache can survive a degenerate greedy; it does not survive full logits."""
 
     def it_agrees_with_prefill_stepwise(

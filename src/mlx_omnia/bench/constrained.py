@@ -25,6 +25,7 @@ import argparse
 import json
 from collections.abc import Iterator, Sequence
 from pathlib import Path
+from time import perf_counter
 
 import mlx.core as mx
 
@@ -58,25 +59,22 @@ class Timed:
     when both are subtracted from the gap is the sync the loop stopped hiding."""
 
     def __init__(self, grammar: Grammar) -> None:
-        from time import perf_counter
-
-        self.clock = perf_counter
         self.inner = grammar.constrain()
         self.masking = 0.0
         self.accepting = 0.0
         self.masks = 0
 
     def mask(self, logits: mx.array, remaining: int) -> mx.array:
-        start = self.clock()
+        start = perf_counter()
         out = self.inner.mask(logits, remaining)
-        self.masking += self.clock() - start
+        self.masking += perf_counter() - start
         self.masks += 1
         return out
 
     def accept(self, token: int) -> bool:
-        start = self.clock()
+        start = perf_counter()
         out = self.inner.accept(token)
-        self.accepting += self.clock() - start
+        self.accepting += perf_counter() - start
         return out
 
 
@@ -93,15 +91,15 @@ def run(args: argparse.Namespace) -> None:
     # Qwen's markers live in `added_tokens`, not in the model's vocab table.
     stop = [tokenizer.added["<|im_end|>"], tokenizer.added["<|endoftext|>"]]
 
-    from time import perf_counter
-
     start = perf_counter()
     vocabulary = Vocabulary(tokenizer, size=size, stop=stop)
     built_in = perf_counter() - start
     grammar = vocabulary.compile(SCHEMA)
     print(f"vocabulary {size} ids built in {built_in:.2f} s, widest open {vocabulary.widest_open}")
 
-    ids = tile(tokenizer.encode, BENCH_PROMPT.read_text() + INSTRUCTION, args.prompt_tokens)
+    ids = tile(
+        tokenizer.encode, BENCH_PROMPT.read_text() + INSTRUCTION, args.prompt_tokens
+    )
     rounds: list[Timed] = []
 
     def free(prompt: Sequence[int], script: Sequence[int] | None, limit: int) -> Iterator[int]:

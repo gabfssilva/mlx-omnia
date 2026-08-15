@@ -54,10 +54,13 @@ class BailingHybridBlock(nn.Module):
         self.config = config
         self._tail = self._build_tail()
         self._traced = _trace_key(self)
+        self._compile_step()
+
+    def _compile_step(self) -> None:
         # `inputs=self.state` keeps the weights implicit inputs of the trace instead of
         # baked constants: a swapped tensor (quantize-on-load, a mutation test) is read
         # on the next call, no retrace needed.
-        if attends:
+        if self.attends:
             self._tail_step = mx.compile(self._build_tail(), inputs=self.state)
         else:
             self._step = mx.compile(self._build_step(), inputs=self.state)
@@ -76,7 +79,7 @@ class BailingHybridBlock(nn.Module):
                 # The MLA projections stay eager: mx.fast.rope takes the offset as an op
                 # attribute and a trace would freeze it at the first token.
                 assert isinstance(mixer, BailingHybridLatentAttention)
-                assert isinstance(cache, (KVCache, BatchedLatentKVCache))
+                assert isinstance(cache, KVCache | BatchedLatentKVCache)
                 projected = mixer(self.input_layernorm(x), cache)
                 self._rebuild()
                 return self._tail_step(x, projected)
@@ -86,7 +89,7 @@ class BailingHybridBlock(nn.Module):
         normed = self.input_layernorm(x)
         if self.attends:
             assert isinstance(mixer, BailingHybridLatentAttention)
-            assert isinstance(cache, (KVCache, BatchedLatentKVCache))
+            assert isinstance(cache, KVCache | BatchedLatentKVCache)
             projected = mixer(normed, cache)
         else:
             assert isinstance(mixer, KimiDeltaAttention) and isinstance(cache, Recurring)
@@ -163,10 +166,7 @@ class BailingHybridBlock(nn.Module):
         key = _trace_key(self)
         if self._traced != key:
             self._traced = key
-            if self.attends:
-                self._tail_step = mx.compile(self._build_tail(), inputs=self.state)
-            else:
-                self._step = mx.compile(self._build_step(), inputs=self.state)
+            self._compile_step()
 
     def _compiled_delta(self, x: mx.array, cache: Recurring) -> mx.array:
         config = self.config

@@ -52,7 +52,13 @@ from typing import Self
 import mlx.core as mx
 
 from mlx_omnia.engine.core.kernels.qkv_rope.default import DefaultQkvRope
-from mlx_omnia.engine.core.kernels.qkv_rope.kernel import Angles, Leaf, Projection, Rotation
+from mlx_omnia.engine.core.kernels.qkv_rope.kernel import (
+    Angles,
+    Leaf,
+    Projection,
+    QkvRopeStrategy,
+    Rotation,
+)
 from mlx_omnia.engine.core.mxcompat import metal_kernel
 
 _DECODE_SOURCE = """
@@ -557,7 +563,7 @@ def qk_norm_rope_prefill(
 
 
 @dataclass(frozen=True)
-class QkNormRope:
+class QkNormRope(QkvRopeStrategy):
     """The table-driven prologue: per-head norm and rotary fused for a whole projection.
 
     Serves the declarations `RopeEpilogue` cannot — a partial rotary, a frequency table,

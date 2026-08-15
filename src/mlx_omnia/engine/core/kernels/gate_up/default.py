@@ -18,12 +18,17 @@ from typing import Self
 import mlx.core as mx
 import mlx.nn as nn
 
-from mlx_omnia.engine.core.kernels.gate_up.kernel import Activation, Layout, OrdinalRouting
+from mlx_omnia.engine.core.kernels.gate_up.kernel import (
+    Activation,
+    GateUpStrategy,
+    Layout,
+    OrdinalRouting,
+)
 from mlx_omnia.engine.core.layers import QuantizedSwitchLinear, SwitchLinear
 
 
 @dataclass(frozen=True)
-class DefaultGateUp:
+class DefaultGateUp(GateUpStrategy):
     leaf: SwitchLinear | QuantizedSwitchLinear
     activation: Activation
     limit: float | None

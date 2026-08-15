@@ -16,11 +16,12 @@ One module per specialization implements it; the `Embed` delegator in `__init__.
 resolves which one serves a given embedding and atlas pair, once, at construction.
 """
 
-from typing import Protocol
+from typing import Protocol, runtime_checkable
 
 import mlx.core as mx
 
 
+@runtime_checkable
 class EmbedStrategy(Protocol):
     """(tokens [1 element], position) -> (hidden [hidden], full_angles [full_width],
     sliding_angles [sliding_width])."""

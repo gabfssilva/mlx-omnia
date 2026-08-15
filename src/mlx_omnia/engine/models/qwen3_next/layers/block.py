@@ -36,7 +36,7 @@ class Qwen3NextBlock(nn.Module):
         if self.attends:
             attention = self.self_attn
             assert isinstance(attention, Qwen3NextAttention)
-            assert isinstance(cache, (KVCache, Attending))
+            assert isinstance(cache, KVCache | Attending)
             mixed = x + attention(normed, cache)
         else:
             linear = self.linear_attn

@@ -25,6 +25,7 @@ import mlx.core as mx
 import pytest
 
 import mlx_omnia.engine.core.kernels.attention.full as ffa
+from mlx_omnia.engine.core.kernels.attention.digest import digest_kernel, metal_float
 from mlx_omnia.engine.core.kernels.attention.full import (
     full_fused_attention,
     full_fused_attention_applies,
@@ -321,9 +322,9 @@ def _mutate(
         assert header_edit[0] in header
         header = header.replace(*header_edit)
     substituted = Template(source).substitute(
-        eps=ffa._metal_float(EPS), mscale=ffa._metal_float(MSCALE)
+        eps=metal_float(EPS), mscale=metal_float(MSCALE)
     )
-    broken = ffa._build(substituted, header)
+    broken = digest_kernel(ffa._PREFIX, ffa._INPUTS, substituted, header)
     monkeypatch.setattr(ffa, "_kernel", lambda _eps, _mscale: broken)
 
 

@@ -27,11 +27,12 @@ from mlx_omnia.engine.core.kernels.route.ordinal import (
     ordinal_keys,
     router_tournament,
 )
+from mlx_omnia.engine.core.kernels.swiglu_moe_step.kernel import SwigluMoeStepStrategy
 from mlx_omnia.engine.core.layers import QuantizedSwitchLinear, SwiGLU, SwitchLinear
 
 
 @dataclass(frozen=True)
-class Nvfp4PackedSwigluMoeStep:
+class Nvfp4PackedSwigluMoeStep(SwigluMoeStepStrategy):
     route: OrdinalRoute
     gate_up: Nvfp4PackedGateUp
     down: Nvfp4PackedDownCombine

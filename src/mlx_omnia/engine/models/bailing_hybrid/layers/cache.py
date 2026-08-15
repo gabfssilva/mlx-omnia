@@ -2,10 +2,11 @@ from collections.abc import Sequence
 
 import mlx.core as mx
 
+from mlx_omnia.engine.batching import RaggedAdapter, RaggedBatchable
 from mlx_omnia.engine.core.cache import KVCache, LayerCache
 
 
-class LatentKVCache(KVCache):
+class LatentKVCache(KVCache, RaggedBatchable):
     """The MLA cache: `keys` are the compressed latent and `values` are `k_pe`.
 
     Nothing about the storage differs from `KVCache` — what differs is the read. The
@@ -23,7 +24,7 @@ class LatentKVCache(KVCache):
         return BatchedLatentKVCache(latents)
 
 
-class BatchedLatentKVCache:
+class BatchedLatentKVCache(RaggedAdapter):
     """N `LatentKVCache`s as one ragged layer.
 
     The rows are ragged, so there is no dense history to hand back: `update_and_fetch`

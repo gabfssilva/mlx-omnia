@@ -22,7 +22,7 @@ import threading
 import time
 from collections.abc import Callable
 from dataclasses import dataclass
-from typing import Protocol
+from typing import Protocol, runtime_checkable
 
 from mlx_omnia.bench.report import stderr
 
@@ -33,11 +33,16 @@ gate says so and goes on, because the alternative is refusing to run on a workin
 _CANDIDATES = ("/opt/homebrew/bin/macmon", "/usr/local/bin/macmon")
 
 
+# `Macmon` and `Cool` implement these structurally rather than by inheritance: both are
+# `slots=True` dataclasses, and a Protocol base is not slotted — inheriting one hands every
+# instance back the `__dict__` that `slots=True` removes.
+@runtime_checkable
 class Sensor(Protocol):
     def temperature(self) -> float | None:
         """°C, or `None` when this reading did not come back."""
 
 
+@runtime_checkable
 class Gate(Protocol):
     def wait(self) -> float | None:
         """Blocks until a round may start; answers the temperature it started at."""

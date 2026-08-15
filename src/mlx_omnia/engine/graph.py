@@ -22,7 +22,7 @@ describes a decode step and says so.
 from __future__ import annotations
 
 import re
-from collections.abc import Iterator, Mapping, Sequence
+from collections.abc import Generator, Mapping, Sequence
 from contextlib import contextmanager
 from dataclasses import dataclass, field
 from pathlib import Path
@@ -179,7 +179,7 @@ def _collect(value: object, out: list[int], held: list[mx.array]) -> None:
 
 
 @contextmanager
-def _recording(model: nn.Module) -> Iterator[tuple[_Call, list[tuple[int, int, int]]]]:
+def _recording(model: nn.Module) -> Generator[tuple[_Call, list[tuple[int, int, int]]]]:
     named = {id(module): path for path, module in model.named_modules()}
     root = _Call(path="", kind=type(model).__name__)
     stack = [root]
@@ -532,6 +532,9 @@ def blueprint(
 
 def trunk_of(model: object) -> nn.Module | None:
     """The checkpoint's own tree under whatever facades `load` wrapped it in."""
+    # Not `language.trunk_of`: that one descends `Wrapping` and stops where the protocol
+    # does, and a blueprint is asked of trees this walk reaches through a plain `model`
+    # attribute the facade never declared — hence `getattr`, and a depth that ends the walk.
     found = model
     for _ in range(8):
         if isinstance(found, nn.Module):

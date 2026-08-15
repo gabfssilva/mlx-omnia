@@ -21,7 +21,7 @@ from typing import Self
 import mlx.core as mx
 import mlx.nn as nn
 
-from mlx_omnia.engine.core.kernels.qmv.kernel import Epilogue, QmvLeaf
+from mlx_omnia.engine.core.kernels.qmv.kernel import Epilogue, QmvLeaf, QmvStrategy
 from mlx_omnia.engine.core.mxcompat import metal_kernel
 
 _VALUES_PER_THREAD = 8
@@ -132,7 +132,7 @@ def gate_softplus(
 
 
 @dataclass(frozen=True)
-class SoftplusQmv:
+class SoftplusQmv(QmvStrategy):
     weight: mx.array
     scales: mx.array
     biases: mx.array

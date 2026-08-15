@@ -1,6 +1,5 @@
 import math
 from dataclasses import dataclass
-from typing import assert_never
 
 import mlx.core as mx
 
@@ -117,5 +116,3 @@ class Phi3Config:
                 return ids
             case int() as single:
                 return (single,)
-            case unreachable:
-                assert_never(unreachable)

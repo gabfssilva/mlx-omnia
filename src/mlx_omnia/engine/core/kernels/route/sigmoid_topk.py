@@ -17,7 +17,7 @@ from typing import Self
 
 import mlx.core as mx
 
-from mlx_omnia.engine.core.kernels.route.kernel import Routing
+from mlx_omnia.engine.core.kernels.route.kernel import RouteStrategy, Routing
 from mlx_omnia.engine.core.mxcompat import metal_kernel
 
 
@@ -104,7 +104,7 @@ _NORM_EPS = 1e-6
 
 
 @dataclass(frozen=True)
-class SigmoidTopkRoute:
+class SigmoidTopkRoute(RouteStrategy):
     """The fused-gemv sigmoid pick. Alone among the strategies it reads the token row
     rather than a logit row, so it rejects a caller-supplied `logits` operand."""
 

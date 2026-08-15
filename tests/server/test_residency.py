@@ -389,7 +389,7 @@ def test_a_storm_of_loads_finishes_and_a_generation_in_the_middle_still_answers(
 
     A load's body blocks its thread on a coroutine, and that coroutine needs a thread of the
     loop's own to finish: `Engine._load` hands the loader to one, and so do admission's
-    `_checkpoint_size` and `Engine._decode`. Run the bodies on that same executor and enough
+    `_checkpoint_size` and `Engine._generate`. Run the bodies on that same executor and enough
     concurrent loads hold every thread the coroutines are waiting for — no load finishes, no
     generation starts, and the interpreter joins the blocked threads on the way out.
 

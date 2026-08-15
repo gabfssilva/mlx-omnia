@@ -16,13 +16,28 @@ import json
 import threading
 import time
 from collections import deque
-from collections.abc import AsyncIterator, Callable, Collection, Iterator, Mapping, Sequence
+from collections.abc import (
+    AsyncGenerator,
+    Callable,
+    Collection,
+    Iterator,
+    Mapping,
+    Sequence,
+)
 from concurrent.futures import ThreadPoolExecutor
 from contextlib import asynccontextmanager, suppress
 from dataclasses import dataclass, field, replace
 from functools import partial
 from types import MappingProxyType
-from typing import NoReturn, NotRequired, Protocol, TypedDict, runtime_checkable
+from typing import (
+    Literal,
+    NoReturn,
+    NotRequired,
+    Protocol,
+    TypedDict,
+    TypeIs,
+    runtime_checkable,
+)
 
 import mlx.core as mx
 import mlx.nn as nn
@@ -144,7 +159,8 @@ class _Settings:
     ttl: int | None
     prefix_budget: int
     disk_budget: int
-    not_resident: str
+    not_resident: Literal["load", "fail"]
+    """`config.Policy`, spelled out rather than imported: that module reads this one."""
     concurrency: int
 
 
@@ -945,7 +961,7 @@ class Engine:
         self.on_change()
 
     @asynccontextmanager
-    async def reserve(self) -> AsyncIterator[object]:
+    async def reserve(self) -> AsyncGenerator[object]:
         """`acquire_queue` and `release_queue` as a block, for a caller that lives on the
         loop. The work of a job does not — it runs in a thread and drives the loop through
         `run_coroutine_threadsafe` — which is why the two halves exist separately."""
@@ -1150,60 +1166,74 @@ class Engine:
                 mx.clear_cache()
                 item.done.set()
                 continue
-            jobs = [item]
-            batcher = self._batcher(item)
-            concurrency = self._concurrency(item)
-            if concurrency <= 1:
-                batcher = None
-            if batcher is not None:
-                await asyncio.sleep(0)
-                while len(jobs) < concurrency:
-                    try:
-                        candidate = self._queue.get_nowait()
-                    except asyncio.QueueEmpty:
-                        break
-                    if (
-                        isinstance(candidate, Job)
-                        and candidate.model is item.model
-                        and self._batcher(candidate) is batcher
-                    ):
-                        jobs.append(candidate)
-                        continue
-                    self._pending.append(candidate)
+            await self._round(item)
+            # A round's jobs die with its frame; this name is the last reference left, and
+            # holding it across the wait above would keep a model alive through its unload.
+            del item
+
+    async def _round(self, item: Job) -> None:
+        """One group, from the queue to the last token: whoever else is queued for the same
+        model and batcher joins it, and every member is metered whether it generates or was
+        already cancelled."""
+        jobs = [item]
+        batcher = self._batcher(item)
+        concurrency = self._concurrency(item)
+        if batcher is not None:
+            await asyncio.sleep(0)
+            while len(jobs) < concurrency:
+                try:
+                    candidate = self._queue.get_nowait()
+                except asyncio.QueueEmpty:
                     break
-            self._current = jobs.copy()
-            self.on_change()
+                if self._joins(candidate, item, batcher):
+                    jobs.append(candidate)
+                    continue
+                self._pending.append(candidate)
+                break
+        self._current = jobs.copy()
+        self.on_change()
+        for job in jobs:
+            entry = self._residency.get(job.model_id)
+            job.metrics_key = self._metrics.begin(
+                job.model_id,
+                job.meter,
+                None if entry is None else entry.active_bytes,
+                job.load_seconds,
+            )
+        try:
+            active = [job for job in jobs if not job.cancelled.is_set()]
             for job in jobs:
-                entry = self._residency.get(job.model_id)
-                job.metrics_key = self._metrics.begin(
-                    job.model_id,
-                    job.meter,
-                    None if entry is None else entry.active_bytes,
-                    job.load_seconds,
-                )
-            try:
-                active = [job for job in jobs if not job.cancelled.is_set()]
-                for job in jobs:
-                    if job not in active:
-                        job.state = "cancelled"
-                        job.chunks.put_nowait(None)
-                if active:
-                    await self._generate(batcher, active, jobs)
-            except Exception as error:
-                for job in jobs:
-                    if job.state not in ("completed", "cancelled"):
-                        job.error = f"{type(error).__name__}: {error}"
-                        job.state = "error"
-                        job.chunks.put_nowait(None)
-            finally:
-                self._current.clear()
-                for job in jobs:
-                    self._metrics.end(job.state, job.metrics_key)
-                    if job.lease is not None:
-                        job.lease.leases -= 1
-                self._changed.set()
-                self.on_change()
-                del active, item, job, jobs
+                if job not in active:
+                    job.state = "cancelled"
+                    job.chunks.put_nowait(None)
+            if active:
+                await self._generate(batcher, active, jobs)
+        except Exception as error:
+            for job in jobs:
+                if job.state not in ("completed", "cancelled"):
+                    job.error = f"{type(error).__name__}: {error}"
+                    job.state = "error"
+                    job.chunks.put_nowait(None)
+        finally:
+            self._current.clear()
+            for job in jobs:
+                self._metrics.end(job.state, job.metrics_key)
+                if job.lease is not None:
+                    job.lease.leases -= 1
+            self._changed.set()
+            self.on_change()
+
+    def _joins(
+        self, candidate: object, exemplar: Job, batcher: ContinuousLanguageModel
+    ) -> TypeIs[Job]:
+        """Whether a queued item can ride the group `exemplar` opened: the same resident
+        model, and a batcher that is the very object already decoding — two ids pointing at
+        one checkpoint are one model, and two models are never one batch."""
+        return (
+            isinstance(candidate, Job)
+            and candidate.model is exemplar.model
+            and self._batcher(candidate) is batcher
+        )
 
     @staticmethod
     def _batcher(job: Job) -> ContinuousLanguageModel | None:
@@ -1233,9 +1263,18 @@ class Engine:
         prefill = model.begin_batch(
             job.model.prepare(job.input), replace(job.options, meter=job.meter)
         )
-        if prefill is None:
-            raise TypeError("request became incompatible with continuous batching")
-        return _Prefilling(prefill)
+        if prefill is not None:
+            return _Prefilling(prefill)
+        # `can_batch` answers on the options, before the conversation has been rendered; what
+        # the prompt turned out to be is only known here, and a picture is a prompt no
+        # `step_batch` takes. Refused this late the request is not a failure — it is a
+        # request that does not batch, which is what the streaming phase is for. The clock
+        # drives it one `next` per tick beside whatever else the group is decoding.
+        pieces = job.model.stream(job.input, replace(job.options, meter=job.meter))
+        settled = mx.get_active_memory()
+        loads = self._loads
+        mx.reset_peak_memory()
+        return _Streaming(pieces, settled, loads)
 
     async def _enlist(self, model: ContinuousLanguageModel | None, job: Job) -> _Member:
         phase = await asyncio.get_running_loop().run_in_executor(
@@ -1249,11 +1288,7 @@ class Engine:
     ) -> Job | None:
         if self._pending:
             candidate = self._pending[0]
-            if (
-                isinstance(candidate, Job)
-                and candidate.model is exemplar.model
-                and self._batcher(candidate) is model
-            ):
+            if self._joins(candidate, exemplar, model):
                 self._pending.popleft()
                 return candidate
             return None
@@ -1261,11 +1296,7 @@ class Engine:
             candidate = self._queue.get_nowait()
         except asyncio.QueueEmpty:
             return None
-        if (
-            isinstance(candidate, Job)
-            and candidate.model is exemplar.model
-            and self._batcher(candidate) is model
-        ):
+        if self._joins(candidate, exemplar, model):
             return candidate
         self._pending.append(candidate)
         return None

@@ -37,6 +37,7 @@ from fastapi import APIRouter, Depends, HTTPException, Request
 from pydantic import BaseModel, ConfigDict, Field, ValidationError, model_validator
 
 from mlx_omnia.server import catalog
+from mlx_omnia.server.deps import StoreDep
 from mlx_omnia.server.events import announce
 from mlx_omnia.server.store import Store
 
@@ -220,19 +221,12 @@ def _view(config: Config) -> dict[str, Setting]:
     }
 
 
-def _store(request: Request) -> Store:
-    store = request.app.state.store
-    assert isinstance(store, Store)
-    return store
-
-
 def _host(request: Request) -> str:
     host = request.app.state.host
     assert isinstance(host, str)
     return host
 
 
-StoreDep = Annotated[Store, Depends(_store)]
 HostDep = Annotated[str, Depends(_host)]
 
 router = APIRouter()

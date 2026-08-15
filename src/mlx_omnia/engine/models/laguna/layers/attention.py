@@ -6,6 +6,7 @@ import mlx.core as mx
 import mlx.nn as nn
 
 from mlx_omnia.engine.core.attend import Attending, KVStore, attend
+from mlx_omnia.engine.core.cache import FixedKVCache, KVCache, RingKVCache
 from mlx_omnia.engine.core.kernels.attention import AttentionCache, AttentionStep
 from mlx_omnia.engine.core.kernels.attention.default import rotate
 from mlx_omnia.engine.core.kernels.qmv import Qmv
@@ -69,6 +70,8 @@ class LagunaAttention(nn.Module):
         kv_width = self._key_values
         projected = self._project_qkv(x) if length == 1 else self.qkv_proj(x)
         if solo:
+            # One row and no ragged reader: what Laguna builds there is a plain store.
+            assert isinstance(cache, KVCache | FixedKVCache | RingKVCache)
             attended = self._attention(cache)(
                 projected[..., :width],
                 projected[..., width : width + kv_width],
@@ -95,7 +98,7 @@ class LagunaAttention(nn.Module):
         output = attended.transpose(0, 2, 1, 3).reshape(batch, length, width)
         gate = self._gate(x, output.dtype)
         if length == 1:
-            return self._kernels().out(output, gate)
+            return self.kernels().out(output, gate)
         heads = output.reshape(batch, length, self.heads, self.head_dim)
         gated = (heads * gate[..., None]).reshape(batch, length, width)
         return self.o_proj(gated)
@@ -110,7 +113,7 @@ class LagunaAttention(nn.Module):
             offset=offset,
         )
 
-    def _kernels(self) -> _Kernels:
+    def kernels(self) -> _Kernels:
         """Resolved once, at the first T=1 step — after load, when the leaves' formats
         are final."""
         kernels = self._projections
@@ -146,7 +149,7 @@ class LagunaAttention(nn.Module):
                 eps=self.q_norm.eps,
                 rotary_pairs=self._rotary_dim // 2,
                 mscale=self._mscale,
-                angles=self._angles,
+                angles=self.angles,
                 freqs=self._freqs,
                 base=self._base,
             )
@@ -154,19 +157,19 @@ class LagunaAttention(nn.Module):
         return step
 
     def _project_qkv(self, x: mx.array) -> mx.array:
-        return self._kernels().qkv(x)
+        return self.kernels().qkv(x)
 
-    def _prepare_decode(self, cache: AttentionCache) -> None:
+    def prepare_decode(self, cache: AttentionCache) -> None:
         """Every resolution the decode graph will need, before it is traced."""
-        self._kernels()
+        self.kernels()
         self._attention(cache)
 
     def _gate(self, x: mx.array, dtype: mx.Dtype) -> mx.array:
         if x.shape[1] == 1:
-            return self._kernels().gate(x).astype(dtype)
+            return self.kernels().gate(x).astype(dtype)
         return nn.softplus(self.g_proj(x).astype(mx.float32)).astype(dtype)
 
-    def _angles(self, offset: int | mx.array) -> mx.array:
+    def angles(self, offset: int | mx.array) -> mx.array:
         """One row off a table built once, not four ops per layer per token.
 
         Deriving the angles per step is what made the fused rotation cost more than the
@@ -175,13 +178,13 @@ class LagunaAttention(nn.Module):
         the reference tree calls a rope angle atlas.
         """
         key = id(self)
-        atlas = _ATLASES.get(key) if _ATLAS_OWNERS.get(key) is self else None
+        atlas = ATLASES.get(key) if _ATLAS_OWNERS.get(key) is self else None
         if atlas is None:
             atlas = _angle_atlas(
                 _ATLAS_ROWS, self._rotary_dim, self._freqs, self._base
             )
             mx.eval(atlas)
-            _ATLASES[key] = atlas
+            ATLASES[key] = atlas
             _ATLAS_OWNERS[key] = self
         if isinstance(offset, int):
             if offset >= atlas.shape[0]:
@@ -189,7 +192,7 @@ class LagunaAttention(nn.Module):
                     offset + 1, self._rotary_dim, self._freqs, self._base
                 )
                 mx.eval(atlas)
-                _ATLASES[key] = atlas
+                ATLASES[key] = atlas
             return atlas[offset]
         return mx.take(atlas, offset, axis=0).reshape(-1)
 
@@ -226,7 +229,7 @@ _ATLAS_ROWS = 4096
 
 # Kept off the module: assigning an mx.array to an nn.Module attribute enrolls it in the
 # parameter tree, and this table is derived state, not a weight.
-_ATLASES: dict[int, mx.array] = {}
+ATLASES: dict[int, mx.array] = {}
 _ATLAS_OWNERS: weakref.WeakValueDictionary[int, LagunaAttention] = weakref.WeakValueDictionary()
 
 
@@ -234,6 +237,8 @@ def _angle_atlas(rows: int, rotary_dim: int, freqs: mx.array | None, base: float
     """`[rows, rotary_dim]` fp32: cosines then sines of every position's angle."""
     if freqs is None:
         exponents = mx.arange(0, rotary_dim, 2, dtype=mx.float32) / rotary_dim
-        freqs = base**exponents
-    theta = mx.arange(rows, dtype=mx.float32)[:, None] / freqs[None, :]
+        inverse = base**exponents
+    else:
+        inverse = freqs
+    theta = mx.arange(rows, dtype=mx.float32)[:, None] / inverse[None, :]
     return mx.concatenate([mx.cos(theta), mx.sin(theta)], axis=-1).astype(mx.float32)

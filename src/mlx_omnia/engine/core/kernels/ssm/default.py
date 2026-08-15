@@ -14,7 +14,7 @@ from typing import Self
 
 import mlx.core as mx
 
-from mlx_omnia.engine.core.kernels.ssm.kernel import compute_dt
+from mlx_omnia.engine.core.kernels.ssm.kernel import SsmStrategy, compute_dt
 
 
 def ssm_step_ref(
@@ -64,7 +64,7 @@ def ssm_step_ref(
 
 
 @dataclass(frozen=True)
-class DefaultSsm:
+class DefaultSsm(SsmStrategy):
     A_log: mx.array
     D: mx.array
     dt_bias: mx.array

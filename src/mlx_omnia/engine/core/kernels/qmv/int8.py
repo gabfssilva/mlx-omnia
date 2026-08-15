@@ -42,7 +42,7 @@ from typing import Self
 import mlx.core as mx
 import mlx.nn as nn
 
-from mlx_omnia.engine.core.kernels.qmv.kernel import Epilogue, QmvLeaf
+from mlx_omnia.engine.core.kernels.qmv.kernel import Epilogue, QmvLeaf, QmvStrategy
 from mlx_omnia.engine.core.mxcompat import metal_kernel
 from mlx_omnia.engine.core.patch import Patch
 
@@ -532,7 +532,7 @@ def gated_int8_qmv_shape_applies(
 
 
 @dataclass(frozen=True)
-class Int8Qmv:
+class Int8Qmv(QmvStrategy):
     weight: mx.array
     scales: mx.array
     biases: mx.array

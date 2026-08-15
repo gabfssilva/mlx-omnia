@@ -20,7 +20,7 @@ __all__ = ["ConvStep", "ConvStepStrategy", "DefaultConvStep", "FusedConvStep"]
 _STRATEGIES = (FusedConvStep, DefaultConvStep)
 
 
-class ConvStep:
+class ConvStep(ConvStepStrategy):
     """Resolves the strategy at construction and delegates; itself a
     `ConvStepStrategy`."""
 

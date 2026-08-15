@@ -17,7 +17,7 @@ from typing import Self
 import mlx.core as mx
 import mlx.nn as nn
 
-from mlx_omnia.engine.core.kernels.mlp.kernel import Activation
+from mlx_omnia.engine.core.kernels.mlp.kernel import Activation, MlpStrategy
 from mlx_omnia.engine.core.kernels.shared.nvfp4 import (
     QDOT_HEADER,
     SCALE_PATCH_BYTES,
@@ -147,7 +147,7 @@ def nvfp4_halved_gate_up(
 
 
 @dataclass(frozen=True)
-class Nvfp4Mlp:
+class Nvfp4Mlp(MlpStrategy):
     fused_weight: mx.array
     halved_scales: mx.array
     down: nn.Linear | nn.QuantizedLinear
@@ -159,13 +159,11 @@ class Nvfp4Mlp:
         # Only the gate/up half has a kernel here; the down projection stays the
         # leaf's own call, so its format is free. The halving is a certificate on
         # the checkpoint's scale plane, paid once at construction.
-        gate_up: nn.Module = leaf.gate_up_proj
-        down: nn.Module = leaf.down_proj
+        gate_up = leaf.gate_up_proj
+        down = leaf.down_proj
         if activation != "silu":
             return None
         if not isinstance(gate_up, nn.QuantizedLinear) or gate_up.mode != "nvfp4":
-            return None
-        if not isinstance(down, nn.Linear | nn.QuantizedLinear):
             return None
         if not nvfp4_halved_gate_up_applies(hidden, inner):
             return None

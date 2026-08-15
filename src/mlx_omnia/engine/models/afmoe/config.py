@@ -1,5 +1,4 @@
 from dataclasses import dataclass
-from typing import assert_never
 
 from mlx_omnia.engine.core.masks import FULL, SLIDING
 
@@ -64,5 +63,3 @@ class AfmoeConfig:
                 return ids
             case int() as single:
                 return (single,)
-            case unreachable:
-                assert_never(unreachable)

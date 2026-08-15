@@ -15,11 +15,12 @@ import mlx.core as mx
 from mlx_omnia.engine.core.kernels.down_combine import DownCombine
 from mlx_omnia.engine.core.kernels.gate_up import GateUp
 from mlx_omnia.engine.core.kernels.route import DefaultRoute, Route
+from mlx_omnia.engine.core.kernels.swiglu_moe_step.kernel import SwigluMoeStepStrategy
 from mlx_omnia.engine.core.layers import QuantizedSwitchLinear, SwiGLU, SwitchLinear
 
 
 @dataclass(frozen=True)
-class DefaultSwigluMoeStep:
+class DefaultSwigluMoeStep(SwigluMoeStepStrategy):
     route: Route
     gate_up: GateUp
     down: DownCombine

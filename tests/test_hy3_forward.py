@@ -26,6 +26,7 @@ from tests.conftest import (
     relative_diff,
     requires_checkpoint,
 )
+from tests.mutation import mutated
 
 FIXTURE = Path(__file__).parent / "fixtures" / "hy3_transformers.safetensors"
 REPO = "tencent/Hy3"
@@ -101,12 +102,9 @@ def test_mutation_breaks_parity(model: Hy3, golden: dict[str, mx.array]) -> None
     assert isinstance(layer.mlp, Hy3SparseMoe)
     original = layer.mlp.switch_mlp.gate_up_proj.weight
     assert isinstance(original, mx.array)
-    layer.mlp.switch_mlp.gate_up_proj.weight = original * 1.5
-    try:
+    with mutated(layer.mlp.switch_mlp.gate_up_proj, "weight", original * 1.5):
         logits = model(golden["input_ids"][None])
         assert relative_diff(logits, golden["logits"]) > golden["noise.logits"].item()
-    finally:
-        layer.mlp.switch_mlp.gate_up_proj.weight = original
 
 
 @requires_checkpoint(LOCAL_REPO)

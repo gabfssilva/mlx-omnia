@@ -1,4 +1,3 @@
-# pyright: basic
 """softmax_bias_topk: softmax → bias-to-scores → top-k (no renorm) in one dispatch.
 
 The replica is the routing step the kernel replaces — softmax(logits, precise=True),

@@ -29,6 +29,7 @@ from tests.conftest import (
     local_snapshot,
     relative_diff,
 )
+from tests.mutation import mutated
 
 FIXTURE = Path(__file__).parent / "fixtures" / "gpt_oss_mlxlm.safetensors"
 REPO = "openai/gpt-oss-20b"
@@ -120,12 +121,9 @@ def test_zeroed_sink_breaks_parity(model: GPTOSS, golden: dict[str, mx.array]) -
     attention = model.model.layers[0].self_attn
     original = attention.sinks
     assert isinstance(original, mx.array)
-    attention.sinks = mx.zeros_like(original)
-    try:
+    with mutated(attention, "sinks", mx.zeros_like(original)):
         logits = model(golden["input_ids"][None])
         assert relative_diff(logits, golden["logits"]) > golden["noise.logits"].item()
-    finally:
-        attention.sinks = original
 
 
 @requires_checkpoint
@@ -134,14 +132,12 @@ def test_swapped_gate_up_breaks_parity(model: GPTOSS, golden: dict[str, mx.array
     a plausible port bug that no shape catches."""
     gate_up = _mxfp4_leaves(model)[0]
     original = gate_up.weight
-    gate_up.weight = original.reshape(original.shape[0], -1, 2, original.shape[2])[
-        :, :, ::-1
-    ].reshape(original.shape)
-    try:
+    swapped = original.reshape(original.shape[0], -1, 2, original.shape[2])[:, :, ::-1].reshape(
+        original.shape
+    )
+    with mutated(gate_up, "weight", swapped):
         logits = model(golden["input_ids"][None])
         assert relative_diff(logits, golden["logits"]) > golden["noise.logits"].item()
-    finally:
-        gate_up.weight = original
 
 
 @requires_checkpoint

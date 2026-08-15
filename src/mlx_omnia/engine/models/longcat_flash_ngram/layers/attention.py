@@ -141,27 +141,42 @@ class LongcatFlashMLA(nn.Module):
             return self._ragged(cache, q_nope, q_pe, latent, k_pe, mask, b, length)
         latent, k_pe = cache.update_and_fetch(latent, k_pe)
 
+        if length == 1:
+            output = self._absorbed(q_nope, q_pe, latent, k_pe, mask)
+        else:
+            pe_scores = (q_pe * self.scale) @ k_pe.swapaxes(-1, -2)
+            if mask is not None:
+                pe_scores = mx.where(
+                    mask, pe_scores, mx.array(mx.finfo(pe_scores.dtype).min, pe_scores.dtype)
+                )
+            k = self.embed_q(latent, transpose=False)
+            v = self.unembed_out(latent)
+            output = mx.fast.scaled_dot_product_attention(
+                q_nope, k, v, scale=self.scale, mask=pe_scores,
+            )
+
+        output = output.transpose(0, 2, 1, 3).reshape(b, length, -1)
+        return self.o_proj(output)
+
+    def _absorbed(
+        self,
+        q_nope: mx.array,
+        q_pe: mx.array,
+        latent: mx.array,
+        k_pe: mx.array,
+        mask: mx.array | None,
+    ) -> mx.array:
+        """One decode step against one history: the decoupled `k_pe` scores become the mask
+        the latent attention reads, and q is absorbed into the latent instead of the keys."""
         pe_scores = (q_pe * self.scale) @ k_pe.swapaxes(-1, -2)
         if mask is not None:
             pe_scores = mx.where(
                 mask, pe_scores, mx.array(mx.finfo(pe_scores.dtype).min, pe_scores.dtype)
             )
-
-        if length == 1:
-            q_nope = self.embed_q(q_nope)
-            k = v = latent
-        else:
-            k = self.embed_q(latent, transpose=False)
-            v = self.unembed_out(latent)
-
-        output = mx.fast.scaled_dot_product_attention(
-            q_nope, k, v, scale=self.scale, mask=pe_scores,
+        attended = mx.fast.scaled_dot_product_attention(
+            self.embed_q(q_nope), latent, latent, scale=self.scale, mask=pe_scores
         )
-        if length == 1:
-            output = self.unembed_out(output)
-
-        output = output.transpose(0, 2, 1, 3).reshape(b, length, -1)
-        return self.o_proj(output)
+        return self.unembed_out(attended)
 
     def _ragged(
         self,
@@ -181,19 +196,16 @@ class LongcatFlashMLA(nn.Module):
         pairs = cache.update_and_fetch(latent, k_pe)
         attended: list[mx.array] = []
         for index, (row_latent, row_k_pe) in enumerate(pairs):
-            pe_scores = (q_pe[index : index + 1] * self.scale) @ row_k_pe.swapaxes(-1, -2)
-            if mask is not None:
-                row_mask = mask[index : index + 1][..., : row_k_pe.shape[2]]
-                pe_scores = mx.where(
+            row_mask = None if mask is None else mask[index : index + 1][..., : row_k_pe.shape[2]]
+            attended.append(
+                self._absorbed(
+                    q_nope[index : index + 1],
+                    q_pe[index : index + 1],
+                    row_latent,
+                    row_k_pe,
                     row_mask,
-                    pe_scores,
-                    mx.array(mx.finfo(pe_scores.dtype).min, pe_scores.dtype),
                 )
-            row_q = self.embed_q(q_nope[index : index + 1])
-            row_out = mx.fast.scaled_dot_product_attention(
-                row_q, row_latent, row_latent, scale=self.scale, mask=pe_scores
             )
-            attended.append(self.unembed_out(row_out))
         output = mx.concatenate(attended)
         output = output.transpose(0, 2, 1, 3).reshape(b, length, -1)
         return self.o_proj(output)

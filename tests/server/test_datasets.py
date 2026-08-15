@@ -118,9 +118,10 @@ def test_a_column_that_does_not_exist_is_a_400_naming_the_ones_that_do(
 ) -> None:
     """Which is the whole point of the preview: the alternative is 25% accuracy at the end
     of a run, and nothing saying why."""
+    columns: dict[str, object] = {"question": "question", "choices": "options", "answer": "answer"}
     response = client.post(
         "/admin/benchmarks/datasets/preview",
-        json={**MMLU_BODY, "columns": {**MMLU_BODY["columns"], "choices": "options"}},  # type: ignore[dict-item]
+        json={**MMLU_BODY, "columns": columns},
     )
 
     assert response.status_code == 400

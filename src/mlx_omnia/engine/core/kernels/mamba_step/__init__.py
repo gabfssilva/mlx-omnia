@@ -21,7 +21,7 @@ __all__ = ["DefaultMambaStep", "FusedMambaStep", "MambaStep", "MambaStepStrategy
 _STRATEGIES = (FusedMambaStep, DefaultMambaStep)
 
 
-class MambaStep:
+class MambaStep(MambaStepStrategy):
     """Resolves the strategy at construction and delegates; itself a
     `MambaStepStrategy`."""
 

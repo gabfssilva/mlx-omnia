@@ -45,6 +45,7 @@ from mlx_omnia.engine.parsers import Segment
 from mlx_omnia.server import bench, jobs
 from mlx_omnia.server.engine import Engine, Loader
 from mlx_omnia.server.store import Store
+from tests.server.polling import wait_for
 
 _DEADLINE = 30.0
 """Every wait here is bounded by it: a job that never arrives fails this suite instead of
@@ -195,26 +196,6 @@ def start(client: TestClient, body: dict[str, object]) -> str:
     job_id = response.json()["id"]
     assert isinstance(job_id, str)
     return job_id
-
-
-def view(client: TestClient, job_id: str) -> dict[str, object]:
-    response = client.get(f"/admin/jobs/{job_id}")
-    assert response.status_code == 200, response.text
-    payload = response.json()
-    assert isinstance(payload, dict)
-    return payload
-
-
-def wait_for(client: TestClient, job_id: str, state: str) -> dict[str, object]:
-    deadline = time.monotonic() + _DEADLINE
-    while True:
-        current = view(client, job_id)
-        if current["state"] == state:
-            return current
-        assert time.monotonic() < deadline, (
-            f"job stayed in {current['state']!r} ({current['error']!r}), wanted {state!r}"
-        )
-        time.sleep(0.01)
 
 
 def history(client: TestClient, model: str | None = None) -> dict[str, object]:

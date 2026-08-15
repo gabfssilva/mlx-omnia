@@ -24,6 +24,7 @@ from typing import Self
 
 import mlx.core as mx
 
+from mlx_omnia.engine.core.kernels.mamba_step.kernel import MambaStepStrategy
 from mlx_omnia.engine.core.kernels.mamba_step.norm import (
     gated_group_norm,
     gated_group_norm_applies,
@@ -134,7 +135,7 @@ _KERNEL = metal_kernel(
 
 
 @dataclass(frozen=True)
-class FusedMambaStep:
+class FusedMambaStep(MambaStepStrategy):
     taps: mx.array
     conv_bias: mx.array
     A_log: mx.array

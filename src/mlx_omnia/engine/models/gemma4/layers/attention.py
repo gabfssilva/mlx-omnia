@@ -19,8 +19,7 @@ class Gemma4Attention(nn.Module):
         super().__init__()
         self.heads = config.num_attention_heads
         self.kv_heads = config.num_key_value_heads
-        self.layer_type = config.attention_types[layer_idx]
-        self.sliding = self.layer_type == SLIDING
+        self.sliding = config.attention_types[layer_idx] == SLIDING
         self.window = config.sliding_window if self.sliding else None
         self.scale = 1.0
 
@@ -33,7 +32,6 @@ class Gemma4Attention(nn.Module):
         self.rope_type = rope.rope_type
         self.rope_theta = rope.rope_theta
         self.partial_rotary_factor = rope.partial_rotary_factor
-        self.is_full = not self.sliding
 
         self.k_eq_v = config.attention_k_eq_v and not self.sliding
 
@@ -55,8 +53,7 @@ class Gemma4Attention(nn.Module):
                 self.v_proj = nn.Linear(hidden, key_values, bias=False)
             self.v_norm = RMSNormNoScale(self.head_dim, eps=config.rms_norm_eps)
 
-        # Precompute proportional inv_freq for full layers (manual rope).
-        if self.is_full and self.rope_type == "proportional":
+        if not self.sliding and self.rope_type == "proportional":
             self._inv_freq = proportional_inv_freq(
                 self.head_dim, self.partial_rotary_factor, self.rope_theta
             )
@@ -77,60 +74,29 @@ class Gemma4Attention(nn.Module):
         length = x.shape[1]
         offset = cache.offset
 
-        if self.kv_shared:
-            q = self.q_proj(x).reshape(
-                rows, length, self.heads, self.head_dim
-            ).transpose(0, 2, 1, 3)
-            q = self.q_norm(q)
-            q = self._apply_rope(q, offset)
-            if isinstance(cache, Attending):
-                # A shared reader writes nothing of its own; the rows it attends are the
-                # ones its writer published, so `keys`/`values` here are ignored.
-                attended = cache.attend(
-                    q,
-                    keys=q,
-                    values=q,
-                    scale=self.scale,
-                    mask=ragged_mask(length, offset, self.window),
-                )
-            else:
-                assert isinstance(cache, SharedKVReader)
-                keys = cache.keys
-                values = cache.values
-                assert keys is not None and values is not None
-                attended = attend(
-                    None,
-                    q,
-                    keys=keys,
-                    values=values,
-                    scale=self.scale,
-                    mask=self.mask(length, keys.shape[2]),
-                )
-            return self.o_proj(
-                attended.transpose(0, 2, 1, 3).reshape(
-                    rows, length, self.heads * self.head_dim
-                )
-            )
-
         q = self.q_proj(x).reshape(
             rows, length, self.heads, self.head_dim
         ).transpose(0, 2, 1, 3)
-        k = self.k_proj(x).reshape(
-            rows, length, self.kv_heads, self.head_dim
-        ).transpose(0, 2, 1, 3)
-        if self.k_eq_v:
-            v = k
+        q = self.q_norm(q)
+        q = self._apply_rope(q, offset)
+
+        if self.kv_shared:
+            # A shared reader writes nothing of its own; the rows it attends are the
+            # ones its writer published, so the keys and values handed down are ignored.
+            k = v = q
         else:
-            v = self.v_proj(x).reshape(
+            k = self.k_proj(x).reshape(
                 rows, length, self.kv_heads, self.head_dim
             ).transpose(0, 2, 1, 3)
-
-        q = self.q_norm(q)
-        k = self.k_norm(k)
-        v = self.v_norm(v)
-
-        q = self._apply_rope(q, offset)
-        k = self._apply_rope(k, offset)
+            if self.k_eq_v:
+                v = k
+            else:
+                v = self.v_proj(x).reshape(
+                    rows, length, self.kv_heads, self.head_dim
+                ).transpose(0, 2, 1, 3)
+            k = self.k_norm(k)
+            v = self.v_norm(v)
+            k = self._apply_rope(k, offset)
 
         if isinstance(cache, Attending):
             attended = cache.attend(
@@ -139,6 +105,19 @@ class Gemma4Attention(nn.Module):
                 values=v,
                 scale=self.scale,
                 mask=ragged_mask(length, offset, self.window),
+            )
+        elif self.kv_shared:
+            assert isinstance(cache, SharedKVReader)
+            keys = cache.keys
+            values = cache.values
+            assert keys is not None and values is not None
+            attended = attend(
+                None,
+                q,
+                keys=keys,
+                values=values,
+                scale=self.scale,
+                mask=self.mask(length, keys.shape[2]),
             )
         else:
             assert isinstance(cache, KVCache)
@@ -167,7 +146,7 @@ class Gemma4Attention(nn.Module):
 
     def _rope_full(self, x: mx.array, offset: int | mx.array, length: int) -> mx.array:
         assert self._inv_freq is not None
-        if isinstance(offset, mx.array):
+        if not isinstance(offset, int):
             positions = offset[:, mx.newaxis] + mx.arange(length, dtype=mx.int32)
         else:
             positions = mx.arange(offset, offset + length, dtype=mx.int32)
@@ -176,6 +155,6 @@ class Gemma4Attention(nn.Module):
 
     def _apply_rope(self, x: mx.array, offset: int | mx.array) -> mx.array:
         length = x.shape[2]
-        if self.is_full and self.rope_type == "proportional":
+        if self._inv_freq is not None:
             return self._rope_full(x, offset, length)
         return self._rope_sliding(x, offset)

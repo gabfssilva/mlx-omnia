@@ -29,7 +29,7 @@ from fastapi import APIRouter, HTTPException
 from huggingface_hub import HfApi, hf_hub_download
 from pydantic import BaseModel, ConfigDict, Field
 
-from mlx_omnia.server.profiles import StoreDep
+from mlx_omnia.server.deps import StoreDep
 from mlx_omnia.server.store import Dataset, DatasetUse
 
 _PREVIEW_ROWS = 8

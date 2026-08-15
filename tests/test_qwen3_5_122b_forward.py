@@ -27,6 +27,7 @@ from tests.conftest import (
     relative_diff,
     requires_checkpoint,
 )
+from tests.mutation import mutated
 
 FIXTURE = Path(__file__).parent / "fixtures" / "qwen3_5_122b_mlxlm.safetensors"
 REPO = "mlx-community/Qwen3.5-122B-A10B-4bit"
@@ -81,7 +82,7 @@ def test_shapes_after_fusion(model: Qwen35) -> None:
     assert mlp.shared_expert.gate_up_proj.weight.shape[0] == 2 * text.moe_intermediate_size
     # Without this the T=1 step silently falls back to the op chain and the fused
     # kernels below would never be under test.
-    route, _, _ = mlp._kernels()
+    route, _, _ = mlp.kernels()
     assert isinstance(route.strategy, SoftmaxTopkRoute)
 
 
@@ -199,12 +200,9 @@ def test_mutation_of_expert_scales_breaks_parity(
     down = sparse(model).switch_mlp.down_proj
     original = down.scales
     assert isinstance(original, mx.array)
-    down.scales = original * 1.5
-    try:
+    with mutated(down, "scales", original * 1.5):
         logits = model(golden["input_ids"][None])
         assert relative_diff(logits, golden["logits"]) > bound(golden)
-    finally:
-        down.scales = original
 
 
 @requires_checkpoint(REPO)
@@ -225,9 +223,6 @@ def test_mutation_of_shared_expert_breaks_parity(
     shared = sparse(model).shared_expert.down_proj
     original = shared.scales
     assert isinstance(original, mx.array)
-    shared.scales = original * 1.5
-    try:
+    with mutated(shared, "scales", original * 1.5):
         assert relative_diff(model(ids[None]), golden["logits"]) > bound(golden)
         assert relative_diff(stepped(), before) > QUANTUM
-    finally:
-        shared.scales = original

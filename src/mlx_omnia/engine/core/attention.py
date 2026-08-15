@@ -3,12 +3,20 @@
 import math
 from collections.abc import Sequence
 from dataclasses import dataclass
-from typing import Literal, NamedTuple, NotRequired, Protocol, TypedDict
+from typing import (
+    Literal,
+    NamedTuple,
+    NotRequired,
+    Protocol,
+    TypedDict,
+    assert_never,
+    runtime_checkable,
+)
 
 import mlx.core as mx
 import mlx.nn as nn
 
-from mlx_omnia.engine.core.attend import Attending, KVStore, attend
+from mlx_omnia.engine.core.attend import Attending, AttentionMask, KVStore, attend
 from mlx_omnia.engine.core.cache import KVCache, LayerCache
 from mlx_omnia.engine.core.kernels.qkv_rope import QkvRope
 from mlx_omnia.engine.core.layers import SwiGLU, split_qkv
@@ -19,7 +27,6 @@ __all__ = [
     "Attention",
     "AttentionContext",
     "AttentionMask",
-    "DecodePreparable",
     "DenseActivations",
     "DenseAttention",
     "DenseBlock",
@@ -36,34 +43,51 @@ __all__ = [
     "QKTransform",
     "QKVProjection",
     "SeparateQKVAttention",
+    "ragged_mask",
     "smooth_rotary_freqs",
 ]
 
-type AttentionMask = mx.array | str | None
-
-
-def ragged_mask(length: int, offset: int | mx.array, window: int | None) -> AttentionMask:
-    """What `attention_mask` builds from a fetched span, rebuilt from the store's own
-    positions — an `Attending` store hands no rows back to measure. One row per step:
-    the ragged stores mask validity per row themselves, so full attention needs nothing
-    and a window needs only its band, cut per row by the store."""
-    if length != 1:
-        raise ValueError("a ragged store steps one token at a time")
-    if window is None:
-        return None
-    if isinstance(offset, mx.array):
-        span = int(mx.max(offset).item()) + length
-        columns = mx.arange(span)[None, None, None, :]
-        return columns > offset[:, None, None, None] - window
-    span = offset + length
-    if span <= window:
-        return None
-    return mx.arange(span) > offset - window
 type Position = int | mx.array
 type FusedProjectionName = Literal["qkv_proj", "query_key_value", "c_attn", "fused_proj"]
 type OutputProjectionName = Literal["o_proj", "out_proj", "dense", "c_proj"]
 
 
+@runtime_checkable
+class Spanned(Protocol):
+    """A ragged store that can say, as a static int, how many columns a mask over its rows
+    must cover. Buffer shapes do not change inside a step, so the answer survives an
+    `mx.compile` trace — which per-row positions, being traced arrays, cannot."""
+
+    @property
+    def span(self) -> int: ...
+
+
+def ragged_mask(
+    length: int, offset: Position, window: int | None, *, span: int | None = None
+) -> AttentionMask:
+    """What `attention_mask` builds from a fetched span, rebuilt from the store's own
+    positions — an `Attending` store hands no rows back to measure. One row per step:
+    the ragged stores mask validity per row themselves, so full attention needs nothing
+    and a window needs only its band, cut per row by the store.
+
+    With per-row positions, `span` is where the band's columns end. A `Spanned` store
+    answers it statically; without one the maximum position is evaluated, which an
+    `mx.compile` trace refuses — so inside a compiled step the store must be `Spanned`.
+    """
+    if length != 1:
+        raise ValueError("a ragged store steps one token at a time")
+    if window is None:
+        return None
+    if isinstance(offset, int):
+        total = offset + length
+        if total <= window:
+            return None
+        return mx.arange(total) > offset - window
+    columns = mx.arange(span if span is not None else int(mx.max(offset).item()) + length)
+    return columns[None, None, None, :] > offset[:, None, None, None] - window
+
+
+@runtime_checkable
 class Attention[C: LayerCache](Protocol):
     """Transform a sequence using an architecture-specific attention cache."""
 
@@ -85,12 +109,14 @@ class Projected[A]:
     auxiliary: A
 
 
+@runtime_checkable
 class QKVProjection[A](Protocol):
     """Project hidden states into query, key, value and auxiliary tensors."""
 
     def __call__(self, x: mx.array) -> Projected[A]: ...
 
 
+@runtime_checkable
 class QKTransform(Protocol):
     """Apply positional and normalization transforms to queries and keys."""
 
@@ -99,6 +125,7 @@ class QKTransform(Protocol):
     ) -> tuple[mx.array, mx.array]: ...
 
 
+@runtime_checkable
 class AttentionContext[C: LayerCache](Protocol):
     """Own context selection, cache mutation and the attention kernel."""
 
@@ -115,6 +142,7 @@ class AttentionContext[C: LayerCache](Protocol):
     ) -> mx.array: ...
 
 
+@runtime_checkable
 class OutputTransform[A](Protocol):
     """Transform attended heads into the attention module output."""
 
@@ -124,12 +152,6 @@ class OutputTransform[A](Protocol):
         residual: mx.array,
         auxiliary: A,
     ) -> mx.array: ...
-
-
-class DecodePreparable(Protocol):
-    """Prepare optional state required by an optimized decode path."""
-
-    def prepare_decode(self) -> None: ...
 
 
 class DenseAttention[A, C: LayerCache](nn.Module):
@@ -196,6 +218,9 @@ class FusedQKVAttention(nn.Module):
         self.kv_heads = kv_heads
         self.head_dim = head_dim
         self.rope_theta = rope_theta
+        self.rope_base = rope_theta
+        """The base `rope` actually rotates with. It is `rope_theta` unless a family
+        overwrites it after `super().__init__` — gemma3 does, per layer type."""
         self.rope_dims = head_dim if rope_dims is None else rope_dims
         self.traditional = traditional
         self.rope_scale = rope_scale
@@ -206,33 +231,39 @@ class FusedQKVAttention(nn.Module):
         key_values = kv_heads * head_dim
         projection = nn.Linear(hidden_size, queries + 2 * key_values, bias=qkv_bias)
         output = nn.Linear(queries, hidden_size, bias=output_bias)
-        self._projection_name = projection_name
-        self._output_name = output_name
-        if projection_name == "qkv_proj":
-            self.qkv_proj = projection
-        elif projection_name == "query_key_value":
-            self.query_key_value = projection
-        elif projection_name == "c_attn":
-            self.c_attn = projection
-        else:
-            self.fused_proj = projection
-        if output_name == "o_proj":
-            self.o_proj = output
-        elif output_name == "out_proj":
-            self.out_proj = output
-        elif output_name == "dense":
-            self.dense = output
-        else:
-            self.c_proj = output
+        self._projection_name: FusedProjectionName = projection_name
+        self._output_name: OutputProjectionName = output_name
+        match projection_name:
+            case "qkv_proj":
+                self.qkv_proj = projection
+            case "query_key_value":
+                self.query_key_value = projection
+            case "c_attn":
+                self.c_attn = projection
+            case "fused_proj":
+                self.fused_proj = projection
+        match output_name:
+            case "o_proj":
+                self.o_proj = output
+            case "out_proj":
+                self.out_proj = output
+            case "dense":
+                self.dense = output
+            case "c_proj":
+                self.c_proj = output
 
     def _qkv_projection(self, x: mx.array) -> mx.array:
-        if self._projection_name == "qkv_proj":
-            return self.qkv_proj(x)
-        if self._projection_name == "query_key_value":
-            return self.query_key_value(x)
-        if self._projection_name == "c_attn":
-            return self.c_attn(x)
-        return self.fused_proj(x)
+        match self._projection_name:
+            case "qkv_proj":
+                return self.qkv_proj(x)
+            case "query_key_value":
+                return self.query_key_value(x)
+            case "c_attn":
+                return self.c_attn(x)
+            case "fused_proj":
+                return self.fused_proj(x)
+            case _:
+                assert_never(self._projection_name)
 
     def split_heads(self, x: mx.array) -> tuple[mx.array, mx.array, mx.array]:
         """Project and reshape QKV into head-major tensors."""
@@ -243,17 +274,16 @@ class FusedQKVAttention(nn.Module):
             head_dim=self.head_dim,
         )
 
-    def rope(self, x: mx.array, offset: int | mx.array) -> mx.array:
+    def rope(self, x: mx.array, offset: Position) -> mx.array:
         """Apply the configured rotary transform."""
         if self.rope_dims == 0:
             return x
         scaled = x if self._rope_input_scale == 1.0 else x * self._rope_input_scale
-        base = self.rope_base if hasattr(self, "rope_base") else self.rope_theta
         return mx.fast.rope(
             scaled,
             self.rope_dims,
             traditional=self.traditional,
-            base=base if self._freqs is None else None,
+            base=self.rope_base if self._freqs is None else None,
             scale=self.rope_scale,
             offset=offset,
             freqs=self._freqs,
@@ -271,8 +301,7 @@ class FusedQKVAttention(nn.Module):
         queries = self.rope(q, offset)
         keys = self.rope(k, offset)
         values = v
-        causal_decode = length == 1 and isinstance(mask, str) and mask == "causal"
-        effective_mask = None if causal_decode else mask
+        effective_mask = None if _causal_decode(length, mask) else mask
         attended = attend(
             cache, queries, keys=keys, values=values, scale=self.scale, mask=effective_mask
         )
@@ -281,20 +310,67 @@ class FusedQKVAttention(nn.Module):
         return self._output(output, x)
 
     def _output(self, attended: mx.array, x: mx.array) -> mx.array:
-        if self._output_name == "o_proj":
-            return self.o_proj(attended)
-        if self._output_name == "out_proj":
-            return self.out_proj(attended)
-        if self._output_name == "dense":
-            return self.dense(attended)
-        return self.c_proj(attended)
+        match self._output_name:
+            case "o_proj":
+                return self.o_proj(attended)
+            case "out_proj":
+                return self.out_proj(attended)
+            case "dense":
+                return self.dense(attended)
+            case "c_proj":
+                return self.c_proj(attended)
+            case _:
+                assert_never(self._output_name)
 
 
 type QKNormNames = Literal["q_norm", "query_layernorm", "q_layernorm"]
 type QKNormLayout = Literal["head", "shaped", "flat"]
 
 
-class NormalizedFusedQKVAttention(FusedQKVAttention):
+class _QKNorm(nn.Module):
+    """Per-head Q/K normalization under the checkpoint's own leaf names.
+
+    The names are the checkpoint's and not a choice: three families spell the same two
+    norms three ways, so the pair is installed under the spelling the weights use and
+    read back through it. Shared by the fused and the separate attentions because it is
+    the same wiring in both, down to the leaf.
+    """
+
+    def _install_norms(
+        self, names: QKNormNames, query_norm: nn.Module | None, key_norm: nn.Module | None
+    ) -> None:
+        self._norm_names: QKNormNames = names
+        self._normalize = query_norm is not None and key_norm is not None
+        if query_norm is None or key_norm is None:
+            return
+        match names:
+            case "q_norm":
+                self.q_norm = query_norm
+                self.k_norm = key_norm
+            case "query_layernorm":
+                self.query_layernorm = query_norm
+                self.key_layernorm = key_norm
+            case "q_layernorm":
+                self.q_layernorm = query_norm
+                self.k_layernorm = key_norm
+
+    def _normalize_heads(
+        self, queries: mx.array, keys: mx.array
+    ) -> tuple[mx.array, mx.array]:
+        if not self._normalize:
+            return queries, keys
+        match self._norm_names:
+            case "q_norm":
+                return self.q_norm(queries), self.k_norm(keys)
+            case "query_layernorm":
+                return self.query_layernorm(queries), self.key_layernorm(keys)
+            case "q_layernorm":
+                return self.q_layernorm(queries), self.k_layernorm(keys)
+            case _:
+                assert_never(self._norm_names)
+
+
+class NormalizedFusedQKVAttention(FusedQKVAttention, _QKNorm):
     """Add per-head RMS normalization to fused-QKV rotary attention."""
 
     def __init__(
@@ -339,40 +415,16 @@ class NormalizedFusedQKVAttention(FusedQKVAttention):
             output_name=output_name,
         )
         self.eps = norm_eps
-        self._norm_names = norm_names
-        self._normalize = normalize
         self._fused_decode = fused_decode
         self.window = window
         self._automatic_mask = automatic_mask
         self._norm_layout = norm_layout
         self._prologue_kernel: QkvRope | None = None
-        if not normalize:
-            return
-        query_norm = query_norm or nn.RMSNorm(head_dim, eps=norm_eps)
-        key_norm = key_norm or nn.RMSNorm(head_dim, eps=norm_eps)
-        match norm_names:
-            case "q_norm":
-                self.q_norm = query_norm
-                self.k_norm = key_norm
-            case "query_layernorm":
-                self.query_layernorm = query_norm
-                self.key_layernorm = key_norm
-            case "q_layernorm":
-                self.q_layernorm = query_norm
-                self.k_layernorm = key_norm
-
-    def _normalize_heads(
-        self, queries: mx.array, keys: mx.array
-    ) -> tuple[mx.array, mx.array]:
-        if not self._normalize:
-            return queries, keys
-        match self._norm_names:
-            case "q_norm":
-                return self.q_norm(queries), self.k_norm(keys)
-            case "query_layernorm":
-                return self.query_layernorm(queries), self.key_layernorm(keys)
-            case "q_layernorm":
-                return self.q_layernorm(queries), self.k_layernorm(keys)
+        self._install_norms(
+            norm_names,
+            (query_norm or nn.RMSNorm(head_dim, eps=norm_eps)) if normalize else None,
+            (key_norm or nn.RMSNorm(head_dim, eps=norm_eps)) if normalize else None,
+        )
 
     def split_heads(self, x: mx.array) -> tuple[mx.array, mx.array, mx.array]:
         """Project, reshape and normalize QKV before rotation."""
@@ -421,7 +473,7 @@ class NormalizedFusedQKVAttention(FusedQKVAttention):
         return prologue
 
     def step_heads(
-        self, x: mx.array, offset: int | mx.array
+        self, x: mx.array, offset: Position
     ) -> tuple[mx.array, mx.array, mx.array]:
         """Fuse projection epilogue, QK normalization and RoPE for decode."""
         return self._prologue()(x, offset)
@@ -447,16 +499,17 @@ class NormalizedFusedQKVAttention(FusedQKVAttention):
     def __call__(
         self,
         x: mx.array,
-        cache: KVStore,
+        cache: KVStore | None = None,
         mask: AttentionMask = "causal",
     ) -> mx.array:
         length = x.shape[1]
-        if self.step_applies(length):
-            queries, keys, values = self.step_heads(x, cache.offset)
+        offset = 0 if cache is None else cache.offset
+        if cache is not None and self.step_applies(length):
+            queries, keys, values = self.step_heads(x, offset)
         else:
             queries, keys, values = self.split_heads(x)
-            queries = self.rope(queries, cache.offset)
-            keys = self.rope(keys, cache.offset)
+            queries = self.rope(queries, offset)
+            keys = self.rope(keys, offset)
         if self._automatic_mask and isinstance(mask, str) and mask == "causal":
             if isinstance(cache, Attending):
                 # A store that hands no rows back builds nothing to measure a span from:
@@ -466,14 +519,20 @@ class NormalizedFusedQKVAttention(FusedQKVAttention):
                     keys=keys,
                     values=values,
                     scale=self.scale,
-                    mask=ragged_mask(length, cache.offset, self.window),
+                    mask=ragged_mask(
+                        length,
+                        cache.offset,
+                        self.window,
+                        span=cache.span if isinstance(cache, Spanned) else None,
+                    ),
                 )
             else:
                 # This branch still fetches. The mask it builds spans the cache *as
                 # fetched*, and a ring reports its whole window rather than what it has
                 # seen — so deriving the span from the offset would be right for a growing
-                # cache and wrong for the others.
-                keys, values = cache.update_and_fetch(keys, values)
+                # cache and wrong for the others. Cacheless, the rows at hand are the span.
+                if cache is not None:
+                    keys, values = cache.update_and_fetch(keys, values)
                 attended = mx.fast.scaled_dot_product_attention(
                     queries,
                     keys,
@@ -482,14 +541,13 @@ class NormalizedFusedQKVAttention(FusedQKVAttention):
                     mask=self.attention_mask(length, keys.shape[2]),
                 )
         else:
-            causal_decode = length == 1 and isinstance(mask, str) and mask == "causal"
             attended = attend(
                 cache,
                 queries,
                 keys=keys,
                 values=values,
                 scale=self.scale,
-                mask=None if causal_decode else mask,
+                mask=None if _causal_decode(length, mask) else mask,
             )
         width = self.heads * self.head_dim
         output = attended.transpose(0, 2, 1, 3).reshape(x.shape[0], length, width)
@@ -572,7 +630,7 @@ class HeadLayerNorm(nn.Module):
 type OutputNormName = Literal["attn_sub_norm", "none"]
 
 
-class SeparateQKVAttention(nn.Module):
+class SeparateQKVAttention(_QKNorm):
     """Run configurable KV attention over separate Q, K and V projections."""
 
     def __init__(
@@ -620,26 +678,15 @@ class SeparateQKVAttention(nn.Module):
         self.q_proj = q_proj
         self.k_proj = k_proj
         self.v_proj = v_proj
-        self._output_name = output_name
-        if output_name == "o_proj":
-            self.o_proj = output_proj
-        elif output_name == "out_proj":
-            self.out_proj = output_proj
-        else:
-            self.dense = output_proj
-        self._norm_names = norm_names
-        self._normalize = query_norm is not None and key_norm is not None
-        if self._normalize:
-            match norm_names:
-                case "q_norm":
-                    self.q_norm = query_norm
-                    self.k_norm = key_norm
-                case "query_layernorm":
-                    self.query_layernorm = query_norm
-                    self.key_layernorm = key_norm
-                case "q_layernorm":
-                    self.q_layernorm = query_norm
-                    self.k_layernorm = key_norm
+        self._output_name: OutputProjectionName = output_name
+        match output_name:
+            case "o_proj":
+                self.o_proj = output_proj
+            case "out_proj":
+                self.out_proj = output_proj
+            case "dense" | "c_proj":
+                self.dense = output_proj
+        self._install_norms(norm_names, query_norm, key_norm)
         if output_norm is not None:
             self.attn_sub_norm = output_norm
         self._has_output_norm = output_norm is not None
@@ -655,7 +702,7 @@ class SeparateQKVAttention(nn.Module):
         self._has_gate = gate is not None
         self._gate_per_head = gate_per_head
 
-    def rope(self, x: mx.array, offset: int | mx.array) -> mx.array:
+    def rope(self, x: mx.array, offset: Position) -> mx.array:
         """Apply the configured rotary transform."""
         if self.rope_dims == 0:
             return x
@@ -669,19 +716,6 @@ class SeparateQKVAttention(nn.Module):
             freqs=self._freqs,
         )
 
-    def _normalize_heads(
-        self, queries: mx.array, keys: mx.array
-    ) -> tuple[mx.array, mx.array]:
-        if not self._normalize:
-            return queries, keys
-        match self._norm_names:
-            case "q_norm":
-                return self.q_norm(queries), self.k_norm(keys)
-            case "query_layernorm":
-                return self.query_layernorm(queries), self.key_layernorm(keys)
-            case "q_layernorm":
-                return self.q_layernorm(queries), self.k_layernorm(keys)
-
     def attention_mask(self, queries: int, keys: int) -> AttentionMask:
         """Build the causal or sliding-window mask for the current shape."""
         if queries == 1 and (self.window is None or keys <= self.window):
@@ -689,11 +723,15 @@ class SeparateQKVAttention(nn.Module):
         return causal_mask(queries, keys, self.window)
 
     def _project_output(self, output: mx.array) -> mx.array:
-        if self._output_name == "o_proj":
-            return self.o_proj(output)
-        if self._output_name == "out_proj":
-            return self.out_proj(output)
-        return self.dense(output)
+        match self._output_name:
+            case "o_proj":
+                return self.o_proj(output)
+            case "out_proj":
+                return self.out_proj(output)
+            case "dense" | "c_proj":
+                return self.dense(output)
+            case _:
+                assert_never(self._output_name)
 
     def __call__(
         self,
@@ -712,10 +750,14 @@ class SeparateQKVAttention(nn.Module):
         use_automatic = self._automatic_mask and isinstance(mask, str) and mask == "causal"
         if isinstance(cache, Attending):
             if use_automatic:
-                effective_mask = ragged_mask(length, cache.offset, self.window)
+                effective_mask = ragged_mask(
+                    length,
+                    cache.offset,
+                    self.window,
+                    span=cache.span if isinstance(cache, Spanned) else None,
+                )
             else:
-                causal_decode = length == 1 and isinstance(mask, str) and mask == "causal"
-                effective_mask = None if causal_decode else mask
+                effective_mask = None if _causal_decode(length, mask) else mask
             attended = cache.attend(
                 queries,
                 keys=keys,
@@ -729,8 +771,7 @@ class SeparateQKVAttention(nn.Module):
             if use_automatic:
                 effective_mask = self.attention_mask(length, keys.shape[2])
             else:
-                causal_decode = length == 1 and isinstance(mask, str) and mask == "causal"
-                effective_mask = None if causal_decode else mask
+                effective_mask = None if _causal_decode(length, mask) else mask
             sinks = self.sinks if self._has_sinks else None
             attended = mx.fast.scaled_dot_product_attention(
                 queries,
@@ -905,3 +946,9 @@ class DenseModel(nn.Module):
 
     def __call__(self, ids: mx.array, cache: Sequence[KVStore] | None = None) -> mx.array:
         return self.activations(ids, cache).logits
+
+
+def _causal_decode(length: int, mask: AttentionMask) -> bool:
+    """A one-row step under the default causal mask, which needs no mask at all: the single
+    query sits at the end of the context and hides nothing."""
+    return length == 1 and isinstance(mask, str) and mask == "causal"

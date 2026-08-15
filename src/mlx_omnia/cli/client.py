@@ -85,108 +85,10 @@ class ModelEntry:
     resident: bool
 
 
-class _HealthJson(TypedDict):
-    status: str
-    models: list[str]
-
-
-class _SystemJson(TypedDict):
-    chip: str
-    gpu_cores: int
-    memory_bytes: int
-    bandwidth_theoretical_gbs: float
-    bandwidth_sustained_gbs: float
-    disk_free_bytes: int
-    catalog: str
-    version: str
-
-
-class _ModelJson(TypedDict):
-    id: str
-    architecture: str
-    quantization: str | None
-    bytes_on_disk: int
-    resident: bool
-
-
-class _DeltaJson(TypedDict):
-    content: NotRequired[str]
-
-
-class _ChoiceJson(TypedDict):
-    delta: _DeltaJson
-
-
-class _ChunkJson(TypedDict):
-    choices: list[_ChoiceJson]
-
-
 @dataclass(frozen=True)
 class Event:
     name: str
     data: str
-
-
-def _detail(response: httpx.Response) -> str:
-    """The daemon's words out of the two error shapes it writes: FastAPI's `detail` and the
-    dialect's `error.message`. The refusal to delete a resident model says why in there, and
-    a status code alone would leave the user with nothing to act on."""
-    try:
-        body: object = response.json()
-    except ValueError:
-        return response.text.strip()
-    if not isinstance(body, dict):
-        return response.text.strip()
-    fields = cast(dict[str, object], body)
-    detail = fields.get("detail")
-    if isinstance(detail, str):
-        return detail
-    error = fields.get("error")
-    if isinstance(error, dict):
-        message = cast(dict[str, object], error).get("message")
-        if isinstance(message, str):
-            return message
-    return response.text.strip()
-
-
-def _check(response: httpx.Response) -> None:
-    if response.is_success:
-        return
-    raise ServerError(
-        f"{response.request.url} answered {response.status_code}: {_detail(response)}",
-        response.status_code,
-    )
-
-
-def _unreadable(response: httpx.Response, error: Exception) -> ServerError:
-    return ServerError(
-        f"{response.request.url} answered a body this client does not read: {error}",
-        response.status_code,
-    )
-
-
-def _request(
-    method: str,
-    base_url: str,
-    path: str,
-    *,
-    timeout: float,
-    params: dict[str, str] | None = None,
-) -> httpx.Response:
-    """`InvalidURL` alongside the transport failures: the address is a flag the user types."""
-    url = f"{base_url}{path}"
-    try:
-        response = httpx.request(method, url, params=params, timeout=timeout)
-    except (httpx.HTTPError, httpx.InvalidURL) as error:
-        raise ServerError(f"{url} did not answer: {error}") from error
-    _check(response)
-    return response
-
-
-def _path(model_id: str) -> str:
-    """Ids carry slashes — a repository id, and a whole directory for a quantized entry —
-    and the route that takes them is a `:path`, so the separators stay separators."""
-    return f"/admin/models/{quote(model_id, safe='/')}"
 
 
 def health(base_url: str, *, timeout: float = PROBE_TIMEOUT) -> Health:
@@ -204,6 +106,7 @@ def system(base_url: str, *, timeout: float = READ_TIMEOUT) -> SystemInfo:
     response = _request("GET", base_url, "/admin/system", timeout=timeout)
     try:
         body: _SystemJson = response.json()
+        # Field by field, never a splat: the server growing a key must not break this client.
         return SystemInfo(
             chip=body["chip"],
             gpu_cores=body["gpu_cores"],
@@ -323,3 +226,101 @@ def stream_chat(
                 ) from error
             if piece:
                 yield piece
+
+
+class _HealthJson(TypedDict):
+    status: str
+    models: list[str]
+
+
+class _SystemJson(TypedDict):
+    chip: str
+    gpu_cores: int
+    memory_bytes: int
+    bandwidth_theoretical_gbs: float
+    bandwidth_sustained_gbs: float
+    disk_free_bytes: int
+    catalog: str
+    version: str
+
+
+class _ModelJson(TypedDict):
+    id: str
+    architecture: str
+    quantization: str | None
+    bytes_on_disk: int
+    resident: bool
+
+
+class _DeltaJson(TypedDict):
+    content: NotRequired[str]
+
+
+class _ChoiceJson(TypedDict):
+    delta: _DeltaJson
+
+
+class _ChunkJson(TypedDict):
+    choices: list[_ChoiceJson]
+
+
+def _detail(response: httpx.Response) -> str:
+    """The daemon's words out of the two error shapes it writes: FastAPI's `detail` and the
+    dialect's `error.message`. The refusal to delete a resident model says why in there, and
+    a status code alone would leave the user with nothing to act on."""
+    try:
+        body: object = response.json()
+    except ValueError:
+        return response.text.strip()
+    if not isinstance(body, dict):
+        return response.text.strip()
+    fields = cast(dict[str, object], body)
+    detail = fields.get("detail")
+    if isinstance(detail, str):
+        return detail
+    error = fields.get("error")
+    if isinstance(error, dict):
+        message = cast(dict[str, object], error).get("message")
+        if isinstance(message, str):
+            return message
+    return response.text.strip()
+
+
+def _check(response: httpx.Response) -> None:
+    if response.is_success:
+        return
+    raise ServerError(
+        f"{response.request.url} answered {response.status_code}: {_detail(response)}",
+        response.status_code,
+    )
+
+
+def _unreadable(response: httpx.Response, error: Exception) -> ServerError:
+    return ServerError(
+        f"{response.request.url} answered a body this client does not read: {error}",
+        response.status_code,
+    )
+
+
+def _request(
+    method: str,
+    base_url: str,
+    path: str,
+    *,
+    timeout: float,
+    params: dict[str, str] | None = None,
+) -> httpx.Response:
+    """`InvalidURL` alongside the transport failures: the address is a flag the user types."""
+    url = f"{base_url}{path}"
+    try:
+        response = httpx.request(method, url, params=params, timeout=timeout)
+    except (httpx.HTTPError, httpx.InvalidURL) as error:
+        raise ServerError(f"{url} did not answer: {error}") from error
+    _check(response)
+    return response
+
+
+def _path(model_id: str) -> str:
+    """Ids carry slashes — a repository id, and a whole directory for a quantized entry —
+    and the route that takes them is a `:path`, so the separators stay separators."""
+    return f"/admin/models/{quote(model_id, safe='/')}"

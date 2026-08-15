@@ -21,7 +21,7 @@ __all__ = ["ConvMix", "ConvMixStrategy", "DefaultConvMix", "FusedConvMix"]
 _STRATEGIES = (FusedConvMix, DefaultConvMix)
 
 
-class ConvMix:
+class ConvMix(ConvMixStrategy):
     """Resolves the strategy at construction and delegates; itself a
     `ConvMixStrategy`."""
 

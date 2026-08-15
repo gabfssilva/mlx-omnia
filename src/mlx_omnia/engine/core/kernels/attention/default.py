@@ -18,7 +18,11 @@ from typing import Self
 import mlx.core as mx
 
 from mlx_omnia.engine.core.cache import FixedKVCache, RingKVCache
-from mlx_omnia.engine.core.kernels.attention.kernel import Angles, AttentionCache
+from mlx_omnia.engine.core.kernels.attention.kernel import (
+    Angles,
+    AttentionCache,
+    AttentionStepStrategy,
+)
 
 
 def split_heads(raw: mx.array, count: int, head_dim: int) -> mx.array:
@@ -67,7 +71,7 @@ def write_position(cache: AttentionCache) -> int | mx.array:
 
 
 @dataclass(frozen=True)
-class DefaultAttentionStep:
+class DefaultAttentionStep(AttentionStepStrategy):
     cache: AttentionCache
     heads: int
     kv_heads: int

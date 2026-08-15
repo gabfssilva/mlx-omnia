@@ -21,7 +21,7 @@ from mlx_omnia.engine.models.nemotron_h.layers.mamba import NemotronHMamba
 
 
 def _joins(
-    blocks: list[nn.Module], norm_f: nn.RMSNorm
+    blocks: Sequence[nn.Module], norm_f: nn.RMSNorm
 ) -> list[RowsAddRmsNorm] | None:
     """One residual join per block: block `i`'s add fused with the norm that reads the
     sum — block `i + 1`'s for every block but the last, whose sum `norm_f` reads.
@@ -235,7 +235,7 @@ class NemotronH(nn.Module):
             assert isinstance(block, NemotronHBlock)
             mixer = block.mixer
             assert isinstance(mixer, NemotronHMamba)
-            if not isinstance(mixer._mamba_step().strategy, FusedMambaStep):
+            if not isinstance(mixer.mamba_step().strategy, FusedMambaStep):
                 return None
         if ATTENTION not in pattern:
             return None
@@ -302,6 +302,7 @@ class NemotronH(nn.Module):
                     if kind == MAMBA:
                         mixer = block.mixer
                         assert isinstance(mixer, NemotronHMamba)
+                        assert isinstance(layer_cache, DeltaCache)
                         mixed = mixer.verify_rows(normed, layer_cache)
                     else:
                         mixed = block.mix(normed, layer_cache, mask)

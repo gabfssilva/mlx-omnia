@@ -19,7 +19,7 @@ type NemotronHLayer = LayerCache | KVStore | Recurring
 class NemotronHBlock(nn.Module):
     def __init__(self, config: NemotronHConfig, block_type: BlockKind) -> None:
         super().__init__()
-        self.block_type = block_type
+        self.block_type: BlockKind = block_type
         self.norm = nn.RMSNorm(config.hidden_size, eps=config.layer_norm_epsilon)
         match block_type:
             case "M":

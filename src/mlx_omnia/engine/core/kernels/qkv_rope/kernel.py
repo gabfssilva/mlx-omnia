@@ -15,7 +15,7 @@ returns None when a part it needs is missing.
 """
 
 from collections.abc import Callable
-from typing import Protocol
+from typing import Protocol, runtime_checkable
 
 import mlx.core as mx
 import mlx.nn as nn
@@ -26,6 +26,7 @@ type Rotation = Callable[[mx.array, int | mx.array], mx.array]
 type Angles = Callable[[int | mx.array, int], mx.array]
 
 
+@runtime_checkable
 class QkvRopeStrategy(Protocol):
     """`(x [batch, length, hidden], offset) -> (q, k, v)`, head-major."""
 

@@ -26,7 +26,7 @@ __all__ = [
 _STRATEGIES = (SortedMoeTail, DefaultMoeTail)
 
 
-class MoeTail:
+class MoeTail(MoeTailStrategy):
     """Resolves the strategy at construction and delegates; itself a
     `MoeTailStrategy`."""
 

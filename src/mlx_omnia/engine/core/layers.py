@@ -248,8 +248,11 @@ class SwiGLU(nn.Module):
     ) -> None:
         super().__init__()
         self.inner = inner
-        self.gate_up_proj = nn.Linear(hidden, 2 * inner, bias=False)
-        self.down_proj = nn.Linear(inner, hidden, bias=False)
+        # Load-time quantization swaps these children for `nn.QuantizedLinear`, which is
+        # not a `Linear` subclass — the declaration carries both so the strategies'
+        # `isinstance` checks stay real checks.
+        self.gate_up_proj: nn.Linear | nn.QuantizedLinear = nn.Linear(hidden, 2 * inner, bias=False)
+        self.down_proj: nn.Linear | nn.QuantizedLinear = nn.Linear(inner, hidden, bias=False)
         self._activation = activation
 
     def __call__(self, x: mx.array) -> mx.array:

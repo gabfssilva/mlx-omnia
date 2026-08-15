@@ -12,9 +12,11 @@ from typing import Self
 import mlx.core as mx
 import mlx.nn as nn
 
+from mlx_omnia.engine.core.kernels.add_norm.kernel import AddRmsNormStrategy
+
 
 @dataclass(frozen=True)
-class DefaultAddRmsNorm:
+class DefaultAddRmsNorm(AddRmsNormStrategy):
     weight: mx.array
     eps: float
 

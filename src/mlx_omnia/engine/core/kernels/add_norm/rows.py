@@ -20,6 +20,7 @@ from typing import Self
 import mlx.core as mx
 import mlx.nn as nn
 
+from mlx_omnia.engine.core.kernels.add_norm.kernel import AddRmsNormStrategy
 from mlx_omnia.engine.core.mxcompat import metal_kernel
 
 _N_READS = 4
@@ -100,7 +101,7 @@ def applies(hidden: int) -> bool:
 
 
 @dataclass(frozen=True)
-class RowsAddRmsNorm:
+class RowsAddRmsNorm(AddRmsNormStrategy):
     weight: mx.array
     eps: float
 

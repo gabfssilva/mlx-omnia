@@ -86,6 +86,11 @@ class Qwen3MoE(nn.Module):
     def make_cache(self) -> list[KVCache]:
         return [KVCache() for _ in self.model.layers]
 
+    def head(self, normed: mx.array) -> mx.array:
+        if self.config.tie_word_embeddings:
+            return self.model.embed_tokens.as_linear(normed)
+        return self.lm_head(normed)
+
     def activations(
         self, ids: mx.array, cache: Sequence[KVStore] | None = None
     ) -> Qwen3MoEActivations:
@@ -96,11 +101,7 @@ class Qwen3MoE(nn.Module):
             x = block(x, layer_cache)
             blocks.append(x)
         normed = self.model.norm(x)
-        if self.config.tie_word_embeddings:
-            logits = self.model.embed_tokens.as_linear(normed)
-        else:
-            logits = self.lm_head(normed)
-        return Qwen3MoEActivations(blocks, logits)
+        return Qwen3MoEActivations(blocks, self.head(normed))
 
     def __call__(self, ids: mx.array, cache: Sequence[KVStore] | None = None) -> mx.array:
         return self.activations(ids, cache).logits

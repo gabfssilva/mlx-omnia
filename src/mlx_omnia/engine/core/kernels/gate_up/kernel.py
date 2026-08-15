@@ -7,7 +7,7 @@ declaration, once, at construction.
 """
 
 from dataclasses import dataclass
-from typing import Literal, Protocol
+from typing import Literal, Protocol, runtime_checkable
 
 import mlx.core as mx
 
@@ -34,6 +34,7 @@ class OrdinalRouting:
         return mx.argsort(keys)[: self.top_k].astype(mx.uint32)
 
 
+@runtime_checkable
 class GateUpStrategy(Protocol):
     """The declared activation over the chosen experts' gate‖up stacks:
     (row [hidden], chosen [k]) -> [k, inner]."""

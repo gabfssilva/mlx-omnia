@@ -90,6 +90,27 @@ def walks(grammar: Grammar, ids: list[int], stop: int) -> bool:
     return stop_is_legal(constraint, stop)
 
 
+def run(
+    tokenizer: GPT2Tokenizer,
+    script: list[int],
+    stop: int,
+    budget: int,
+    constraint: SchemaConstraint | None = None,
+) -> str:
+    """One scripted run decoded back to text, free or under a grammar."""
+    return tokenizer.decode(
+        list(
+            stream_ids(
+                ScriptedLM(script, VOCAB),
+                PROMPT,
+                max_tokens=budget,
+                stop=(stop,),
+                constraint=constraint,
+            )
+        )
+    )
+
+
 @pytest.mark.parametrize("entry", SCHEMAS, ids=[entry["name"] for entry in SCHEMAS])
 def test_a_schema_is_either_enforced_or_refused_in_the_compilers_own_words(
     vocabulary: Vocabulary, tokenizer: GPT2Tokenizer, stop: int, entry: Entry
@@ -159,23 +180,11 @@ def test_a_run_that_hits_the_limit_closes_the_document_instead_of_truncating(
     assert len(script) > 70
 
     for budget in range(20, 71, 5):
-        free = tokenizer.decode(
-            list(stream_ids(ScriptedLM(script, VOCAB), PROMPT, max_tokens=budget, stop=(stop,)))
-        )
+        free = run(tokenizer, script, stop, budget)
         with pytest.raises(json.JSONDecodeError):
             json.loads(free)
 
-        masked = tokenizer.decode(
-            list(
-                stream_ids(
-                    ScriptedLM(script, VOCAB),
-                    PROMPT,
-                    max_tokens=budget,
-                    stop=(stop,),
-                    constraint=grammar.constrain(),
-                )
-            )
-        )
+        masked = run(tokenizer, script, stop, budget, grammar.constrain())
         parsed = json.loads(masked)
         assert sorted(parsed) == ["confidence", "label", "rationale"]
         assert parsed["label"] == "billing"
@@ -198,17 +207,7 @@ def test_a_document_that_cannot_close_in_the_budget_truncates_rather_than_breaki
     )
     script = [*tokenizer.encode(document), stop]
 
-    masked = tokenizer.decode(
-        list(
-            stream_ids(
-                ScriptedLM(script, VOCAB),
-                PROMPT,
-                max_tokens=35,
-                stop=(stop,),
-                constraint=grammar.constrain(),
-            )
-        )
-    )
+    masked = run(tokenizer, script, stop, 35, grammar.constrain())
 
     with pytest.raises(json.JSONDecodeError):
         json.loads(masked)
@@ -278,22 +277,10 @@ def test_a_model_that_leaves_the_enum_is_let_out_free_and_cannot_be_masked(
     strayed = compact({"label": "refund", "confidence": 0.9, "rationale": "duplicate charge"})
     script = [*tokenizer.encode(strayed), stop]
 
-    free = tokenizer.decode(
-        list(stream_ids(ScriptedLM(script, VOCAB), PROMPT, max_tokens=NO_LIMIT, stop=(stop,)))
-    )
+    free = run(tokenizer, script, stop, NO_LIMIT)
     assert json.loads(free)["label"] == "refund", "the free path wrote the label it wanted"
 
-    masked = tokenizer.decode(
-        list(
-            stream_ids(
-                ScriptedLM(script, VOCAB),
-                PROMPT,
-                max_tokens=NO_LIMIT,
-                stop=(stop,),
-                constraint=grammar.constrain(),
-            )
-        )
-    )
+    masked = run(tokenizer, script, stop, NO_LIMIT, grammar.constrain())
     # The four spelled out rather than read back out of the schema: the fixture types it as
     # `dict[str, object]`, so reaching into it is an index on `object`, and a test that
     # derived the expectation from the same structure under test would agree with itself.

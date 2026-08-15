@@ -7,7 +7,8 @@ from pathlib import Path
 from fastapi.testclient import TestClient
 
 from mlx_omnia.server import benchmarks
-from tests.server.benchmark_stand import HUGE, SMALL, SPEED_BODY, WINDOWED, stand, wait_for
+from tests.server.benchmark_stand import HUGE, SMALL, SPEED_BODY, WINDOWED, stand
+from tests.server.polling import wait_for
 
 MODEL = "house/small"
 BIG = "house/huge"

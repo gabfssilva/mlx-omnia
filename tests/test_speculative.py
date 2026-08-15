@@ -31,6 +31,14 @@ ALTERNATING = [token if i % 2 == 0 else token + 1 for i, token in enumerate(TARG
 LOOKAHEAD = 2
 
 
+def scripted_logits(script: list[int], vocab: int, offset: int, length: int) -> mx.array:
+    """The script read at absolute positions `offset .. offset + length`, as logits whose
+    peak is unique: `-|arange - script[p]|` has no tie for the argmax to break."""
+    rows = mx.array([script[min(offset + i, len(script) - 1)] for i in range(length)])
+    distance = mx.abs(mx.arange(vocab)[None] - rows[:, None]).astype(mx.float32)
+    return (-distance)[None]
+
+
 class ScriptedLM:
     """Logits that depend only on the row's absolute position, read from the cache's offset.
 
@@ -52,11 +60,10 @@ class ScriptedLM:
         assert cache is not None, "the speculative loop always carries a cache"
         offset = cache[0].offset
         length = ids.shape[-1]
-        rows = mx.array([self.script[min(offset + i, len(self.script) - 1)] for i in range(length)])
+        logits = scripted_logits(self.script, self.vocab, offset, length)
         consumed = mx.zeros((1, 1, length, 1))
         cache[0].update_and_fetch(consumed, consumed)
-        distance = mx.abs(mx.arange(self.vocab)[None] - rows[:, None]).astype(mx.float32)
-        return (-distance)[None]
+        return logits
 
 
 class RecurrentLM:
@@ -81,7 +88,7 @@ class RotatingLM:
         raise AssertionError("the refusal must land before any forward")
 
 
-class ReplayingLM(ScriptedLM):
+class ReplayingLM:
     """The same script over a cache that cannot trim, only start over.
 
     `state` is the running sum of every id the cache has taken, which is the cheapest thing
@@ -92,16 +99,17 @@ class ReplayingLM(ScriptedLM):
     """
 
     def __init__(self, script: list[int], vocab: int) -> None:
-        super().__init__(script, vocab)
+        self.script = script
+        self.vocab = vocab
         self.handed: list[list[DeltaCache]] = []
         """Every cache this model made, so a test can read the one the loop kept — the
         speculative stream builds its own and hands it to nobody."""
 
-    def make_cache(self) -> list[DeltaCache]:  # type: ignore[override]
+    def make_cache(self) -> list[DeltaCache]:
         self.handed.append([DeltaCache()])
         return self.handed[-1]
 
-    def __call__(self, ids: mx.array, cache: list[DeltaCache] | None = None) -> mx.array:  # type: ignore[override]
+    def __call__(self, ids: mx.array, cache: list[DeltaCache] | None = None) -> mx.array:
         assert cache is not None, "the speculative loop always carries a cache"
         layer = cache[0]
         offset = layer.offset
@@ -110,9 +118,7 @@ class ReplayingLM(ScriptedLM):
         # Reassigned, never mutated: that is what makes `checkpoint()` a restore point.
         layer.state = running + mx.sum(ids.astype(mx.float32))
         layer.offset = offset + length
-        rows = mx.array([self.script[min(offset + i, len(self.script) - 1)] for i in range(length)])
-        distance = mx.abs(mx.arange(self.vocab)[None] - rows[:, None]).astype(mx.float32)
-        return (-distance)[None]
+        return scripted_logits(self.script, self.vocab, offset, length)
 
 
 @pytest.fixture

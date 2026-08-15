@@ -64,7 +64,7 @@ _STRATEGIES = (
 )
 
 
-class GateUp:
+class GateUp(GateUpStrategy):
     """Resolves the strategy at construction and delegates; itself a
     `GateUpStrategy`."""
 

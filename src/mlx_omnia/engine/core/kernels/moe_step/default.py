@@ -12,6 +12,7 @@ from typing import Self
 import mlx.core as mx
 import mlx.nn as nn
 
+from mlx_omnia.engine.core.kernels.moe_step.kernel import MoeStepStrategy
 from mlx_omnia.engine.core.layers import QuantizedSwitchLinear, SwitchLinear
 
 SharedPair = tuple[nn.Linear | nn.QuantizedLinear, nn.Linear | nn.QuantizedLinear]
@@ -23,7 +24,7 @@ def _squared_relu(x: mx.array) -> mx.array:
 
 
 @dataclass(frozen=True)
-class DefaultMoeStep:
+class DefaultMoeStep(MoeStepStrategy):
     fc1: SwitchLinear | QuantizedSwitchLinear
     fc2: SwitchLinear | QuantizedSwitchLinear
     shared: SharedPair | None

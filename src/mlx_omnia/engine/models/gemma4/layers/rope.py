@@ -29,11 +29,8 @@ def cos_sin_tables(
     """
     if positions.ndim == 1:
         freqs = mx.outer(positions.astype(mx.float32), inv_freq)
-        # [length, head_dim//2] — freqs for each position, each frequency pair
-        cos = mx.cos(freqs)
-        sin = mx.sin(freqs)
-        return cos, sin
-    freqs = positions.astype(mx.float32)[:, mx.newaxis, :, mx.newaxis] * inv_freq
+    else:
+        freqs = positions.astype(mx.float32)[:, mx.newaxis, :, mx.newaxis] * inv_freq
     return mx.cos(freqs), mx.sin(freqs)
 
 
@@ -48,11 +45,6 @@ def manual_rope(x: mx.array, cos: mx.array, sin: mx.array) -> mx.array:
     half = cos.shape[-1]
     x1 = x[..., :half]
     x2 = x[..., half:]
-    if cos.ndim == 2:
-        # cos/sin are [length, head_dim//2] — broadcast over heads.
-        cos_b = cos[mx.newaxis, mx.newaxis, :, :]
-        sin_b = sin[mx.newaxis, mx.newaxis, :, :]
-    else:
-        # [batch, 1, length, head_dim//2] — one table per row, broadcast over heads.
-        cos_b, sin_b = cos, sin
+    cos_b = cos if cos.ndim == 4 else cos[mx.newaxis, mx.newaxis]
+    sin_b = sin if sin.ndim == 4 else sin[mx.newaxis, mx.newaxis]
     return mx.concatenate([x1 * cos_b - x2 * sin_b, x1 * sin_b + x2 * cos_b], axis=-1)

@@ -41,6 +41,3 @@ class Step3p7Attention(GatedNormalizedFusedQKVAttention):
             gate_per_head=True,
             window=config.sliding_window if sliding else None,
         )
-        self.sliding = sliding
-        self._rotary_dim = rotary_dim
-        self._theta = theta

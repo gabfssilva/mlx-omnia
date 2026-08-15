@@ -17,11 +17,12 @@ from typing import Self
 
 import mlx.core as mx
 
+from mlx_omnia.engine.core.kernels.hyper_connection.kernel import HyperConnectionStrategy
 from mlx_omnia.engine.core.mxcompat import softmax
 
 
 @dataclass(frozen=True)
-class DefaultHyperConnection:
+class DefaultHyperConnection(HyperConnectionStrategy):
     iters: int
     eps: float
     norm_eps: float

@@ -56,7 +56,7 @@ _STRATEGIES = (
 )
 
 
-class Route:
+class Route(RouteStrategy):
     """Resolves the strategy at construction and delegates; itself a `RouteStrategy`."""
 
     def __init__(

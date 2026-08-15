@@ -36,7 +36,7 @@ __all__ = [
 _STRATEGIES = (FusedAddRmsNorm, RowsAddRmsNorm, DefaultAddRmsNorm)
 
 
-class AddRmsNorm:
+class AddRmsNorm(AddRmsNormStrategy):
     """Resolves the strategy at construction and delegates; itself an
     `AddRmsNormStrategy`."""
 

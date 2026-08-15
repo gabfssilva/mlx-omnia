@@ -7,10 +7,10 @@ space is no longer the prompt the model was trained on.
 """
 
 import json
-from collections.abc import Iterator
+from collections.abc import Iterator, Mapping
 from datetime import datetime
 from pathlib import Path
-from typing import Any, TypeIs, cast
+from typing import NotRequired, TypedDict, TypeIs, cast
 
 import numpy as np
 import pytest
@@ -40,8 +40,49 @@ from mlx_omnia.engine.parsers.qwen_xml import PARSER as QWEN_XML
 from mlx_omnia.engine.vision import RGB_IMAGE, Image
 from tests.conftest import local_snapshot
 
+type RawPart = dict[str, object]
+"""One content part as the fixture spells it — a `ChatMessage` part with the image still a
+placeholder, which is what `with_images` fills in."""
+
+
+class RawMessage(TypedDict):
+    role: str
+    content: str | list[RawPart]
+    tool_calls: NotRequired[list[dict[str, object]]]
+
+
+class Kwargs(TypedDict, total=False):
+    """The kwargs transformers was called with, which is the ground truth of the render."""
+
+    enable_thinking: bool
+    tools: list[Mapping[str, object]]
+
+
+class Case(TypedDict):
+    repo: str
+    name: str
+    template: str | None
+    """The case's own template when it carries one, `None` when the checkpoint's is used."""
+    messages: list[RawMessage]
+    kwargs: Kwargs
+    rendered: str
+    ids: list[int]
+
+
+class RepoMeta(TypedDict):
+    source: str
+    template: str
+    special_tokens: dict[str, str]
+
+
+class Golden(TypedDict):
+    clock: str
+    repos: dict[str, RepoMeta]
+    cases: list[Case]
+
+
 FIXTURE = Path(__file__).parent / "fixtures" / "chat_template.json"
-GOLDEN: dict[str, Any] = json.loads(FIXTURE.read_text(encoding="utf-8"))
+GOLDEN: Golden = json.loads(FIXTURE.read_text(encoding="utf-8"))
 CLOCK = datetime.fromisoformat(GOLDEN["clock"])
 
 CASES = [
@@ -51,7 +92,7 @@ CASES = [
 REPOS = list(GOLDEN["repos"])
 
 
-def has_image(case: dict[str, Any]) -> bool:
+def has_image(case: Case) -> bool:
     return any(
         not isinstance(message["content"], str)
         and any(part["type"] == "image" for part in message["content"])
@@ -63,7 +104,7 @@ IMAGE_CASES = [pytest.param(case, id=case["name"]) for case in GOLDEN["cases"] i
 FIRST_IMAGE_CASE = next(case for case in GOLDEN["cases"] if has_image(case))
 
 
-def template_of(case: dict[str, Any]) -> ChatTemplate:
+def template_of(case: Case) -> ChatTemplate:
     """The checkpoint's template, or the case's own when it carries one (the synthetic one
     that exercises the environment's whitespace control)."""
     meta = GOLDEN["repos"][case["repo"]]
@@ -72,7 +113,7 @@ def template_of(case: dict[str, Any]) -> ChatTemplate:
     )
 
 
-def chat_of(case: dict[str, Any]) -> Chat:
+def chat_of(case: Case) -> Chat:
     """The fixture is written in the kwargs transformers was called with, which is the
     ground truth this compares against. `enable_thinking` is the bool the effort resolves
     to, so the case is read back through the same mapping the render applies."""
@@ -94,12 +135,12 @@ def checkpoint_of(repo: str) -> Path:
 
 
 @pytest.mark.parametrize("case", CASES)
-def test_render_matches_transformers(case: dict[str, Any]) -> None:
+def test_render_matches_transformers(case: Case) -> None:
     assert template_of(case).render(chat_of(case)) == case["rendered"]
 
 
 @pytest.mark.parametrize("case", CASES)
-def test_ids_match_transformers(case: dict[str, Any]) -> None:
+def test_ids_match_transformers(case: Case) -> None:
     """The rendered text encoded back with the checkpoint's tokenizer: this is where the
     added tokens (`<|im_start|>`, `<|image_pad|>`) have to come out as one id, not bytes."""
     tokenizer = ByteLevelBPE.from_file(checkpoint_of(case["repo"]) / "tokenizer.json")
@@ -132,7 +173,7 @@ def marker_of(repo: str) -> str:
     return "".join(tokens[key] for key in ("vision_bos_token", "image_token", "vision_eos_token"))
 
 
-def with_images(case: dict[str, Any]) -> tuple[Chat, list[Image]]:
+def with_images(case: Case) -> tuple[Chat, list[Image]]:
     """The same fixture case with real `Image`s where the pixel placeholder was."""
     images: list[Image] = []
     messages: list[ChatMessage] = []
@@ -141,7 +182,7 @@ def with_images(case: dict[str, Any]) -> tuple[Chat, list[Image]]:
         if isinstance(content, str):
             messages.append(cast(ChatMessage, message))
             continue
-        parts: list[dict[str, Any]] = []
+        parts: list[RawPart] = []
         for part in content:
             if part["type"] != "image":
                 parts.append(part)
@@ -153,7 +194,7 @@ def with_images(case: dict[str, Any]) -> tuple[Chat, list[Image]]:
 
 
 @pytest.mark.parametrize("case", IMAGE_CASES)
-def test_multimodal_capability_splits_on_the_marker(case: dict[str, Any]) -> None:
+def test_multimodal_capability_splits_on_the_marker(case: Case) -> None:
     """Putting the marker back where the images are reproduces the render exactly: that is
     what says nothing was swallowed or duplicated by the cut."""
     marker = marker_of(case["repo"])

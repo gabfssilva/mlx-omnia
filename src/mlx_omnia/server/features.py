@@ -29,9 +29,9 @@ import asyncio
 import json
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Annotated, Literal
+from typing import Literal
 
-from fastapi import APIRouter, Depends, HTTPException, Request
+from fastapi import APIRouter, HTTPException
 from pydantic import BaseModel, ConfigDict, Field, field_validator, model_validator
 
 from mlx_omnia import load_drafter
@@ -41,7 +41,8 @@ from mlx_omnia.engine.quant.quantization import MXFP, NVFP, Affine, Quantization
 from mlx_omnia.engine.speculative import Drafting
 from mlx_omnia.engine.task import MTP_PREFIX, has_mtp, mtp_head
 from mlx_omnia.server import catalog
-from mlx_omnia.server.engine import Compression, Engine
+from mlx_omnia.server.deps import EngineDep, StoreDep
+from mlx_omnia.server.engine import Compression
 from mlx_omnia.server.store import ModelSettings, Store
 
 DRAFTERS: dict[str, str] = {"muse_glimmer_assistant": "muse_glimmer"}
@@ -225,10 +226,6 @@ def drafting(model: object) -> Drafting | None:
     return model
 
 
-def _entry(model_id: str) -> object:
-    return next((found for found in catalog.scan() if found.id == model_id), None)
-
-
 def pair(model_id: str, model: object, speculation: Speculation | None) -> None:
     """Give a freshly loaded model the draft its settings name, or leave it alone.
 
@@ -247,7 +244,7 @@ def pair(model_id: str, model: object, speculation: Speculation | None) -> None:
     if facade is None:
         raise ValueError(f"nothing under {model_id!r} takes a drafter")
     if speculation.kind == "mtp":
-        entry = _entry(model_id)
+        entry = catalog.entry_of(model_id)
         if entry is None:
             raise ValueError(f"no model {model_id!r} in the catalog")
         directory = entry.directory
@@ -255,7 +252,7 @@ def pair(model_id: str, model: object, speculation: Speculation | None) -> None:
             raise ValueError(f"{model_id!r} carries no MTP head this engine can build")
         facade.speculate_with(mtp_head(directory), block_size=speculation.block_size)
         return
-    found = _entry(speculation.drafter or "")
+    found = catalog.entry_of(speculation.drafter or "")
     if found is None:
         raise ValueError(f"the drafter {speculation.drafter!r} is not in the catalog")
     facade.speculate_with(
@@ -275,9 +272,9 @@ def drafter_bytes(model_id: str, store: Store) -> int:
     if speculation is None or speculation.kind is None:
         return 0
     if speculation.kind == "mtp":
-        entry = _entry(model_id)
+        entry = catalog.entry_of(model_id)
         return 0 if entry is None else checkpoint_bytes(entry.directory, MTP_PREFIX)
-    found = _entry(speculation.drafter or "")
+    found = catalog.entry_of(speculation.drafter or "")
     return 0 if found is None else checkpoint_bytes(found.directory)
 
 
@@ -363,21 +360,6 @@ class SettingsBody(BaseModel):
     max_concurrent_requests: int | None = Field(default=None, ge=1)
 
 
-def _store(request: Request) -> Store:
-    store = request.app.state.store
-    assert isinstance(store, Store)
-    return store
-
-
-def _engine(request: Request) -> Engine:
-    engine = request.app.state.engine
-    assert isinstance(engine, Engine)
-    return engine
-
-
-StoreDep = Annotated[Store, Depends(_store)]
-EngineDep = Annotated[Engine, Depends(_engine)]
-
 router = APIRouter()
 
 
@@ -454,7 +436,7 @@ def _save(model_id: str, body: SettingsBody, store: Store) -> SettingsView:
         # The head is not an id to look up: it is either in this checkpoint's shards or it is
         # not, and a switch stored against a checkpoint that has none is one the next load
         # fails on.
-        entry = next((found for found in catalog.scan() if found.id == model_id), None)
+        entry = catalog.entry_of(model_id)
         if entry is None:
             raise HTTPException(status_code=409, detail=f"{model_id!r} is not in the catalog")
         if not has_mtp(entry.directory):
@@ -464,7 +446,7 @@ def _save(model_id: str, body: SettingsBody, store: Store) -> SettingsView:
             )
     elif speculation is not None and speculation.drafter is not None:
         named = speculation.drafter
-        entry = next((found for found in catalog.scan() if found.id == named), None)
+        entry = catalog.entry_of(named)
         if entry is None:
             raise HTTPException(status_code=409, detail=f"{named!r} is not in the catalog")
         block = declared_block_size(entry.directory)

@@ -15,7 +15,7 @@ from typing import Self
 
 import mlx.core as mx
 
-from mlx_omnia.engine.core.kernels.route.kernel import Routing, gate_logits
+from mlx_omnia.engine.core.kernels.route.kernel import RouteStrategy, Routing, gate_logits
 from mlx_omnia.engine.core.mxcompat import metal_kernel
 
 _SOURCE = """
@@ -108,7 +108,7 @@ def softmax_bias_topk(
 
 
 @dataclass(frozen=True)
-class BiasTopkRoute:
+class BiasTopkRoute(RouteStrategy):
     """Softmax scoring with the correction bias on the *scores*, selection on the biased
     scores and no renormalization — the Longcat Flash router."""
 

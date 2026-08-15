@@ -17,14 +17,14 @@ import os
 import subprocess
 import sys
 import tempfile
-from collections.abc import Callable, Iterator, Mapping, Sequence
+from collections.abc import Callable, Generator, Mapping, Sequence
 from contextlib import contextmanager
 from dataclasses import dataclass, field
 from pathlib import Path
 from statistics import median
 
 from mlx_omnia.bench.report import Axis, Calibration, Drift, Verdict, axis, stderr, verdict
-from mlx_omnia.bench.sample import Sample
+from mlx_omnia.bench.sample import Sample, divergence
 
 
 @dataclass(frozen=True, slots=True)
@@ -55,7 +55,7 @@ def git_root(start: Path | None = None) -> Path:
 
 
 @contextmanager
-def worktree(ref: str, *, root: Path | None = None) -> Iterator[Path]:
+def worktree(ref: str, *, root: Path | None = None) -> Generator[Path]:
     """A detached checkout of `ref`, removed on the way out. A dirty working tree is what
     makes this necessary: the candidate is the tree as it stands, uncommitted included, so the
     baseline cannot be a checkout of the same directory."""
@@ -102,11 +102,7 @@ class Paired:
 
     @property
     def divergence(self) -> int | None:
-        baseline, candidate = self.streams[self.baseline], self.streams[self.candidate]
-        for index, (theirs, ours) in enumerate(zip(baseline, candidate, strict=False)):
-            if theirs != ours:
-                return index
-        return None if len(baseline) == len(candidate) else min(len(baseline), len(candidate))
+        return divergence(self.streams[self.baseline], self.streams[self.candidate])
 
     def render(self) -> str:
         lines = [self._row(name) for name in (self.baseline, self.candidate)]

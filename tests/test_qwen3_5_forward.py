@@ -29,6 +29,7 @@ from mlx_omnia.engine.models.qwen3_5.layers import block, deltanet, flags
 from mlx_omnia.engine.models.qwen3_5.layers.block import Qwen35Block
 from mlx_omnia.engine.models.qwen3_5.layers.deltanet import l2norm
 from tests.conftest import floor, load_golden, relative_diff
+from tests.mutation import mutated
 
 FIXTURE = Path(__file__).parent / "fixtures" / "qwen3_5_forward.safetensors"
 N_LAYER = 24
@@ -226,25 +227,17 @@ def test_mutation_of_conv_breaks_parity(model: Qwen35, golden: dict[str, mx.arra
     """The causal conv is the DeltaNet's own path: scaling one tap must blow past the
     fixture floor."""
     conv = model.model.layers[LINEAR_LAYER].linear_attn.conv1d
-    original = conv.weight
-    conv.weight = original * 1.01
-    try:
+    with mutated(conv, "weight", conv.weight * 1.01):
         logits = model(golden["input_ids"][None])
         assert relative_diff(logits, golden["logits"]) > floor(golden, "logits")
-    finally:
-        conv.weight = original
 
 
 def test_mutation_of_decay_breaks_parity(model: Qwen35, golden: dict[str, mx.array]) -> None:
     """A_log only reaches the logits through the recurrence's decay."""
     delta = model.model.layers[LINEAR_LAYER].linear_attn
-    original = delta.A_log
-    delta.A_log = original + 0.5
-    try:
+    with mutated(delta, "A_log", delta.A_log + 0.5):
         logits = model(golden["input_ids"][None])
         assert relative_diff(logits, golden["logits"]) > floor(golden, "logits")
-    finally:
-        delta.A_log = original
 
 
 def test_mutation_of_attention_gate_breaks_parity(
@@ -257,14 +250,11 @@ def test_mutation_of_attention_gate_breaks_parity(
     queries = (
         model.config.text_config.num_attention_heads * model.config.text_config.head_dim
     )
-    mutated = mx.array(original)
-    mutated[:queries] = original[queries : 2 * queries]
-    attention.fused_proj.weight = mutated
-    try:
+    gateless = mx.array(original)
+    gateless[:queries] = original[queries : 2 * queries]
+    with mutated(attention.fused_proj, "weight", gateless):
         logits = model(golden["input_ids"][None])
         assert relative_diff(logits, golden["logits"]) > floor(golden, "logits")
-    finally:
-        attention.fused_proj.weight = original
 
 
 def testl2norm_eps_is_inside_the_sum() -> None:

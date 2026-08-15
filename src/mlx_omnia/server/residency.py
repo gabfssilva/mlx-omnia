@@ -19,23 +19,13 @@ catalog, a `DELETE /admin/models/a/b/residency` is the catalog's own delete read
 
 import asyncio
 import threading
-from typing import Annotated
 
-from fastapi import APIRouter, Depends, HTTPException, Request
+from fastapi import APIRouter, HTTPException
 from fastapi.responses import JSONResponse
 
+from mlx_omnia.server.deps import EngineDep
 from mlx_omnia.server.engine import Engine
 from mlx_omnia.server.jobs import Job, JobsDep, Load, Progress, Work, accepted
-
-
-async def _engine(request: Request) -> Engine:
-    """Async so it reads the engine's dicts on the loop that mutates them."""
-    engine = request.app.state.engine
-    assert isinstance(engine, Engine)
-    return engine
-
-
-EngineDep = Annotated[Engine, Depends(_engine)]
 
 router = APIRouter()
 

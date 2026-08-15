@@ -31,6 +31,7 @@ from tests.conftest import (
     relative_diff,
     requires_checkpoint,
 )
+from tests.mutation import mutated
 
 FIXTURE = Path(__file__).parent / "fixtures" / "longcat_flash_ngram_mlxlm.safetensors"
 REPO = "meituan-longcat/LongCat-Flash-Lite"
@@ -201,12 +202,9 @@ def test_mutation_of_expert_scales_breaks_parity(
     down = model.model.layers[0].mlp.switch_mlp.down_proj
     original = down.scales
     assert isinstance(original, mx.array)
-    down.scales = original * 1.5
-    try:
+    with mutated(down, "scales", original * 1.5):
         logits = model(golden["input_ids"][None])
         assert relative_diff(logits, golden["logits"]) > bound(golden)
-    finally:
-        down.scales = original
 
 
 @requires_checkpoint(REPO)
@@ -225,10 +223,6 @@ def test_mutation_of_identity_expert_breaks_parity(
     # the bias boost that pulls them in — the selection changes and so does the
     # identity contribution.
     n_routed = model.config.n_routed_experts
-    router.e_score_correction_bias = mx.where(
-        mx.arange(original_bias.shape[0]) >= n_routed, 0.0, original_bias
-    )
-    try:
+    unboosted = mx.where(mx.arange(original_bias.shape[0]) >= n_routed, 0.0, original_bias)
+    with mutated(router, "e_score_correction_bias", unboosted):
         assert relative_diff(model(ids[None]), golden["logits"]) > bound(golden)
-    finally:
-        router.e_score_correction_bias = original_bias

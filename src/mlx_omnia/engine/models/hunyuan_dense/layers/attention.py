@@ -15,4 +15,3 @@ class HunyuanDenseAttention(NormalizedFusedQKVAttention):
             qkv_bias=config.attention_bias,
             output_bias=config.attention_bias,
         )
-        self.rope_base = config.rope_base

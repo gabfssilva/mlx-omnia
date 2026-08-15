@@ -12,7 +12,7 @@ A ternary leaf is not an `nn.Linear`: its weight is a packed uint8 table and its
 the matmul inside that leaf, not for the leaf. Every other leaf's facade is the leaf.
 """
 
-from typing import Literal, Protocol, TypeGuard
+from typing import Literal, Protocol, TypeGuard, runtime_checkable
 
 import mlx.core as mx
 import mlx.nn as nn
@@ -42,6 +42,7 @@ def is_ternary(leaf: QmvLeaf) -> TypeGuard[TernaryLinear]:
     return not isinstance(leaf, (nn.Linear, nn.QuantizedLinear))
 
 
+@runtime_checkable
 class QmvStrategy(Protocol):
     """x [..., kdim] through the leaf's stack, with the declared epilogue:
     (x, gate) -> [..., rows]. `gate` is read only by the gate epilogue."""

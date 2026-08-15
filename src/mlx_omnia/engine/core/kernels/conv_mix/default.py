@@ -12,9 +12,11 @@ from typing import Self
 
 import mlx.core as mx
 
+from mlx_omnia.engine.core.kernels.conv_mix.kernel import ConvMixStrategy
+
 
 @dataclass(frozen=True)
-class DefaultConvMix:
+class DefaultConvMix(ConvMixStrategy):
     hidden: int
     kernel: int
     proj_bias: mx.array | None

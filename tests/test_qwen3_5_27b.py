@@ -23,6 +23,7 @@ from tests.conftest import (
     relative_diff,
     requires_checkpoint,
 )
+from tests.mutation import mutated
 
 FIXTURE = Path(__file__).parent / "fixtures" / "qwen3_5_27b_mlxlm.safetensors"
 REPO = "mlx-community/Qwen3.6-27B-6bit"
@@ -124,9 +125,6 @@ def test_mutation_breaks_parity(model: Qwen35, golden: dict[str, mx.array]) -> N
     delta = model.model.layers[1].linear_attn
     original = delta.fused_proj.scales
     assert isinstance(original, mx.array)
-    delta.fused_proj.scales = original * 1.5
-    try:
+    with mutated(delta.fused_proj, "scales", original * 1.5):
         logits = model(golden["input_ids"][None])
         assert relative_diff(logits, golden["logits"]) > golden["noise.batching"].item()
-    finally:
-        delta.fused_proj.scales = original

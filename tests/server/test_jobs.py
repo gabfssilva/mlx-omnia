@@ -364,8 +364,8 @@ def test_the_bodies_run_on_this_registry_s_own_pool_and_not_more_than_it_is_wide
 ) -> None:
     """The other half of task 48, and the one a shared executor fails outright: the bodies run
     on threads this registry owns, so a client cannot turn `_WORKERS + 2` PUTs into
-    `_WORKERS + 2` threads of the loop's — which is where `Engine._load` and `Engine._decode`
-    have to find one.
+    `_WORKERS + 2` threads of the loop's — which is where `Engine._load` and
+    `Engine._generate` have to find one.
 
     The peak is what says it, and no window is needed to read it in: on the loop's own
     executor all `_WORKERS + 2` bodies start in the same turn and the peak is `_WORKERS + 2`,

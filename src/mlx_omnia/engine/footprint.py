@@ -15,7 +15,7 @@ carries slots no routing decides, and the step reads those whole.
 import json
 from collections.abc import Mapping
 from pathlib import Path
-from typing import NamedTuple, Protocol, TypedDict, runtime_checkable
+from typing import NamedTuple, Protocol, TypedDict, TypeIs, runtime_checkable
 
 import mlx.core as mx
 import mlx.nn as nn
@@ -124,8 +124,13 @@ def _own_bytes(module: nn.Module) -> int:
     return sum(
         value.nbytes
         for key, value in _members(module).items()
-        if isinstance(value, mx.array) and not key.startswith("_")
+        if _is_array(value) and not key.startswith("_")
     )
+
+
+def _is_array(value: object) -> TypeIs[mx.array]:
+    """`mx.array` is untyped, so a bare `isinstance` leaves the member `object`."""
+    return isinstance(value, mx.array)
 
 
 def _candidates(module: nn.Module) -> int | None:

@@ -8,11 +8,12 @@ v [B, T, Hv, Dv], g the decay **past the exp** — `[B, T, Hv]` per head or
 strategy, so no repeated q/k is ever materialized by the caller.
 """
 
-from typing import Protocol
+from typing import Protocol, runtime_checkable
 
 import mlx.core as mx
 
 
+@runtime_checkable
 class GatedDeltaStrategy(Protocol):
     """(q, k, v, g, beta, state) -> (y, advanced state), in the kernel's convention."""
 

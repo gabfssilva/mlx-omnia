@@ -53,7 +53,11 @@ from mlx_omnia.engine.core.kernels.attention.default import (
     split_heads,
     write_position,
 )
-from mlx_omnia.engine.core.kernels.attention.kernel import Angles, AttentionCache
+from mlx_omnia.engine.core.kernels.attention.kernel import (
+    Angles,
+    AttentionCache,
+    AttentionStepStrategy,
+)
 from mlx_omnia.engine.core.mxcompat import metal_kernel
 
 _SPLITS = 8
@@ -245,7 +249,7 @@ def sink_attention(
 
 
 @dataclass(frozen=True)
-class SinkAttentionStep:
+class SinkAttentionStep(AttentionStepStrategy):
     """The decode step of a layer with learned sinks: norm and rotation in ops, then the
     cache write and the split-K flash-decode on `sink_attention`.
 

@@ -16,7 +16,13 @@ from typing import Self
 
 import mlx.core as mx
 
-from mlx_omnia.engine.core.kernels.qkv_rope.kernel import Angles, Leaf, Projection, Rotation
+from mlx_omnia.engine.core.kernels.qkv_rope.kernel import (
+    Angles,
+    Leaf,
+    Projection,
+    QkvRopeStrategy,
+    Rotation,
+)
 
 
 def split_heads(
@@ -35,7 +41,7 @@ def split_heads(
 
 
 @dataclass(frozen=True)
-class DefaultQkvRope:
+class DefaultQkvRope(QkvRopeStrategy):
     projection: Projection
     heads: int
     kv_heads: int

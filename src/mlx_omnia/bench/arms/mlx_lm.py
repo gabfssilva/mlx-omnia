@@ -21,7 +21,9 @@ def build(
     from mlx_lm import load
     from mlx_lm.generate import generate_step
 
-    model, _ = load(repo)
+    # `load` answers a 2-tuple or a 3-tuple depending on what it was asked for; the model is
+    # the first either way, and unpacking would have to know which.
+    model = load(repo)[0]
     if dtype is not None:
         model.set_dtype(DTYPES[dtype])
         mx.eval(model.parameters())

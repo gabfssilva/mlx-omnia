@@ -44,6 +44,7 @@ from mlx_omnia.engine.models.qwen3_5.vision import (
 )
 from mlx_omnia.engine.vision import RGB_IMAGE, Image
 from tests.conftest import floor, load_golden, relative_diff
+from tests.mutation import mutated
 
 FIXTURE = Path(__file__).parent / "fixtures" / "qwen3_5_vision.safetensors"
 N_LAYER = 24
@@ -446,12 +447,9 @@ def test_mutation_of_patch_order_breaks_the_tower(
     def raster(_grid: Grid) -> mx.array:
         return original(_grid)[mx.array(np.argsort(_block_order(_grid, 2)))]
 
-    tower.positions = raster  # pyright: ignore[reportAttributeAccessIssue]
-    try:
+    with mutated(tower, "positions", raster):
         merged = tower(patches, grid)
         assert relative_diff(merged, golden["vision_merged"]) > floor(golden, "vision_merged")
-    finally:
-        tower.positions = original  # pyright: ignore[reportAttributeAccessIssue]
 
 
 def test_mutation_of_grid_transpose_breaks_positions(
@@ -470,7 +468,6 @@ def test_mutation_of_merger_gelu_breaks_parity(
     approximation. They differ by ~1e-3 relative at these magnitudes — small enough to
     look like rounding, large enough that the fixture's floor rejects it."""
     patches, grid = processed
-    original = VisionMerger.__call__
 
     def approximated(self: VisionMerger, x: mx.array) -> mx.array:
         grouped = self.norm(x).reshape(-1, self.linear_fc1.weight.shape[-1])
@@ -480,9 +477,6 @@ def test_mutation_of_merger_gelu_breaks_parity(
         )
         return self.linear_fc2(tanh)
 
-    VisionMerger.__call__ = approximated
-    try:
+    with mutated(VisionMerger, "__call__", approximated):
         merged = tower(patches, grid)
         assert relative_diff(merged, golden["vision_merged"]) > floor(golden, "vision_merged")
-    finally:
-        VisionMerger.__call__ = original

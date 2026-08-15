@@ -2,12 +2,30 @@ from collections.abc import Callable, Sequence
 
 import mlx.core as mx
 
+from mlx_omnia.engine.batching import RaggedAdapter, RaggedBatchable
 from mlx_omnia.engine.core.cache import LayerCache, reserve
+
+type LatentStore = MLACache | BatchedMLACache
+type NgramStore = NgramCache | BatchedNgramCache
+type LongcatLayer = LayerCache | BatchedMLACache | BatchedNgramCache
+"""What a layer of this family's cache can be — a solo cache, or one of the ragged adapters
+the batch path reads it through."""
 
 _MIXED = "a batched layer mixes {kind} with another cache kind"
 
 
-class NgramCache(LayerCache):
+class _Batched[CacheT: LayerCache](RaggedAdapter):
+    """The rows of one ragged layer, held as they are; each adapter answers `offset` itself."""
+
+    def __init__(self, caches: Sequence[CacheT]) -> None:
+        self._caches = tuple(caches)
+
+    @property
+    def rows(self) -> tuple[CacheT, ...]:
+        return self._caches
+
+
+class NgramCache(LayerCache, RaggedBatchable):
     """The last ``n-1`` token ids, carried across the prefill→decode boundary."""
 
     def __init__(self, n: int) -> None:
@@ -59,15 +77,10 @@ class NgramCache(LayerCache):
             self._context = None if remaining <= 0 else self._context[..., :remaining]
 
     def batched(self, rows: Sequence[LayerCache]) -> "BatchedNgramCache":
-        caches: list[NgramCache] = []
-        for row in rows:
-            if not isinstance(row, NgramCache):
-                raise TypeError(_MIXED.format(kind=type(row).__name__))
-            caches.append(row)
-        return BatchedNgramCache(caches)
+        return BatchedNgramCache(_rows(NgramCache, rows))
 
 
-class BatchedNgramCache:
+class BatchedNgramCache(_Batched[NgramCache]):
     """N `NgramCache`s as one: each row's context concatenated along the batch axis.
 
     In regime every row holds exactly ``n-1`` ids, so the stack is exact. Rows that disagree
@@ -75,19 +88,15 @@ class BatchedNgramCache:
     `batching._stack` makes for a recurrent batch mixing prefilled and empty rows.
     """
 
-    def __init__(self, caches: Sequence[NgramCache]) -> None:
-        self._caches = tuple(caches)
-
-    @property
-    def rows(self) -> tuple[NgramCache, ...]:
-        return self._caches
-
     @property
     def offset(self) -> int:
         return self._caches[0].offset
 
     @offset.setter
     def offset(self, value: int) -> None:
+        # The rows are ragged, so there is no batch offset to assign: row 0 stands for the
+        # batch only in how far it moved, and what propagates is that delta, not the value —
+        # the same rule as `BatchedConvCache.offset`.
         advance = value - self._caches[0].offset
         for cache in self._caches:
             cache.offset += advance
@@ -103,7 +112,7 @@ class BatchedNgramCache:
         return mx.concatenate(contexts)
 
 
-class MLACache(LayerCache):
+class MLACache(LayerCache, RaggedBatchable):
     """The compressed latent (``kv_lora_rank``) + decoupled ``k_pe``
     (``qk_rope_head_dim``) per sublayer — 576 elements/token, not full K/V.
 
@@ -121,12 +130,13 @@ class MLACache(LayerCache):
         self, latent: mx.array, k_pe: mx.array
     ) -> tuple[mx.array, mx.array]:
         needed = self.offset + latent.shape[2]
-        self._latent = reserve(self._latent, needed, latent)
-        self._k_pe = reserve(self._k_pe, needed, k_pe)
-        self._latent[..., self.offset : needed, :] = latent
-        self._k_pe[..., self.offset : needed, :] = k_pe
+        latents = reserve(self._latent, needed, latent)
+        pes = reserve(self._k_pe, needed, k_pe)
+        self._latent, self._k_pe = latents, pes
+        latents[..., self.offset : needed, :] = latent
+        pes[..., self.offset : needed, :] = k_pe
         self.offset = needed
-        return self._latent[..., :needed, :], self._k_pe[..., :needed, :]
+        return latents[..., :needed, :], pes[..., :needed, :]
 
     @property
     def is_trimmable(self) -> bool:
@@ -156,28 +166,16 @@ class MLACache(LayerCache):
         self.offset = min(self.offset, length)
 
     def batched(self, rows: Sequence[LayerCache]) -> "BatchedMLACache":
-        caches: list[MLACache] = []
-        for row in rows:
-            if not isinstance(row, MLACache):
-                raise TypeError(_MIXED.format(kind=type(row).__name__))
-            caches.append(row)
-        return BatchedMLACache(caches)
+        return BatchedMLACache(_rows(MLACache, rows))
 
 
-class BatchedMLACache:
+class BatchedMLACache(_Batched[MLACache]):
     """N `MLACache`s as one ragged latent batch.
 
     `BatchedKVCache`'s shape over two tensors instead of keys/values, and without an
     `attend`: MLA's absorbed decode folds the decoupled `k_pe` scores into the mask its
     latent attention reads, so the layer takes the rows back and attends each one itself.
     """
-
-    def __init__(self, caches: Sequence[MLACache]) -> None:
-        self._caches = tuple(caches)
-
-    @property
-    def rows(self) -> tuple[MLACache, ...]:
-        return self._caches
 
     @property
     def offset(self) -> mx.array:
@@ -197,8 +195,10 @@ class BatchedMLACache:
         ]
 
 
-type LatentStore = MLACache | BatchedMLACache
-type NgramStore = NgramCache | BatchedNgramCache
-type LongcatLayer = LayerCache | BatchedMLACache | BatchedNgramCache
-"""What a layer of this family's cache can be — a solo cache, or one of the ragged adapters
-the batch path reads it through."""
+def _rows[CacheT: LayerCache](kind: type[CacheT], rows: Sequence[LayerCache]) -> list[CacheT]:
+    caches: list[CacheT] = []
+    for row in rows:
+        if not isinstance(row, kind):
+            raise TypeError(_MIXED.format(kind=type(row).__name__))
+        caches.append(row)
+    return caches

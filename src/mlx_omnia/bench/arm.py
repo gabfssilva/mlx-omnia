@@ -16,16 +16,13 @@ import time
 from collections.abc import Callable, Iterator, Sequence
 from dataclasses import dataclass
 from itertools import islice
-from typing import Protocol, runtime_checkable
+from typing import Protocol, SupportsInt, runtime_checkable
 
 from mlx_omnia.bench.sample import Sample
 
-
-class TokenId(Protocol):
-    """An id as whatever the engine yields. mlx hands back a scalar array; a pure-Python
-    loop hands back an `int`. Both convert, and only `stream` converts."""
-
-    def __int__(self) -> int: ...
+type TokenId = SupportsInt
+"""An id as whatever the engine yields. mlx hands back a scalar array; a pure-Python loop
+hands back an `int`. Both convert, and only `stream` converts."""
 
 
 type Generate = Callable[[Sequence[int], Sequence[int] | None, int], Iterator[int | TokenId]]
@@ -37,10 +34,14 @@ budget it was given, so a constrained arm asks for more than the cut it is measu
 
 @runtime_checkable
 class Arm(Protocol):
-    name: str
-    free: bool
-    """Whether this arm refuses a script. Speculation is the case: acceptance needs the
-    draft's own proposals, so the round cannot be pinned to someone else's stream."""
+    @property
+    def name(self) -> str: ...
+
+    @property
+    def free(self) -> bool:
+        """Whether this arm refuses a script. Speculation is the case: acceptance needs the
+        draft's own proposals, so the round cannot be pinned to someone else's stream."""
+        ...
 
     def stream(self, prompt: Sequence[int]) -> list[int]: ...
 
@@ -52,6 +53,8 @@ class NothingToTime(RuntimeError):
     first, so one id is a ttft and no rate at all."""
 
 
+# Structural and not `_Generated(Arm)`: a Protocol base is not slotted, and inheriting one
+# would give every instance back the `__dict__` that `slots=True` removes.
 @dataclass(frozen=True, slots=True)
 class _Generated:
     name: str

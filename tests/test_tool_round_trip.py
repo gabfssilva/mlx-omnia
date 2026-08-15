@@ -30,15 +30,23 @@ how a hole stops being visible.
 import json
 from itertools import pairwise
 from pathlib import Path
-from typing import Any
+from typing import TypedDict
 
 import pytest
 
 from mlx_omnia.engine.chat import Chat, ChatMessage, ChatTemplate
 from mlx_omnia.engine.parsers import Parser, Segmenter, ToolCall
 
+
+class FamilyEntry(TypedDict):
+    model_type: str
+    repo: str
+    template: str
+    special_tokens: dict[str, str]
+
+
 FIXTURE = Path(__file__).parent / "fixtures" / "tool_templates.json"
-FAMILIES: list[dict[str, Any]] = json.loads(FIXTURE.read_text(encoding="utf-8"))["families"]
+FAMILIES: list[FamilyEntry] = json.loads(FIXTURE.read_text(encoding="utf-8"))["families"]
 
 CASES = [pytest.param(entry, id=entry["model_type"]) for entry in FAMILIES]
 
@@ -87,7 +95,7 @@ CALLED: ChatMessage = {
 ANSWERED: ChatMessage = {"role": "tool", "content": "22 C, sunny", "tool_call_id": CALL_ID}
 
 
-def template_of(entry: dict[str, Any]) -> ChatTemplate:
+def template_of(entry: FamilyEntry) -> ChatTemplate:
     return ChatTemplate.from_source(entry["template"], entry["special_tokens"])
 
 
@@ -115,7 +123,7 @@ def written(template: ChatTemplate) -> str:
 
 
 @pytest.mark.parametrize("entry", CASES)
-def test_history_with_a_call_renders(entry: dict[str, Any]) -> None:
+def test_history_with_a_call_renders(entry: FamilyEntry) -> None:
     """The whole loop, rendered: the question, the call, and the result answering it.
 
     This is the turn a tool loop reaches second, and the one nothing rendered before this
@@ -126,7 +134,7 @@ def test_history_with_a_call_renders(entry: dict[str, Any]) -> None:
 
 
 @pytest.mark.parametrize("entry", CASES)
-def test_the_template_claims_a_dialect(entry: dict[str, Any]) -> None:
+def test_the_template_claims_a_dialect(entry: FamilyEntry) -> None:
     template = template_of(entry)
     parser = template.parser
     assert parser is not None, (
@@ -140,7 +148,7 @@ def test_the_template_claims_a_dialect(entry: dict[str, Any]) -> None:
 
 
 @pytest.mark.parametrize("entry", CASES)
-def test_the_template_replays_a_call(entry: dict[str, Any]) -> None:
+def test_the_template_replays_a_call(entry: FamilyEntry) -> None:
     """The turn that called something renders as something.
 
     Its own failure and not part of the round trip below, because the fix is somewhere else
@@ -160,7 +168,7 @@ def test_the_template_replays_a_call(entry: dict[str, Any]) -> None:
 
 
 @pytest.mark.parametrize("entry", CASES)
-def test_the_call_survives_the_round_trip(entry: dict[str, Any]) -> None:
+def test_the_call_survives_the_round_trip(entry: FamilyEntry) -> None:
     """Render, cut, segment, parse — and the same call comes back.
 
     Segmented rather than handed to `parse_tool_call` whole, because the segmenter is what
@@ -183,7 +191,7 @@ def test_the_call_survives_the_round_trip(entry: dict[str, Any]) -> None:
 
 
 @pytest.mark.parametrize("entry", CASES)
-def test_the_call_is_written_once(entry: dict[str, Any]) -> None:
+def test_the_call_is_written_once(entry: FamilyEntry) -> None:
     """Exactly one call comes out of a turn that made one.
 
     The families whose template has no `tool_calls` branch get the call written into their
@@ -243,7 +251,7 @@ def loop(template: ChatTemplate, rounds: int) -> list[str]:
 
 
 @pytest.mark.parametrize("entry", CASES)
-def test_a_tool_loop_only_ever_appends_to_its_prompt(entry: dict[str, Any]) -> None:
+def test_a_tool_loop_only_ever_appends_to_its_prompt(entry: FamilyEntry) -> None:
     """What the prefix cache needs, decided without a checkpoint: turn N's prompt is a prefix
     of turn N+1's.
 

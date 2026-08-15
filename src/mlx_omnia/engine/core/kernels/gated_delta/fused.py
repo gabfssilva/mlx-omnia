@@ -25,6 +25,7 @@ from typing import Self
 
 import mlx.core as mx
 
+from mlx_omnia.engine.core.kernels.gated_delta.kernel import GatedDeltaStrategy
 from mlx_omnia.engine.core.mxcompat import metal_kernel
 
 _SOURCE = """
@@ -282,7 +283,7 @@ def gated_delta(
 
 
 @dataclass(frozen=True)
-class FusedGatedDelta:
+class FusedGatedDelta(GatedDeltaStrategy):
     """The whole recurrence in one dispatch, for the shapes the kernel tiles."""
 
     @classmethod

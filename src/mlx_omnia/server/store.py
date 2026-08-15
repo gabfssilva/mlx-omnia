@@ -691,10 +691,6 @@ def _session_summary(row: tuple[object, ...]) -> SessionSummary:
     )
 
 
-def _optional_integer(value: object) -> int | None:
-    return None if value is None else _integer(value)
-
-
 def _benchmark_kind(value: object) -> BenchmarkKind:
     match _text(value):
         case "speed" | "fidelity" | "quality" as kind:

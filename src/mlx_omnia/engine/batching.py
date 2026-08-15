@@ -6,7 +6,7 @@ from typing import Protocol, runtime_checkable
 
 import mlx.core as mx
 
-from mlx_omnia.engine.core.attend import AttentionMask, KVStore, softcapped_attention
+from mlx_omnia.engine.core.attend import Attending, AttentionMask, KVStore, dense_attention
 from mlx_omnia.engine.core.cache import (
     ConvCache,
     DeltaCache,
@@ -21,6 +21,7 @@ from mlx_omnia.engine.core.cache import (
 from mlx_omnia.engine.core.decode import Buckets, SlotBucket
 from mlx_omnia.engine.core.prefill import BLOCK
 from mlx_omnia.engine.generate import (
+    BUDGET_WITH_GRAMMAR,
     BlockOutputs,
     Constraint,
     ConstraintConflict,
@@ -33,10 +34,10 @@ from mlx_omnia.engine.generate import (
 )
 from mlx_omnia.engine.speculative import (
     Proposer,
-    SpeculationRefused,
     Verifiable,
-    _rewinds,
-    _round,
+    one_round,
+    rewinds,
+    taps_refused,
 )
 
 __all__ = [
@@ -57,7 +58,9 @@ __all__ = [
 
 @runtime_checkable
 class RaggedAdapter(Protocol):
-    """The least a family-shipped batch adapter must answer: where each row stands."""
+    """The least a family-shipped batch adapter must answer: where each row stands.
+    `_adapt` dispatches on `RaggedBatchable`, not on this; what the adapter must satisfy
+    beyond `offset` is its own family's layer."""
 
     @property
     def offset(self) -> int | mx.array: ...
@@ -65,7 +68,9 @@ class RaggedAdapter(Protocol):
 
 type BatchedLayer = KVStore | BatchedDeltaCache | BatchedConvCache | RaggedAdapter
 """What a layer of a ragged batch can be: an attention adapter, one of the recurrent
-adapters a hybrid's mixer reads through `window`/`state`, or a family-shipped adapter."""
+adapters a hybrid's mixer reads through `window`/`state`, or a family-shipped adapter.
+To a checker the `RaggedAdapter` member widens this to "anything with an `offset`" — the
+alias documents intent; what each layer truly reads is enforced by the layer itself."""
 
 
 @runtime_checkable
@@ -78,7 +83,7 @@ class RaggedBatchable(Protocol):
     reads. It must refuse rows of another kind, the way `_adapt`'s own branches do.
     """
 
-    def batched(self, rows: Sequence["LayerCache"]) -> "BatchedLayer": ...
+    def batched(self, rows: Sequence[LayerCache]) -> BatchedLayer: ...
 
 
 @runtime_checkable
@@ -174,7 +179,7 @@ class BatchSequence:
     `pending` is the one id past it the cache has not seen, which is the round's gap."""
 
 
-class BatchedKVCache:
+class BatchedKVCache(Attending):
     """Present independent sequence caches as one ragged attention batch.
 
     Parameters
@@ -192,13 +197,32 @@ class BatchedKVCache:
 
     @property
     def offset(self) -> mx.array:
-        positions = [
-            cache.position
-            if isinstance(cache, (FixedKVCache, RingKVCache))
-            else mx.array([cache.offset], dtype=mx.int32)
-            for cache in self._caches
-        ]
+        positions: list[mx.array] = []
+        for cache in self._caches:
+            match cache:
+                case FixedKVCache() | RingKVCache():
+                    positions.append(cache.position)
+                case KVCache():
+                    positions.append(mx.array([cache.offset], dtype=mx.int32))
         return mx.concatenate(positions)
+
+    @property
+    def span(self) -> int:
+        """Columns a mask over these rows must cover — the longest row's key buffer.
+
+        A static int even when the rows' positions are traced arrays: buffer shapes do not
+        change inside a step, which is what lets `ragged_mask` build a band under
+        `mx.compile` without evaluating anything."""
+        spans: list[int] = []
+        for cache in self._caches:
+            match cache:
+                case FixedKVCache():
+                    spans.append(cache.state[0].shape[2])
+                case RingKVCache():
+                    spans.append(cache.window)
+                case KVCache():
+                    spans.append(cache.offset + 1)
+        return max(spans)
 
     @property
     def materialized_kv_bytes(self) -> int:
@@ -220,11 +244,7 @@ class BatchedKVCache:
             history_keys, history_values = cache.update_and_fetch(
                 keys[index : index + 1], values[index : index + 1]
             )
-            effective: AttentionMask = None if isinstance(mask, str) else mask
-            if isinstance(effective, mx.array):
-                if effective.shape[0] == len(self._caches):
-                    effective = effective[index : index + 1]
-                effective = effective[..., : history_keys.shape[2]]
+            effective = _row_mask(mask, index, len(self._caches), history_keys.shape[2])
             if isinstance(cache, (FixedKVCache, RingKVCache)):
                 valid = mx.arange(history_keys.shape[2]) < cache.position
                 valid = valid.reshape(1, 1, 1, -1)
@@ -234,7 +254,7 @@ class BatchedKVCache:
                     else valid & effective
                 )
             attended.append(
-                _row_attention(
+                dense_attention(
                     queries[index : index + 1],
                     history_keys,
                     history_values,
@@ -325,26 +345,7 @@ def _stack(parts: Sequence[mx.array | None]) -> mx.array | None:
     return mx.concatenate(filled)
 
 
-def _row_attention(
-    queries: mx.array,
-    keys: mx.array,
-    values: mx.array,
-    *,
-    scale: float,
-    mask: mx.array | None,
-    sinks: mx.array | None,
-    softcap: float | None,
-) -> mx.array:
-    if softcap is not None:
-        if sinks is not None:
-            raise ValueError("softcap and sinks do not compose; no family asks for both")
-        return softcapped_attention(queries, keys, values, scale=scale, cap=softcap, mask=mask)
-    return mx.fast.scaled_dot_product_attention(
-        queries, keys, values, scale=scale, mask=mask, sinks=sinks
-    )
-
-
-class BatchedLayerCache:
+class BatchedLayerCache(RaggedAdapter):
     """N stateless layers as one: nothing to stack, only offsets to keep in step.
 
     A bare `LayerCache` is what a family hands the layers that keep no state — an MLP-only
@@ -366,7 +367,7 @@ class BatchedLayerCache:
             cache.offset += advance
 
 
-class BatchedSharedKVReader:
+class BatchedSharedKVReader(Attending):
     """N `SharedKVReader`s as one attending layer.
 
     The single-sequence trunk republishes the writer's `fetch()` into each reader every
@@ -391,7 +392,7 @@ class BatchedSharedKVReader:
     def adopt(self, store: BatchedKVCache, length: int) -> None:
         for reader, writer in zip(self._caches, store.rows, strict=True):
             if not isinstance(writer, KVCache):
-                raise TypeError("a shared reader adopts growing rows; got " + type(writer).__name__)
+                raise TypeError(f"a shared reader adopts growing rows; got {type(writer).__name__}")
             reader.keys, reader.values = writer.fetch()
             reader.offset = writer.offset - length
 
@@ -411,18 +412,13 @@ class BatchedSharedKVReader:
             history_keys, history_values = cache.keys, cache.values
             if history_keys is None or history_values is None:
                 raise ValueError("a shared reader attended before its writer published")
-            effective: AttentionMask = None if isinstance(mask, str) else mask
-            if isinstance(effective, mx.array):
-                if effective.shape[0] == len(self._caches):
-                    effective = effective[index : index + 1]
-                effective = effective[..., : history_keys.shape[2]]
             attended.append(
-                _row_attention(
+                dense_attention(
                     queries[index : index + 1],
                     history_keys,
                     history_values,
                     scale=scale,
-                    mask=effective,
+                    mask=_row_mask(mask, index, len(self._caches), history_keys.shape[2]),
                     sinks=sinks,
                     softcap=softcap,
                 )
@@ -453,42 +449,48 @@ def _adapt(layers: tuple[LayerCache, ...]) -> BatchedLayer:
     head = layers[0]
     if isinstance(head, RaggedBatchable):
         return head.batched(layers)
-    if isinstance(head, SharedKVReader):
-        readers: list[SharedKVReader] = []
-        for layer in layers:
-            if not isinstance(layer, SharedKVReader):
-                raise TypeError(_MIXED.format(kind=type(layer).__name__))
-            readers.append(layer)
-        return BatchedSharedKVReader(readers)
-    if isinstance(head, (KVCache, FixedKVCache, RingKVCache)):
-        stores: list[KVCache | FixedKVCache | RingKVCache] = []
-        for layer in layers:
-            if not isinstance(layer, (KVCache, FixedKVCache, RingKVCache)):
-                raise TypeError(_MIXED.format(kind=type(layer).__name__))
-            stores.append(layer)
-        return BatchedKVCache(stores)
-    if isinstance(head, DeltaCache):
-        deltas: list[DeltaCache] = []
-        for layer in layers:
-            if not isinstance(layer, DeltaCache):
-                raise TypeError(_MIXED.format(kind=type(layer).__name__))
-            deltas.append(layer)
-        return BatchedDeltaCache(deltas)
-    if isinstance(head, ConvCache):
-        convs: list[ConvCache] = []
-        for layer in layers:
-            if not isinstance(layer, ConvCache) or isinstance(layer, DeltaCache):
-                raise TypeError(_MIXED.format(kind=type(layer).__name__))
-            convs.append(layer)
-        return BatchedConvCache(convs)
-    if type(head) is LayerCache:
-        stateless: list[LayerCache] = []
-        for layer in layers:
-            if type(layer) is not LayerCache:
-                raise TypeError(_MIXED.format(kind=type(layer).__name__))
-            stateless.append(layer)
-        return BatchedLayerCache(stateless)
-    raise TypeError(f"{type(head).__name__} has no ragged batch adapter")
+    match head:
+        case SharedKVReader():
+            return BatchedSharedKVReader(_uniform(layers, SharedKVReader))
+        case KVCache() | FixedKVCache() | RingKVCache():
+            return BatchedKVCache(_uniform(layers, (KVCache, FixedKVCache, RingKVCache)))
+        case DeltaCache():
+            return BatchedDeltaCache(_uniform(layers, DeltaCache))
+        case ConvCache():
+            convs = _uniform(layers, ConvCache)
+            for conv in convs:
+                if isinstance(conv, DeltaCache):
+                    raise TypeError(_MIXED.format(kind=type(conv).__name__))
+            return BatchedConvCache(convs)
+        case LayerCache() if type(head) is LayerCache:
+            stateless = _uniform(layers, LayerCache)
+            for layer in stateless:
+                if type(layer) is not LayerCache:
+                    raise TypeError(_MIXED.format(kind=type(layer).__name__))
+            return BatchedLayerCache(stateless)
+        case _:
+            raise TypeError(f"{type(head).__name__} has no ragged batch adapter")
+
+
+def _uniform[T](
+    layers: tuple[LayerCache, ...], kind: type[T] | tuple[type[T], ...]
+) -> list[T]:
+    rows: list[T] = []
+    for layer in layers:
+        if not isinstance(layer, kind):
+            raise TypeError(_MIXED.format(kind=type(layer).__name__))
+        rows.append(layer)
+    return rows
+
+
+def _row_mask(mask: AttentionMask, index: int, count: int, span: int) -> mx.array | None:
+    """One row's slice of the batch mask, cut to the row's own history span. The string
+    forms are batch-wide claims that do not survive ragged rows — the adapters rebuild
+    what they meant per row, so here they narrow to `None`."""
+    if mask is None or isinstance(mask, str):
+        return None
+    sliced = mask[index : index + 1] if mask.shape[0] == count else mask
+    return sliced[..., :span]
 
 
 _MIXED = "a batched layer mixes {kind} with another cache kind"
@@ -576,7 +578,7 @@ def _dead_row(
         fresh = model.make_cache()
         model(mx.array([[0]]), fresh)
         mx.eval(*(tensor for layer in fresh for tensor in layer.tensors))
-        dead = [*fresh]
+        dead = list[KVCache | FixedKVCache | RingKVCache](fresh)
         state.dead[key] = dead
     return dead
 
@@ -636,7 +638,7 @@ class BatchPrefill:
 
     model: BatchModel
     prompt: Sequence[int]
-    cache: list[KVCache]
+    cache: SequenceCache
     at: int
     reused: int
     max_tokens: int
@@ -655,10 +657,7 @@ class BatchPrefill:
         if self.reasoning is not None and self.constraint is not None:
             # The same refusal `stream_ids` raises, and for the same reason: the closer is fed
             # past the mask the matcher is advanced under.
-            raise ConstraintConflict(
-                "a reasoning budget and a grammar do not compose: the forced closer bypasses "
-                "the mask the matcher is advanced under"
-            )
+            raise ConstraintConflict(BUDGET_WITH_GRAMMAR)
         self.history = mx.array(self.prompt)
         self._remaining = self.history[None, self.reused :]
 
@@ -669,10 +668,7 @@ class BatchPrefill:
         if proposer is None or not proposer.taps:
             return self.model(ids, self.cache)
         if not isinstance(self.model, BlockOutputs):
-            raise SpeculationRefused(
-                f"this draft conditions on the target's blocks {list(proposer.taps)} and the "
-                "target has no `block_outputs`: what it would read instead is nothing at all"
-            )
+            raise taps_refused(proposer.taps)
         logits, features = self.model.block_outputs(ids, self.cache, at=proposer.taps)
         proposer.absorb(features)
         return logits
@@ -730,7 +726,7 @@ def prepare_batch_sequence(
     meter: Meter | None = None,
     reasoning: ReasoningBudget | None = None,
     proposer: Proposer | None = None,
-    cache: list[KVCache] | None = None,
+    cache: SequenceCache | None = None,
     reused: int = 0,
 ) -> BatchSequence:
     """Prefill one prompt and return its first pending sampled token.
@@ -766,17 +762,17 @@ def prepare_batch_sequence(
     prefill = BatchPrefill(
         model,
         prompt,
-        model.make_cache() if cache is None else cache,
-        0,
-        reused,
-        max_tokens,
-        sampler,
-        stop,
-        penalty,
-        constraint,
-        meter,
-        reasoning,
-        proposer,
+        list[KVCache | FixedKVCache | RingKVCache](model.make_cache()) if cache is None else cache,
+        at=0,
+        reused=reused,
+        max_tokens=max_tokens,
+        sampler=sampler,
+        stop=stop,
+        penalty=penalty,
+        constraint=constraint,
+        meter=meter,
+        reasoning=reasoning,
+        proposer=proposer,
     )
     while (sequence := prefill.advance()) is None:
         pass
@@ -827,17 +823,14 @@ def _speculative_tick(model: BatchModel, sequence: BatchSequence) -> list[int]:
     proposer = sequence.proposer
     assert proposer is not None, "only a drafting slot reaches the round"
     cache = sequence.cache
-    replays = _rewinds(cache, "target")
+    replays = rewinds(cache, "target")
     taps = proposer.taps
 
     def forward(ids: mx.array) -> tuple[mx.array, mx.array | None]:
         if not taps:
             return model(ids, cache), None
         if not isinstance(model, BlockOutputs):
-            raise SpeculationRefused(
-                f"this draft conditions on the target's blocks {list(taps)} and the target "
-                "has no `block_outputs`: what it would read instead is nothing at all"
-            )
+            raise taps_refused(taps)
         return model.block_outputs(ids, cache, at=taps)
 
     def verify(
@@ -849,7 +842,7 @@ def _speculative_tick(model: BatchModel, sequence: BatchSequence) -> list[int]:
         return logits, features, None
 
     gap = _int(sequence.pending)
-    settled, accepted = _round(
+    settled, accepted = one_round(
         verify, forward, proposer, cache, [*sequence.tokens, gap], replays
     )
     if sequence.meter is not None:
@@ -903,7 +896,7 @@ def _shared_step(model: BatchModel, sequences: Sequence[BatchSequence]) -> list[
     drawn_ids = tuple(sequence.pending for sequence in sequences)
     ids = drawn_ids[0][None, None] if count == 1 else mx.stack(drawn_ids)[:, None]
     caches = [sequence.cache for sequence in sequences]
-    bucketed = 2 <= count <= 8
+    bucketed = 2 <= count <= _BUCKET_SIZES[-1]
     unfiltered_greedy = all(
         sequence.sampler is greedy
         and sequence.penalty is None
@@ -912,13 +905,10 @@ def _shared_step(model: BatchModel, sequences: Sequence[BatchSequence]) -> list[
     )
     prepared_single: Callable[[mx.array], mx.array] | None = None
     if count == 1 and unfiltered_greedy:
+        # A reusable prepared step already returned above; reaching here means there is
+        # none for this cache, so prepare one.
         sequence = sequences[0]
-        if sequence.single_greedy is not None and all(
-            source is target
-            for source, target in zip(sequence.cache, sequence.single_slots, strict=True)
-        ):
-            prepared_single = sequence.single_greedy
-        elif isinstance(model, PreparedSingleGreedyDecoder):
+        if isinstance(model, PreparedSingleGreedyDecoder):
             prepared_single = model.prepare_single_greedy(
                 sequence.cache, capacity=sequence.capacity
             )
@@ -975,6 +965,7 @@ def _shared_step(model: BatchModel, sequences: Sequence[BatchSequence]) -> list[
         if generic is not None:
             for sequence in sequences:
                 sequence.capacity = room
+    following: list[mx.array] = []
     if prepared_single is not None:
         following = [prepared_single(ids[0])]
         logits = None

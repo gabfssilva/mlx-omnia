@@ -15,7 +15,6 @@ import asyncio
 import json
 import shutil
 import threading
-import time
 from collections.abc import Callable, Iterator, Mapping
 from dataclasses import dataclass, field
 from pathlib import Path
@@ -29,6 +28,7 @@ from huggingface_hub import ModelInfo
 
 from mlx_omnia.server import catalog, download, jobs, quantize
 from mlx_omnia.server.store import Store
+from tests.server.polling import progress, view, wait_for
 
 REPO = "mlx-community/Qwen3-0.6B-4bit"
 TINY = "hf-internal-testing/tiny-random-gpt2"
@@ -217,36 +217,6 @@ def start(client: TestClient, **body: str) -> str:
     job_id = response.json()["id"]
     assert isinstance(job_id, str)
     return job_id
-
-
-def view(client: TestClient, job_id: str) -> dict[str, object]:
-    response = client.get(f"/admin/jobs/{job_id}")
-    assert response.status_code == 200, response.text
-    payload = response.json()
-    assert isinstance(payload, dict)
-    return payload
-
-
-def wait_for(
-    client: TestClient, job_id: str, state: str, seconds: float = _DEADLINE
-) -> dict[str, object]:
-    deadline = time.monotonic() + seconds
-    while True:
-        current = view(client, job_id)
-        if current["state"] == state:
-            return current
-        assert time.monotonic() < deadline, (
-            f"job stayed in {current['state']!r} ({current['error']!r}), wanted {state!r}"
-        )
-        time.sleep(0.01)
-
-
-def progress(current: Mapping[str, object]) -> tuple[float, float]:
-    frame = current["progress"]
-    assert isinstance(frame, dict)
-    completed, total = frame["completed"], frame["total"]
-    assert isinstance(completed, int | float) and isinstance(total, int | float)
-    return completed, total
 
 
 def repositories(root: Path) -> list[Path]:

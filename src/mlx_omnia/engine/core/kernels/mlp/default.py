@@ -13,12 +13,12 @@ from typing import Self
 
 import mlx.core as mx
 
-from mlx_omnia.engine.core.kernels.mlp.kernel import Activation
+from mlx_omnia.engine.core.kernels.mlp.kernel import Activation, MlpStrategy
 from mlx_omnia.engine.core.layers import SwiGLU
 
 
 @dataclass(frozen=True)
-class DefaultMlp:
+class DefaultMlp(MlpStrategy):
     leaf: SwiGLU
 
     @classmethod

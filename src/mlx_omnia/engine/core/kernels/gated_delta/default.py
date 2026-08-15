@@ -18,6 +18,8 @@ from typing import Self
 
 import mlx.core as mx
 
+from mlx_omnia.engine.core.kernels.gated_delta.kernel import GatedDeltaStrategy
+
 
 def _recurrence(
     q32: mx.array,
@@ -62,7 +64,7 @@ def delta_rule(
 
 
 @dataclass(frozen=True)
-class DefaultGatedDelta:
+class DefaultGatedDelta(GatedDeltaStrategy):
     ratio: int
 
     @classmethod

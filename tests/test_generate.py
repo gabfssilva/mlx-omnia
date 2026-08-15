@@ -9,7 +9,7 @@ from huggingface_hub import hf_hub_download, snapshot_download
 from mlx_omnia import GPT2, GPT2Tokenizer, KVCache, sampler, stream_generate, stream_ids, top_k
 from mlx_omnia.engine.core.cache import DeltaCache, LayerCache, RingKVCache
 from mlx_omnia.engine.core.prompt_cache import PromptCache
-from mlx_omnia.engine.generate import Meter, _boundary
+from mlx_omnia.engine.generate import CausalLM, Constraint, Meter, _boundary
 from mlx_omnia.engine.models.gpt2 import CHECKPOINT
 from mlx_omnia.engine.speculative import SpeculationRefused
 from tests.conftest import load_golden, relative_diff
@@ -121,7 +121,7 @@ def test_streaming_detokenizer_holds_partial_utf8(tokenizer: GPT2Tokenizer) -> N
     assert "�" not in "".join(pieces)
 
 
-class ScriptedLM:
+class ScriptedLM(CausalLM[KVCache]):
     """Emits a fixed id sequence, one per step, so no checkpoint is needed."""
 
     def __init__(self, ids: list[int], vocab: int) -> None:
@@ -242,7 +242,7 @@ def test_a_promotion_leaves_the_trie_the_prompt_and_the_growing_layers() -> None
     assert all(layer.is_trimmable for layer in reuse.caches)
 
 
-class PartiallyPromotingLM:
+class PartiallyPromotingLM(CausalLM[KVCache]):
     """Two growing layers, rows written on every forward, and a compile that replaces only
     the first: the second stays live in `cache` and takes the decode's rows, which is the
     case the insert's trim exists for."""
@@ -362,7 +362,7 @@ CONVERSATION = "The quick brown fox jumps over the lazy dog. " * 60
 NEXT_TURN = " And then?"
 
 
-class Recording:
+class Recording(CausalLM[KVCache]):
     """The model with a tape: how many rows each forward was fed, and the row of logits the
     sampler read from it.
 
@@ -394,7 +394,7 @@ def _from_offset(offset: int, length: int) -> mx.array:
     return mx.broadcast_to(row, (1, length, 8))
 
 
-class RecurrentLM:
+class RecurrentLM(CausalLM[DeltaCache]):
     """A trunk whose layer keeps a recurrent state. It answers like any other: what the
     refusal is about is the reuse, not the request."""
 
@@ -412,7 +412,7 @@ class RecurrentLM:
         return _from_offset(cache[0].offset, ids.shape[1])
 
 
-class MixedLM:
+class MixedLM(CausalLM[LayerCache]):
     """The shape of a hybrid trunk: layers that keep a rewindable KV next to one that keeps
     a recurrent state. What the trie is allowed to do is a property of the list, and the
     homogeneous fakes above never produce a mixed one."""
@@ -686,7 +686,7 @@ def test_speculation_and_prefix_reuse_are_refused_together() -> None:
         list(stream_ids(scripted, [0], max_tokens=2, draft=scripted, prefix=trie))
 
 
-class Recorded:
+class Recorded(Constraint):
     """A constraint that forbids nothing and writes down the order it was called in."""
 
     def __init__(self) -> None:
@@ -701,7 +701,7 @@ class Recorded:
         return True
 
 
-class Only:
+class Only(Constraint):
     """A constraint that leaves exactly one id standing."""
 
     def __init__(self, keep: int) -> None:
@@ -764,7 +764,7 @@ def test_speculation_and_a_grammar_are_refused_together() -> None:
         list(stream_ids(scripted, [0], max_tokens=2, draft=scripted, constraint=Recorded()))
 
 
-class UnkeepableLM:
+class UnkeepableLM(CausalLM[LayerCache]):
     """A trunk whose layer neither rewinds nor serializes — `RingKVCache` and the composite
     Falcon-H1 kept before it declared `is_storable`. Nothing about the request fails; the
     conversation is simply never kept."""
@@ -797,7 +797,7 @@ def test_the_meter_tells_the_three_zeros_apart() -> None:
     assert (unkeepable.reused_tokens, unkeepable.kept_prefix) == (0, False)
 
 
-class PromotedLM:
+class PromotedLM(CausalLM[LayerCache]):
     """A trunk whose live cache is a promoted ring while `make_cache` still builds a growing
     one — what a compiled decode leaves behind. Both halves are storable and neither rewinds,
     so nothing but the signature stands between them."""
@@ -809,11 +809,8 @@ class PromotedLM:
         assert cache is not None
         layer = cache[0]
         rows = mx.zeros((1, 1, ids.shape[1], 4))
-        if isinstance(layer, RingKVCache):
-            layer.update_and_fetch(rows, rows)
-        else:
-            assert isinstance(layer, KVCache)
-            layer.update_and_fetch(rows, rows)
+        assert isinstance(layer, RingKVCache | KVCache)
+        layer.update_and_fetch(rows, rows)
         return _from_offset(layer.offset, ids.shape[1])
 
 

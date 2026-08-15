@@ -31,16 +31,16 @@ from importlib.metadata import version
 from typing import Annotated, Literal
 
 import mlx.core as mx
-from fastapi import APIRouter, Depends, HTTPException, Request
+from fastapi import APIRouter, HTTPException
 from fastapi.responses import JSONResponse, StreamingResponse
 from pydantic import BaseModel, ConfigDict, Field
 
 from mlx_omnia.server import catalog, speed
 from mlx_omnia.server.config import current
+from mlx_omnia.server.deps import EngineDep, StoreDep
 from mlx_omnia.server.engine import Engine
 from mlx_omnia.server.jobs import Benchmark as BenchmarkJob
 from mlx_omnia.server.jobs import Cancelled, Job, JobsDep, Progress, Work, accepted
-from mlx_omnia.server.profiles import StoreDep
 from mlx_omnia.server.speed import ModelFacts, Refusal, SpeedShape
 from mlx_omnia.server.store import (
     BenchmarkKind,
@@ -408,14 +408,6 @@ def _budget(store: Store) -> int:
     the same shapes."""
     return current(store).memory_limit_bytes
 
-
-def _engine(request: Request) -> Engine:
-    engine = request.app.state.engine
-    assert isinstance(engine, Engine)
-    return engine
-
-
-EngineDep = Annotated[Engine, Depends(_engine)]
 
 router = APIRouter()
 

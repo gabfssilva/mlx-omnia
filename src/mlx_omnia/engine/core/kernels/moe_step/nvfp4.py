@@ -10,11 +10,13 @@ accumulates in fp32 expert order, casts once, and adds the shared row in T.
 """
 
 from dataclasses import dataclass
-from typing import Self
+from typing import Self, TypeGuard
 
 import mlx.core as mx
+import mlx.nn as nn
 
 from mlx_omnia.engine.core.kernels.moe_step.default import SharedPair
+from mlx_omnia.engine.core.kernels.moe_step.kernel import MoeStepStrategy
 from mlx_omnia.engine.core.kernels.shared.nvfp4.qmoe import HEADER, applies
 from mlx_omnia.engine.core.layers import QuantizedSwitchLinear, SwitchLinear
 from mlx_omnia.engine.core.mxcompat import metal_kernel
@@ -286,9 +288,7 @@ def _ceil16(rows: int) -> int:
     return (rows + 15) // 16
 
 
-def _nvfp4_linear(leaf: object) -> bool:
-    import mlx.nn as nn
-
+def _nvfp4_linear(leaf: object) -> TypeGuard[nn.QuantizedLinear]:
     return (
         isinstance(leaf, nn.QuantizedLinear)
         and leaf.mode == "nvfp4"
@@ -297,7 +297,7 @@ def _nvfp4_linear(leaf: object) -> bool:
 
 
 @dataclass(frozen=True)
-class Nvfp4MoeStep:
+class Nvfp4MoeStep(MoeStepStrategy):
     fc1: QuantizedSwitchLinear
     fc2: QuantizedSwitchLinear
     hidden: int
@@ -331,9 +331,6 @@ class Nvfp4MoeStep:
         up, down = shared
         if not (_nvfp4_linear(up) and _nvfp4_linear(down)):
             return None
-        import mlx.nn as nn
-
-        assert isinstance(up, nn.QuantizedLinear) and isinstance(down, nn.QuantizedLinear)
         shared_inner = up.weight.shape[0]
         if not (applies(hidden, shared_inner) and applies(shared_inner, hidden)):
             return None

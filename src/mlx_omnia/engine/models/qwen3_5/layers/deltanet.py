@@ -70,6 +70,10 @@ class Qwen35DeltaNet(nn.Module):
         self._rule: GatedDeltaStrategy | None = None
         self._rule_key: tuple[object, ...] | None = None
 
+    def unresolve(self) -> None:
+        """Back to unresolved, so the next call rebuilds outside the trace that reads it."""
+        self._rule = None
+
     def rule(self) -> GatedDeltaStrategy:
         """Resolved once, at the first step — after load, when the shapes are final.
 

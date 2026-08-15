@@ -4,7 +4,7 @@ from typing import NamedTuple
 import mlx.core as mx
 import mlx.nn as nn
 
-from mlx_omnia.engine.batching import batch
+from mlx_omnia.engine.batching import BatchedKVCache, batch
 from mlx_omnia.engine.checkpoint import wire_resident
 from mlx_omnia.engine.core.attend import KVStore
 from mlx_omnia.engine.core.cache import FixedKVCache, KVCache, LayerCache, RingKVCache, fit
@@ -18,11 +18,9 @@ from mlx_omnia.engine.core.kernels.lm_head.argmax import (
 )
 from mlx_omnia.engine.core.patch import uses
 from mlx_omnia.engine.models.laguna.config import FULL, SLIDING, LagunaConfig
-from mlx_omnia.engine.models.laguna.layers.attention import _ATLASES
+from mlx_omnia.engine.models.laguna.layers.attention import ATLASES
 from mlx_omnia.engine.models.laguna.layers.block import LagunaTrunk
 from mlx_omnia.engine.models.laguna.layers.moe import LagunaSparseMoe
-
-_LM_HEAD_PLANES: dict[int, tuple[mx.array, mx.array, mx.array]] = {}
 
 
 class LagunaActivations(NamedTuple):
@@ -59,6 +57,15 @@ def _stores(slots: Sequence[LayerCache]) -> list[FixedKVCache | RingKVCache]:
     return narrowed
 
 
+def _batched(slots: Sequence[Sequence[FixedKVCache | RingKVCache]]) -> list[BatchedKVCache]:
+    """Every Laguna layer is a KV layer, so every adapter `batch` builds is a KV one."""
+    adapters: list[BatchedKVCache] = []
+    for layer in batch(slots):
+        assert isinstance(layer, BatchedKVCache)
+        adapters.append(layer)
+    return adapters
+
+
 @uses(SCALED_DOT_PRODUCT_ATTENTION)
 class Laguna(nn.Module):
     continuous_batching = True
@@ -67,6 +74,7 @@ class Laguna(nn.Module):
     _batch_buckets: Buckets
     _single_live: dict[str, tuple[LayerCache, ...]]
     _batch_dead: dict[tuple[str, int, int, int], list[LagunaCache]]
+    _head_planes_cache: Int5Planes | None
 
     def __init__(self, config: LagunaConfig) -> None:
         super().__init__()
@@ -74,6 +82,7 @@ class Laguna(nn.Module):
         object.__setattr__(self, "_batch_buckets", Buckets())
         object.__setattr__(self, "_single_live", {})
         object.__setattr__(self, "_batch_dead", {})
+        object.__setattr__(self, "_head_planes_cache", None)
         self.config = config
         self.model = LagunaTrunk(config)
         if not config.tie_word_embeddings:
@@ -82,11 +91,10 @@ class Laguna(nn.Module):
     def make_cache(self) -> list[KVCache | RingKVCache]:
         """Sliding layers get a fixed ring: constant shape per step is what lets the fused
         sliding reader own the append, and what keeps the decode graph from being rebuilt
-        around a growing slice."""
-        window = self.config.sliding_window
-        # Held back with the fused sliding reader: correct only once the reader owns the
-        # append, and the per-step slice writes here cost more than the growing cache.
-        del window
+        around a growing slice.
+
+        Held back with the fused sliding reader: correct only once the reader owns the
+        append, and the per-step slice writes here cost more than the growing cache."""
         return [KVCache() for _ in self.config.layer_types]
 
     def compile_decode(
@@ -206,7 +214,7 @@ class Laguna(nn.Module):
         mask reads that position, so the row attends its own stale state and the decode
         drops the result."""
         key = (mode, size, capacity, row)
-        dead = self._batch_dead.get(key)
+        dead: list[LagunaCache] | None = self._batch_dead.get(key)
         if dead is None:
             dead = [*self.make_cache()]
             self._activations(mx.array([[0]]), dead, project_head=False)
@@ -231,18 +239,13 @@ class Laguna(nn.Module):
                 f"prompt length {max(offsets)} does not fit compiled capacity {capacity}"
             )
         slots = self._make_batch_slots(caches, capacity)
-        stores = batch(slots)
-        state = [
-            layer.state
-            for sequence in slots
-            for layer in sequence
-            if isinstance(layer, (FixedKVCache, RingKVCache))
-        ]
+        stores = _batched(slots)
+        state = [layer.state for sequence in slots for layer in sequence]
 
         for block in self.model.layers:
-            block.self_attn._angles(max(offsets))
-            block.self_attn._kernels()
-            block._kernels()
+            block.self_attn.angles(max(offsets))
+            block.self_attn.kernels()
+            block.kernels()
             if isinstance(block.mlp, LagunaSparseMoe):
                 block.mlp.step_applies()
         wire_resident()
@@ -262,7 +265,7 @@ class Laguna(nn.Module):
 
         return SlotBucket(
             tuple(tuple(slot) for slot in slots),
-            mx.compile(forward, inputs=[_ATLASES, state], outputs=state),
+            mx.compile(forward, inputs=[ATLASES, state], outputs=state),
         )
 
     def _make_batch_slots(
@@ -375,9 +378,9 @@ class Laguna(nn.Module):
 
         def prepare(slots: Sequence[LayerCache]) -> None:
             for layer, layer_cache in zip(self.model.layers, _stores(slots), strict=True):
-                layer.self_attn._angles(slots[0].rows)
-                layer.self_attn._prepare_decode(layer_cache)
-                layer._kernels()
+                layer.self_attn.angles(slots[0].rows)
+                layer.self_attn.prepare_decode(layer_cache)
+                layer.kernels()
                 if isinstance(layer.mlp, LagunaSparseMoe):
                     layer.mlp.step_applies()
             wire_resident()
@@ -394,7 +397,7 @@ class Laguna(nn.Module):
             step=step,
             promote=promote,
             prepare=prepare,
-            captures=lambda: [_ATLASES],
+            captures=lambda: [ATLASES],
         )
         layers: list[LayerCache] = [*cache]
         compiled = compiled_decode(plan, layers, capacity)
@@ -457,17 +460,17 @@ class Laguna(nn.Module):
     def _head_planes(self) -> Int5Planes | None:
         if self.config.tie_word_embeddings:
             return None
+        cached = self._head_planes_cache
+        if cached is not None:
+            return cached
         weight = self.lm_head.weight
         vocab, hidden = weight.shape
         if not lm_head_argmax_applies(vocab, hidden, rows=1, dtype=weight.dtype):
             return None
-        key = id(weight)
-        if cached := _LM_HEAD_PLANES.get(key):
-            return Int5Planes(*cached)
         planes = int5_planes(weight)
         if planes is not None:
             mx.eval(*planes)
-            _LM_HEAD_PLANES[key] = tuple(planes)
+            object.__setattr__(self, "_head_planes_cache", planes)
         return planes
 
     def _greedy_logits(self, x: mx.array, planes: Int5Planes | None = None) -> mx.array:
@@ -502,7 +505,7 @@ class Laguna(nn.Module):
         — and at T=1 the single row is causal by construction, leaving `columns >
         offset - window`."""
         window = self.config.sliding_window
-        if isinstance(offset, mx.array):
+        if not isinstance(offset, int):
             keys = int(mx.max(offset).item()) + length
             columns = mx.arange(keys)[None, None, None, :]
             rows = offset[:, None] + mx.arange(length)[None, :]

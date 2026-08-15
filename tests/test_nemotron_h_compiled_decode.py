@@ -15,7 +15,8 @@ import pytest
 import mlx_omnia.engine.models.nemotron_h.model as model_module
 from mlx_omnia.engine.core.cache import FixedDeltaCache, FixedKVCache
 from mlx_omnia.engine.models.nemotron_h.model import NemotronH
-from tests.test_nemotron_h_mtp import PROMPT, _config, _spread
+from tests.conftest import relative_diff
+from tests.test_nemotron_h_mtp import PROMPT, config_of, spread
 
 TOKENS = [0, 1, 2, 3, 2, 1, 0, 3]
 
@@ -23,16 +24,10 @@ TOKENS = [0, 1, 2, 3, 2, 1, 0, 3]
 @pytest.fixture
 def model() -> NemotronH:
     mx.random.seed(11)
-    built = NemotronH(_config("M*EM*E-"))
-    _spread(built)
+    built = NemotronH(config_of("M*EM*E-"))
+    spread(built)
     mx.eval(built.parameters())
     return built
-
-
-def _relative(a: mx.array, b: mx.array) -> float:
-    diff = (mx.abs(a - b).max() / mx.abs(b).max()).item()
-    assert isinstance(diff, float)
-    return diff
 
 
 def test_compiled_decode_matches_stepwise(model: NemotronH) -> None:
@@ -48,7 +43,7 @@ def test_compiled_decode_matches_stepwise(model: NemotronH) -> None:
     produced = [decode(mx.array([token])) for token in TOKENS]
 
     for row, wanted in zip(produced, expected, strict=True):
-        assert _relative(row, wanted) < 1e-5
+        assert relative_diff(row, wanted) < 1e-5
 
 
 def test_compiled_decode_promotes_and_counts(model: NemotronH) -> None:
@@ -88,7 +83,7 @@ def test_compiled_decode_regrows_past_capacity(model: NemotronH) -> None:
     produced = [decode(mx.array([token])) for token in tokens]
 
     for row, wanted in zip(produced, expected, strict=True):
-        assert _relative(row, wanted) < 1e-5
+        assert relative_diff(row, wanted) < 1e-5
 
 
 def test_compiled_verify_regrows_past_capacity(monkeypatch: pytest.MonkeyPatch) -> None:
@@ -97,9 +92,9 @@ def test_compiled_verify_regrows_past_capacity(monkeypatch: pytest.MonkeyPatch) 
     without the regrow, rows past the initial capacity fall off the buffer and the model
     degenerates a few hundred tokens in."""
     mx.random.seed(11)
-    config = dataclasses.replace(_config("M*EM*E-"), ssm_state_size=32)
+    config = dataclasses.replace(config_of("M*EM*E-"), ssm_state_size=32)
     model = NemotronH(config)
-    _spread(model)
+    spread(model)
     mx.eval(model.parameters())
 
     monkeypatch.setattr(model_module, "fit", lambda offset: (offset + 8 + 7) // 8 * 8)
@@ -115,7 +110,7 @@ def test_compiled_verify_regrows_past_capacity(monkeypatch: pytest.MonkeyPatch) 
         drafted = [(round_index + shift) % 4 for shift in (1, 2)]
         logits, _ = verify(mx.array([committed[-1], *drafted]))
         reference = model(mx.array(committed + drafted)[None])[0, -3:]
-        assert _relative(logits, reference) < 1e-5
+        assert relative_diff(logits, reference) < 1e-5
         accepted = 2 if round_index % 2 == 0 else 0
         if accepted < 2:
             rewind(1 + accepted)

@@ -202,12 +202,13 @@ class KVCache(LayerCache):
 
     def update_and_fetch(self, keys: mx.array, values: mx.array) -> tuple[mx.array, mx.array]:
         needed = self.offset + keys.shape[2]
-        self._keys = _reserving(self._keys, needed, keys)
-        self._values = _reserving(self._values, needed, values)
-        self._keys[..., self.offset : needed, :] = keys
-        self._values[..., self.offset : needed, :] = values
+        key_buffer = reserve(self._keys, needed, keys)
+        value_buffer = reserve(self._values, needed, values)
+        key_buffer[..., self.offset : needed, :] = keys
+        value_buffer[..., self.offset : needed, :] = values
+        self._keys, self._values = key_buffer, value_buffer
         self.offset = needed
-        return self._keys[..., :needed, :], self._values[..., :needed, :]
+        return key_buffer[..., :needed, :], value_buffer[..., :needed, :]
 
     @property
     def is_trimmable(self) -> bool:
@@ -228,7 +229,7 @@ class KVCache(LayerCache):
         return True
 
     def stored(self) -> dict[str, mx.array]:
-        """The rows in use, not the buffers. `_reserving` rounds up to the 256-row block, so
+        """The rows in use, not the buffers. `reserve` rounds up to the 256-row block, so
         writing them whole would put up to 255 rows of zero per layer in the file — and read
         them back as state the model never wrote."""
         if self._keys is None or self._values is None:
@@ -240,7 +241,7 @@ class KVCache(LayerCache):
 
     def restore(self, offset: int, tensors: Mapping[str, mx.array]) -> None:
         """The buffers come back exactly `offset` long rather than block-padded, which
-        `_reserving` handles the way it handles any buffer too small for what is coming."""
+        `reserve` handles the way it handles any buffer too small for what is coming."""
         self.offset = offset
         self._keys = tensors.get("keys")
         self._values = tensors.get("values")
@@ -426,7 +427,9 @@ class FixedDeltaCache(DeltaCache):
 _BLOCK = 256
 
 
-def _reserving(buffer: mx.array | None, needed: int, like: mx.array) -> mx.array:
+def reserve(buffer: mx.array | None, needed: int, like: mx.array) -> mx.array:
+    """The block-grown buffer resizer ``KVCache`` writes through, and the entry caches
+    defined outside this module (e.g. a latent KV cache) grow the same way with."""
     if buffer is not None and buffer.shape[2] >= needed:
         return buffer
     capacity = (needed + _BLOCK - 1) // _BLOCK * _BLOCK
@@ -436,12 +439,6 @@ def _reserving(buffer: mx.array | None, needed: int, like: mx.array) -> mx.array
     if buffer is not None:
         grown[..., : buffer.shape[2], :] = buffer
     return grown
-
-
-def reserve(buffer: mx.array | None, needed: int, like: mx.array) -> mx.array:
-    """Public entry to the block-grown buffer resizer, for caches defined outside
-    this module (e.g. a latent KV cache) that grow the same way ``KVCache`` does."""
-    return _reserving(buffer, needed, like)
 
 
 class SharedKVReader(LayerCache):
@@ -504,19 +501,20 @@ class RingKVCache(LayerCache):
         ring = cls(window)
         shape = list(source_keys.shape)
         shape[2] = window
-        ring._keys = mx.zeros(shape, dtype=source_keys.dtype)
-        ring._values = mx.zeros(shape, dtype=source_values.dtype)
+        ring_keys = mx.zeros(shape, dtype=source_keys.dtype)
+        ring_values = mx.zeros(shape, dtype=source_values.dtype)
         count = min(cache.offset, window)
         start = cache.offset - count
         for absolute in range(start, cache.offset):
             target = absolute % window
-            ring._keys[..., target : target + 1, :] = source_keys[..., absolute : absolute + 1, :]
-            ring._values[..., target : target + 1, :] = source_values[
+            ring_keys[..., target : target + 1, :] = source_keys[..., absolute : absolute + 1, :]
+            ring_values[..., target : target + 1, :] = source_values[
                 ..., absolute : absolute + 1, :
             ]
-        mx.eval(ring._keys, ring._values)
+        mx.eval(ring_keys, ring_values)
+        ring._keys, ring._values = ring_keys, ring_values
         ring.offset = cache.offset
-        ring.state = [ring._keys, ring._values, mx.array([cache.offset], dtype=mx.int32)]
+        ring.state = [ring_keys, ring_values, mx.array([cache.offset], dtype=mx.int32)]
         return ring
 
     @property
@@ -530,12 +528,6 @@ class RingKVCache(LayerCache):
         if self.state is None:
             return self.offset % self.window
         return self.position % self.window
-
-    @property
-    def populated(self) -> bool:
-        """Every row of the window holds a real key: what the fused reader assumes, since
-        it attends the whole ring without a mask."""
-        return self._keys is not None and self.offset >= self.window
 
     def advance(self) -> None:
         """Account for a row a reader wrote into the ring itself."""
@@ -556,24 +548,25 @@ class RingKVCache(LayerCache):
             self.state[1] = mx.slice_update(self.state[1], values, index, axes=(2,))
             self.state[2] = self.position + length
             return self.state[0], self.state[1]
-        if self._keys is None:
+        if self._keys is None or self._values is None:
             shape = (keys.shape[0], keys.shape[1], self.window, keys.shape[3])
             self._keys = mx.zeros(shape, keys.dtype)
             self._values = mx.zeros(shape, values.dtype)
-        assert self._values is not None
+        key_buffer, value_buffer = self._keys, self._values
+        assert key_buffer is not None and value_buffer is not None
         if length >= self.window:
             keys, values = keys[..., -self.window :, :], values[..., -self.window :, :]
             length = self.window
         start = self.offset % self.window
         head = min(length, self.window - start)
-        self._keys[..., start : start + head, :] = keys[..., :head, :]
-        self._values[..., start : start + head, :] = values[..., :head, :]
+        key_buffer[..., start : start + head, :] = keys[..., :head, :]
+        value_buffer[..., start : start + head, :] = values[..., :head, :]
         if head < length:
             tail = length - head
-            self._keys[..., :tail, :] = keys[..., head:, :]
-            self._values[..., :tail, :] = values[..., head:, :]
+            key_buffer[..., :tail, :] = keys[..., head:, :]
+            value_buffer[..., :tail, :] = values[..., head:, :]
         self.offset += length
-        return self._keys, self._values
+        return key_buffer, value_buffer
 
     @property
     def is_trimmable(self) -> bool:

@@ -1,3 +1,4 @@
+import itertools
 from collections.abc import Sequence
 from typing import NamedTuple
 
@@ -45,11 +46,11 @@ class FalconH1(nn.Module):
         x = self.model.embed_tokens(ids)
         embedded = x
         blocks: list[mx.array] = []
-        for index, block in enumerate(self.model.layers):
-            mamba_cache = layers[2 * index]
-            kv_cache = layers[2 * index + 1]
+        for block, (mamba_cache, kv_cache) in zip(
+            self.model.layers, itertools.batched(layers, 2, strict=True), strict=True
+        ):
             assert isinstance(mamba_cache, Recurring)
-            assert isinstance(kv_cache, (KVCache, Attending))
+            assert isinstance(kv_cache, KVCache | Attending)
             x = block(x, mamba_cache, kv_cache)
             blocks.append(x)
         normed = self.model.norm(x)

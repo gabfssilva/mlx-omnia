@@ -22,5 +22,3 @@ class Olmo2Attention(NormalizedFusedQKVAttention):
             query_norm=nn.RMSNorm(queries, eps=config.rms_norm_eps),
             key_norm=nn.RMSNorm(key_values, eps=config.rms_norm_eps),
         )
-        self.queries = queries
-        self.key_values = key_values

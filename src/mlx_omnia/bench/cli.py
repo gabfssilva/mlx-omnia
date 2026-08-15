@@ -132,10 +132,11 @@ def run_interleaved(args: argparse.Namespace) -> None:
     )
     arms = [built.arm]
     drafted = None
-    if args.draft is not None:
+    wanted: str | None = args.draft
+    if wanted is not None:
         if not known.draftable:
-            raise SystemExit(f"{args.model} and {args.draft} do not share a tokenizer")
-        draft_model = omnia.drafter(omnia.DRAFTS.get(args.draft, args.draft))
+            raise SystemExit(f"{args.model} and {wanted} do not share a tokenizer")
+        draft_model = omnia.drafter(omnia.DRAFTS.get(wanted, wanted))
         acceptance = omnia.Acceptance()
         drafted = "omnia+draft"
         built = omnia.Built(built.arm, built.model, draft_model, acceptance)
@@ -177,17 +178,21 @@ def run_paired(args: argparse.Namespace) -> None:
         "dtype": known.dtype,
         "tokens": args.tokens,
     }
-    side = {
-        "build": "mlx_omnia.bench.arms.omnia:build",
-        "config": config,
-        "roots": (ENGINE_ROOT,),
-        "verify": ("mlx_omnia",),
-    }
+    def side(label: str, tree: Path) -> Side:
+        return Side(
+            label,
+            build="mlx_omnia.bench.arms.omnia:build",
+            config=config,
+            tree=tree,
+            roots=(ENGINE_ROOT,),
+            verify=("mlx_omnia",),
+        )
+
     stderr(f"baseline: {args.ref}@{commit[:7]}")
     with worktree(args.ref, root=root) as base:
         result = paired(
-            Side("baseline", tree=base, **side),
-            Side("current", tree=root, **side),
+            side("baseline", base),
+            side("current", root),
             ids,
             runs=args.runs,
             floor=args.floor,
@@ -231,12 +236,13 @@ def parser() -> argparse.ArgumentParser:
     root = argparse.ArgumentParser(prog="omnia-bench", description=__doc__)
     commands = root.add_subparsers(dest="command", required=True)
 
-    def shared(one: argparse.ArgumentParser) -> None:
+    def shared(one: argparse.ArgumentParser, *, json_out: bool = True) -> None:
         one.add_argument("model", help="a nickname from the table, or a repository id")
         one.add_argument("--prompt-tokens", type=int, default=1024)
         one.add_argument("--tokens", type=int, default=128)
         one.add_argument("--runs", type=int, default=5)
-        one.add_argument("--json", help="write the full result to this file")
+        if json_out:
+            one.add_argument("--json", help="write the full result to this file")
         one.add_argument(
             "--no-gate",
             action="store_true",
@@ -273,15 +279,7 @@ def parser() -> argparse.ArgumentParser:
     # No `--against` and no `--json`: both arms are this engine, and what this prints beyond
     # the comparison — the mask and accept microseconds — has no place in the shared shape.
     three = commands.add_parser("constrained", help="the same decode, free and under a schema")
-    three.add_argument("model", help="a nickname from the table, or a repository id")
-    three.add_argument("--prompt-tokens", type=int, default=1024)
-    three.add_argument("--tokens", type=int, default=128)
-    three.add_argument("--runs", type=int, default=5)
-    three.add_argument(
-        "--no-gate",
-        action="store_true",
-        help="run without the thermal gate; the numbers do not compare with gated ones",
-    )
+    shared(three, json_out=False)
     three.set_defaults(run=run_constrained)
     return root
 

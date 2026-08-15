@@ -69,13 +69,7 @@ class BailingHybridLatentAttention(nn.Module):
             queries = mx.concatenate([self.embed_q(q_nope), q_pe], axis=-1)
             attended = mx.concatenate(
                 [
-                    mx.fast.scaled_dot_product_attention(
-                        queries[index : index + 1],
-                        mx.concatenate([row_latent, row_pe], axis=-1),
-                        row_latent,
-                        scale=self.scale,
-                        mask=None,
-                    )
+                    self._absorbed(queries[index : index + 1], row_latent, row_pe)
                     for index, (row_latent, row_pe) in enumerate(
                         cache.update_and_fetch(latent, k_pe)
                     )
@@ -87,11 +81,8 @@ class BailingHybridLatentAttention(nn.Module):
             if length == 1:
                 # Absorbed: the query moves into the latent's space, so nothing expands and
                 # the whole prefix is read once, 576 columns wide.
-                keys = mx.concatenate([history, history_pe], axis=-1)
                 queries = mx.concatenate([self.embed_q(q_nope), q_pe], axis=-1)
-                attended = mx.fast.scaled_dot_product_attention(
-                    queries, keys, history, scale=self.scale, mask=None
-                )
+                attended = self._absorbed(queries, history, history_pe)
                 attended = self.unembed_out(attended)
             else:
                 k_nope = self.embed_q(history, transpose=False)
@@ -111,4 +102,15 @@ class BailingHybridLatentAttention(nn.Module):
         attended = attended * gate.transpose(0, 2, 1)[..., None]
         return self.dense(
             attended.transpose(0, 2, 1, 3).reshape(rows, length, self.heads * self.v_head_dim)
+        )
+
+    def _absorbed(self, queries: mx.array, latent: mx.array, latent_pe: mx.array) -> mx.array:
+        """One absorbed step against one history: keys are `concat(latent, k_pe)`, values are
+        the latent itself, so the output comes back in latent space."""
+        return mx.fast.scaled_dot_product_attention(
+            queries,
+            mx.concatenate([latent, latent_pe], axis=-1),
+            latent,
+            scale=self.scale,
+            mask=None,
         )

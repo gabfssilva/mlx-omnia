@@ -75,11 +75,12 @@ from pydantic import BaseModel, ConfigDict, Field
 
 from mlx_omnia.engine import task
 from mlx_omnia.engine.footprint import checkpoint_bytes
-from mlx_omnia.engine.language import Prefill, tokenizer_of, trunk_of
+from mlx_omnia.engine.language import Prefill, Tokenizer, tokenizer_of, trunk_of
 from mlx_omnia.engine.quant.awq import Applied, Outcome, apply_awq, derive_pairs
 from mlx_omnia.engine.quant.calibration import (
     CalibrationConfig,
     Collector,
+    Encoder,
     ImportanceMatrix,
     SecondMoment,
     format_tag,
@@ -354,6 +355,20 @@ def _leaves(directory: Path, model: nn.Module) -> list[Leaf]:
     return leaves if dtype is None else [replace(leaf, dtype=dtype) for leaf in leaves]
 
 
+class _Encoder(Encoder):
+    """A `language.Tokenizer` as the corpus sampler's encoder.
+
+    The two disagree about one thing: a prompt may still be arriving, so `encode` hands back
+    an iterator. A corpus file is whole text and the sampler slices it, which needs the
+    list."""
+
+    def __init__(self, tokenizer: Tokenizer) -> None:
+        self._tokenizer = tokenizer
+
+    def encode(self, text: str) -> list[int]:
+        return list(self._tokenizer.encode(text))
+
+
 def _observe(
     job: Job,
     source: str,
@@ -380,7 +395,7 @@ def _observe(
     corpus = load_corpus(seed=_SEED)
     sampled = sample_sequences(
         corpus,
-        tokenizer,
+        _Encoder(tokenizer),
         sequences=request.sequences,
         length=request.sequence_length,
     )

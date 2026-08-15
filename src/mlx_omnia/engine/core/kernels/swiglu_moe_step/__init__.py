@@ -29,7 +29,7 @@ __all__ = [
 _STRATEGIES = (Nvfp4PackedSwigluMoeStep, DefaultSwigluMoeStep)
 
 
-class SwigluMoeStep:
+class SwigluMoeStep(SwigluMoeStepStrategy):
     """Resolves the strategy at construction and delegates; itself a
     `SwigluMoeStepStrategy`."""
 

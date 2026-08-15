@@ -2,11 +2,14 @@ from collections.abc import Callable, Sequence
 
 import mlx.core as mx
 
-from mlx_omnia.engine.batching import BatchedKVCache
+from mlx_omnia.engine.batching import BatchedKVCache, RaggedAdapter, RaggedBatchable
 from mlx_omnia.engine.core.cache import KVCache, LayerCache
 
+type DSAStore = DSACache | BatchedDSACache
+"""What one DSA layer reads: its own cache, or a row of a ragged batch of them."""
 
-class DSACache(LayerCache):
+
+class DSACache(LayerCache, RaggedBatchable):
     """One layer's two histories: the attention's keys/values and the indexer's keys.
 
     They advance together and rewind together, so the layer presents a single `offset`
@@ -64,7 +67,7 @@ class DSACache(LayerCache):
         return BatchedDSACache(caches)
 
 
-class BatchedDSACache:
+class BatchedDSACache(RaggedAdapter):
     """N `DSACache`s as one ragged layer.
 
     Selection is per row — each row's history has its own length, and its own answer to
@@ -85,7 +88,3 @@ class BatchedDSACache:
     @property
     def offset(self) -> mx.array:
         return mx.array([cache.offset for cache in self._caches], dtype=mx.int32)
-
-
-type DSAStore = DSACache | BatchedDSACache
-"""What one DSA layer reads: its own cache, or a row of a ragged batch of them."""

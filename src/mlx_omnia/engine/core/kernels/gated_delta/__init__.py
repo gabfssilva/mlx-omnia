@@ -38,7 +38,7 @@ __all__ = [
 _STRATEGIES = (FusedGatedDelta, DefaultGatedDelta)
 
 
-class GatedDelta:
+class GatedDelta(GatedDeltaStrategy):
     """Resolves the strategy at construction and delegates; itself a
     `GatedDeltaStrategy`."""
 

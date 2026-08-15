@@ -38,6 +38,7 @@ from mlx_omnia.engine.speculative import (
     SpeculationRefused,
     stream_speculative_ids,
 )
+from tests.conftest import relative_diff
 
 PROMPT = [3, 1, 2, 1, 0, 3, 2, 1]
 
@@ -47,7 +48,7 @@ PROMPT = [3, 1, 2, 1, 0, 3, 2, 1]
 VOCAB = 4
 
 
-def _config(pattern: str) -> NemotronHConfig:
+def config_of(pattern: str) -> NemotronHConfig:
     return NemotronHConfig(
         hidden_size=64,
         num_hidden_layers=len(pattern),
@@ -77,7 +78,7 @@ _ROUTER = ("gate.weight", "e_score_correction_bias")
 _MAMBA = ("conv1d.weight", "A_log", "D", "dt_bias")
 
 
-def _spread(model: nn.Module) -> None:
+def spread(model: nn.Module) -> None:
     """Three families of leaf are born constant and mean nothing until they are moved.
 
     The **router**'s weight and correction bias are zero, which makes every expert tie and the
@@ -126,8 +127,8 @@ class _Recording:
 @pytest.fixture
 def trunk() -> NemotronH:
     mx.random.seed(11)
-    model = NemotronH(_config("M*EM*E"))
-    _spread(model)
+    model = NemotronH(config_of("M*EM*E"))
+    spread(model)
     mx.eval(model.parameters())
     return model
 
@@ -136,7 +137,7 @@ def trunk() -> NemotronH:
 def step(trunk: NemotronH) -> NemotronHMTP:
     mx.random.seed(23)
     head = NemotronHMTP(trunk.config, ("*", "E"))
-    _spread(head)
+    spread(head)
     mx.eval(head.parameters())
     return head
 
@@ -148,11 +149,6 @@ def test_the_trunk_needs_both_rewinds(trunk: NemotronH) -> None:
     assert [type(layer) for layer in cache[:3]] == [DeltaCache, KVCache, type(cache[2])]
     assert not all(layer.is_trimmable for layer in cache)
     assert all(layer.is_replayable for layer in cache)
-
-
-def _relative(a: mx.array, b: mx.array) -> float:
-    a32, b32 = a.astype(mx.float32), b.astype(mx.float32)
-    return float((mx.max(mx.abs(a32 - b32)) / mx.max(mx.abs(b32))).item())
 
 
 @pytest.mark.parametrize("kept", [0, 1, 2])
@@ -191,10 +187,10 @@ def test_verify_rewinds_the_recurrent_state_to_the_rows_that_were_kept(
         assert isinstance(got, DeltaCache)
         assert isinstance(want, DeltaCache) and isinstance(other, DeltaCache)
         assert got.state is not None and want.state is not None and other.state is not None
-        floor = _relative(want.state, other.state)
-        assert _relative(got.state, want.state) <= max(3 * floor, 1e-6)
+        floor = relative_diff(want.state, other.state)
+        assert relative_diff(got.state, want.state) <= max(3 * floor, 1e-6)
         assert got.window is not None and want.window is not None
-        assert _relative(got.window, want.window) <= 1e-6
+        assert relative_diff(got.window, want.window) <= 1e-6
 
 
 def test_the_step_fuses_before_it_concatenates(trunk: NemotronH, step: NemotronHMTP) -> None:

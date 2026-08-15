@@ -19,6 +19,7 @@ from typing import Self
 
 import mlx.core as mx
 
+from mlx_omnia.engine.core.kernels.moe_tail.kernel import MoeTailStrategy
 from mlx_omnia.engine.core.mxcompat import metal_kernel
 
 _SOURCE = """
@@ -68,7 +69,7 @@ _KERNEL = metal_kernel(
 
 
 @dataclass(frozen=True)
-class SortedMoeTail:
+class SortedMoeTail(MoeTailStrategy):
     hidden: int
 
     @classmethod

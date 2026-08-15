@@ -28,7 +28,7 @@ from pathlib import Path
 from fastapi import APIRouter, HTTPException
 from pydantic import BaseModel
 
-from mlx_omnia.server.profiles import StoreDep
+from mlx_omnia.server.deps import StoreDep
 from mlx_omnia.server.store import ReferenceCache, Store
 
 CACHE = Path.home() / ".cache" / "mlx_omnia" / "fidelity"

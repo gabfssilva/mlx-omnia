@@ -2,7 +2,7 @@ import mlx.core as mx
 import mlx.nn as nn
 
 from mlx_omnia.engine.core.attend import Attending, AttentionMask, KVStore, attend
-from mlx_omnia.engine.core.attention import ragged_mask
+from mlx_omnia.engine.core.attention import Spanned, ragged_mask
 from mlx_omnia.engine.core.layers import split_qkv
 from mlx_omnia.engine.core.masks import SLIDING, causal_mask
 from mlx_omnia.engine.models.gemma2.config import Gemma2Config
@@ -47,7 +47,12 @@ class Gemma2Attention(nn.Module):
         )
         allowed: AttentionMask
         if isinstance(cache, Attending):
-            allowed = ragged_mask(length, offset, self.window)
+            allowed = ragged_mask(
+                length,
+                offset,
+                self.window,
+                span=cache.span if isinstance(cache, Spanned) else None,
+            )
         else:
             # A growing KV cache fetches exactly what it holds, so its own offset measures
             # the span the mask has to cover.

@@ -34,6 +34,7 @@ from tests.conftest import (
     relative_diff,
     requires_checkpoint,
 )
+from tests.mutation import mutated
 
 FIXTURE = Path(__file__).parent / "fixtures" / "laguna_mlxlm.safetensors"
 REPO = "local/Laguna-S-2.1-mlx-oQ3e-fast-gs128"
@@ -91,10 +92,10 @@ def test_rope_atlas_rebuilds_when_an_object_id_is_reused() -> None:
     first = Laguna(tiny_config()).model.layers[0].self_attn
     second = Laguna(tiny_config()).model.layers[0].self_attn
     key = id(first)
-    laguna_attention._ATLASES[key] = mx.zeros((1, 1))
+    laguna_attention.ATLASES[key] = mx.zeros((1, 1))
     laguna_attention._ATLAS_OWNERS[key] = second
 
-    angles = first._angles(0)
+    angles = first.angles(0)
 
     assert angles.shape == (first._rotary_dim,)
 
@@ -374,12 +375,9 @@ def test_mutation_breaks_parity(model: Laguna, golden: dict[str, mx.array]) -> N
     assert isinstance(layer.mlp, LagunaSparseMoe)
     original = layer.mlp.switch_mlp.gate_up_proj.weight
     assert isinstance(original, mx.array)
-    layer.mlp.switch_mlp.gate_up_proj.weight = original * 1.5
-    try:
+    with mutated(layer.mlp.switch_mlp.gate_up_proj, "weight", original * 1.5):
         logits = model(golden["input_ids"][None])
         assert relative_diff(logits, golden["logits"]) > golden["noise.logits"].item()
-    finally:
-        layer.mlp.switch_mlp.gate_up_proj.weight = original
 
 
 @requires_checkpoint(REPO)

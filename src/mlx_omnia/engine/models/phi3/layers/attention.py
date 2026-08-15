@@ -16,4 +16,3 @@ class Phi3Attention(FusedQKVAttention):
             rope_freqs=None if long_rope is None else long_rope.freqs,
             rope_input_scale=1.0 if long_rope is None else long_rope.scale,
         )
-        self.long_rope = long_rope

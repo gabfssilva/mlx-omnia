@@ -18,6 +18,7 @@ from typing import Self
 
 import mlx.core as mx
 
+from mlx_omnia.engine.core.kernels.conv_mix.kernel import ConvMixStrategy
 from mlx_omnia.engine.core.mxcompat import metal_kernel
 
 _SOURCE = """
@@ -82,7 +83,7 @@ def applies(hidden: int, kernel: int, has_bias: bool) -> bool:
 
 
 @dataclass(frozen=True)
-class FusedConvMix:
+class FusedConvMix(ConvMixStrategy):
     hidden: int
 
     @classmethod

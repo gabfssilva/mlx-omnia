@@ -35,7 +35,7 @@ __all__ = [
 _STRATEGIES = (Nvfp4Mlp, DenseMlp, DefaultMlp)
 
 
-class Mlp:
+class Mlp(MlpStrategy):
     """Resolves the strategy at construction and delegates; itself an `MlpStrategy`."""
 
     def __init__(

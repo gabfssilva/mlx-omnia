@@ -5,14 +5,24 @@ import pytest
 
 from mlx_omnia.engine.batching import (
     BatchedKVCache,
+    BatchedLayer,
+    BatchGreedyDecoder,
+    BatchModel,
+    PreparedSingleGreedyDecoder,
+    SingleGreedyDecoder,
     batch,
     prepare_batch_sequence,
     step,
 )
-from mlx_omnia.engine.core.attend import KVStore
-from mlx_omnia.engine.core.cache import FixedKVCache, KVCache
+from mlx_omnia.engine.core.cache import FixedKVCache, KVCache, RingKVCache
 from mlx_omnia.engine.core.prefill import BLOCK
-from mlx_omnia.engine.generate import Meter, ReasoningBlock, ReasoningBudget, greedy
+from mlx_omnia.engine.generate import (
+    Constraint,
+    Meter,
+    ReasoningBlock,
+    ReasoningBudget,
+    greedy,
+)
 from mlx_omnia.engine.language import GenerationOptions, Text, TextLanguageModel
 from mlx_omnia.engine.models.qwen3.config import Qwen3Config, Qwen3MoEConfig
 from mlx_omnia.engine.models.qwen3.model import Qwen3, Qwen3MoE
@@ -105,7 +115,7 @@ def test_qwen3_moe_ragged_batch_matches_independent_decode_steps() -> None:
     assert mx.allclose(together, apart, rtol=1e-5, atol=1e-5).item()
 
 
-class CountingModel:
+class CountingModel(BatchModel):
     continuous_batching = True
 
     def __init__(self, vocab: int) -> None:
@@ -116,7 +126,7 @@ class CountingModel:
     def make_cache(self) -> list[KVCache]:
         return [KVCache()]
 
-    def __call__(self, ids: mx.array, cache: Sequence[KVStore]) -> mx.array:
+    def __call__(self, ids: mx.array, cache: Sequence[BatchedLayer]) -> mx.array:
         self.batch_sizes.append(ids.shape[0])
         self.widths.append(ids.shape[1])
         targets = (ids + 1) % self.vocab
@@ -124,7 +134,7 @@ class CountingModel:
         return -mx.abs(vocabulary - targets[..., None]).astype(mx.float32)
 
 
-class GreedyCountingModel(CountingModel):
+class GreedyCountingModel(CountingModel, BatchGreedyDecoder):
     def __init__(self, vocab: int) -> None:
         super().__init__(vocab)
         self.greedy_batch_sizes: list[int] = []
@@ -132,7 +142,7 @@ class GreedyCountingModel(CountingModel):
     def batch_greedy(
         self,
         ids: mx.array,
-        caches: Sequence[list[KVCache]],
+        caches: Sequence[list[KVCache | FixedKVCache | RingKVCache]],
         *,
         capacity: int,
     ) -> tuple[mx.array, ...]:
@@ -141,7 +151,7 @@ class GreedyCountingModel(CountingModel):
         return tuple(tokens[index] for index in range(ids.shape[0]))
 
 
-class HybridCountingModel(GreedyCountingModel):
+class HybridCountingModel(GreedyCountingModel, SingleGreedyDecoder):
     def __init__(self, vocab: int) -> None:
         super().__init__(vocab)
         self.single_greedy_calls = 0
@@ -149,7 +159,7 @@ class HybridCountingModel(GreedyCountingModel):
     def single_greedy(
         self,
         ids: mx.array,
-        cache: list[KVCache | FixedKVCache],
+        cache: list[KVCache | FixedKVCache | RingKVCache],
         *,
         capacity: int,
     ) -> mx.array:
@@ -167,7 +177,7 @@ class StableCapacityModel(HybridCountingModel):
     def single_greedy(
         self,
         ids: mx.array,
-        cache: list[KVCache | FixedKVCache],
+        cache: list[KVCache | FixedKVCache | RingKVCache],
         *,
         capacity: int,
     ) -> mx.array:
@@ -180,14 +190,14 @@ class StableCapacityModel(HybridCountingModel):
         return super().single_greedy(ids, cache, capacity=capacity)
 
 
-class PreparedSingleCountingModel(HybridCountingModel):
+class PreparedSingleCountingModel(HybridCountingModel, PreparedSingleGreedyDecoder):
     def __init__(self, vocab: int) -> None:
         super().__init__(vocab)
         self.prepare_single_calls = 0
 
     def prepare_single_greedy(
         self,
-        cache: list[KVCache | FixedKVCache],
+        cache: list[KVCache | FixedKVCache | RingKVCache],
         *,
         capacity: int,
     ) -> Callable[[mx.array], mx.array]:
@@ -220,7 +230,7 @@ class AsciiTokenizer:
         return bytes(ids)
 
 
-class ForceThenStop:
+class ForceThenStop(Constraint):
     def __init__(self, token: int) -> None:
         self.token = token
         self.accepted: list[int] = []

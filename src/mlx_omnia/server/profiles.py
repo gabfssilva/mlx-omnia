@@ -23,14 +23,14 @@ than accepted and ignored.
 """
 
 from dataclasses import dataclass, field
-from typing import Annotated
 
-from fastapi import APIRouter, Depends, HTTPException, Request
+from fastapi import APIRouter, HTTPException
 from pydantic import BaseModel, ConfigDict, Field
 
 from mlx_omnia.engine.chat import Effort
 from mlx_omnia.engine.checkpoint import SamplingDefaults
 from mlx_omnia.server import catalog, features
+from mlx_omnia.server.deps import StoreDep
 from mlx_omnia.server.features import Features
 from mlx_omnia.server.store import Profile, Store
 
@@ -177,14 +177,6 @@ def served_ids(store: Store) -> list[str]:
         for served in (entry.id, *(f"{entry.id}:{name}" for name in names.get(entry.id, ())))
     ]
 
-
-def _store(request: Request) -> Store:
-    store = request.app.state.store
-    assert isinstance(store, Store)
-    return store
-
-
-StoreDep = Annotated[Store, Depends(_store)]
 
 router = APIRouter()
 

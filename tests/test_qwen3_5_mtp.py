@@ -38,6 +38,7 @@ from mlx_omnia.engine.speculative import (
     Persistent,
     stream_speculative_ids,
 )
+from tests.conftest import relative_diff
 
 PROMPT = [3, 1, 2, 1, 0, 3, 2, 1]
 
@@ -129,11 +130,6 @@ def step(trunk: Qwen35) -> Qwen35MTP:
     return head
 
 
-def _relative(a: mx.array, b: mx.array) -> float:
-    a32, b32 = a.astype(mx.float32), b.astype(mx.float32)
-    return float((mx.max(mx.abs(a32 - b32)) / mx.max(mx.abs(b32))).item())
-
-
 def test_the_trunk_needs_both_rewinds(trunk: Qwen35) -> None:
     """What makes this family the hard case, stated as an assertion so it cannot quietly
     stop being true: three caches in four are DeltaNet, and none of those can trim."""
@@ -173,10 +169,10 @@ def test_verify_rewinds_the_recurrent_state_to_the_rows_that_were_kept(
         assert isinstance(got, DeltaCache)
         assert isinstance(want, DeltaCache) and isinstance(other, DeltaCache)
         assert got.state is not None and want.state is not None and other.state is not None
-        floor = _relative(want.state, other.state)
-        assert _relative(got.state, want.state) <= max(3 * floor, 1e-6)
+        floor = relative_diff(want.state, other.state)
+        assert relative_diff(got.state, want.state) <= max(3 * floor, 1e-6)
         assert got.window is not None and want.window is not None
-        assert _relative(got.window, want.window) <= 1e-6
+        assert relative_diff(got.window, want.window) <= 1e-6
 
 
 def test_the_step_fuses_before_it_concatenates(trunk: Qwen35, step: Qwen35MTP) -> None:
@@ -372,10 +368,10 @@ def test_compiled_verify_rewinds_to_the_rows_that_were_kept(
             assert isinstance(want, DeltaCache) and isinstance(other, DeltaCache)
             assert want.state is not None and other.state is not None
             state, window = got.graph[1], got.graph[0]
-            floor = _relative(want.state, other.state)
-            assert _relative(state, want.state) <= max(3 * floor, 1e-6)
+            floor = relative_diff(want.state, other.state)
+            assert relative_diff(state, want.state) <= max(3 * floor, 1e-6)
             assert want.window is not None
-            assert _relative(window, want.window) <= 1e-6
+            assert relative_diff(window, want.window) <= 1e-6
         else:
             assert isinstance(got, FixedKVCache)
             assert got.rows == want.offset
@@ -405,7 +401,7 @@ def test_the_compiled_verify_forward_is_the_eager_forward(
     verify, _ = compiled
     logits, features = verify(rows)
 
-    assert _relative(logits, expected) < 1e-5
+    assert relative_diff(logits, expected) < 1e-5
     assert features.shape == (1, 3, 64)
 
 

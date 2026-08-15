@@ -11,11 +11,12 @@ from mlx_omnia.engine.batching import (
     BatchModel,
     BatchPrefill,
     BatchSequence,
+    SequenceCache,
 )
 from mlx_omnia.engine.batching import (
     step as batch_step,
 )
-from mlx_omnia.engine.core.cache import FixedKVCache, KVCache, LayerCache
+from mlx_omnia.engine.core.cache import FixedKVCache, KVCache, LayerCache, RingKVCache
 from mlx_omnia.engine.core.prompt_cache import Budget, PromptCache, Spill
 from mlx_omnia.engine.generate import (
     BlockOutputs,
@@ -40,7 +41,7 @@ from mlx_omnia.engine.model import (
     Wrapping,
 )
 from mlx_omnia.engine.parsers import FALLBACK, REASONING, Parser, Segment, Segmenter, opened
-from mlx_omnia.engine.speculative import Chained, Speculable, Step
+from mlx_omnia.engine.speculative import Chained, Proposer, Speculable, Step
 
 TEXT = ContentType(Modality.TEXT, "text/plain")
 
@@ -294,13 +295,23 @@ def prefix_cache[C: LayerCache](
         return None
     if prefix is not None:
         kept = (
-            prefix.budget is budget
-            if isinstance(budget, Budget)
-            else prefix.budget.total == budget
+            prefix.budget is budget if isinstance(budget, Budget) else prefix.budget.total == budget
         )
         if kept:
             return prefix
     return PromptCache(budget, spill)
+
+
+type StandingLayer = KVCache | FixedKVCache | RingKVCache
+"""What the batched trie stores: `batching.SequenceCache`'s element. A sliding layer keeps
+its rotation — only the fixed form is converted back, by `_grown` below."""
+
+
+def _batch_cache(model: BatchModel) -> SequenceCache:
+    """The batch contract's cache and not the trunk's: `self.model` narrowed to `BatchModel`
+    is an intersection whose `make_cache` still answers with the trunk's own element type,
+    and what the batched path threads is the batch's."""
+    return list(model.make_cache())
 
 
 def _grown(layer: FixedKVCache) -> KVCache:
@@ -319,7 +330,7 @@ class TextBatch:
     tokenizer: Tokenizer
     decoder: codecs.IncrementalDecoder
     segmenter: Segmenter
-    prefix: PromptCache[KVCache] | None = None
+    prefix: PromptCache[StandingLayer] | None = None
     closed: bool = False
 
     def push(self, token: int) -> tuple[Segment, ...]:
@@ -338,7 +349,7 @@ class TextBatch:
             # shorter match and which the bucket goes on overwriting for its next member.
             # `stored()` hands over the rows in use, and a growing cache reads them back
             # unchanged — the same conversion `FixedKVCache.is_storable` promises.
-            standing = [
+            standing: SequenceCache = [
                 layer if not isinstance(layer, FixedKVCache) else _grown(layer)
                 for layer in self.state.cache
             ]
@@ -366,7 +377,7 @@ class TextPrefill:
     tokenizer: Tokenizer
     decoder: codecs.IncrementalDecoder
     segmenter: Segmenter
-    prefix: PromptCache[KVCache] | None = None
+    prefix: PromptCache[StandingLayer] | None = None
 
     def advance(self) -> TextBatch | None:
         state = self.prefill.advance()
@@ -379,18 +390,14 @@ class TextPrefill:
 class ContinuousLanguageModel(Protocol):
     def can_batch(self, options: GenerationOptions) -> bool: ...
 
-    def begin_batch(
-        self, input: ModelInput, options: GenerationOptions
-    ) -> TextPrefill | None: ...
+    def begin_batch(self, input: ModelInput, options: GenerationOptions) -> TextPrefill | None: ...
 
-    def prepare_batch(
-        self, input: ModelInput, options: GenerationOptions
-    ) -> TextBatch | None: ...
+    def prepare_batch(self, input: ModelInput, options: GenerationOptions) -> TextBatch | None: ...
 
     def step_batch(self, sequences: Sequence[TextBatch]) -> list[tuple[Segment, ...]]: ...
 
 
-class TextLanguageModel[C: LayerCache]:
+class TextLanguageModel[C: LayerCache, I: ModelInput = Text]:
     def __init__(
         self,
         model: CausalLM[C],
@@ -411,13 +418,13 @@ class TextLanguageModel[C: LayerCache]:
         weigh it: with an MTP head the two are one checkpoint on disk and still two trees
         here, and only one of them is under `self.model`."""
         self._block: int | None = None
-        self.batch_prefix: PromptCache[KVCache] | None = None
+        self.batch_prefix: PromptCache[StandingLayer] | None = None
 
     @property
     def native_signature(self) -> ModelSignature:
         return ModelSignature(frozenset({TEXT}), frozenset({TEXT}))
 
-    def accepts(self, input: ModelInput) -> TypeIs[Text]:
+    def accepts(self, input: ModelInput) -> TypeIs[I]:
         return isinstance(input, Text)
 
     def speculate_with(self, drafter: nn.Module, *, block_size: int | None = None) -> None:
@@ -451,7 +458,7 @@ class TextLanguageModel[C: LayerCache]:
         self.drafter = drafter
         self._block = block
 
-    def _proposer(self, options: GenerationOptions) -> "Chained[LayerCache] | None":
+    def _proposer(self, options: GenerationOptions) -> Proposer | None:
         """The proposer for this request, or `None` for every request that cannot be verified
         against the target's own argmax.
 
@@ -503,7 +510,7 @@ class TextLanguageModel[C: LayerCache]:
         )
         if proposer is None:
             self.batch_prefix = prefix
-        cache = model.make_cache()
+        cache = _batch_cache(model)
         reuse = None if prefix is None else prefix.take(encoded, into=cache)
         if reuse is not None:
             cache = reuse.caches
@@ -545,11 +552,7 @@ class TextLanguageModel[C: LayerCache]:
             raise TypeError(f"{type(model).__name__} does not support continuous batching")
         active = [index for index, sequence in enumerate(sequences) if not sequence.state.finished]
         emitted: list[list[int]] = [[] for _ in sequences]
-        advanced = (
-            batch_step(model, [sequences[index].state for index in active])
-            if active
-            else []
-        )
+        advanced = batch_step(model, [sequences[index].state for index in active]) if active else []
         for index, ids in zip(active, advanced, strict=True):
             emitted[index] = ids
         return [
@@ -577,15 +580,10 @@ class TextLanguageModel[C: LayerCache]:
     def stream(self, input: Text, options: GenerationOptions) -> Iterator[Segment]:
         """The generation, as segments.
 
-        A whole-text prompt on a trunk that batches goes through `prepare_batch`/`step_batch`;
-        what still decodes here is what that path does not answer for — a drafted run, a
-        prompt still arriving, and a family with no batched decode.
+        A whole-text prompt goes through `prepare_batch`/`step_batch`; what still decodes
+        here is what that path does not answer for — a prompt still arriving as an iterator.
         """
-        if (
-            isinstance(input, Text)
-            and isinstance(input.value, str)
-            and self.can_batch(options)
-        ):
+        if isinstance(input.value, str) and self.can_batch(options):
             yield from self._stream_batched(input, options)
             return
         self.prefix = prefix_cache(self.prefix, options.prefix_budget, options.prefix_spill)

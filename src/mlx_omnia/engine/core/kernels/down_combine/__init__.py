@@ -50,7 +50,7 @@ _STRATEGIES = (
 )
 
 
-class DownCombine:
+class DownCombine(DownCombineStrategy):
     """Resolves the strategy at construction and delegates; itself a
     `DownCombineStrategy`."""
 

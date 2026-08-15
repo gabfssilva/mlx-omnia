@@ -93,18 +93,7 @@ def _moe_tree(config: Qwen3VLMoEConfig) -> Qwen3MoE:
     return Qwen3MoE(config.moe)
 
 
-def _dense_composite(directory: Path, model: Qwen3) -> LanguageModel[ModelInput]:
-    return CompositeModel(
-        TextLanguageModel(
-            model,
-            ByteLevelBPE.from_file(directory / "tokenizer.json"),
-            stop=stop_tokens(directory, model.config.eos),
-        ),
-        chat_capabilities(directory),
-    )
-
-
-def _moe_composite(directory: Path, model: Qwen3MoE) -> LanguageModel[ModelInput]:
+def _composite(directory: Path, model: Qwen3 | Qwen3MoE) -> LanguageModel[ModelInput]:
     return CompositeModel(
         TextLanguageModel(
             model,
@@ -128,7 +117,7 @@ CHECKPOINT = checkpoint(
     Qwen3VLConfig,
     _dense_tree,
     dense_weights,
-    _dense_composite,
+    _composite,
     model_types=("qwen3_vl",),
 )
 MOE_CHECKPOINT = checkpoint(
@@ -136,6 +125,6 @@ MOE_CHECKPOINT = checkpoint(
     Qwen3VLMoEConfig,
     _moe_tree,
     moe_weights,
-    _moe_composite,
+    _composite,
     model_types=("qwen3_vl_moe",),
 )

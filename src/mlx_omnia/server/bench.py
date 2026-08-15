@@ -28,19 +28,18 @@ import statistics
 import time
 from dataclasses import dataclass
 from importlib.metadata import version
-from typing import Annotated
 
-from fastapi import APIRouter, Depends, Request
+from fastapi import APIRouter
 from fastapi.responses import JSONResponse
 from pydantic import BaseModel, ConfigDict, Field
 
 from mlx_omnia import GenerationOptions, Text
 from mlx_omnia.engine.footprint import ceiling
+from mlx_omnia.server.deps import EngineDep, StoreDep
 from mlx_omnia.server.engine import Engine
 from mlx_omnia.server.engine import Job as Generation
 from mlx_omnia.server.jobs import Bench as BenchJob
 from mlx_omnia.server.jobs import Cancelled, Job, JobsDep, Progress, Work, accepted
-from mlx_omnia.server.profiles import StoreDep
 from mlx_omnia.server.store import Bench, Store
 
 _TOKENS = 128
@@ -156,14 +155,6 @@ class History:
     benches: list[Bench]
     """Newest first, as the store orders them."""
 
-
-def _engine(request: Request) -> Engine:
-    engine = request.app.state.engine
-    assert isinstance(engine, Engine)
-    return engine
-
-
-EngineDep = Annotated[Engine, Depends(_engine)]
 
 router = APIRouter()
 

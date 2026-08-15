@@ -31,7 +31,7 @@ from typing import Self
 
 import mlx.core as mx
 
-from mlx_omnia.engine.core.kernels.route.kernel import Routing, gate_logits
+from mlx_omnia.engine.core.kernels.route.kernel import RouteStrategy, Routing, gate_logits
 from mlx_omnia.engine.core.mxcompat import metal_kernel
 
 ORDINAL_HEADER = """
@@ -252,7 +252,7 @@ def ordinal_keys(scores: mx.array) -> mx.array:
 
 
 @dataclass(frozen=True)
-class OrdinalRoute:
+class OrdinalRoute(RouteStrategy):
     """Sigmoid scoring, selection by a bitonic tournament over ordinal keys.
 
     The one strategy whose tie rule is the *lower* index: the sort is stable descending

@@ -57,7 +57,7 @@ _STRATEGIES = (
 )
 
 
-class Qmv:
+class Qmv(QmvStrategy):
     """Resolves the strategy at construction and delegates; itself a `QmvStrategy`."""
 
     def __init__(

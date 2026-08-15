@@ -47,6 +47,7 @@ from mlx_omnia import (
 )
 from mlx_omnia.bench.gate import Macmon, find_macmon
 from mlx_omnia.engine.footprint import checkpoint_bytes
+from mlx_omnia.engine.generate import Meter
 from mlx_omnia.server.catalog import CatalogEntry
 from mlx_omnia.server.engine import Engine
 from mlx_omnia.server.engine import Job as GenerationJob
@@ -394,8 +395,26 @@ def prompt_of(context: int) -> str:
     return _FILLER * max(1, context * 4 // len(_FILLER) + 1)
 
 
-def _drain(
-    job: Job,
+def _round(model: str, meter: Meter) -> Round:
+    """The row one spent generation leaves behind.
+
+    A generation that produced a single token has no interval between two to divide by, and
+    the meter answers `None` for both figures — a round with nothing in it to report, which
+    is an error and not a zero."""
+    rate, ttft = meter.tokens_per_second, meter.ttft
+    if rate is None or ttft is None:
+        raise RuntimeError(
+            f"{model!r} generated {meter.completion_tokens} token(s): no rate to measure"
+        )
+    return Round(
+        prompt_tokens=meter.prompt_tokens,
+        completion_tokens=meter.completion_tokens,
+        ttft_ms=ttft * 1000,
+        decode_tps=rate,
+    )
+
+
+def _drain(    job: Job,
     engine: Engine,
     model: str,
     prompt: str,
@@ -435,18 +454,7 @@ def _drain(
         raise Cancelled(job.id)
     if generation.error is not None:
         raise RuntimeError(generation.error)
-    meter = generation.meter
-    rate, ttft = meter.tokens_per_second, meter.ttft
-    if rate is None or ttft is None:
-        raise RuntimeError(
-            f"{model!r} generated {meter.completion_tokens} token(s): no rate to measure"
-        )
-    return Round(
-        prompt_tokens=meter.prompt_tokens,
-        completion_tokens=meter.completion_tokens,
-        ttft_ms=ttft * 1000,
-        decode_tps=rate,
-    )
+    return _round(model, generation.meter)
 
 
 def _drain_many(
@@ -500,23 +508,11 @@ def _drain_many(
         if generation.error is not None:
             raise RuntimeError(generation.error)
         meter = generation.meter
-        rate, ttft = meter.tokens_per_second, meter.ttft
-        if rate is None or ttft is None:
-            raise RuntimeError(
-                f"{model!r} generated {meter.completion_tokens} token(s): no rate to measure"
-            )
+        rounds.append(_round(model, meter))
         assert meter.first_token is not None and meter.last_token is not None
         first_tokens.append(meter.first_token)
         last_tokens.append(meter.last_token)
         decoded += meter.completion_tokens - 1
-        rounds.append(
-            Round(
-                prompt_tokens=meter.prompt_tokens,
-                completion_tokens=meter.completion_tokens,
-                ttft_ms=ttft * 1000,
-                decode_tps=rate,
-            )
-        )
     elapsed = max(last_tokens) - min(first_tokens)
     return ConcurrentRound(tuple(rounds), decoded / elapsed)
 

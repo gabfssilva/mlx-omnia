@@ -14,6 +14,7 @@ from mlx_omnia.engine.checkpoint import (
 )
 from mlx_omnia.engine.language import LanguageModel, TextLanguageModel
 from mlx_omnia.engine.model import CompositeModel, ModelInput
+from mlx_omnia.engine.models.lfm2.checkpoint import fuse_dense_mlp
 from mlx_omnia.engine.models.lfm2.config import LFM2MoEConfig
 from mlx_omnia.engine.models.lfm2.moe.model import LFM2MoE
 
@@ -35,20 +36,8 @@ def weights(
         drop_tied_head(loaded)
 
     loaded = fuse_qkv(loaded, config.num_hidden_layers)
-    loaded = _fuse_dense_mlp(loaded, config.num_dense_layers)
+    loaded = fuse_dense_mlp(loaded, config.num_dense_layers)
     return _stack_experts(loaded, config)
-
-
-def _fuse_dense_mlp(weights: dict[str, mx.array], layers: int) -> dict[str, mx.array]:
-    for layer in range(layers):
-        prefix = f"model.layers.{layer}.feed_forward."
-        keys = [f"{prefix}{name}.weight" for name in ("w1", "w3")]
-        if not all(key in weights for key in keys):
-            continue
-        fused = mx.concatenate([weights.pop(key) for key in keys], axis=0)
-        mx.eval(fused)
-        weights[f"{prefix}w13.weight"] = fused
-    return weights
 
 
 def _stack_experts(weights: dict[str, mx.array], config: LFM2MoEConfig) -> dict[str, mx.array]:

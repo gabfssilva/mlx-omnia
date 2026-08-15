@@ -18,7 +18,7 @@ from typing import Self
 
 import mlx.core as mx
 
-from mlx_omnia.engine.core.kernels.route.kernel import Routing, gate_logits
+from mlx_omnia.engine.core.kernels.route.kernel import RouteStrategy, Routing, gate_logits
 from mlx_omnia.engine.core.mxcompat import metal_kernel
 
 _SOURCE = """
@@ -96,7 +96,7 @@ def sigmoid_wide_applies(experts: int, k: int) -> bool:
 
 
 @dataclass(frozen=True)
-class SigmoidWideRoute:
+class SigmoidWideRoute(RouteStrategy):
     """The unfused-gemv sigmoid pick for wide routers: the logits arrive from the op
     chain's own matmul, and everything after it is one dispatch."""
 

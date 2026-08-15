@@ -56,7 +56,7 @@ _STRATEGIES = (
 )
 
 
-class QkvRope:
+class QkvRope(QkvRopeStrategy):
     """Resolves the strategy at construction and delegates; itself a
     `QkvRopeStrategy`."""
 

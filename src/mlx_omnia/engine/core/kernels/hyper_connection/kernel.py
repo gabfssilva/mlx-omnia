@@ -13,11 +13,12 @@ Given the *next* junction's `fn` it also returns that junction's gemv partial su
 the rounded expansion, so the following junction skips its own serial gemv dispatch.
 """
 
-from typing import Protocol
+from typing import Protocol, runtime_checkable
 
 import mlx.core as mx
 
 
+@runtime_checkable
 class HyperConnectionStrategy(Protocol):
     """(x [B, L, hc, D], partials [B, L, NT, mix], scale [3], base [mix], norm_weight [D])
     -> (normed [B, L, D], post [B, L, hc], comb [B, L, hc, hc]), plus the re-expansion."""

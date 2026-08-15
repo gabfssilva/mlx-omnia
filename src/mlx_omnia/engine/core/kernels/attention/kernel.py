@@ -14,7 +14,7 @@ the cache and advances it; the caller does not.
 """
 
 from collections.abc import Callable
-from typing import Protocol
+from typing import Protocol, runtime_checkable
 
 import mlx.core as mx
 
@@ -30,6 +30,7 @@ the rotation it feeds, so the caller owns an atlas and this is a lookup into it.
 """
 
 
+@runtime_checkable
 class AttentionStepStrategy(Protocol):
     """(raw_queries, raw_keys, raw_values, mask) -> context [1, heads, T, head_dim]."""
 

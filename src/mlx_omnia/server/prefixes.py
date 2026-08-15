@@ -42,7 +42,7 @@ from mlx_omnia.engine.core.cache_file import (
     storable,
     written,
 )
-from mlx_omnia.engine.core.prompt_cache import Role
+from mlx_omnia.engine.core.prompt_cache import Role, Spill
 from mlx_omnia.server.store import PrefixCacheFile, Store
 
 CACHE = Path.home() / ".cache" / "mlx_omnia" / "prefixes"
@@ -59,7 +59,7 @@ def directory(model_id: str) -> Path:
     return CACHE / model_id.replace("/", "--")
 
 
-class DiskSpill:
+class DiskSpill(Spill[LayerCache]):
     """One model's disk tier: the trie hands it evictions and asks it about misses.
 
     It holds the model's identity rather than being told it per call, because a `PromptCache`

@@ -21,7 +21,7 @@ __all__ = ["DefaultMoeStep", "MoeStep", "MoeStepStrategy", "Nvfp4MoeStep", "Shar
 _STRATEGIES = (Nvfp4MoeStep, DefaultMoeStep)
 
 
-class MoeStep:
+class MoeStep(MoeStepStrategy):
     """Resolves the strategy at construction and delegates; itself a
     `MoeStepStrategy`."""
 

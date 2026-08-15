@@ -7,7 +7,6 @@ lands.
 """
 
 import json
-import time
 from collections.abc import AsyncGenerator, Generator, Iterator, Mapping, Sequence
 from contextlib import asynccontextmanager, contextmanager
 from dataclasses import dataclass
@@ -30,10 +29,6 @@ from mlx_omnia.engine.parsers import Segment
 from mlx_omnia.server import benchmarks, catalog, jobs
 from mlx_omnia.server.engine import Engine
 from mlx_omnia.server.store import Store
-
-DEADLINE = 30.0
-"""Every wait here is bounded by it: a job that never arrives fails the suite instead of
-hanging it."""
 
 SHARD_BYTES = 2048
 
@@ -165,21 +160,6 @@ def stand(tmp_path: Path, models: Sequence[tuple[str, Mapping[str, object]]]) ->
             yield Stand(client=client, store=store, engine=engine, model=scripted)
     finally:
         catalog.HUB_CACHE, catalog.QUANTIZED_CACHE = previous
-
-
-def wait_for(client: TestClient, job_id: str, *states: str) -> dict[str, object]:
-    deadline = time.monotonic() + DEADLINE
-    while True:
-        response = client.get(f"/admin/jobs/{job_id}")
-        assert response.status_code == 200, response.text
-        current = response.json()
-        assert isinstance(current, dict)
-        if current["state"] in states:
-            return current
-        assert time.monotonic() < deadline, (
-            f"job stayed in {current['state']!r} ({current['error']!r}), wanted {states!r}"
-        )
-        time.sleep(0.01)
 
 
 SPEED_BODY: dict[str, object] = {

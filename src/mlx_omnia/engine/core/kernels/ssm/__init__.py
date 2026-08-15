@@ -39,7 +39,7 @@ __all__ = [
 _STRATEGIES = (FusedSsm, DefaultSsm)
 
 
-class Ssm:
+class Ssm(SsmStrategy):
     """Resolves the strategy at construction and delegates; itself an
     `SsmStrategy`."""
 

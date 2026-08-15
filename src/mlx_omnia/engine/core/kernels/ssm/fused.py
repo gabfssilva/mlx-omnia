@@ -17,13 +17,14 @@ from typing import Self
 import mlx.core as mx
 
 from mlx_omnia.engine.core.kernels.ssm.chunked import ssm_attn
+from mlx_omnia.engine.core.kernels.ssm.kernel import SsmStrategy
 from mlx_omnia.engine.core.kernels.ssm.step import ssm_step, ssm_step_applies
 
 _SMALL = 8
 
 
 @dataclass(frozen=True)
-class FusedSsm:
+class FusedSsm(SsmStrategy):
     A_log: mx.array
     D: mx.array
     dt_bias: mx.array

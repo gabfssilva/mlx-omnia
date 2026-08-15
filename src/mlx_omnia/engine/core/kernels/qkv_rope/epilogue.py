@@ -22,7 +22,13 @@ from typing import Self
 import mlx.core as mx
 
 from mlx_omnia.engine.core.kernels.qkv_rope.default import DefaultQkvRope
-from mlx_omnia.engine.core.kernels.qkv_rope.kernel import Angles, Leaf, Projection, Rotation
+from mlx_omnia.engine.core.kernels.qkv_rope.kernel import (
+    Angles,
+    Leaf,
+    Projection,
+    QkvRopeStrategy,
+    Rotation,
+)
 from mlx_omnia.engine.core.mxcompat import metal_kernel
 
 _SOURCE = """
@@ -110,7 +116,7 @@ def rope_epilogue(
 
 
 @dataclass(frozen=True)
-class RopeEpilogue:
+class RopeEpilogue(QkvRopeStrategy):
     """The one-token prologue whose norm and rotation ride the projection's tail.
 
     Serves the full-rotary, q/k-normed decode of a fused projection: the angle is

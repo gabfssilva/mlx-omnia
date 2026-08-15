@@ -20,7 +20,13 @@ import mlx.nn as nn
 
 from mlx_omnia.engine.core.kernels import MetalDispatch, MetalKernel
 from mlx_omnia.engine.core.kernels.qkv_rope.default import DefaultQkvRope
-from mlx_omnia.engine.core.kernels.qkv_rope.kernel import Angles, Leaf, Projection, Rotation
+from mlx_omnia.engine.core.kernels.qkv_rope.kernel import (
+    Angles,
+    Leaf,
+    Projection,
+    QkvRopeStrategy,
+    Rotation,
+)
 
 _VALUES_PER_LANE = 8
 _BLOCK = _VALUES_PER_LANE * 32
@@ -351,7 +357,7 @@ def _kernel(
 
 
 @dataclass(frozen=True)
-class SegmentedQkv:
+class SegmentedQkv(QkvRopeStrategy):
     """The prologue of a projection kept as three physical leaves.
 
     Only the projection fuses here — `qkv_step` reads the three leaves in whatever

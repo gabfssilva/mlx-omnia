@@ -15,15 +15,15 @@ direction a ceiling forgives.
 
 import ctypes
 from dataclasses import dataclass
-from typing import Annotated, Literal
+from typing import Literal
 
 import mlx.core as mx
-from fastapi import APIRouter, Depends, Request
+from fastapi import APIRouter, Request
 
 from mlx_omnia.server import prefixes
-from mlx_omnia.server.engine import Engine, KvCompression
+from mlx_omnia.server.deps import EngineDep, StoreDep
+from mlx_omnia.server.engine import KvCompression
 from mlx_omnia.server.events import announce
-from mlx_omnia.server.store import Store
 
 _MACH_TASK_BASIC_INFO = 20
 
@@ -111,25 +111,8 @@ class State:
     `fidelity` already makes for keeping its own listing."""
 
 
-async def _engine(request: Request) -> Engine:
-    """Async so it reads the engine's dicts on the loop that mutates them."""
-    engine = request.app.state.engine
-    assert isinstance(engine, Engine)
-    return engine
-
-
-EngineDep = Annotated[Engine, Depends(_engine)]
-
 router = APIRouter()
 
-
-def _store(request: Request) -> Store:
-    store = request.app.state.store
-    assert isinstance(store, Store)
-    return store
-
-
-StoreDep = Annotated[Store, Depends(_store)]
 
 
 @router.get("/admin/state")

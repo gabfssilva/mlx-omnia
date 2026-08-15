@@ -8,15 +8,14 @@ import numpy as np
 from mlx_omnia.engine.core.attend import KVStore
 from mlx_omnia.engine.core.cache import KVCache
 from mlx_omnia.engine.core.prefill import prefill
-from mlx_omnia.engine.core.prompt_cache import PromptCache
-from mlx_omnia.engine.generate import Meter, Penalty, Sampler, greedy, stream_ids, stream_text
+from mlx_omnia.engine.generate import Meter, Penalty, Sampler, greedy, stream_text
 from mlx_omnia.engine.language import (
     TEXT,
     GenerationOptions,
     LanguagePrompt,
     Text,
+    TextLanguageModel,
     Tokenizer,
-    prefix_cache,
 )
 from mlx_omnia.engine.model import ModelInput, ModelSignature
 from mlx_omnia.engine.models.muse_glimmer.config import MuseGlimmerConfig
@@ -243,7 +242,13 @@ def sees(config: MuseGlimmerConfig, processor: ProcessorConfig | None) -> bool:
     )
 
 
-class MuseGlimmerLanguageModel:
+class MuseGlimmerLanguageModel(TextLanguageModel[KVCache, MuseGlimmerInput]):
+    """The chassis with the vision path over it and its own speculation door: a text request
+    is `TextLanguageModel`'s — the trie, the batched decode — and what is the family's is the
+    picture and the DFlash drafter."""
+
+    model: MuseGlimmer
+
     def __init__(
         self,
         model: MuseGlimmer,
@@ -252,15 +257,8 @@ class MuseGlimmerLanguageModel:
         *,
         stop: Collection[int] = (),
     ) -> None:
-        self.model = model
-        self.tokenizer = tokenizer
+        super().__init__(model, tokenizer, stop=stop)
         self.processor = processor
-        self.stop = stop
-        self.prefix: PromptCache[KVCache] | None = None
-        self.drafter: nn.Module | None = None
-        """The DFlash checkpoint this model speculates with, when it was given one
-        (`speculative.Drafting`). It is not part of `model` — two checkpoints, two trees —
-        and it is `None` for every model nobody paired one with."""
         self._draft_block: int | None = None
         self._vision = sees(model.full_config, processor)
 
@@ -271,6 +269,10 @@ class MuseGlimmerLanguageModel:
 
     def speculate_with(self, drafter: nn.Module, *, block_size: int | None = None) -> None:
         """Take a DFlash drafter for this target — `speculative.Drafting`.
+
+        The chassis' door takes an MTP `Step` and this one does not: a DFlash proposal is one
+        forward over a block of mask tokens against layers the *drafter's* own config names,
+        so what is checked here is that config against this trunk.
 
         The three checks are what a checkpoint id cannot promise: the tree is the right
         architecture, it folds the width this trunk produces, and every block it reads
@@ -357,43 +359,24 @@ class MuseGlimmerLanguageModel:
         return MuseGlimmerDFlash(self.model, self.drafter, block_size=self._draft_block)
 
     def stream(self, input: MuseGlimmerInput, options: GenerationOptions) -> Iterator[Segment]:
-        stop = self.stop if options.stop is None else options.stop
-        parser = _parser(input)
-        match input:
-            case Text(value=rendered):
-                self.prefix = prefix_cache(self.prefix, options.prefix_budget)
-                draft = self._proposer(options)
-                ids = stream_ids(
-                    self.model,
-                    self.tokenizer.encode(rendered),
-                    max_tokens=options.max_tokens,
-                    sampler=options.sampler,
-                    stop=stop,
-                    penalty=options.penalty,
-                    meter=options.meter,
-                    # The two do not compose (`stream_ids` says why), and a round is worth
-                    # more than a prefix: the trie saves the prefill of a turn, the drafter
-                    # saves a read of the weights per token of every turn.
-                    prefix=None if draft is not None else self.prefix,
-                    constraint=options.constraint,
-                    draft=draft,
-                )
-            case Image() | LanguagePrompt():
-                parts = input.parts if isinstance(input, LanguagePrompt) else ()
-                rendered = "".join(part.value for part in parts if isinstance(part, Text))
-                prompt = self.prepare(input)
-                # No prefix trie: an image is one id repeated per patch, so two different
-                # pictures on the same grid produce the same ids.
-                ids = stream_multimodal_ids(
-                    self.model,
-                    prompt,
-                    max_tokens=options.max_tokens,
-                    sampler=options.sampler,
-                    stop=stop,
-                    penalty=options.penalty,
-                    meter=options.meter,
-                )
-            case _:
-                assert_never(input)
-
-        yield from stream_text(ids, self.tokenizer, parser=parser, prompt=rendered)
+        """A text prompt is the chassis' generation — batched when the trunk batches, and
+        drafted by this family's `_proposer`; what is answered here is the one thing the
+        chassis has no path for, a prompt with a picture in it."""
+        if isinstance(input, Text):
+            yield from super().stream(input, options)
+            return
+        parts = input.parts if isinstance(input, LanguagePrompt) else ()
+        rendered = "".join(part.read() for part in parts if isinstance(part, Text))
+        prompt = self.prepare(input)
+        # No prefix trie: an image is one id repeated per patch, so two different pictures on
+        # the same grid produce the same ids.
+        ids = stream_multimodal_ids(
+            self.model,
+            prompt,
+            max_tokens=options.max_tokens,
+            sampler=options.sampler,
+            stop=self.stop if options.stop is None else options.stop,
+            penalty=options.penalty,
+            meter=options.meter,
+        )
+        yield from stream_text(ids, self.tokenizer, parser=_parser(input), prompt=rendered)

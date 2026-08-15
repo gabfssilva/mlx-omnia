@@ -21,7 +21,13 @@ from typing import Self
 
 import mlx.core as mx
 
-from mlx_omnia.engine.core.kernels.qmv.kernel import Epilogue, QmvLeaf, TernaryLinear, is_ternary
+from mlx_omnia.engine.core.kernels.qmv.kernel import (
+    Epilogue,
+    QmvLeaf,
+    QmvStrategy,
+    TernaryLinear,
+    is_ternary,
+)
 from mlx_omnia.engine.core.mxcompat import metal_kernel
 
 _SOURCE = """
@@ -138,7 +144,7 @@ def ternary_matmul(x: mx.array, weight: mx.array, weight_scale: mx.array) -> mx.
 
 
 @dataclass(frozen=True)
-class TernaryQmv:
+class TernaryQmv(QmvStrategy):
     leaf: TernaryLinear
     in_features: int
     out_features: int

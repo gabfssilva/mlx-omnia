@@ -9,30 +9,25 @@ none of the three is named here.
 
 import asyncio
 import threading
-from collections.abc import AsyncIterator, Awaitable, Callable, Sequence
+from collections.abc import Awaitable, Callable, Sequence
 from concurrent.futures import Executor
-from dataclasses import dataclass, field
+from dataclasses import dataclass
 
 
 class Outlet[T]:
     """Where one member's pieces come out.
 
     `emit` never blocks the clock — the queue is unbounded, and a consumer that reads
-    slowly costs memory rather than a tick. `close` is idempotent and is what ends the
-    consumer's `async for`; the sentinel it writes is an implementation detail of this
-    class, and no reader of `__aiter__` ever sees it.
+    slowly costs memory rather than a tick. `close` is idempotent and writes the `None`
+    sentinel the queue's consumer ends on.
 
     Both are callable from the model thread: the queue belongs to the loop, so every
     write goes through `call_soon_threadsafe`.
     """
 
-    def __init__(
-        self,
-        loop: asyncio.AbstractEventLoop,
-        queue: asyncio.Queue[T | None] | None = None,
-    ) -> None:
+    def __init__(self, loop: asyncio.AbstractEventLoop, queue: asyncio.Queue[T | None]) -> None:
         self._loop = loop
-        self._queue: asyncio.Queue[T | None] = asyncio.Queue() if queue is None else queue
+        self._queue = queue
         self._closed = False
 
     def emit(self, item: T) -> None:
@@ -46,13 +41,6 @@ class Outlet[T]:
         self._closed = True
         self._loop.call_soon_threadsafe(self._queue.put_nowait, None)
 
-    async def __aiter__(self) -> AsyncIterator[T]:
-        while True:
-            item = await self._queue.get()
-            if item is None:
-                return
-            yield item
-
 
 @dataclass
 class Member[S, T]:
@@ -61,7 +49,7 @@ class Member[S, T]:
 
     state: S
     outlet: Outlet[T]
-    cancelled: threading.Event = field(default_factory=threading.Event)
+    cancelled: threading.Event
 
 
 @dataclass(frozen=True)
@@ -87,9 +75,9 @@ class Clock[S, T]:
         executor: Executor,
         tick: Callable[[Sequence[Member[S, T]]], Sequence[Emission[S, T]]],
         *,
-        room: Callable[[], int] = lambda: 0,
-        join: Callable[[], Awaitable[Member[S, T] | None]] | None = None,
-        on_leave: Callable[[Member[S, T]], None] | None = None,
+        room: Callable[[], int],
+        join: Callable[[], Awaitable[Member[S, T] | None]],
+        on_leave: Callable[[Member[S, T]], None],
     ) -> None:
         self._executor = executor
         self._tick = tick
@@ -116,8 +104,6 @@ class Clock[S, T]:
             # A joiner queued while this tick ran is only visible to the queue's own
             # consumer after the loop has had a turn.
             await asyncio.sleep(0)
-            if self._join is None:
-                continue
             while len(active) < self._room():
                 joiner = await self._join()
                 if joiner is None:
@@ -131,6 +117,5 @@ class Clock[S, T]:
         return True
 
     def _leave(self, member: Member[S, T]) -> None:
-        if self._on_leave is not None:
-            self._on_leave(member)
+        self._on_leave(member)
         member.outlet.close()

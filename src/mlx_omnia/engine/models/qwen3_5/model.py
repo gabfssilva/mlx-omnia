@@ -16,14 +16,11 @@ from mlx_omnia.engine.core.cache import (
 )
 from mlx_omnia.engine.core.decode import DecodePlan, compiled_decode
 from mlx_omnia.engine.core.prefill import prefill
-from mlx_omnia.engine.core.prompt_cache import PromptCache
 from mlx_omnia.engine.generate import (
-    BlockOutputs,
     Meter,
     Penalty,
     Sampler,
     greedy,
-    stream_ids,
     stream_text,
 )
 from mlx_omnia.engine.language import (
@@ -31,8 +28,8 @@ from mlx_omnia.engine.language import (
     GenerationOptions,
     LanguagePrompt,
     Text,
+    TextLanguageModel,
     Tokenizer,
-    prefix_cache,
 )
 from mlx_omnia.engine.model import ModelInput, ModelSignature
 from mlx_omnia.engine.models.qwen3_5.config import Qwen35Config
@@ -140,7 +137,7 @@ class Qwen35(nn.Module):
             """The delegators this graph baked. A per-block step run in between re-resolves
             them: streaming with a prefix cache takes that path and streaming without takes
             this one, so the same resident model alternates."""
-            return tuple(block.epoch for block in blocks if isinstance(block, Qwen35Block))
+            return tuple(block.epoch for block in blocks)
 
         def step(ids: mx.array, slots: Sequence[LayerCache], mask: mx.array | None) -> mx.array:
             anchor = next(layer for layer in slots if isinstance(layer, FixedKVCache))
@@ -269,14 +266,15 @@ class Qwen35(nn.Module):
             return None
         if tuple(at) not in ((-1,), (len(kinds) - 1,)):
             return None
-        from mlx_omnia.engine.core.kernels.gated_delta import FusedGatedDelta
+        from mlx_omnia.engine.core.kernels.gated_delta import FusedGatedDelta, GatedDelta
 
         blocks = self.model.layers
         for block, kind in zip(blocks, kinds, strict=True):
             if kind == "full_attention":
                 continue
             assert isinstance(block, Qwen35Block)
-            if not isinstance(block.linear_attn.rule().strategy, FusedGatedDelta):
+            rule = block.linear_attn.rule()
+            if not isinstance(rule, GatedDelta) or not isinstance(rule.strategy, FusedGatedDelta):
                 return None
 
         offset = cache[0].offset
@@ -354,7 +352,7 @@ class Qwen35(nn.Module):
                 assert isinstance(normed, mx.array) and isinstance(logits, mx.array)
                 return logits[0], normed
 
-            epochs = [block.epoch for block in blocks if isinstance(block, Qwen35Block)]
+            epochs = [block.epoch for block in blocks]
             return (
                 mx.compile(forward, inputs=state_containers, outputs=state_containers),
                 fitting,
@@ -366,7 +364,7 @@ class Qwen35(nn.Module):
         before = offset
 
         def stale() -> bool:
-            currently = [block.epoch for block in blocks if isinstance(block, Qwen35Block)]
+            currently = [block.epoch for block in blocks]
             return currently != epochs
 
         def verify(ids: mx.array) -> tuple[mx.array, mx.array]:
@@ -586,7 +584,13 @@ def sees(config: Qwen35Config, processor: ProcessorConfig | None) -> bool:
     )
 
 
-class Qwen35LanguageModel:
+class Qwen35LanguageModel(TextLanguageModel[LayerCache, Qwen35Input]):
+    """The chassis with the vision path over it: everything a text request needs — the trie,
+    the MTP door, continuous batching — is `language.TextLanguageModel`'s, and what is the
+    family's is the picture."""
+
+    model: Qwen35
+
     def __init__(
         self,
         model: Qwen35,
@@ -595,42 +599,9 @@ class Qwen35LanguageModel:
         *,
         stop: Collection[int] = (),
     ) -> None:
-        self.model = model
-        self.tokenizer = tokenizer
+        super().__init__(model, tokenizer, stop=stop)
         self.processor = processor
-        self.stop = stop
-        self.prefix: PromptCache[KVCache | DeltaCache] | None = None
-        """What this model kept of the prompts before it. A trunk with a recurrent layer has
-        nothing to cut at a common prefix and `stream_ids` refuses it there — this holds the
-        trie for the all-attention configurations of the same architecture."""
-        self.drafter: nn.Module | None = None
-        """`speculative.Drafting`. Out of the trunk's tree so whoever accounts for memory
-        can weigh it: with an MTP head the two are one checkpoint on disk and still two
-        trees here, and only one of them is under `self.model`."""
-        self._block: int | None = None
         self._vision = sees(model.config, processor)
-
-    def speculate_with(self, drafter: nn.Module, *, block_size: int | None = None) -> None:
-        """Take an MTP step for this trunk — `speculative.Drafting`, the same door
-        `language.TextLanguageModel` opens. A facade of its own only because of the vision
-        path; the checks are the protocol's, not the family's."""
-        if not isinstance(drafter, Step):
-            raise TypeError(f"{type(drafter).__name__} is not an MTP step for this engine")
-        if not isinstance(self.model, Speculable):
-            raise TypeError(
-                f"{type(self.model).__name__} does not lend its embedding table and its head "
-                "(`speculative.Speculable`), which is the whole of an MTP step's vocabulary"
-            )
-        if not isinstance(self.model, BlockOutputs):
-            raise TypeError(
-                f"{type(self.model).__name__} has no `block_outputs`, so there is nothing "
-                "for the step to condition on"
-            )
-        block = drafter.block if block_size is None else block_size
-        if block < 2:
-            raise ValueError(f"a block of {block} proposes nothing")
-        self.drafter = drafter
-        self._block = block
 
     def _proposer(self, options: GenerationOptions) -> Persistent[LayerCache] | None:
         """The proposer for this request, or `None` for every request that cannot be
@@ -705,45 +676,25 @@ class Qwen35LanguageModel:
         return multimodal_prompt(self.model, ids, images)
 
     def stream(self, input: Qwen35Input, options: GenerationOptions) -> Iterator[Segment]:
-        stop = self.stop if options.stop is None else options.stop
-        parser = _parser(input)
-        match input:
-            case Text():
-                rendered = input.read()
-                draft = self._proposer(options)
-                self.prefix = prefix_cache(self.prefix, options.prefix_budget)
-                ids = stream_ids(
-                    self.model,
-                    self.tokenizer.encode(rendered),
-                    max_tokens=options.max_tokens,
-                    sampler=options.sampler,
-                    stop=stop,
-                    penalty=options.penalty,
-                    meter=options.meter,
-                    # The two do not compose (`stream_ids` says why), and a round is worth
-                    # more than a prefix: the trie saves the prefill of a turn, the head
-                    # saves a read of the weights per token of every turn.
-                    prefix=None if draft is not None else self.prefix,
-                    constraint=options.constraint,
-                    draft=draft,
-                )
-            case Image() | LanguagePrompt():
-                parts = input.parts if isinstance(input, LanguagePrompt) else ()
-                rendered = "".join(part.read() for part in parts if isinstance(part, Text))
-                prompt = self.prepare(input)
-                # No prefix here, and it is not an omission: an image is one id repeated per
-                # patch, so two different pictures on the same grid produce the same ids — a
-                # trie keyed on ids would hand one image's attention to another.
-                ids = stream_multimodal_ids(
-                    self.model,
-                    prompt,
-                    max_tokens=options.max_tokens,
-                    sampler=options.sampler,
-                    stop=stop,
-                    penalty=options.penalty,
-                    meter=options.meter,
-                )
-            case _:
-                assert_never(input)
-
-        yield from stream_text(ids, self.tokenizer, parser=parser, prompt=rendered)
+        """A text prompt is the chassis' generation — batched when the trunk batches; what is
+        answered here is the one thing the chassis has no path for, a prompt with a picture
+        in it."""
+        if isinstance(input, Text):
+            yield from super().stream(input, options)
+            return
+        parts = input.parts if isinstance(input, LanguagePrompt) else ()
+        rendered = "".join(part.read() for part in parts if isinstance(part, Text))
+        prompt = self.prepare(input)
+        # No prefix here, and it is not an omission: an image is one id repeated per patch,
+        # so two different pictures on the same grid produce the same ids — a trie keyed on
+        # ids would hand one image's attention to another.
+        ids = stream_multimodal_ids(
+            self.model,
+            prompt,
+            max_tokens=options.max_tokens,
+            sampler=options.sampler,
+            stop=self.stop if options.stop is None else options.stop,
+            penalty=options.penalty,
+            meter=options.meter,
+        )
+        yield from stream_text(ids, self.tokenizer, parser=_parser(input), prompt=rendered)

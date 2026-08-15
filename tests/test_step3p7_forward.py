@@ -20,6 +20,7 @@ from tests.conftest import (
     relative_diff,
     requires_checkpoint,
 )
+from tests.mutation import mutated
 
 FIXTURE = Path(__file__).parent / "fixtures" / "step3p7_mlxlm.safetensors"
 REPO = "stepfun-ai/Step-3.7-Flash"
@@ -76,12 +77,9 @@ def test_mutation_breaks_parity(model: Step3p7, golden: dict[str, mx.array]) -> 
     assert isinstance(layer.moe, Step3p7MoE)
     original = layer.moe.switch_mlp.gate_up_proj.weight
     assert isinstance(original, mx.array)
-    layer.moe.switch_mlp.gate_up_proj.weight = original * 1.5
-    try:
+    with mutated(layer.moe.switch_mlp.gate_up_proj, "weight", original * 1.5):
         logits = model(golden["input_ids"][None])
         assert relative_diff(logits, golden["logits"]) > golden["noise.logits"].item()
-    finally:
-        layer.moe.switch_mlp.gate_up_proj.weight = original
 
 
 @requires_checkpoint(REPO)

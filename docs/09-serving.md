@@ -6,9 +6,7 @@ What changes when a model stops being a function you call and becomes a process 
 
 MLX enqueues on a single GPU stream, and the decode loop is CPU-hot. Two requests calling `generate()` at once do not run twice as fast; they interleave badly and both get slower.
 
-So generation is **serialized behind a global FCFS gate**: one worker task consumes a queue and runs each job to completion (or cancellation) before starting the next (`packages/mlx_omnia-server/src/mlx_omnia_server/engine.py`).
-
-This deliberate simplification lets a long generation block shorter ones. Continuous batching runs several sequences through one forward pass and admits or retires them independently. It is the intended replacement, but has not been implemented here yet.
+So generation runs on **one model thread**, and requests share it through **continuous batching**: a single clock ticks a group of sequences through one forward pass per token, admitting and retiring members independently (`src/mlx_omnia/server/engine.py`, `src/mlx_omnia/server/flow.py`). Every model family batches; a request the batch cannot answer for — a prompt still arriving as an iterator, an image prompt — streams alone on the same thread. `max_concurrent_requests` bounds the group.
 
 One thing is explicitly kept *outside* the gate: **model loading**. A cold load of a large model takes seconds, and holding the generation gate through it would make every resident model wait on it.
 

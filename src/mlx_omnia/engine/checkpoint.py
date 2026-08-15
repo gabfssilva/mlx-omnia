@@ -9,12 +9,12 @@ strict → `materialize`).
 """
 
 import json
-from collections.abc import Callable, Iterator, Mapping, Sequence
+from collections.abc import Callable, Generator, Mapping, Sequence
 from contextlib import contextmanager
 from contextvars import ContextVar
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Literal, NotRequired, Protocol, TypedDict, assert_never
+from typing import Generic, Literal, NotRequired, Protocol, TypedDict, TypeVar, assert_never
 
 import mlx.core as mx
 import mlx.nn as nn
@@ -50,7 +50,7 @@ def materialize(*arrays: object) -> None:
 
 
 @contextmanager
-def dormant() -> Iterator[None]:
+def dormant() -> Generator[None]:
     """Build a checkpoint's tree without reading a weight.
 
     Everything but the numbers is already free: the shard headers give shape and dtype,
@@ -652,8 +652,15 @@ def load_checkpoint[M: nn.Module](
     return attach_weights(model, prepared, declared=declared)
 
 
+_Produced = TypeVar("_Produced", covariant=True)
+"""Declared the old way because PEP 695 has no variance marker and infers invariance from a
+dataclass field: `Pending` is frozen, and a registry holding one architecture's declaration
+beside another's is only well typed if what the tail produces is covariant. `Checkpoint` and
+`Drafter` then infer their own covariance from this one."""
+
+
 @dataclass(frozen=True, slots=True)
-class Pending[M]:
+class Pending(Generic[_Produced]):  # noqa: UP046
     """The same load split where quantization happens: the lazy tree (which is what the
     plan resolves against and costs nothing to build), the prepared weight dict, and the
     tail that binds one to the other. The split is what lets `cache=False` quantize
@@ -664,7 +671,7 @@ class Pending[M]:
 
     model: nn.Module
     weights: Callable[[], dict[str, mx.array]]
-    attach: Callable[[dict[str, mx.array]], M]
+    attach: Callable[[dict[str, mx.array]], _Produced]
 
 
 @dataclass(frozen=True, slots=True)
@@ -778,11 +785,17 @@ def checkpoint[M: nn.Module, C](
     `patterns` is what the architecture declares, plus `_CARRIED` — see there for why the
     spine adds it rather than each family."""
 
+    parse: Callable[[Path], C]
     if isinstance(config, type):
-        cls = config
+        # The mirror arm is a bare `type` and not `type[C]` because a class is itself a
+        # callable: narrowing `Callable[[Path], C] | type[C]` leaves pyright with
+        # `type[object]`, and the tie to `C` only survives in the signature above.
+        mirror: type = config
 
-        def parse(path: Path) -> C:
-            return load_config(cls, path, allowed_model_types=model_types)
+        def read(path: Path) -> C:
+            return load_config(mirror, path, allowed_model_types=model_types)
+
+        parse = read
     else:
         parse = config
 

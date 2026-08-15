@@ -4,7 +4,7 @@
 There is no transformers ground truth to have: the released modeling file delegates the
 KDA recurrence to fla's triton kernels, which do not run here, and the only published
 checkpoint is 124B. The fixture's own docstring says what the reference is and how the
-floors were measured; every tolerance below is `3 ×` a floor from the fixture, never a
+floors were measured; every tolerance below is `3 x` a floor from the fixture, never a
 number chosen to make a test pass.
 """
 

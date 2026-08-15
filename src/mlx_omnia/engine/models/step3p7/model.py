@@ -6,17 +6,17 @@ import mlx.nn as nn
 import numpy as np
 
 from mlx_omnia.engine.core.attend import KVStore
-from mlx_omnia.engine.core.attention import ragged_mask
+from mlx_omnia.engine.core.attention import Spanned, ragged_mask
 from mlx_omnia.engine.core.cache import KVCache
 from mlx_omnia.engine.core.prefill import prefill
-from mlx_omnia.engine.generate import Meter, Penalty, Sampler, greedy, stream_ids, stream_text
+from mlx_omnia.engine.generate import Meter, Penalty, Sampler, greedy, stream_text
 from mlx_omnia.engine.language import (
     TEXT,
     GenerationOptions,
     LanguagePrompt,
     Text,
+    TextLanguageModel,
     Tokenizer,
-    prefix_cache,
 )
 from mlx_omnia.engine.model import ModelInput, ModelSignature
 from mlx_omnia.engine.models.step3p7.config import FULL, SLIDING, Step3p7Config
@@ -72,7 +72,8 @@ class Step3p7(nn.Module):
         sliding: mx.array | str | None = None
         if SLIDING in types:
             if isinstance(offset, mx.array):
-                sliding = ragged_mask(length, offset, text.sliding_window)
+                span = cache[0].span if isinstance(cache[0], Spanned) else None
+                sliding = ragged_mask(length, offset, text.sliding_window, span=span)
             else:
                 sliding = self._sliding_mask(length, offset)
 
@@ -179,7 +180,12 @@ def sees(config: Step3p7Config, processor: Step3p7Processor | None) -> bool:
     )
 
 
-class Step3p7LanguageModel:
+class Step3p7LanguageModel(TextLanguageModel[KVCache, Step3p7Input]):
+    """The chassis with the vision path over it: a text request is `TextLanguageModel`'s —
+    the trie, the batched decode — and what is the family's is the picture."""
+
+    model: Step3p7
+
     def __init__(
         self,
         model: Step3p7,
@@ -188,11 +194,8 @@ class Step3p7LanguageModel:
         *,
         stop: Collection[int] = (),
     ) -> None:
-        self.model = model
-        self.tokenizer = tokenizer
+        super().__init__(model, tokenizer, stop=stop)
         self.processor = processor
-        self.stop = stop
-        self.prefix: object | None = None
         self._vision = sees(model.config, processor)
 
     @property
@@ -252,39 +255,25 @@ class Step3p7LanguageModel:
         return Step3p7Prompt(ids, embeddings)
 
     def stream(self, input: Step3p7Input, options: GenerationOptions) -> Iterator[Segment]:
-        stop = self.stop if options.stop is None else options.stop
-        parser = _parser(input)
-        match input:
-            case Text(value=rendered):
-                self.prefix = prefix_cache(self.prefix, options.prefix_budget)  # type: ignore[arg-type]
-                ids = stream_ids(
-                    self.model,
-                    self.tokenizer.encode(rendered),
-                    max_tokens=options.max_tokens,
-                    sampler=options.sampler,
-                    stop=stop,
-                    penalty=options.penalty,
-                    meter=options.meter,
-                    prefix=self.prefix,  # type: ignore[arg-type]
-                    constraint=options.constraint,
-                )
-            case Image() | LanguagePrompt():
-                parts = input.parts if isinstance(input, LanguagePrompt) else ()
-                rendered = "".join(part.value for part in parts if isinstance(part, Text))
-                prompt = self.prepare(input)
-                ids = stream_step3p7_ids(
-                    self.model,
-                    prompt,
-                    max_tokens=options.max_tokens,
-                    sampler=options.sampler,
-                    stop=stop,
-                    penalty=options.penalty,
-                    meter=options.meter,
-                )
-            case _:
-                assert_never(input)
-
-        yield from stream_text(ids, self.tokenizer, parser=parser, prompt=rendered)
+        """A text prompt is the chassis' generation — batched when the trunk batches; what is
+        answered here is the one thing the chassis has no path for, a prompt with a picture
+        in it."""
+        if isinstance(input, Text):
+            yield from super().stream(input, options)
+            return
+        parts = input.parts if isinstance(input, LanguagePrompt) else ()
+        rendered = "".join(part.read() for part in parts if isinstance(part, Text))
+        prompt = self.prepare(input)
+        ids = stream_step3p7_ids(
+            self.model,
+            prompt,
+            max_tokens=options.max_tokens,
+            sampler=options.sampler,
+            stop=self.stop if options.stop is None else options.stop,
+            penalty=options.penalty,
+            meter=options.meter,
+        )
+        yield from stream_text(ids, self.tokenizer, parser=_parser(input), prompt=rendered)
 
     def _vision_embeddings(
         self, ids: mx.array, image_features: ImageFeatures

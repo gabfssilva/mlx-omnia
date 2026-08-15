@@ -11,11 +11,11 @@ from typing import Self
 
 import mlx.core as mx
 
-from mlx_omnia.engine.core.kernels.lm_head.kernel import HeadProjection
+from mlx_omnia.engine.core.kernels.lm_head.kernel import GreedyHeadStrategy, HeadProjection
 
 
 @dataclass(frozen=True)
-class DefaultGreedyHead:
+class DefaultGreedyHead(GreedyHeadStrategy):
     projection: HeadProjection
 
     @classmethod

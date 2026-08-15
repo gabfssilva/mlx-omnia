@@ -60,10 +60,10 @@ class LongcatFlashNgram(nn.Module):
     ) -> LongcatFlashNgramActivations:
         layers: Sequence[LongcatLayer] = self.make_cache() if cache is None else cache
         ngram_cache = layers[0]
-        assert isinstance(ngram_cache, (NgramCache, BatchedNgramCache))
+        assert isinstance(ngram_cache, NgramCache | BatchedNgramCache)
         mla_caches: list[LatentStore] = []
         for c in layers[1:]:
-            assert isinstance(c, (MLACache, BatchedMLACache))
+            assert isinstance(c, MLACache | BatchedMLACache)
             mla_caches.append(c)
 
         x = self.model.ngram_embeddings(ids, ngram_cache)

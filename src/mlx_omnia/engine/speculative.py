@@ -33,6 +33,25 @@ class SpeculationRefused(Exception):
     degraded mode: a wrong number costs more than the speculation was worth."""
 
 
+def _lends_vocabulary(target: object, block: int) -> "Speculable":
+    """The two refusals `Chained` and `Persistent` share, before either holds state."""
+    if block < 2:
+        raise ValueError(f"a block of {block} proposes nothing")
+    if not isinstance(target, Speculable):
+        raise SpeculationRefused(
+            f"{type(target).__name__} does not lend its embedding table and its head "
+            "(`speculative.Speculable`), which is the whole of an MTP step's vocabulary"
+        )
+    return target
+
+
+def taps_refused(taps: Collection[int]) -> SpeculationRefused:
+    return SpeculationRefused(
+        f"this draft conditions on the target's blocks {list(taps)} and the target has "
+        "no `block_outputs`: what it would read instead is nothing at all"
+    )
+
+
 @runtime_checkable
 class Drafting(Protocol):
     """A model facade that can be handed a second checkpoint to speculate with.
@@ -326,14 +345,7 @@ class Chained[S: LayerCache]:
         block: int,
         tap: int,
     ) -> None:
-        if block < 2:
-            raise ValueError(f"a block of {block} proposes nothing")
-        if not isinstance(target, Speculable):
-            raise SpeculationRefused(
-                f"{type(target).__name__} does not lend its embedding table and its head "
-                "(`speculative.Speculable`), which is the whole of an MTP step's vocabulary"
-            )
-        self._target = target
+        self._target = _lends_vocabulary(target, block)
         self._step = step
         self._width = block - 1
         self._tap = tap
@@ -420,14 +432,7 @@ class Persistent[S: LayerCache]:
         block: int,
         tap: int,
     ) -> None:
-        if block < 2:
-            raise ValueError(f"a block of {block} proposes nothing")
-        if not isinstance(target, Speculable):
-            raise SpeculationRefused(
-                f"{type(target).__name__} does not lend its embedding table and its head "
-                "(`speculative.Speculable`), which is the whole of an MTP step's vocabulary"
-            )
-        self._target = target
+        self._target = _lends_vocabulary(target, block)
         self._step = step
         self._width = block - 1
         self._tap = tap
@@ -506,12 +511,9 @@ def stream_speculative_ids[C: LayerCache, D: LayerCache](
     proposer: Proposer = draft if isinstance(draft, Proposer) else Autoregressive(draft, lookahead)
     taps = proposer.taps
     if taps and not isinstance(target, BlockOutputs):
-        raise SpeculationRefused(
-            f"this draft conditions on the target's blocks {list(taps)} and the target has "
-            "no `block_outputs`: what it would read instead is nothing at all"
-        )
+        raise taps_refused(taps)
     target_cache = target.make_cache()
-    replays = _rewinds(target_cache, "target")
+    replays = rewinds(target_cache, "target")
 
     # Read here, ahead of the meter that wants its length: a round rewinds both caches in
     # step, so this loop needs the whole prompt before its first forward whatever shape it
@@ -563,7 +565,7 @@ def stream_speculative_ids[C: LayerCache, D: LayerCache](
             if compiled is not None and target_cache[0].offset == len(committed) - 1:
                 pending, accepted = _compiled_round(compiled, proposer, committed)
             else:
-                pending, accepted = _round(
+                pending, accepted = one_round(
                     verify, forward, proposer, target_cache, committed, replays
                 )
             committed += pending
@@ -609,7 +611,7 @@ def _compiled_round(
     return [*proposed[:accepted], predicted[accepted]], accepted
 
 
-def _round[C: LayerCache](
+def one_round[C: LayerCache](
     verify: Callable[[mx.array], tuple[mx.array, mx.array | None, Callable[[int], None] | None]],
     forward: Callable[[mx.array], tuple[mx.array, mx.array | None]],
     proposer: Proposer,
@@ -675,7 +677,7 @@ def _round[C: LayerCache](
     return [*proposed[:accepted], predicted[accepted]], accepted
 
 
-def _rewinds(cache: Sequence[LayerCache], role: str) -> bool:
+def rewinds(cache: Sequence[LayerCache], role: str) -> bool:
     """How this cache goes back, or a refusal. `False` is `trim`, `True` is replay.
 
     Trim first, because it is free where it applies. A trunk with one recurrent layer in it

@@ -1,10 +1,11 @@
 import math
 from collections.abc import Sequence
-from typing import NamedTuple, Protocol, runtime_checkable
+from typing import NamedTuple
 
 import mlx.core as mx
 import mlx.nn as nn
 
+from mlx_omnia.engine.batching import BatchedKVCache, BatchedSharedKVReader
 from mlx_omnia.engine.core.attend import KVStore
 from mlx_omnia.engine.core.cache import KVCache, SharedKVReader
 from mlx_omnia.engine.models.gemma4.config import Gemma4Config, Gemma4TextConfig
@@ -29,15 +30,6 @@ class Gemma4Trunk(nn.Module):
                 config.hidden_size, n * ple_dim, bias=False
             )
             self.per_layer_projection_norm = nn.RMSNorm(ple_dim, eps=config.rms_norm_eps)
-
-
-@runtime_checkable
-class Adopting(Protocol):
-    """The batched stand-in for a `SharedKVReader`: it takes its rows from the writer's
-    own batch adapter, one row at a time, because a ragged batch has no single pair of
-    published tensors. Declared structurally so the family does not import `batching`."""
-
-    def adopt(self, store: KVStore, length: int) -> None: ...
 
 
 class Gemma4Activations(NamedTuple):
@@ -92,41 +84,35 @@ class Gemma4(nn.Module):
         length = ids.shape[1]
         x = self.embed(ids)
         embeddings = x
-        per_layer_input = self._per_layer_inputs(ids)
+        per_layer_input = self._per_layer_inputs(ids, x)
         blocks: list[mx.array] = []
 
-        # Track shared KV: for each layer_type, the storing layer's cache and its
-        # pre-update offset. The offset is captured BEFORE the store layer runs, so the
-        # shared layer's q is rotated by the correct starting position.
-        stores: dict[str, KVStore | SharedKVReader] = {}
-        positions: dict[str, int] = {}
+        # For each layer_type, the storing layer's cache and its pre-update offset — the
+        # offset is captured BEFORE the store layer runs, so the shared layer's q is
+        # rotated by the correct starting position.
+        stores: dict[str, tuple[KVStore | SharedKVReader, int | None]] = {}
 
         for i, (block, layer_cache) in enumerate(
             zip(self.model.layers, cache, strict=True)
         ):
-            # If this is a storing layer, capture its pre-update offset for shared layers.
             if text.store_full_length_kv(i):
-                stores[types[i]] = layer_cache
-                if isinstance(layer_cache, KVCache):
-                    positions[types[i]] = layer_cache.offset
+                pre = layer_cache.offset if isinstance(layer_cache, KVCache) else None
+                stores[types[i]] = (layer_cache, pre)
 
-            # If this is a shared layer, publish full-length KV from the store.
-            # The keys/values are the store's post-update cache (includes current step);
-            # the offset is the store's pre-update offset (the q starting position).
             if text.is_kv_shared_layer(i):
-                store_cache = stores[types[i]]
-                if isinstance(layer_cache, Adopting):
+                store_cache, pre = stores[types[i]]
+                if isinstance(layer_cache, BatchedSharedKVReader):
                     # Ragged rows have no one pair of tensors to publish; the adapter
                     # takes the writer's rows, and derives the same pre-update offset.
-                    assert not isinstance(store_cache, SharedKVReader)
+                    assert isinstance(store_cache, BatchedKVCache)
                     layer_cache.adopt(store_cache, length)
                 else:
                     assert isinstance(store_cache, KVCache)
                     assert isinstance(layer_cache, SharedKVReader)
+                    assert pre is not None
                     layer_cache.keys, layer_cache.values = store_cache.fetch()
-                    layer_cache.offset = positions[types[i]]
+                    layer_cache.offset = pre
 
-            # Extract per-layer slice for this block.
             ple_slice = None
             if per_layer_input is not None:
                 ple_slice = per_layer_input[:, :, i, :]
@@ -143,11 +129,12 @@ class Gemma4(nn.Module):
     ) -> mx.array:
         return self.activations(ids, cache).logits
 
-    def _per_layer_inputs(self, ids: mx.array) -> mx.array | None:
+    def _per_layer_inputs(self, ids: mx.array, embedded: mx.array) -> mx.array | None:
         """The PLE pipeline: token identity + context projection, combined at 1/sqrt(2).
 
-        The context projection takes the **scaled** main embedding (h = embed * sqrt(hidden)),
-        matching the reference implementation's `_project_per_layer_inputs(h, ...)`.
+        The context projection takes the **scaled** main embedding (`embedded`, as
+        `self.embed` built it), matching the reference implementation's
+        `_project_per_layer_inputs(h, ...)`.
         """
         cfg = self.config.text_config
         if cfg.hidden_size_per_layer_input == 0:
@@ -155,7 +142,6 @@ class Gemma4(nn.Module):
         ple_dim = cfg.hidden_size_per_layer_input
         n = cfg.num_hidden_layers
 
-        # Token-identity: scaled embedding lookup, reshaped to [B, S, n, ple_dim].
         rows = ids.shape[0]
         ple_embed = self.model.embed_tokens_per_layer(ids)
         ple_scale = mx.array(math.sqrt(ple_dim), mx.float32).astype(ple_embed.dtype)
@@ -163,19 +149,13 @@ class Gemma4(nn.Module):
             rows, ple_embed.shape[1], n, ple_dim
         )
 
-        # Context: project the SCALED main embedding → n*ple_dim, scale by 1/sqrt(hidden), norm.
-        main_embed = self.model.embed_tokens(ids)
-        h = main_embed * mx.array(
-            math.sqrt(cfg.hidden_size), mx.float32
-        ).astype(main_embed.dtype)
-        ctx = self.model.per_layer_model_projection(h)
+        ctx = self.model.per_layer_model_projection(embedded)
         ctx_scale = mx.array(
             1.0 / math.sqrt(cfg.hidden_size), mx.float32
         ).astype(ctx.dtype)
         ctx = (ctx * ctx_scale).reshape(rows, ctx.shape[1], n, ple_dim)
         ctx = self.model.per_layer_projection_norm(ctx)
 
-        # Combine.
         combine = mx.array(
             1.0 / math.sqrt(2.0), mx.float32
         ).astype(token_identity.dtype)

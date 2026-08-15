@@ -2,6 +2,7 @@ from collections.abc import Callable, Sequence
 
 import mlx.core as mx
 
+from mlx_omnia.engine.batching import RaggedAdapter, RaggedBatchable
 from mlx_omnia.engine.core.cache import KVCache, LayerCache, reserve
 from mlx_omnia.engine.models.deepseek_v4.config import LOCAL
 
@@ -63,19 +64,21 @@ class PoolCache(LayerCache):
         """The rows that complete whole windows, and the absolute position of the first of
         them. What is left over is kept for the next call."""
         length = kv.shape[1]
-        if self.tail_kv is None or self.tail_gate is None:
-            self.tail_kv = mx.zeros((1, self.ratio, kv.shape[-1]), dtype=kv.dtype)
-            self.tail_gate = mx.zeros((1, self.ratio, gate.shape[-1]), dtype=gate.dtype)
+        tail_kv, tail_gate = self.tail_kv, self.tail_gate
+        if tail_kv is None or tail_gate is None:
+            tail_kv = mx.zeros((1, self.ratio, kv.shape[-1]), dtype=kv.dtype)
+            tail_gate = mx.zeros((1, self.ratio, gate.shape[-1]), dtype=gate.dtype)
+            self.tail_kv, self.tail_gate = tail_kv, tail_gate
 
         total = length + self.remainder
         usable = total // self.ratio * self.ratio
         rest = total % self.ratio
         if usable:
             ready_kv = mx.concatenate(
-                [self.tail_kv[:, : self.remainder], kv[:, : usable - self.remainder]], axis=1
+                [tail_kv[:, : self.remainder], kv[:, : usable - self.remainder]], axis=1
             )
             ready_gate = mx.concatenate(
-                [self.tail_gate[:, : self.remainder], gate[:, : usable - self.remainder]], axis=1
+                [tail_gate[:, : self.remainder], gate[:, : usable - self.remainder]], axis=1
             )
             base = offset - self.remainder
             self.remainder = 0
@@ -83,15 +86,16 @@ class PoolCache(LayerCache):
             ready_kv, ready_gate, base = kv[:, :0], gate[:, :0], 0
 
         if rest:
-            self.tail_kv[:, self.remainder : rest] = kv[:, -rest:]
-            self.tail_gate[:, self.remainder : rest] = gate[:, -rest:]
+            tail_kv[:, self.remainder : rest] = kv[:, -rest:]
+            tail_gate[:, self.remainder : rest] = gate[:, -rest:]
         self.remainder = rest
         return ready_kv, ready_gate, base
 
     def append(self, pooled: mx.array) -> None:
         needed = self.pooled_rows + pooled.shape[2]
-        self.pooled = reserve(self.pooled, needed, pooled)
-        self.pooled[..., self.pooled_rows : needed, :] = pooled
+        buffer = reserve(self.pooled, needed, pooled)
+        self.pooled = buffer
+        buffer[..., self.pooled_rows : needed, :] = pooled
         self.pooled_rows = needed
 
     def fetch(self, head_dim: int, dtype: mx.Dtype) -> mx.array:
@@ -108,7 +112,7 @@ class PoolCache(LayerCache):
         return mx.arange(self.pooled_rows).reshape(1, -1) < rows // self.ratio
 
 
-class DeepseekV4Cache(LayerCache):
+class DeepseekV4Cache(LayerCache, RaggedBatchable):
     """One layer's histories: the local keys (K == V, one buffer), the compressor's pooled
     rows and — on the indexed layers — the indexer's own pooled rows. They advance
     together and the layer presents a single `offset`."""
@@ -189,7 +193,7 @@ class DeepseekV4Cache(LayerCache):
         return BatchedDeepseekV4Cache(held)
 
 
-class BatchedDeepseekV4Cache:
+class BatchedDeepseekV4Cache(RaggedAdapter):
     """N `DeepseekV4Cache`s as one ragged layer: the rows, and where each one stands."""
 
     def __init__(self, caches: Sequence[DeepseekV4Cache]) -> None:

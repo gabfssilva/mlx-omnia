@@ -12,7 +12,7 @@ is a silent numerical substitution.
 """
 
 from dataclasses import dataclass
-from typing import Literal, Protocol
+from typing import Literal, Protocol, runtime_checkable
 
 import mlx.core as mx
 
@@ -47,6 +47,7 @@ class Routing:
         return self.k + (1 if self.shared else 0)
 
 
+@runtime_checkable
 class RouteStrategy(Protocol):
     """(row [hidden]) -> (indices [slots] uint32, weights [slots]).
 

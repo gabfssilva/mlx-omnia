@@ -9,11 +9,12 @@ not an operand. The shared expert is construction-time leaves; it quantizes on i
 schedule, so no declaration ties its format to the routed stack's.
 """
 
-from typing import Protocol
+from typing import Protocol, runtime_checkable
 
 import mlx.core as mx
 
 
+@runtime_checkable
 class SwigluMoeStepStrategy(Protocol):
     """(x, residual, logits?, keys?) ->
     `residual + scale · Σ_e w_e · down_e(silu(gate_e x) · up_e x) + shared(x)`, rounded

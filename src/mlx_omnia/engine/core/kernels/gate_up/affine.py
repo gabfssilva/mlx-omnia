@@ -12,7 +12,12 @@ from typing import Self
 import mlx.core as mx
 import mlx.nn as nn
 
-from mlx_omnia.engine.core.kernels.gate_up.kernel import Activation, Layout, OrdinalRouting
+from mlx_omnia.engine.core.kernels.gate_up.kernel import (
+    Activation,
+    GateUpStrategy,
+    Layout,
+    OrdinalRouting,
+)
 from mlx_omnia.engine.core.kernels.shared.affine import HEADER
 from mlx_omnia.engine.core.layers import QuantizedSwitchLinear, SwitchLinear
 from mlx_omnia.engine.core.mxcompat import metal_kernel
@@ -107,7 +112,7 @@ def applies(hidden: int, inner: int, group: int) -> bool:
 
 
 @dataclass(frozen=True)
-class AffineGateUp:
+class AffineGateUp(GateUpStrategy):
     weight: mx.array
     scales: mx.array
     biases: mx.array

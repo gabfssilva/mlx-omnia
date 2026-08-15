@@ -13,6 +13,7 @@ from mlx_omnia.engine.checkpoint import (
 )
 from mlx_omnia.engine.language import LanguageModel, TextLanguageModel
 from mlx_omnia.engine.model import CompositeModel, ModelInput
+from mlx_omnia.engine.models.lfm2.checkpoint import fuse_dense_mlp
 from mlx_omnia.engine.models.lfm2.config import LFM2Config
 from mlx_omnia.engine.models.lfm2.dense.model import LFM2
 
@@ -24,19 +25,7 @@ def weights(directory: Path, config: LFM2Config, dtype: mx.Dtype | None) -> dict
     if config.tie_word_embeddings:
         drop_tied_head(loaded)
     loaded = fuse_qkv(loaded, config.num_hidden_layers)
-    return _fuse_dense_mlp(loaded, config.num_hidden_layers)
-
-
-def _fuse_dense_mlp(weights: dict[str, mx.array], layers: int) -> dict[str, mx.array]:
-    for layer in range(layers):
-        prefix = f"model.layers.{layer}.feed_forward."
-        keys = [f"{prefix}{name}.weight" for name in ("w1", "w3")]
-        if not all(key in weights for key in keys):
-            continue
-        fused = mx.concatenate([weights.pop(key) for key in keys], axis=0)
-        mx.eval(fused)
-        weights[f"{prefix}w13.weight"] = fused
-    return weights
+    return fuse_dense_mlp(loaded, config.num_hidden_layers)
 
 
 def _composite(directory: Path, model: LFM2) -> LanguageModel[ModelInput]:

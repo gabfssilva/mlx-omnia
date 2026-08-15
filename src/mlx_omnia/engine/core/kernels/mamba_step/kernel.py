@@ -11,11 +11,12 @@ the normed row ready for out_proj plus the slid window and advanced state —
 resolves which module serves a given configuration, once, at construction.
 """
 
-from typing import Protocol
+from typing import Protocol, runtime_checkable
 
 import mlx.core as mx
 
 
+@runtime_checkable
 class MambaStepStrategy(Protocol):
     """(proj, window, state) -> (normed row for out_proj, slid window, new state)."""
 

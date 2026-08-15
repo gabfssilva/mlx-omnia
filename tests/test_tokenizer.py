@@ -1,5 +1,5 @@
 from pathlib import Path
-from typing import Protocol
+from typing import Protocol, runtime_checkable
 
 import pytest
 from huggingface_hub import hf_hub_download
@@ -36,6 +36,7 @@ def tokenizer() -> GPT2Tokenizer:
     return GPT2Tokenizer.from_files(vocab, merges)
 
 
+@runtime_checkable
 class Encodes(Protocol):
     def encode(self, text: str) -> list[int]: ...
 

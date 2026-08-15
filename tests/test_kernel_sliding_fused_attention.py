@@ -24,6 +24,7 @@ import mlx.core as mx
 import pytest
 
 import mlx_omnia.engine.core.kernels.attention.sliding as sfa
+from mlx_omnia.engine.core.kernels.attention.digest import digest_kernel, metal_float
 from mlx_omnia.engine.core.kernels.attention.sliding import (
     sliding_fused_attention,
     sliding_fused_attention_applies,
@@ -259,7 +260,8 @@ def _mutate(
     if header_edit is not None:
         assert header_edit[0] in header
         header = header.replace(*header_edit)
-    broken = sfa._build(Template(source).substitute(eps=sfa._metal_float(EPS)), header)
+    substituted = Template(source).substitute(eps=metal_float(EPS))
+    broken = digest_kernel(sfa._PREFIX, sfa._INPUTS, substituted, header)
     monkeypatch.setattr(sfa, "_kernel", lambda _eps: broken)
 
 

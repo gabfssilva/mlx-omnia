@@ -19,6 +19,7 @@ from mlx_omnia.engine.core.kernels.ssm.step import ssm_step
 from mlx_omnia.engine.models.mamba2 import CHECKPOINT, Mamba2, Mamba2Activations
 from mlx_omnia.engine.models.mamba2.layers import flags, ssd
 from tests.conftest import floor, load_golden, relative_diff
+from tests.mutation import mutated
 
 FIXTURE = Path(__file__).parent / "fixtures" / "mamba2_forward.safetensors"
 N_LAYER = 64
@@ -115,23 +116,17 @@ def test_delta_cache_is_not_trimmable(model: Mamba2) -> None:
 def test_mutation_of_conv_breaks_parity(model: Mamba2, golden: dict[str, mx.array]) -> None:
     conv = model.model.layers[LAYER].mixer.conv1d
     original = conv.weight
-    conv.weight = original * 1.01
-    try:
+    with mutated(conv, "weight", original * 1.01):
         logits = model(golden["input_ids"][None])
         assert relative_diff(logits, golden["logits"]) > floor(golden, "logits")
-    finally:
-        conv.weight = original
 
 
 def test_mutation_of_decay_breaks_parity(model: Mamba2, golden: dict[str, mx.array]) -> None:
     mixer = model.model.layers[LAYER].mixer
     original = mixer.A_log
-    mixer.A_log = original + 0.5
-    try:
+    with mutated(mixer, "A_log", original + 0.5):
         logits = model(golden["input_ids"][None])
         assert relative_diff(logits, golden["logits"]) > floor(golden, "logits")
-    finally:
-        mixer.A_log = original
 
 
 # --- Kernel seams --------------------------------------------------------

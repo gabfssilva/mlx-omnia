@@ -30,7 +30,7 @@ __all__ = [
 _STRATEGIES = (AtlasEmbed, DefaultEmbed)
 
 
-class Embed:
+class Embed(EmbedStrategy):
     """Resolves the strategy at construction and delegates; itself an `EmbedStrategy`."""
 
     def __init__(

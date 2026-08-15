@@ -16,8 +16,8 @@ from tests.server.benchmark_stand import (
     Scripted,
     composite,
     stand,
-    wait_for,
 )
+from tests.server.polling import wait_for
 
 MODEL = "house/small"
 OTHER = "house/other"

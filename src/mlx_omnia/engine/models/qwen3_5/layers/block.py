@@ -81,7 +81,7 @@ class Qwen35Block(nn.Module):
         # `_traced_state()` keeps the weights this module reads directly implicit inputs
         # of the trace instead of baked constants: a swapped tensor (quantize-on-load, a
         # mutation test) is read on the next call, no retrace needed. What a delegator
-        # holds is baked instead, and `Qwen35MoE._kernels` is what notices a swap there.
+        # holds is baked instead, and `Qwen35MoE.kernels` is what notices a swap there.
         if self.attends:
             self._tail_step = mx.compile(self._tail, inputs=self._traced_state())
         else:
@@ -114,7 +114,7 @@ class Qwen35Block(nn.Module):
         mask: mx.array | None = None,
     ) -> mx.array:
         if self.attends:
-            assert isinstance(cache, (KVCache, FixedKVCache, Attending))
+            assert isinstance(cache, KVCache | FixedKVCache | Attending)
             return self.self_attn(self.input_layernorm(x), cache, positions, mask)
         assert isinstance(cache, Recurring)
         return self.linear_attn(self.input_layernorm(x), cache)
@@ -135,7 +135,7 @@ class Qwen35Block(nn.Module):
             self.linear_attn.rule()
         mlp = self.mlp
         if isinstance(mlp, Qwen35MoE):
-            mlp._kernels()
+            mlp.kernels()
         self._resolved_outside = True
 
     def graph_step(
@@ -241,7 +241,7 @@ class Qwen35Block(nn.Module):
         resolved kernels, which hold them as their own fields — and an array that is both
         a declared input and a strategy's frozen field is exactly what `mx.compile`
         rejects: it swaps the one inside the container for a tracer and the strategy goes
-        on reading the original. `Qwen35MoE._kernels` re-resolves when a leaf is replaced,
+        on reading the original. `Qwen35MoE.kernels` re-resolves when a leaf is replaced,
         so nothing is lost by leaving them baked. A dense MLP stays: the trace reads it
         directly."""
         mixer = self.self_attn if self.attends else self.linear_attn
@@ -260,7 +260,7 @@ class Qwen35Block(nn.Module):
         reads the scale plane — and an array read inside `mx.compile` raises."""
         mlp = self.mlp
         if isinstance(mlp, Qwen35MoE):
-            mlp._kernels()
+            mlp.kernels()
 
     def _drop_resolutions(self) -> None:
         """Every lazily-bound delegator back to unresolved.
@@ -278,12 +278,10 @@ class Qwen35Block(nn.Module):
         self._join_strategy = None
         self._join_key = None
         if not self.attends:
-            self.linear_attn._rule = None
+            self.linear_attn.unresolve()
         mlp = self.mlp
         if isinstance(mlp, Qwen35MoE):
-            mlp._route = None
-            mlp._gate_up = None
-            mlp._down = None
+            mlp.unresolve()
 
     def _rebuild(self) -> None:
         # The traces bake the resolved delegators and the A/B flags in; rebuild when any

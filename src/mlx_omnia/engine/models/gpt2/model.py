@@ -30,23 +30,24 @@ class GPT2(nn.Module):
     def make_cache(self) -> list[KVCache]:
         return [KVCache() for _ in self.h]
 
-    def activations(self, ids: mx.array) -> GPT2Activations:
-        x = self.wte(ids) + self.wpe(mx.arange(ids.shape[-1]))
+    def activations(
+        self, ids: mx.array, cache: Sequence[KVStore] | None = None
+    ) -> GPT2Activations:
+        positions = mx.arange(ids.shape[-1])
+        if cache is not None:
+            offset = cache[0].offset
+            # One offset per row under a ragged batch, one for the whole step otherwise.
+            start = offset if isinstance(offset, int) else offset[:, None]
+            positions = start + positions
+        x = self.wte(ids) + self.wpe(positions)
         embeddings = x
         blocks: list[mx.array] = []
-        for block in self.h:
-            x = block(x)
+        caches: Sequence[KVStore | None] = cache if cache is not None else [None] * len(self.h)
+        for block, layer_cache in zip(self.h, caches, strict=True):
+            x = block(x, layer_cache)
             blocks.append(x)
         normed = self.ln_f(x)
         return GPT2Activations(embeddings, blocks, normed, self.wte.as_linear(normed))
 
     def __call__(self, ids: mx.array, cache: Sequence[KVStore] | None = None) -> mx.array:
-        if cache is None:
-            return self.activations(ids).logits
-        offset = cache[0].offset
-        # One offset per row under a ragged batch, one for the whole step otherwise.
-        start = offset[:, None] if isinstance(offset, mx.array) else offset
-        x = self.wte(ids) + self.wpe(start + mx.arange(ids.shape[-1]))
-        for block, layer_cache in zip(self.h, cache, strict=True):
-            x = block(x, layer_cache)
-        return self.wte.as_linear(self.ln_f(x))
+        return self.activations(ids, cache).logits

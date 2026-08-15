@@ -13,9 +13,11 @@ from typing import Self
 
 import mlx.core as mx
 
+from mlx_omnia.engine.core.kernels.embed.kernel import EmbedStrategy
+
 
 @dataclass(frozen=True)
-class DefaultEmbed:
+class DefaultEmbed(EmbedStrategy):
     embedding: mx.array
     full_atlas: mx.array
     sliding_atlas: mx.array

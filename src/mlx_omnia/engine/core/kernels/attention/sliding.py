@@ -45,7 +45,6 @@ lanes. `sliding_fused_attention_applies` states that, and the rest of the geomet
 the contract.
 """
 
-import hashlib
 from dataclasses import dataclass
 from functools import cache
 from string import Template
@@ -55,8 +54,12 @@ import mlx.core as mx
 
 from mlx_omnia.engine.core.cache import RingKVCache
 from mlx_omnia.engine.core.kernels.attention.default import DefaultAttentionStep
-from mlx_omnia.engine.core.kernels.attention.kernel import Angles, AttentionCache
-from mlx_omnia.engine.core.mxcompat import metal_kernel
+from mlx_omnia.engine.core.kernels.attention.digest import digest_kernel, metal_float
+from mlx_omnia.engine.core.kernels.attention.kernel import (
+    Angles,
+    AttentionCache,
+    AttentionStepStrategy,
+)
 
 if TYPE_CHECKING:
     from mlx_omnia.engine.core.mxcompat import MetalKernel
@@ -64,7 +67,9 @@ if TYPE_CHECKING:
 _HEAD_DIM = 128
 _THREADS = 1024
 
-_INPUTS = [
+_PREFIX = "sliding_fused_attn_ring"
+
+_INPUTS = (
     "raw_queries",
     "raw_keys",
     "raw_values",
@@ -75,7 +80,7 @@ _INPUTS = [
     "v_cache",
     "params",
     "scale_arr",
-]
+)
 
 _HEADER = r"""
 #define ONLINE_RESCALE(dst, delta_expr)         \
@@ -424,28 +429,10 @@ if (lane == 0) {
 """
 
 
-def _metal_float(value: float) -> str:
-    return f"{value!r}f"
-
-
-@cache
-def _build(source: str, header: str) -> "MetalKernel":
-    """The kernel name carries a digest of the text: mlx caches a compiled library by
-    name, so two variants of this source must not answer to the same one. Parameterized
-    by source and header so a mutation test can rebuild a broken variant."""
-    digest = hashlib.blake2b((header + source).encode(), digest_size=6).hexdigest()
-    return metal_kernel(
-        name=f"sliding_fused_attn_ring_{digest}",
-        input_names=_INPUTS,
-        output_names=["attended"],
-        source=source,
-        header=header,
-    )
-
-
 @cache
 def _kernel(eps: float) -> "MetalKernel":
-    return _build(Template(_SOURCE).substitute(eps=_metal_float(eps)), _HEADER)
+    source = Template(_SOURCE).substitute(eps=metal_float(eps))
+    return digest_kernel(_PREFIX, _INPUTS, source, _HEADER)
 
 
 def sliding_fused_attention_applies(
@@ -593,7 +580,7 @@ def sliding_fused_attention(
 
 
 @dataclass(frozen=True)
-class SlidingAttentionStep:
+class SlidingAttentionStep(AttentionStepStrategy):
     """The whole decode step of a sliding-window layer on `sliding_fused_attention`.
 
     The mask is not read: the ring *is* the window, and `valid_rows` holds attention to

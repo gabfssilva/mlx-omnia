@@ -32,7 +32,7 @@ __all__ = [
 _STRATEGIES = (ArgmaxGreedyHead, DefaultGreedyHead)
 
 
-class GreedyHead:
+class GreedyHead(GreedyHeadStrategy):
     """Resolves the strategy at construction and delegates; itself a
     `GreedyHeadStrategy`."""
 

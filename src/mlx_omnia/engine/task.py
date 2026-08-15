@@ -13,7 +13,7 @@ import huggingface_hub
 import mlx.core as mx
 import mlx.nn as nn
 
-from mlx_omnia.engine.checkpoint import MTP_PREFIX, Drafter, Pending, Sight, save_quantized
+from mlx_omnia.engine.checkpoint import MTP_PREFIX, Pending, Sight, save_quantized
 from mlx_omnia.engine.core.cache import LayerCache
 from mlx_omnia.engine.footprint import checkpoint_bytes
 from mlx_omnia.engine.generate import CausalLM
@@ -127,19 +127,35 @@ def _download_snapshot(
     )
 
 
-class _Packaged(Protocol):
+class _Packaged[P](Protocol):
     """What resolving a checkpoint needs of whoever declared it, which is less than being
     a model: the patterns an entry has to carry over, and the split where quantization
-    happens. A `Checkpoint` satisfies it and so does a `Drafter`."""
+    happens. A `Checkpoint` satisfies it and so does a `Drafter`.
+
+    `P` is what the split's tail produces, because the two declarations do not agree on it:
+    a model's is a model, a drafter's is the tree itself, and the caller that packs either
+    reads it as `object`."""
 
     @property
     def patterns(self) -> tuple[str, ...]: ...
 
     @property
-    def quantize(self) -> Callable[[Path, mx.Dtype | None], Pending[object]] | None: ...
+    def quantize(self) -> Callable[[Path, mx.Dtype | None], Pending[P]] | None: ...
 
 
-class _Registered(_Packaged, Protocol):
+class _Drafting(_Packaged[nn.Module], Protocol):
+    """A drafter's declaration read at `nn.Module`, the same erasure `_Registered` makes for
+    the same reason: `Drafter` is a dataclass, so it is invariant in the tree it loads, and
+    one table holds the declarations of several."""
+
+    @property
+    def load(self) -> Callable[[Path, mx.Dtype | None], nn.Module]: ...
+
+    @property
+    def quantize(self) -> Callable[[Path, mx.Dtype | None], Pending[nn.Module]]: ...
+
+
+class _Registered(_Packaged[LanguageModel[ModelInput]], Protocol):
     """What `load` and `tree` read off an architecture's `Checkpoint`. The tree loader
     is typed at `nn.Module`, not at the architecture's own class — a read-only callable
     return is covariant, and that erasure is what lets one dict hold declarations typed
@@ -150,6 +166,9 @@ class _Registered(_Packaged, Protocol):
 
     @property
     def task(self) -> Callable[[Path, mx.Dtype | None], LanguageModel[ModelInput]]: ...
+
+    @property
+    def sight(self) -> Callable[[Path], Sight | None]: ...
 
 
 _MODEL_SPECS: dict[str, _Registered] = {
@@ -264,9 +283,7 @@ def _auxiliary(source: Path, patterns: Sequence[str]) -> list[str]:
     collected."""
     names = {path.name for pattern in patterns for path in source.glob(pattern)}
     return sorted(
-        name
-        for name in names
-        if name != "config.json" and not fnmatch(name, "model*.safetensors")
+        name for name in names if name != "config.json" and not fnmatch(name, "model*.safetensors")
     )
 
 
@@ -322,8 +339,10 @@ def _packed_head(
     the head's own — `expand_plan` over the head's tree — because the trunk's is a map of
     leaves the head does not have.
     """
-    spec = None if selection is None else _MTP_SPECS.get(_architecture(checkpoint))
-    if spec is None or not has_mtp(checkpoint):
+    if selection is None or not has_mtp(checkpoint):
+        return {}, {}
+    spec = _MTP_SPECS.get(_architecture(checkpoint))
+    if spec is None:
         return {}, {}
     pending = spec.quantize(checkpoint, None)
     plan = expand_plan(pending.model, selection)
@@ -369,7 +388,7 @@ def provenance(
     }
 
 
-def _resolve[S: _Packaged](
+def _resolve[S: _Packaged[object]](
     model: str | Path,
     revision: str | None,
     local_files_only: bool,
@@ -413,12 +432,12 @@ def _resolve[S: _Packaged](
     return directory, spec, config, repository
 
 
-def _pending(
-    spec: _Packaged,
+def _pending[P](
+    spec: _Packaged[P],
     model_type: str,
     directory: Path,
     dtype: mx.Dtype | None,
-) -> Pending[object]:
+) -> Pending[P]:
     if spec.quantize is None:
         raise ValueError(f"quantize= is not supported for model_type {model_type!r}")
     return spec.quantize(directory, dtype)
@@ -528,7 +547,7 @@ def load(
     return spec.task(entry, None)
 
 
-_DRAFTER_SPECS: dict[str, Drafter[nn.Module]] = {
+_DRAFTER_SPECS: dict[str, _Drafting] = {
     "muse_glimmer_assistant": muse_glimmer.ASSISTANT,
 }
 """The checkpoints that are not models: a drafter serves no task, has no tokenizer and no
@@ -562,7 +581,7 @@ def sight(model_type: str, directory: Path) -> Sight | None:
     return None if spec is None else spec.sight(directory)
 
 
-def _quantizable() -> dict[str, _Packaged]:
+def _quantizable() -> dict[str, _Packaged[object]]:
     """Everything with weights to pack. Wider than `_MODEL_SPECS` on purpose and read by
     `source` alone: quantizing a checkpoint asks it for a lazy tree and a weight dict, and
     neither is what makes something a model — while `load` and `tree` stay on the models,
@@ -588,7 +607,7 @@ def load_drafter(directory: Path, dtype: mx.Dtype | None = None) -> nn.Module:
     return spec.load(directory, dtype)
 
 
-_MTP_SPECS: dict[str, Drafter[nn.Module]] = {
+_MTP_SPECS: dict[str, _Drafting] = {
     "nemotron_h": nemotron_h.MTP,
     "qwen3_5": qwen3_5.MTP,
 }

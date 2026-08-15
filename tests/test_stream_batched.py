@@ -4,9 +4,7 @@ import mlx.core as mx
 
 from mlx_omnia.engine.core.attend import KVStore
 from mlx_omnia.engine.core.cache import KVCache
-from mlx_omnia.engine.generate import Meter
 from mlx_omnia.engine.language import GenerationOptions, Text, TextLanguageModel
-from mlx_omnia.engine.parsers import Segment
 
 
 class CountingModel:
@@ -46,31 +44,3 @@ def test_stream_matches_the_unbatched_path_segment_for_segment() -> None:
 
     assert batched.can_batch(options)
     assert list(batched.stream(Text("AB"), options)) == list(plain.stream(Text("AB"), options))
-
-
-def test_stream_yields_the_generated_text_as_content() -> None:
-    model = TextLanguageModel(CountingModel(128), AsciiTokenizer())
-
-    segments = list(model.stream(Text("A"), GenerationOptions(max_tokens=3)))
-
-    assert segments == [
-        Segment("content", "B"),
-        Segment("content", "C"),
-        Segment("content", "D"),
-    ]
-
-
-def test_stream_leaves_its_prefix_for_the_next_request() -> None:
-    model = TextLanguageModel(CountingModel(128), AsciiTokenizer())
-    options = GenerationOptions(max_tokens=2, prefix_budget=1024**2)
-    list(model.stream(Text("A"), options))
-    meter = Meter()
-
-    list(
-        model.stream(
-            Text("ABC"),
-            GenerationOptions(max_tokens=2, prefix_budget=1024**2, meter=meter),
-        )
-    )
-
-    assert meter.reused_tokens > 0

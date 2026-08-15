@@ -6,6 +6,7 @@ from mlx_omnia.engine.chat import chat_capabilities
 from mlx_omnia.engine.checkpoint import (
     checkpoint,
     drop_tied_head,
+    load_shards,
     reject_dtype_cast,
     stop_tokens,
 )
@@ -19,16 +20,13 @@ from mlx_omnia.engine.models.gemma4.model import Gemma4
 def weights(
     directory: Path, config: Gemma4Config, dtype: mx.Dtype | None
 ) -> dict[str, mx.array]:
-    loaded: dict[str, mx.array] = {}
-    for shard in sorted(directory.glob("model*.safetensors")):
-        part = mx.load(str(shard))
-        assert isinstance(part, dict)
-        reject_dtype_cast(dtype, part)
-        for name, array in part.items():
-            renamed = _renamed(name)
-            if renamed is None:
-                continue
-            loaded[renamed] = array.astype(dtype) if dtype is not None else array
+    shards = load_shards(directory)
+    reject_dtype_cast(dtype, shards)
+    loaded = {
+        renamed: array.astype(dtype) if dtype is not None else array
+        for name, array in shards.items()
+        if (renamed := _renamed(name)) is not None
+    }
 
     if config.tied:
         drop_tied_head(loaded)

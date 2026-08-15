@@ -21,7 +21,6 @@ class Hy3Block(nn.Module):
         self.post_attention_layernorm = nn.RMSNorm(
             config.hidden_size, eps=config.rms_norm_eps
         )
-        self.k = config.num_experts_per_tok
         self._join_norm: AddRmsNorm | None = None
 
     def __call__(

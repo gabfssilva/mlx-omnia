@@ -66,19 +66,15 @@ class Llama4Attention(nn.Module):
                 q = mx.fast.rms_norm(q, weight=None, eps=QK_NORM_EPS)
                 k = mx.fast.rms_norm(k, weight=None, eps=QK_NORM_EPS)
         elif self.attn_temperature_tuning:
-            if isinstance(offset, mx.array):
+            if not isinstance(offset, int):
                 # Ragged decode: one position per row, broadcast over heads and head_dim.
                 positions = (offset + 1).astype(mx.float32).reshape(-1, 1, 1, 1)
-                attn_scales = (
-                    mx.log(mx.floor(positions / self.floor_scale) + 1.0) * self.attn_scale + 1.0
-                )
-                q = (q * attn_scales).astype(q.dtype)
             else:
-                positions = mx.arange(offset + 1, offset + length + 1, dtype=mx.float32)
-                attn_scales = (
-                    mx.log(mx.floor(positions / self.floor_scale) + 1.0) * self.attn_scale + 1.0
-                )
-                q = (q * attn_scales[:, None]).astype(q.dtype)
+                positions = mx.arange(offset + 1, offset + length + 1, dtype=mx.float32)[:, None]
+            attn_scales = (
+                mx.log(mx.floor(positions / self.floor_scale) + 1.0) * self.attn_scale + 1.0
+            )
+            q = (q * attn_scales).astype(q.dtype)
         attended = attend(cache, q, keys=k, values=v, scale=self.scale, mask=mask)
         return self.o_proj(
             attended.transpose(0, 2, 1, 3).reshape(x.shape[0], length, query_width)

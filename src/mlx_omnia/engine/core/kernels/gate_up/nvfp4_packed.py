@@ -35,7 +35,12 @@ from typing import Self
 import mlx.core as mx
 import mlx.nn as nn
 
-from mlx_omnia.engine.core.kernels.gate_up.kernel import Activation, Layout, OrdinalRouting
+from mlx_omnia.engine.core.kernels.gate_up.kernel import (
+    Activation,
+    GateUpStrategy,
+    Layout,
+    OrdinalRouting,
+)
 from mlx_omnia.engine.core.kernels.route.ordinal import ORDINAL_HEADER
 from mlx_omnia.engine.core.kernels.shared.nvfp4 import (
     QDOT_HEADER,
@@ -273,7 +278,7 @@ def applies(hidden: int, inner: int, experts: int, top_k: int) -> bool:
 
 
 @dataclass(frozen=True)
-class Nvfp4PackedGateUp:
+class Nvfp4PackedGateUp(GateUpStrategy):
     weight: mx.array
     packed_scales: mx.array
     top_k: int

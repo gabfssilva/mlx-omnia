@@ -14,7 +14,7 @@ from typing import Self
 
 import mlx.core as mx
 
-from mlx_omnia.engine.core.kernels.route.kernel import Routing, gate_logits
+from mlx_omnia.engine.core.kernels.route.kernel import RouteStrategy, Routing, gate_logits
 from mlx_omnia.engine.core.mxcompat import metal_kernel
 
 _SOURCE = """
@@ -293,7 +293,7 @@ _SOFTPLUS_NORM_EPS = 1e-20
 
 
 @dataclass(frozen=True)
-class SoftmaxTopkRoute:
+class SoftmaxTopkRoute(RouteStrategy):
     """The one-simdgroup routing family: softmax, sigmoid or `sqrt(softplus)` scoring,
     top-k and the declared renormalization in a single dispatch over the router row."""
 

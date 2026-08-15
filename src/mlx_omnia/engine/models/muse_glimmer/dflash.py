@@ -211,7 +211,7 @@ class MuseGlimmerDFlash:
 
     def __init__(
         self,
-        target: Speculable,
+        target: object,
         drafter: MuseGlimmerAssistant,
         *,
         block_size: int | None = None,

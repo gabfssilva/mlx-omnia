@@ -52,7 +52,7 @@ _STRATEGIES = (
 )
 
 
-class AttentionStep:
+class AttentionStep(AttentionStepStrategy):
     """Resolves the strategy at construction and delegates; itself an
     `AttentionStepStrategy`.
 

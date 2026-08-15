@@ -1,8 +1,8 @@
 """Qwen3-0.6B fp32 parity against transformers, plus cache and mutation gates.
 
-The shared spine (`definition.py`) carries the floors, the greedy match and the cache
-agreement; every tolerance is `3 x` the fixture's own measured fp32-vs-fp64 floor for
-that tensor. What lives here is the Qwen3 delta: q/k norm between projection and
+The shared spine (`tests/parity/definition.py`) carries the floors, the greedy match and
+the cache agreement; every tolerance is `3 x` the fixture's own measured fp32-vs-fp64 floor
+for that tensor. What lives here is the Qwen3 delta: q/k norm between projection and
 rotation, the fused rope epilogue, and the mutations that pin both.
 """
 
@@ -18,7 +18,12 @@ from mlx_omnia.engine.core.kernels.qkv_rope.epilogue import rope_epilogue
 from mlx_omnia.engine.models.qwen3.dense import CHECKPOINT
 from mlx_omnia.engine.models.qwen3.model import Qwen3, Qwen3Activations
 from tests.conftest import floor, load_golden, relative_diff
-from tests.parity.definition import a_faithful_cache, a_parity_trunk, an_exact_embedding_lookup
+from tests.mutation import mutated
+from tests.parity.definition import (
+    a_faithful_cache,
+    a_parity_trunk,
+    an_exact_embedding_lookup,
+)
 
 FIXTURE = Path(__file__).parent.parent / "fixtures" / "qwen3_forward.safetensors"
 N_LAYER = 28
@@ -95,27 +100,17 @@ def describe_qwen3():
         ) -> None:
             """Perturbing one fused gate‖up must blow past the fixture floor."""
             mlp = model.model.layers[13].mlp
-            original = mlp.gate_up_proj.weight
-            mlp.gate_up_proj.weight = original * (1 + 1e-3)
-            try:
+            with mutated(mlp.gate_up_proj, "weight", mlp.gate_up_proj.weight * (1 + 1e-3)):
                 logits = model(golden["input_ids"][None])
                 assert relative_diff(logits, golden["logits"]) > floor(golden, "logits")
-            finally:
-                mlp.gate_up_proj.weight = original
 
-        def it_fails_when_q_norm_is_flattened(
-            model: Qwen3, golden: dict[str, mx.array]
-        ) -> None:
+        def it_fails_when_q_norm_is_flattened(model: Qwen3, golden: dict[str, mx.array]) -> None:
             """q_norm is the Qwen3 delta: without it the trunk still runs, so it needs its
             own mutation or a missing per-head norm would go unnoticed."""
             attention = model.model.layers[0].self_attn
-            original = attention.q_norm.weight
-            attention.q_norm.weight = mx.ones_like(original)
-            try:
+            with mutated(attention.q_norm, "weight", mx.ones_like(attention.q_norm.weight)):
                 logits = model(golden["input_ids"][None])
                 assert relative_diff(logits, golden["logits"]) > floor(golden, "logits")
-            finally:
-                attention.q_norm.weight = original
 
     def describe_rope_epilogue():
         def it_matches_the_op_path(

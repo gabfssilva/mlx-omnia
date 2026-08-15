@@ -7,13 +7,14 @@ declaration, once, at construction. The activation is the only thing the
 architectures disagree on, and the kernels bake silu.
 """
 
-from typing import Literal, Protocol
+from typing import Literal, Protocol, runtime_checkable
 
 import mlx.core as mx
 
 Activation = Literal["silu", "gelu_tanh"]
 
 
+@runtime_checkable
 class MlpStrategy(Protocol):
     """One token through the unrouted SwiGLU leaf, residual added:
     (row [hidden], residual [hidden]) -> [hidden]."""

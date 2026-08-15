@@ -27,7 +27,7 @@ from typing import Self
 import mlx.core as mx
 import mlx.nn as nn
 
-from mlx_omnia.engine.core.kernels.mlp.kernel import Activation
+from mlx_omnia.engine.core.kernels.mlp.kernel import Activation, MlpStrategy
 from mlx_omnia.engine.core.layers import SwiGLU
 from mlx_omnia.engine.core.mxcompat import metal_kernel
 
@@ -219,7 +219,7 @@ def dense_down_residual(
 
 
 @dataclass(frozen=True)
-class DenseMlp:
+class DenseMlp(MlpStrategy):
     fused_weight: mx.array
     down_weight: mx.array
 

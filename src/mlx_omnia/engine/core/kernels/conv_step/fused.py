@@ -13,6 +13,7 @@ from typing import Self
 
 import mlx.core as mx
 
+from mlx_omnia.engine.core.kernels.conv_step.kernel import ConvStepStrategy
 from mlx_omnia.engine.core.mxcompat import metal_kernel
 
 _SOURCE = """
@@ -54,7 +55,7 @@ _KERNEL = metal_kernel(
 
 
 @dataclass(frozen=True)
-class FusedConvStep:
+class FusedConvStep(ConvStepStrategy):
     taps: mx.array
     bias: mx.array
     conv_dim: int

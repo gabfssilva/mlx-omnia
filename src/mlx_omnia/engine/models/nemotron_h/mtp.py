@@ -193,14 +193,11 @@ class NemotronHMTP(nn.Module):
 
         compiled = mx.compile(forward, inputs=state, outputs=state)
 
-        def chain(token: mx.array, hidden: mx.array) -> tuple[mx.array, mx.array]:
-            return compiled(token, hidden)
-
         def reset() -> None:
             for layer in fixed:
                 layer.state[2] = mx.array([0], dtype=mx.int32)
 
-        return chain, reset
+        return compiled, reset
 
     def make_cache(self) -> list[LayerCache]:
         """One per block, as the trunk does. The attention block is the only one with state,

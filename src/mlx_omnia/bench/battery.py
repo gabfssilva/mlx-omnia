@@ -17,7 +17,7 @@ from statistics import median
 from mlx_omnia.bench.arm import Arm
 from mlx_omnia.bench.gate import Cool, Gate, Macmon, find_macmon
 from mlx_omnia.bench.report import stderr
-from mlx_omnia.bench.sample import Sample
+from mlx_omnia.bench.sample import Sample, divergence
 
 
 class Incomparable(RuntimeError):
@@ -69,11 +69,7 @@ class Comparison:
     def divergence(self, name: str) -> int | None:
         """Where this arm's own stream parts from the reference's, or `None` if it never
         does."""
-        reference, other = self.streams[self.reference], self.streams[name]
-        for index, (theirs, ours) in enumerate(zip(reference, other, strict=False)):
-            if theirs != ours:
-                return index
-        return None if len(reference) == len(other) else min(len(reference), len(other))
+        return divergence(self.streams[self.reference], self.streams[name])
 
     def render(self) -> str:
         lines = [self._row(name) for name in self.names]

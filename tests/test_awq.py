@@ -27,12 +27,15 @@ _OUT = 32
 _FORMAT = Affine(group_size=32, bits=3)
 
 
-def _plan(target: str = "mlp.down") -> QuantizationPlan:
-    return {target: _FORMAT}
+_TARGET = "mlp.down"
 
 
-def _statistics(mean_square: mx.array, target: str = "mlp.down") -> dict[str, mx.array]:
-    return {f"imatrix/{target}.mean_square": mean_square}
+def _plan() -> QuantizationPlan:
+    return {_TARGET: _FORMAT}
+
+
+def _statistics(mean_square: mx.array) -> dict[str, mx.array]:
+    return {f"imatrix/{_TARGET}.mean_square": mean_square}
 
 
 def _reference_scale(mean_square: list[float], alpha: float) -> list[float]:

@@ -19,7 +19,14 @@ import mlx.core as mx
 from mlx_omnia.engine.core.cache import FixedKVCache, KVCache, RingKVCache
 from mlx_omnia.engine.core.mxcompat import softmax
 
-__all__ = ["Attending", "AttentionMask", "KVStore", "attend", "softcapped_attention"]
+__all__ = [
+    "Attending",
+    "AttentionMask",
+    "KVStore",
+    "attend",
+    "dense_attention",
+    "softcapped_attention",
+]
 
 type AttentionMask = mx.array | str | None
 
@@ -116,6 +123,23 @@ def attend(
         )
     if cache is not None:
         keys, values = cache.update_and_fetch(keys, values)
+    return dense_attention(
+        queries, keys, values, scale=scale, mask=mask, sinks=sinks, softcap=softcap
+    )
+
+
+def dense_attention(
+    queries: mx.array,
+    keys: mx.array,
+    values: mx.array,
+    *,
+    scale: float,
+    mask: AttentionMask,
+    sinks: mx.array | None = None,
+    softcap: float | None = None,
+) -> mx.array:
+    """The attention itself, over rows already fetched — the tail of `attend`, shared with
+    whoever loops rows of a ragged batch."""
     if softcap is not None:
         if isinstance(mask, str):
             raise ValueError("a softcapped attention needs an explicit boolean mask, not " + mask)

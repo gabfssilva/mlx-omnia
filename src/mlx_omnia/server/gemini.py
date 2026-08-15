@@ -26,9 +26,9 @@ does, which is what the turn a template renders is keyed by here.
 import json
 from collections.abc import AsyncIterator, Mapping
 from dataclasses import replace
-from typing import Annotated, Literal
+from typing import Literal
 
-from fastapi import APIRouter, Depends, Request
+from fastapi import APIRouter
 from fastapi.responses import JSONResponse, StreamingResponse
 from pydantic import AliasChoices, BaseModel, ConfigDict, Field
 
@@ -54,11 +54,12 @@ from mlx_omnia import ChatMessage as Turn
 from mlx_omnia.engine.chat import Effort, parser_of
 from mlx_omnia.engine.generate import Constraint, Meter
 from mlx_omnia.engine.grammar import GrammarRefused
-from mlx_omnia.engine.parsers import Segment, ToolCall
+from mlx_omnia.engine.parsers import ToolCall
 from mlx_omnia.engine.schema import MalformedJSON, SchemaViolation
 from mlx_omnia.server import profiles
-from mlx_omnia.server.engine import Engine, Job, NotConstrainable, NotQuantizable
-from mlx_omnia.server.profiles import Sampling, StoreDep
+from mlx_omnia.server.deps import EngineDep, StoreDep
+from mlx_omnia.server.engine import Job, NotConstrainable, NotQuantizable
+from mlx_omnia.server.profiles import Sampling
 from mlx_omnia.server.responses import (
     Calls,
     Checked,
@@ -66,6 +67,7 @@ from mlx_omnia.server.responses import (
     content_of,
     declared,
     document,
+    drain,
     failed,
     image_part,
     instruction,
@@ -508,13 +510,6 @@ def _reply(
     return payload
 
 
-async def _drain(job: Job) -> list[Segment]:
-    pieces: list[Segment] = []
-    while (piece := await job.chunks.get()) is not None:
-        pieces.append(piece)
-    return pieces
-
-
 async def _events(
     job: Job, model: str, calls: Calls | None, budget: int, checked: Checked | None
 ) -> AsyncIterator[str]:
@@ -569,14 +564,6 @@ async def _events(
     finally:
         job.cancel()
 
-
-def _engine(request: Request) -> Engine:
-    engine = request.app.state.engine
-    assert isinstance(engine, Engine)
-    return engine
-
-
-EngineDep = Annotated[Engine, Depends(_engine)]
 
 router = APIRouter()
 
@@ -672,7 +659,7 @@ async def generate(
         )
 
     try:
-        pieces = await _drain(job)
+        pieces = await drain(job)
     finally:
         job.cancel()
     if job.error is not None:

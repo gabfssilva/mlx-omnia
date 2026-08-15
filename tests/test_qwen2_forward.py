@@ -15,6 +15,7 @@ from huggingface_hub import snapshot_download
 from mlx_omnia import KVCache, stream_ids
 from mlx_omnia.engine.models.qwen2 import CHECKPOINT, Qwen2, Qwen2Activations
 from tests.conftest import assert_greedy_modulo_ties, floor, load_golden, relative_diff
+from tests.mutation import mutated
 
 FIXTURE = Path(__file__).parent / "fixtures" / "qwen2_forward.safetensors"
 Q4_FIXTURE = Path(__file__).parent / "fixtures" / "qwen2_q4_mlxlm.safetensors"
@@ -129,12 +130,9 @@ def test_mutation_breaks_parity(model: Qwen2, golden: dict[str, mx.array]) -> No
     """Perturbing one fused gate‖up must blow past the fixture floor."""
     mlp = model.model.layers[11].mlp
     original = mlp.gate_up_proj.weight
-    mlp.gate_up_proj.weight = original * (1 + 1e-3)
-    try:
+    with mutated(mlp.gate_up_proj, "weight", original * (1 + 1e-3)):
         logits = model(golden["input_ids"][None])
         assert relative_diff(logits, golden["logits"]) > floor(golden, "logits")
-    finally:
-        mlp.gate_up_proj.weight = original
 
 
 def test_mutation_of_qkv_bias_breaks_parity(model: Qwen2, golden: dict[str, mx.array]) -> None:
@@ -142,12 +140,9 @@ def test_mutation_of_qkv_bias_breaks_parity(model: Qwen2, golden: dict[str, mx.a
     could drop the bias (or misalign it against the concatenated rows) unnoticed."""
     attention = model.model.layers[0].self_attn
     original = attention.qkv_proj.bias
-    attention.qkv_proj.bias = mx.zeros_like(original)
-    try:
+    with mutated(attention.qkv_proj, "bias", mx.zeros_like(original)):
         logits = model(golden["input_ids"][None])
         assert relative_diff(logits, golden["logits"]) > floor(golden, "logits")
-    finally:
-        attention.qkv_proj.bias = original
 
 
 @pytest.fixture(scope="module")
@@ -204,9 +199,6 @@ def test_q4_mutation_breaks_parity(q4_model: Qwen2, q4_golden: dict[str, mx.arra
     attention = q4_model.model.layers[9].self_attn
     original = attention.qkv_proj.scales
     assert isinstance(original, mx.array)
-    attention.qkv_proj.scales = original * 1.5
-    try:
+    with mutated(attention.qkv_proj, "scales", original * 1.5):
         logits = q4_model(q4_golden["input_ids"][None])
         assert relative_diff(logits, q4_golden["logits"]) > q4_golden["noise.logits"].item()
-    finally:
-        attention.qkv_proj.scales = original

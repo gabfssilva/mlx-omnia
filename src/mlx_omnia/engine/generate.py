@@ -20,7 +20,12 @@ from mlx_omnia.engine.core.mxcompat import softmax
 from mlx_omnia.engine.core.prefill import ARRIVING, BLOCK, pulled
 from mlx_omnia.engine.core.prompt_cache import PromptCache
 from mlx_omnia.engine.parsers import FALLBACK, Parser, Segment, Segmenter
-from mlx_omnia.engine.speculative import Acceptance, SpeculationRefused, stream_speculative_ids
+from mlx_omnia.engine.speculative import (
+    Acceptance,
+    Proposer,
+    SpeculationRefused,
+    stream_speculative_ids,
+)
 
 type Sampler = Callable[[mx.array], mx.array]
 type LogitFilter = Callable[[mx.array], mx.array]
@@ -85,6 +90,12 @@ class Constraint(Protocol):
 class ConstraintConflict(ValueError):
     """Two things asking for the same step. The one pair that exists is a grammar and a
     reasoning budget, and it is named where it is raised."""
+
+
+BUDGET_WITH_GRAMMAR = (
+    "a reasoning budget and a grammar do not compose: the forced closer bypasses the "
+    "mask the matcher is advanced under"
+)
 
 
 @dataclass(frozen=True)
@@ -397,7 +408,7 @@ def stream_ids[C: LayerCache, D: LayerCache](
     stop: Collection[int] = (),
     penalty: Penalty | None = None,
     meter: Meter | None = None,
-    draft: CausalLM[D] | None = None,
+    draft: CausalLM[D] | Proposer | None = None,
     lookahead: int = 4,
     acceptance: Acceptance | None = None,
     prefix: PromptCache[C] | None = None,
@@ -491,16 +502,20 @@ def stream_ids[C: LayerCache, D: LayerCache](
         return
 
     cache = model.make_cache()
-    if prefix is not None and not isinstance(prompt, Sequence):
+    whole: Sequence[int] | None = None
+    reuse = None
+    if prefix is not None:
         # The trie descends the ids one by one and `take` sizes its match against the whole
         # list, so a prompt still being produced is waited for here rather than matched
         # against a piece of itself — a match cut short at a block boundary would be reuse
         # silently lost on exactly the long conversations the trie exists for.
-        prompt = list(prompt)
-    # The fresh cache goes in as well as out: a trie backed by disk fills *this* list rather
-    # than handing one back, because a file has no cache in it — only the rows one would
-    # hold, and which class holds them is the trunk's answer and nobody else's.
-    reuse = None if prefix is None else prefix.take(prompt, into=cache)
+        whole = prompt if isinstance(prompt, Sequence) else list(prompt)
+        prompt = whole
+        # The fresh cache goes in as well as out: a trie backed by disk fills *this* list
+        # rather than handing one back, because a file has no cache in it — only the rows
+        # one would hold, and which class holds them is the trunk's answer and nobody
+        # else's.
+        reuse = prefix.take(whole, into=cache)
     if reuse is not None:
         cache = reuse.caches
     # What the cache holds, row for row, for the insert at the end: the prompt, whether its
@@ -541,10 +556,7 @@ def stream_ids[C: LayerCache, D: LayerCache](
         # which is advanced over every id this yields — would then be asked to accept an id
         # it had forbidden. A grammar leaves no reasoning block to budget anyway: it forces
         # the document from the first step, so the block a template opened never closes.
-        raise ConstraintConflict(
-            "a reasoning budget and a grammar do not compose: the forced closer bypasses the "
-            "mask the matcher is advanced under"
-        )
+        raise ConstraintConflict(BUDGET_WITH_GRAMMAR)
     budget = None if reasoning_budget is None else ReasoningWalk(reasoning_budget)
     boundary: list[C] | None = None
     """Bound before the `try`, because the `finally` reads it and a forward that raises on
@@ -686,7 +698,7 @@ def stream_ids[C: LayerCache, D: LayerCache](
                 or standing is not None
                 or all(layer.is_trimmable for layer in cache)
             )
-        if prefix is not None and boundary is not None:
+        if prefix is not None and whole is not None and boundary is not None:
             # The prompt, as a `user` entry: it is where the conversation stopped being the
             # model's own writing, and it outranks an assistant turn under eviction for the
             # same reason. Beside the longer one below and not instead of it — which of the
@@ -695,19 +707,19 @@ def stream_ids[C: LayerCache, D: LayerCache](
             # state. The byte count double-counts what they share, which evicts early and
             # never over-promises.
             prefix.insert(
-                prompt,
+                whole,
                 boundary,
                 role="user",
                 nbytes=sum(layer.nbytes for layer in boundary),
             )
-        if prefix is not None and standing is not None:
+        if prefix is not None and whole is not None and standing is not None:
             # The prompt's entry, out of the layers the promotion abandoned. The trim is for
             # a promotion that replaced only some of them: a layer still live in `cache` had
             # the decode's rows written into it, past the prompt this entry claims.
             for layer in standing:
                 layer.trim(prompt_length)
             prefix.insert(
-                prompt,
+                whole,
                 standing,
                 role="user",
                 nbytes=sum(layer.nbytes for layer in standing),

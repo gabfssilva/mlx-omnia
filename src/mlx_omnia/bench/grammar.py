@@ -41,13 +41,13 @@ import time
 from collections.abc import Callable, Mapping, Sequence
 from dataclasses import dataclass, field
 from pathlib import Path
-from typing import Protocol
+from typing import Protocol, runtime_checkable
 
 import numpy as np
 from numpy.typing import NDArray
 from transformers import AutoTokenizer
 
-FIXTURE = Path(__file__).parents[3] / "packages/engine/tests/fixtures/grammar_schemas.json"
+FIXTURE = Path(__file__).parents[3] / "tests/fixtures/grammar_schemas.json"
 HUB = Path.home() / ".cache/huggingface/hub"
 DEFAULT_MODEL = "mlx-community/Qwen3-30B-A3B-4bit"
 
@@ -68,6 +68,7 @@ class Refused(Exception):
     """A schema the compiler will not take, carrying its own message."""
 
 
+@runtime_checkable
 class Matcher(Protocol):
     def fill(self, mask: Mask) -> bool | None:
         """Whether the mask has to be applied, or `None` when the library does not say."""
@@ -87,6 +88,7 @@ class Matcher(Protocol):
 Factory = Callable[[], Matcher]
 
 
+@runtime_checkable
 class Backend(Protocol):
     name: str
 
@@ -94,7 +96,7 @@ class Backend(Protocol):
         """The factory for matchers over this schema, plus whatever the compiler warned."""
 
 
-class XGrammarMatcher:
+class XGrammarMatcher(Matcher):
     def __init__(self, matcher: object) -> None:
         self._matcher = matcher
 
@@ -118,7 +120,7 @@ class XGrammarMatcher:
         return ""
 
 
-class XGrammar:
+class XGrammar(Backend):
     name = "xgrammar"
 
     def __init__(self, tokenizer: object, vocab: int) -> None:
@@ -137,7 +139,7 @@ class XGrammar:
         return lambda: XGrammarMatcher(self._xgrammar.GrammarMatcher(grammar)), ""
 
 
-class LLGuidanceMatcher:
+class LLGuidanceMatcher(Matcher):
     def __init__(self, matcher: object, fill: Callable[[object, Mask], None]) -> None:
         self._matcher = matcher
         self._fill = fill
@@ -162,7 +164,7 @@ class LLGuidanceMatcher:
         return self._matcher.get_error()
 
 
-class LLGuidance:
+class LLGuidance(Backend):
     def __init__(self, tokenizer: object, vocab: int, *, slices: str) -> None:
         import llguidance
         import llguidance.hf

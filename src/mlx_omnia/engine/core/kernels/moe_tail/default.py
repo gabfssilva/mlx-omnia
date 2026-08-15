@@ -14,9 +14,11 @@ from typing import Self
 
 import mlx.core as mx
 
+from mlx_omnia.engine.core.kernels.moe_tail.kernel import MoeTailStrategy
+
 
 @dataclass(frozen=True)
-class DefaultMoeTail:
+class DefaultMoeTail(MoeTailStrategy):
     hidden: int
 
     @classmethod

@@ -60,7 +60,7 @@ from typing import NamedTuple, Self
 
 import mlx.core as mx
 
-from mlx_omnia.engine.core.kernels.lm_head.kernel import HeadProjection
+from mlx_omnia.engine.core.kernels.lm_head.kernel import GreedyHeadStrategy, HeadProjection
 from mlx_omnia.engine.core.mxcompat import metal_kernel
 
 _HEADER = """
@@ -954,7 +954,7 @@ def lm_head_argmax_row(
 
 
 @dataclass(frozen=True)
-class ArgmaxGreedyHead:
+class ArgmaxGreedyHead(GreedyHeadStrategy):
     weight: mx.array
     planes: Int5Planes
     refine: bool

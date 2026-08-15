@@ -127,7 +127,7 @@ class NemotronHMamba(nn.Module):
         cache.window = padded[:, length:]
         return mixed * mx.sigmoid(mixed)
 
-    def _mamba_step(self) -> MambaStep:
+    def mamba_step(self) -> MambaStep:
         """Resolved once, at the first step — after load, when the weights are final."""
         middle = self._middle
         if middle is None:
@@ -165,7 +165,7 @@ class NemotronHMamba(nn.Module):
         from mlx_omnia.engine.core.kernels.mamba_step.verify import VerifyMambaStep
 
         assert isinstance(cache, FixedDeltaCache) and len(cache.graph) == 5
-        middle = self._mamba_step().strategy
+        middle = self.mamba_step().strategy
         assert isinstance(middle, FusedMambaStep)
         verify = self._verify
         if verify is None:
@@ -192,7 +192,7 @@ class NemotronHMamba(nn.Module):
         batch, length = x.shape[0], x.shape[1]
         window, state = cache.window, cache.state
         if length == 1 and batch == 1 and window is not None and state is not None:
-            normed, slid, advanced = self._mamba_step()(
+            normed, slid, advanced = self.mamba_step()(
                 self.in_proj(x)[0, 0], window[0], state[0]
             )
             cache.window = slid[None]

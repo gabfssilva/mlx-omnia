@@ -11,11 +11,12 @@ dispatches saves the ops the caller would otherwise pay. The `MoeStep` delegator
 `__init__.py` resolves which module serves a given declaration, once, at construction.
 """
 
-from typing import Protocol
+from typing import Protocol, runtime_checkable
 
 import mlx.core as mx
 
 
+@runtime_checkable
 class MoeStepStrategy(Protocol):
     """(x [hidden], chosen [k], weights [k]) ->
     `(Σ_e weights[e] · fc2_e(squared_relu(fc1_e x))) + shared(x)`, rounded the way the

@@ -13,11 +13,16 @@ from pydantic import ValidationError
 
 from mlx_omnia.server import gemini
 from mlx_omnia.server.app import ChatRequest
-from mlx_omnia.server.app import _options as chat_options
-from mlx_omnia.server.app import _preset as chat_preset
 from mlx_omnia.server.gemini import GenerationConfig
 from mlx_omnia.server.profiles import Sampling
-from mlx_omnia.server.responses import PROFILE_ONLY, ResponsesRequest, effort_of
+from mlx_omnia.server.responses import (
+    PROFILE_ONLY,
+    OpenAIEffort,
+    ResponsesRequest,
+    effort_of,
+    options,
+    preset_of,
+)
 
 
 def chat(**fields: object) -> ChatRequest:
@@ -46,8 +51,9 @@ def test_the_openai_rungs_map_onto_the_engines() -> None:
     assert effort_of(None, None) == "auto"
     assert effort_of("none", None) == "off"
     assert effort_of("minimal", None) == "low"
-    for rung in ("low", "medium", "high", "xhigh", "max"):
-        assert effort_of(rung, None) == rung  # type: ignore[arg-type]
+    rungs: tuple[OpenAIEffort, ...] = ("low", "medium", "high", "xhigh", "max")
+    for rung in rungs:
+        assert effort_of(rung, None) == rung
 
 
 def test_a_profile_fills_the_effort_a_request_left_out() -> None:
@@ -89,10 +95,13 @@ def test_the_budget_reaches_the_openai_dialects_only_through_a_profile() -> None
     rather than copied onto the request: copied, `reasoning_effort="on"` would land in a
     field typed for OpenAI's words and be read as none of them."""
     preset = Sampling(reasoning_budget=128, reasoning_effort="on")
-    assert chat_options(chat(), preset, None).reasoning_budget == 128
-    assert chat_options(chat(), Sampling(), None).reasoning_budget is None
+    request = chat()
+    asked = options(request, preset, None, max_tokens=request.max_tokens, context_limit=None)
+    plain = options(request, Sampling(), None, max_tokens=request.max_tokens, context_limit=None)
+    assert asked.reasoning_budget == 128
+    assert plain.reasoning_budget is None
 
-    filled = chat_preset(chat(), preset)
+    filled = preset_of(chat(), preset)
     assert filled.reasoning_effort is None, "the profile's word is not this dialect's"
     assert {"reasoning_budget", "reasoning_effort"} == PROFILE_ONLY
 

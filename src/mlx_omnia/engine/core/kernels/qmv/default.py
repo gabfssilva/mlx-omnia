@@ -15,12 +15,12 @@ from typing import Self
 import mlx.core as mx
 import mlx.nn as nn
 
-from mlx_omnia.engine.core.kernels.qmv.kernel import Epilogue, QmvLeaf, is_ternary
+from mlx_omnia.engine.core.kernels.qmv.kernel import Epilogue, QmvLeaf, QmvStrategy, is_ternary
 from mlx_omnia.engine.core.kernels.qmv.ternary import ternary_matmul
 
 
 @dataclass(frozen=True)
-class DefaultQmv:
+class DefaultQmv(QmvStrategy):
     leaf: QmvLeaf
     epilogue: Epilogue
     heads: int | None

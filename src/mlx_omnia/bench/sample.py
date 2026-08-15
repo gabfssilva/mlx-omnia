@@ -10,6 +10,7 @@ one is not bookkeeping: two arms that generated different counts are not two mea
 the same work, and a report that cannot see the counts divides them anyway.
 """
 
+from collections.abc import Sequence
 from dataclasses import asdict, dataclass
 
 
@@ -32,3 +33,13 @@ class Sample:
 
     def as_dict(self) -> dict[str, float | int]:
         return {**asdict(self), "decode": self.decode, "prefill": self.prefill}
+
+
+def divergence(reference: Sequence[int], other: Sequence[int]) -> int | None:
+    """Where two streams part, or `None` when they are the same ids all the way. A stream
+    that only ran shorter parts at the end of the shorter one: nothing said it agreed
+    there."""
+    for index, (theirs, ours) in enumerate(zip(reference, other, strict=False)):
+        if theirs != ours:
+            return index
+    return None if len(reference) == len(other) else min(len(reference), len(other))

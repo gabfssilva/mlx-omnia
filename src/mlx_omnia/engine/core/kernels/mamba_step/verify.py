@@ -19,6 +19,7 @@ from typing import Self
 
 import mlx.core as mx
 
+from mlx_omnia.engine.core.kernels.mamba_step.fused import FusedMambaStep
 from mlx_omnia.engine.core.kernels.mamba_step.norm import (
     gated_group_norm,
     gated_group_norm_applies,
@@ -154,10 +155,7 @@ class VerifyMambaStep:
     has_bias: bool
 
     @classmethod
-    def of(cls, fused: object) -> Self:
-        from mlx_omnia.engine.core.kernels.mamba_step.fused import FusedMambaStep
-
-        assert isinstance(fused, FusedMambaStep)
+    def of(cls, fused: FusedMambaStep) -> Self:
         return cls(
             fused.taps, fused.conv_bias, fused.A_log, fused.D, fused.dt_bias,
             fused.norm_weight, fused.limits, fused.eps_array, fused.eps, fused.inner,

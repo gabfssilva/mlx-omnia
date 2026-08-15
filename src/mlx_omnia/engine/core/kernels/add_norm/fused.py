@@ -20,6 +20,7 @@ import mlx.core as mx
 import mlx.nn as nn
 
 from mlx_omnia.engine.core.kernels import MetalDispatch, MetalKernel
+from mlx_omnia.engine.core.kernels.add_norm.kernel import AddRmsNormStrategy
 
 _SOURCE = """
     uint tid = thread_position_in_threadgroup.x;
@@ -94,7 +95,7 @@ def applies(hidden: int) -> bool:
 
 
 @dataclass(frozen=True)
-class FusedAddRmsNorm:
+class FusedAddRmsNorm(AddRmsNormStrategy):
     weight: mx.array
     eps: float
 

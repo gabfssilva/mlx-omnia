@@ -1,5 +1,4 @@
 from dataclasses import dataclass
-from typing import assert_never
 
 
 @dataclass(frozen=True)
@@ -34,5 +33,3 @@ class SeedOssConfig:
                 return eos
             case int() as eos:
                 return (eos,)
-            case never:
-                assert_never(never)

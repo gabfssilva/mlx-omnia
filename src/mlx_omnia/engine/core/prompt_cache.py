@@ -17,7 +17,7 @@ memory arithmetic hands over.
 import weakref
 from collections.abc import Iterator, Sequence
 from dataclasses import dataclass, field
-from typing import Literal, Protocol
+from typing import Literal, Protocol, runtime_checkable
 
 from mlx_omnia.engine.core.cache import LayerCache
 
@@ -26,6 +26,7 @@ type Role = Literal["system", "user", "assistant"]
 _EVICTION_ORDER: tuple[Role, ...] = ("assistant", "user", "system")
 
 
+@runtime_checkable
 class Spill[C: LayerCache](Protocol):
     """Where an entry goes when the budget pushes it out, and where a miss looks before
     giving up. A protocol so that nothing here learns what a daemon's disk looks like: what
@@ -48,6 +49,7 @@ class Spill[C: LayerCache](Protocol):
         ...
 
 
+@runtime_checkable
 class Ledger(Protocol):
     """A trie as the ceiling it answers to sees it: how much it holds, which entry it would
     give up next, and the order to do it in. No type parameter, which is the whole point —
@@ -170,7 +172,7 @@ class _Entry[C: LayerCache]:
     serial: int
 
 
-class PromptCache[C: LayerCache]:
+class PromptCache[C: LayerCache](Ledger):
     """Materialized prefixes, evicted by role under a ceiling of `budget` bytes.
 
     `take` hands the cache over instead of lending it: whoever generates from it writes

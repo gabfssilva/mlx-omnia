@@ -73,7 +73,7 @@ class Llama4(nn.Module):
         ANDed with causal. Not a sliding window — the window starts at the chunk
         boundary, not at `p - chunk`."""
         chunk = self.text.attention_chunk_size
-        if isinstance(offset, mx.array):
+        if not isinstance(offset, int):
             # Ragged decode: one band per row. Causality needs no term — each row's mask is
             # trimmed to its own key span before it is applied.
             span = int(mx.max(offset).item()) + 1

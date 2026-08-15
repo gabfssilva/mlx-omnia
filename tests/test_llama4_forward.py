@@ -28,6 +28,7 @@ from tests.conftest import (
     relative_diff,
     requires_checkpoint,
 )
+from tests.mutation import mutated
 
 FIXTURE = Path(__file__).parent / "fixtures" / "llama4_mlxlm.safetensors"
 REPO = "mlx-community/Llama-4-Scout-17B-16E-Instruct-4bit"
@@ -98,12 +99,9 @@ def test_mutation_breaks_parity(model: Llama4, golden: dict[str, mx.array]) -> N
     assert layer.mlp.switch_mlp is not None
     original = layer.mlp.switch_mlp.gate_up_proj.scales
     assert isinstance(original, mx.array)
-    layer.mlp.switch_mlp.gate_up_proj.scales = original * 1.5
-    try:
+    with mutated(layer.mlp.switch_mlp.gate_up_proj, "scales", original * 1.5):
         logits = model(golden["input_ids"][None])
         assert relative_diff(logits, golden["logits"]) > golden["noise.logits"].item()
-    finally:
-        layer.mlp.switch_mlp.gate_up_proj.scales = original
 
 
 @requires_checkpoint(REPO)

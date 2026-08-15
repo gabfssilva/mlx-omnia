@@ -8,7 +8,7 @@ is the caller's routing, not this package's. The down side rounds `(T)((T)dot·w
 per expert and accumulates in fp32, adding the residual at T.
 """
 
-from typing import Literal, Protocol
+from typing import Literal, Protocol, runtime_checkable
 
 import mlx.core as mx
 
@@ -19,6 +19,7 @@ silu(gate)·up, `[n, inner]`. `blocked` means it is the un-activated `[gate ‖ 
 layout."""
 
 
+@runtime_checkable
 class DownCombineStrategy(Protocol):
     """(act [n, inner], chosen [n], weights [n], residual [hidden]) -> [hidden]."""
 

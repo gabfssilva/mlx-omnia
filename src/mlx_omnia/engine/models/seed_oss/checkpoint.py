@@ -18,7 +18,7 @@ from mlx_omnia.engine.models.seed_oss.config import SeedOssConfig
 from mlx_omnia.engine.models.seed_oss.model import SeedOss
 
 
-def _weights(directory: Path, config: SeedOssConfig, dtype: mx.Dtype | None) -> dict[str, mx.array]:
+def weights(directory: Path, config: SeedOssConfig, dtype: mx.Dtype | None) -> dict[str, mx.array]:
     layers = config.num_hidden_layers
     return prepare_weights(
         config,
@@ -52,7 +52,7 @@ CHECKPOINT = checkpoint(
     ),
     SeedOssConfig,
     SeedOss,
-    _weights,
+    weights,
     _composite,
     model_types=("seed_oss",),
 )

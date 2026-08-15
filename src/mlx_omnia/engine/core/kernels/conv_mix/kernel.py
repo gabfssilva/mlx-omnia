@@ -7,11 +7,12 @@ over B*x against the cached window, and C's gate —
 resolves which module serves a given shape and declaration, once, at construction.
 """
 
-from typing import Protocol
+from typing import Protocol, runtime_checkable
 
 import mlx.core as mx
 
 
+@runtime_checkable
 class ConvMixStrategy(Protocol):
     """One token through the gated short conv, returning the gate's output and the
     slid window."""

@@ -61,7 +61,7 @@ from dataclasses import replace
 from itertools import count
 from typing import Annotated, Literal
 
-from fastapi import APIRouter, Depends, Request
+from fastapi import APIRouter
 from fastapi.responses import JSONResponse, StreamingResponse
 from pydantic import BaseModel, ConfigDict, Field, model_validator
 
@@ -88,8 +88,9 @@ from mlx_omnia.engine.grammar import GrammarRefused
 from mlx_omnia.engine.language import tokenizer_of
 from mlx_omnia.engine.parsers import CallDelta, Segment, ToolCall, unmarked
 from mlx_omnia.server import profiles
-from mlx_omnia.server.engine import Engine, Job, NotConstrainable, NotQuantizable
-from mlx_omnia.server.profiles import Sampling, StoreDep
+from mlx_omnia.server.deps import EngineDep, StoreDep
+from mlx_omnia.server.engine import Job, NotConstrainable, NotQuantizable
+from mlx_omnia.server.profiles import Sampling
 from mlx_omnia.server.responses import (
     Calls,
     Halt,
@@ -852,14 +853,6 @@ async def _events(
         job.cancel()
 
 
-def _engine(request: Request) -> Engine:
-    engine = request.app.state.engine
-    assert isinstance(engine, Engine)
-    return engine
-
-
-EngineDep = Annotated[Engine, Depends(_engine)]
-
 router = APIRouter()
 
 
@@ -1082,8 +1075,8 @@ async def messages(
             if piece.channel == "reasoning":
                 written.wrote("thinking", unmarked(piece.text))
                 continue
-            content = piece.text if calls is None else calls.push(piece)[0]
-            written.wrote("text", halt.push(content))
+            chunk = piece.text if calls is None else calls.push(piece)[0]
+            written.wrote("text", halt.push(chunk))
             if halt.matched is not None:
                 # The client's sequence, in the text as it arrived: what the model writes
                 # after it is not the answer, so it is not waited for either.

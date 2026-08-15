@@ -11,7 +11,8 @@ from mlx_omnia.engine.models.deepseek_v4.layers.cache import (
     DeepseekV4Cache,
 )
 
-type V4Cache = DeepseekV4Cache | BatchedDeepseekV4Cache
+type DeepseekV4Layer = DeepseekV4Cache | BatchedDeepseekV4Cache
+"""What one layer of this family's cache can be: its own cache, or the ragged adapter."""
 
 
 class DeepseekV4Activations(NamedTuple):
@@ -36,7 +37,7 @@ class DeepseekV4(nn.Module):
         ]
 
     def activations(
-        self, ids: mx.array, cache: Sequence[V4Cache] | None = None
+        self, ids: mx.array, cache: Sequence[DeepseekV4Layer] | None = None
     ) -> DeepseekV4Activations:
         cache = cache if cache is not None else self.make_cache()
         if isinstance(cache[0], BatchedDeepseekV4Cache):
@@ -48,7 +49,12 @@ class DeepseekV4(nn.Module):
             single.append(layer)
         return self._forward(ids, single)
 
-    def _ragged(self, ids: mx.array, cache: Sequence[V4Cache]) -> DeepseekV4Activations:
+    def __call__(
+        self, ids: mx.array, cache: Sequence[DeepseekV4Layer] | None = None
+    ) -> mx.array:
+        return self.activations(ids, cache).logits
+
+    def _ragged(self, ids: mx.array, cache: Sequence[DeepseekV4Layer]) -> DeepseekV4Activations:
         """A ragged batch, one row at a time.
 
         Every scalar this family carries per sequence is genuinely per row — the
@@ -98,9 +104,6 @@ class DeepseekV4(nn.Module):
             blocks.append(h)
         normed = self.model.norm(self.model.hc_head(h))
         return DeepseekV4Activations(blocks, self.lm_head(normed))
-
-    def __call__(self, ids: mx.array, cache: Sequence[V4Cache] | None = None) -> mx.array:
-        return self.activations(ids, cache).logits
 
     def _window(self, length: int, offset: int) -> mx.array | str | None:
         """The band `rows >= columns and rows < columns + 128`, built only where it is not

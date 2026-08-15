@@ -42,11 +42,11 @@ import zlib
 from collections.abc import AsyncIterator, Iterator, Mapping, Sequence
 from dataclasses import dataclass, replace
 from itertools import count
-from typing import Annotated, Final, Literal
+from typing import Annotated, Final, Literal, Protocol, runtime_checkable
 
 import numpy as np
 import numpy.typing as npt
-from fastapi import APIRouter, Depends, Request
+from fastapi import APIRouter
 from fastapi.responses import JSONResponse, StreamingResponse
 from pydantic import BaseModel, ConfigDict, Field
 
@@ -89,8 +89,9 @@ from mlx_omnia.engine.schema import (
     validate,
 )
 from mlx_omnia.server import profiles
-from mlx_omnia.server.engine import Engine, Job, NotConstrainable, NotQuantizable
-from mlx_omnia.server.profiles import Sampling, StoreDep
+from mlx_omnia.server.deps import EngineDep, StoreDep
+from mlx_omnia.server.engine import Job, NotConstrainable, NotQuantizable
+from mlx_omnia.server.profiles import Sampling
 
 _KEEP_ALIVE_SECONDS = 0.5
 
@@ -703,18 +704,41 @@ class ResponsesRequest(BaseModel):
     seed: int | None = None
 
 
-def _options(
-    request: ResponsesRequest, sampling: Sampling, constraint: Constraint | None
+@runtime_checkable
+class Knobs(Protocol):
+    """The sampling fields both OpenAI routes spell the same way. Structural and not a base
+    class: the two requests are pydantic models in two modules, and this one may not import
+    the other's."""
+
+    temperature: float
+    top_p: float
+    top_k: int | None
+    min_p: float
+    repetition_penalty: float
+    seed: int | None
+
+
+def options(
+    request: Knobs,
+    sampling: Sampling,
+    constraint: Constraint | None,
+    *,
+    max_tokens: int,
+    context_limit: int | None,
 ) -> GenerationOptions:
     """The dialect's defaults are OpenAI's, so an unset `temperature` is 1.0 and the answer
     is drawn, not argmaxed. Filters run in the order below — the cuts read the distribution
-    temperature already shaped.
+    temperature already shaped, which is what makes `top_p` mean the same here as upstream.
 
     The constraint composes with all of them and is nobody's filter: the mask is applied
     before the sampler runs, so what is drawn is drawn from what the grammar left.
 
-    `sampling` is here for the knobs this dialect has no field for — `reasoning_budget` is
-    the only one so far — which `_preset` cannot fill because there is nothing to fill."""
+    `sampling` is here for the knobs neither dialect has a field for — `reasoning_budget` is
+    the only one so far — which `preset_of` cannot fill because there is nothing to fill.
+
+    The budget is a parameter because the two routes name it differently (`max_tokens`
+    against `max_output_tokens`), and so is `context_limit` because they disagree about it:
+    `chat/completions` passes the checkpoint's window and `/responses` passes none."""
     repeats = request.repetition_penalty
     penalty: Penalty | None = None if repeats == 1.0 else repetition_penalty(repeats)
     thinking = sampling.reasoning_budget
@@ -722,11 +746,12 @@ def _options(
         # The deterministic end of the dial: no distribution is left to draw from, and
         # dividing by it would hand the sampler a row of infinities.
         return GenerationOptions(
-            max_tokens=request.max_output_tokens,
+            max_tokens=max_tokens,
             sampler=greedy,
             penalty=penalty,
             constraint=constraint,
             reasoning_budget=thinking,
+            context_limit=context_limit,
         )
 
     filters: list[LogitFilter] = [temperature(request.temperature)]
@@ -738,11 +763,12 @@ def _options(
         filters.append(min_p(request.min_p))
     drawn: Sampler = sampler(*filters, seed=request.seed)
     return GenerationOptions(
-        max_tokens=request.max_output_tokens,
+        max_tokens=max_tokens,
         sampler=drawn,
         penalty=penalty,
         constraint=constraint,
         reasoning_budget=thinking,
+        context_limit=context_limit,
     )
 
 
@@ -776,9 +802,10 @@ in a field typed for OpenAI's words and be read by `effort_of` as none of them.
 Both routes share the set, because both refuse for the same reasons."""
 
 
-def _preset(request: ResponsesRequest, sampling: Sampling) -> ResponsesRequest:
+def preset_of[R: BaseModel](request: R, sampling: Sampling) -> R:
     """The preset — the profile, over the sampling defaults the checkpoint declares — fills
-    the knobs the client left out, and only those. Which ones were left
+    the knobs the client left out, and only those: a request that names a temperature means
+    it, whatever the profile it also named says. Which ones were left
     out is `model_fields_set` — the dialect's defaults are values like any other, so an unset
     field cannot be told from an explicit one by its value."""
     filled = {
@@ -789,10 +816,19 @@ def _preset(request: ResponsesRequest, sampling: Sampling) -> ResponsesRequest:
     return request.model_copy(update=filled)
 
 
-# The same invariant `chat/completions` asserts, for the same reason: `model_copy(update=...)`
-# writes the keys straight into the instance, so a knob the profile grows and this route does
-# not have would be set on the request and read by nobody.
-assert set(Sampling.model_fields) - PROFILE_ONLY <= set(ResponsesRequest.model_fields)
+def covers(request: type[BaseModel]) -> bool:
+    """Whether a dialect's request has a field for every knob `preset_of` may fill.
+
+    `model_copy(update=...)` writes the keys straight into the instance: no validation, and
+    the `extra="forbid"` of the request never sees them. A knob the profile grows and a
+    dialect does not have would be set on the request and read by nobody — silently, and only
+    for requests that name a profile, which is the one path with no dialect-level schema to
+    catch it. `PROFILE_ONLY` is the exception with a reader: those are excluded above and read
+    in `options`."""
+    return set(Sampling.model_fields) - PROFILE_ONLY <= set(request.model_fields)
+
+
+assert covers(ResponsesRequest)
 
 
 def _given_part(part: ContentPart | InputImage) -> TextPart | ImagePart:
@@ -1004,7 +1040,10 @@ def _event(name: str, sequence: int, fields: dict[str, object]) -> str:
     return f"event: {name}\ndata: {json.dumps(payload)}\n\n"
 
 
-async def _drain(job: Job) -> list[Segment]:
+async def drain(job: Job) -> list[Segment]:
+    """Every segment of a non-streaming generation, to the sentinel. Shared with the two
+    other dialects that answer whole: what a job hands back is the same list wherever it is
+    read, and the wire shape is what differs."""
     pieces: list[Segment] = []
     while (piece := await job.chunks.get()) is not None:
         pieces.append(piece)
@@ -1230,14 +1269,6 @@ async def _events(
         job.cancel()
 
 
-def _engine(request: Request) -> Engine:
-    engine = request.app.state.engine
-    assert isinstance(engine, Engine)
-    return engine
-
-
-EngineDep = Annotated[Engine, Depends(_engine)]
-
 router = APIRouter()
 
 
@@ -1279,7 +1310,7 @@ async def respond(
 
     model_id, profile = profiles.resolve(store, request.model)
     preset = profiles.preset(model_id, profile)
-    asked = _preset(request, preset)
+    asked = preset_of(request, preset)
     turns = _prefixed(
         given, request.instructions, None if profile is None else profile.system_prompt
     )
@@ -1313,7 +1344,15 @@ async def respond(
                 model_id,
                 conversation,
                 replace(
-                    _options(asked, preset, constrained),
+                    options(
+                        asked,
+                        preset,
+                        constrained,
+                        max_tokens=asked.max_output_tokens,
+                        # No `context_limit`: this route caps on its own budget alone, where
+                        # `chat/completions` also caps on the checkpoint's window.
+                        context_limit=None,
+                    ),
                     speculate=profiles.speculating(store, model_id, profile),
                 ),
             )
@@ -1351,7 +1390,7 @@ async def respond(
         )
 
     try:
-        pieces = await _drain(job)
+        pieces = await drain(job)
     finally:
         job.cancel()
     if job.error is not None:

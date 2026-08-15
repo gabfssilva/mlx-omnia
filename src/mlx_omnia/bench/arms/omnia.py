@@ -2,14 +2,16 @@
 
 `build` is the entry point a paired run names: everything it takes is JSON, because a
 subprocess boundary sits between the caller and it. `loaded` is the same construction with the
-pieces left reachable — the tree, the drafter, the acceptance counter — which is what the CLI
-needs to report a speculative round against its own ceiling.
+tree left reachable, which is what the CLI needs to read a round against its own ceiling —
+and what it adds a drafter over, with `drafter` and `over`, when a speculative arm is asked
+for.
 """
 
 import statistics
 import time
 from collections.abc import Callable, Iterator, Sequence
 from dataclasses import dataclass
+from typing import NamedTuple
 
 import mlx.core as mx
 import mlx.nn as nn
@@ -21,7 +23,10 @@ from mlx_omnia.bench.forcing import forced
 from mlx_omnia.bench.gate import Gate
 from mlx_omnia.engine.batching import BatchModel, prepare_batch_sequence, step
 from mlx_omnia.engine.bpe import ByteLevelBPE
-from mlx_omnia.engine.footprint import SUSTAINED_GBS, Routed, active_bytes_per_token
+from mlx_omnia.engine.core.cache import LayerCache
+from mlx_omnia.engine.footprint import SUSTAINED_GBS, Routed
+from mlx_omnia.engine.footprint import active_bytes_per_token as _module_bytes_per_token
+from mlx_omnia.engine.generate import CausalLM
 from mlx_omnia.engine.speculative import Acceptance
 
 __all__ = [
@@ -33,6 +38,7 @@ __all__ = [
     "ConcurrencyRow",
     "ConcurrencySweep",
     "Known",
+    "Tree",
     "active_bytes_per_token",
     "build",
     "drafter",
@@ -43,6 +49,10 @@ __all__ = [
     "sparse",
     "tokenizer",
 ]
+
+type Tree = CausalLM[LayerCache]
+"""What `mlx_omnia.tree` hands back: the forward and the cache, which is all `stream_ids`
+asks of a model."""
 
 
 @dataclass(frozen=True, slots=True)
@@ -110,9 +120,7 @@ def measure_concurrency(
     if 1 not in counts or any(count < 1 for count in counts):
         raise ValueError("concurrencies must be positive and include 1")
 
-    measured: list[
-        tuple[int, float, tuple[float, ...], tuple[float, ...], tuple[int, ...]]
-    ] = []
+    measured: list[_Measured] = []
     for concurrency in counts:
         ttfts: list[float] = []
         rates: list[float] = []
@@ -141,36 +149,45 @@ def measure_concurrency(
                 sum(layer.nbytes for sequence in sequences for layer in sequence.cache)
             )
         measured.append(
-            (
+            _Measured(
                 concurrency,
                 statistics.median(ttfts),
+                statistics.median(rates),
                 tuple(rates),
                 tuple(temperatures),
                 tuple(kv_bytes),
             )
         )
 
-    baseline = next(
-        statistics.median(rates)
-        for concurrency, _, rates, _, _ in measured
-        if concurrency == 1
-    )
+    baseline = next(one.rate for one in measured if one.concurrency == 1)
     return ConcurrencySweep(
         tuple(
             ConcurrencyRow(
-                concurrency,
-                ttft * 1000,
-                statistics.median(rates),
-                statistics.median(rates) / concurrency,
-                statistics.median(rates) / baseline,
-                statistics.median(rates) / (baseline * concurrency),
-                rates,
-                temperatures,
-                kv_bytes,
+                one.concurrency,
+                one.ttft * 1000,
+                one.rate,
+                one.rate / one.concurrency,
+                one.rate / baseline,
+                one.rate / (baseline * one.concurrency),
+                one.rates,
+                one.temperatures,
+                one.kv_bytes,
             )
-            for concurrency, ttft, rates, temperatures, kv_bytes in measured
+            for one in measured
         )
     )
+
+
+class _Measured(NamedTuple):
+    """One concurrency's rounds, with the medians the rows divide by taken once."""
+
+    concurrency: int
+    ttft: float
+    rate: float
+    rates: tuple[float, ...]
+    temperatures: tuple[float, ...]
+    kv_bytes: tuple[int, ...]
+
 
 DTYPES = {"float16": mx.float16, "bfloat16": mx.bfloat16, "float32": mx.float32}
 
@@ -228,28 +245,40 @@ def resolve(name: str) -> Known:
     return MODELS.get(name) or Known(name)
 
 
-def _loaded_tree(repo: str, patterns: Sequence[str], dtype: str | None) -> nn.Module:
+def _loaded_tree(repo: str, patterns: Sequence[str], dtype: str | None) -> Tree:
     directory = snapshot(repo, *patterns) if patterns else cached(repo)
     return tree(directory, dtype=None if dtype is None else DTYPES[dtype])
+
+
+def _module(model: Tree) -> nn.Module:
+    """A loaded tree is an `nn.Module`; `tree` types it by the protocol `stream_ids` needs.
+    Walking the weights — what the footprint arithmetic does — needs the module back."""
+    assert isinstance(model, nn.Module)
+    return model
 
 
 @dataclass(frozen=True, slots=True)
 class Built:
     arm: Arm
-    model: nn.Module
-    draft: nn.Module | None
+    model: Tree
+    draft: Tree | None
     acceptance: Acceptance | None
 
 
-def drafter(repo: str) -> nn.Module:
+def active_bytes_per_token(model: Tree) -> int:
+    """What one decode step of this tree reads."""
+    return _module_bytes_per_token(_module(model))
+
+
+def drafter(repo: str) -> Tree:
     return _loaded_tree(repo, (), None)
 
 
 def over(
-    model: nn.Module,
+    model: Tree,
     *,
     tokens: int = 128,
-    draft: nn.Module | None = None,
+    draft: Tree | None = None,
     lookahead: int = 4,
     acceptance: Acceptance | None = None,
     name: str = "omnia",
@@ -281,22 +310,10 @@ def loaded(
     patterns: Sequence[str] = (),
     dtype: str | None = None,
     tokens: int = 128,
-    draft: str | None = None,
-    lookahead: int = 4,
     name: str = "omnia",
 ) -> Built:
     model = _loaded_tree(repo, patterns, dtype)
-    draft_model = None if draft is None else drafter(draft)
-    acceptance = None if draft is None else Acceptance()
-    built = over(
-        model,
-        tokens=tokens,
-        draft=draft_model,
-        lookahead=lookahead,
-        acceptance=acceptance,
-        name=name,
-    )
-    return Built(built, model, draft_model, acceptance)
+    return Built(over(model, tokens=tokens, name=name), model, None, None)
 
 
 def build(
@@ -305,26 +322,16 @@ def build(
     patterns: Sequence[str] = (),
     dtype: str | None = None,
     tokens: int = 128,
-    draft: str | None = None,
-    lookahead: int = 4,
     name: str = "omnia",
 ) -> Arm:
-    return loaded(
-        repo,
-        patterns=patterns,
-        dtype=dtype,
-        tokens=tokens,
-        draft=draft,
-        lookahead=lookahead,
-        name=name,
-    ).arm
+    return loaded(repo, patterns=patterns, dtype=dtype, tokens=tokens, name=name).arm
 
 
-def sparse(model: nn.Module) -> bool:
+def sparse(model: Tree) -> bool:
     """Whether a verified row gathers experts of its own — which is what makes a speculative
     round's target read grow with the rows instead of staying at one read."""
     routed: list[str] = []
-    model.apply_to_modules(
+    _module(model).apply_to_modules(
         lambda path, module: routed.append(path) if isinstance(module, Routed) else None
     )
     return bool(routed)

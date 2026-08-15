@@ -196,7 +196,7 @@ def blocks(model, module, ids: mx.array) -> tuple[list[mx.array], mx.array]:
     attn_mask = module.create_attention_mask(h, cache[trunk._attn_idx], return_array=True)
     gla_mask = module.create_ssm_mask(h, cache[trunk._gla_idx])
     out: list[mx.array] = []
-    for layer, layer_cache in zip(trunk.layers, cache):
+    for layer, layer_cache in zip(trunk.layers, cache, strict=True):
         h = layer(h, attn_mask if layer.is_global else gla_mask, layer_cache, offset=0)
         mx.eval(h)
         out.append(h)
@@ -212,7 +212,7 @@ def stepwise(model, ids: list[int]) -> tuple[list[mx.array], mx.array]:
     logits: list[mx.array] = []
     for token in ids:
         h = trunk.word_embeddings(mx.array([[token]]))
-        for i, (layer, c) in enumerate(zip(trunk.layers, cache)):
+        for i, (layer, c) in enumerate(zip(trunk.layers, cache, strict=True)):
             h = layer(h, None, c, offset=0)
             mx.eval(h)
             rows[i].append(h)

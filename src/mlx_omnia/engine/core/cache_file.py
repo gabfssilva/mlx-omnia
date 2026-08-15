@@ -7,7 +7,7 @@ layer answers for is its own tensors and nothing else.
 
 What is written is `[..., :offset, :]`: the block-grown buffer reserves up to 255 rows past
 the offset, and rows a model never wrote are not state. What is read back is exactly as long
-as it was written, which `core.cache._reserving` grows on the next update like any buffer too
+as it was written, which `core.cache.reserve` grows on the next update like any buffer too
 small for what is coming.
 
 The offsets ride in the file's string metadata rather than as tensors of one element: they

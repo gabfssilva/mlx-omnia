@@ -21,6 +21,7 @@ from mlx_omnia.engine.generate import Meter
 from mlx_omnia.engine.models.laguna import CHECKPOINT, Laguna
 from mlx_omnia.engine.models.laguna.layers.moe import LagunaSparseMoe
 from tests.conftest import checkpoint_dir, relative_diff, requires_checkpoint
+from tests.mutation import mutated
 
 FIXTURE = Path(__file__).parent / "fixtures" / "laguna_xs_mlxfast_golden.json"
 REPO = "poolside/Laguna-XS-2.1-NVFP4-mlx"
@@ -202,12 +203,9 @@ def test_mutation_moves_logits(model: Laguna, case: dict[str, list[int]]) -> Non
     dtype e o `gather_qmm` recusaria antes de calcular nada."""
     layer = model.model.layers[5]
     assert isinstance(layer.mlp, LagunaSparseMoe)
-    original = layer.mlp.switch_mlp.gate_up_proj.weight
+    projection = layer.mlp.switch_mlp.gate_up_proj
     ids = mx.array(case["prompt_tokens"])[None]
     base = mx.argmax(model(ids), axis=-1)
-    try:
-        layer.mlp.switch_mlp.gate_up_proj.weight = original ^ 0x0F0F0F0F
-        mutated = mx.argmax(model(ids), axis=-1)
-    finally:
-        layer.mlp.switch_mlp.gate_up_proj.weight = original
-    assert not bool(mx.all(base == mutated))
+    with mutated(projection, "weight", projection.weight ^ 0x0F0F0F0F):
+        flipped = mx.argmax(model(ids), axis=-1)
+    assert not bool(mx.all(base == flipped))

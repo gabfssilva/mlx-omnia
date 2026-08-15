@@ -17,20 +17,16 @@ second half the row (height) rotation. ``layer_norm_eps`` is 1e-5.
 
 import math
 from dataclasses import dataclass
-from typing import TYPE_CHECKING
 
 import mlx.core as mx
 import mlx.nn as nn
 import numpy as np
 
-if TYPE_CHECKING:
+from mlx_omnia.engine.processors.step3p7 import WINDOW_SIZE, ImageFeatures
 
-    def _quick_gelu(x: mx.array) -> mx.array: ...
 
-else:
-
-    def _quick_gelu(x: mx.array) -> mx.array:
-        return x * mx.sigmoid(1.702 * x)
+def _quick_gelu(x: mx.array) -> mx.array:
+    return x * mx.sigmoid(1.702 * x)
 
 
 _ROPE_THETA = 10000.0
@@ -265,17 +261,14 @@ class Step3p7Vision(nn.Module):
         x = self._forward(pixels, grid_h, grid_w)
         return self._downsample(x, grid_h, grid_w)
 
-    def process(self, features: object) -> mx.array:
+    def process(self, features: ImageFeatures) -> mx.array:
         """Process all base images and tiles, return concatenated features
         [total_tokens, width*4] in tile-then-base order (matching input_ids layout)."""
-        from mlx_omnia.engine.processors.step3p7 import ImageFeatures
-
-        assert isinstance(features, ImageFeatures)
         config = self.config
         outputs: list[mx.array] = []
 
         if features.tile_pixels is not None and features.tile_pixels.shape[0] > 0:
-            tile_grid = 504 // config.patch_size  # 36
+            tile_grid = WINDOW_SIZE // config.patch_size
             outputs.append(
                 self.process_single(features.tile_pixels, tile_grid, tile_grid)
             )

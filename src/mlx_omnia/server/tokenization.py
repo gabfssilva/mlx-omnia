@@ -14,13 +14,12 @@ seconds and tens of gigabytes, and it is asked for on purpose through
 
 import asyncio
 from dataclasses import dataclass
-from typing import Annotated
 
-from fastapi import APIRouter, Depends, HTTPException, Request
+from fastapi import APIRouter, HTTPException
 from pydantic import BaseModel, ConfigDict
 
 from mlx_omnia.engine.language import tokenizer_of
-from mlx_omnia.server.engine import Engine
+from mlx_omnia.server.deps import EngineDep
 
 
 class TokenizeRequest(BaseModel):
@@ -33,15 +32,6 @@ class TokenizeRequest(BaseModel):
 class Tokens:
     ids: list[int]
 
-
-async def _engine(request: Request) -> Engine:
-    """Async so it reads the engine's dicts on the loop that mutates them."""
-    engine = request.app.state.engine
-    assert isinstance(engine, Engine)
-    return engine
-
-
-EngineDep = Annotated[Engine, Depends(_engine)]
 
 router = APIRouter()
 

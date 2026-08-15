@@ -8,12 +8,13 @@ before its own arithmetic. The `Ssm` delegator in `__init__.py` resolves which
 strategy serves a given configuration, once, at construction.
 """
 
-from typing import Protocol
+from typing import Protocol, runtime_checkable
 
 import mlx.core as mx
 import mlx.nn as nn
 
 
+@runtime_checkable
 class SsmStrategy(Protocol):
     """The SSD scan over `T` tokens, carrying the state forward."""
 

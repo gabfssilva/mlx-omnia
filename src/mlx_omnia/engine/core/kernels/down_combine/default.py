@@ -16,12 +16,12 @@ from typing import Self
 import mlx.core as mx
 import mlx.nn as nn
 
-from mlx_omnia.engine.core.kernels.down_combine.kernel import Layout
+from mlx_omnia.engine.core.kernels.down_combine.kernel import DownCombineStrategy, Layout
 from mlx_omnia.engine.core.layers import QuantizedSwitchLinear, SwitchLinear
 
 
 @dataclass(frozen=True)
-class DefaultDownCombine:
+class DefaultDownCombine(DownCombineStrategy):
     leaf: SwitchLinear | QuantizedSwitchLinear
     bias: mx.array | None
     shared: nn.Linear | nn.QuantizedLinear | None

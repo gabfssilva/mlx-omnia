@@ -53,7 +53,7 @@ class LagunaBlock(nn.Module):
         cache: KVStore,
     ) -> mx.array:
         branch = self.self_attn(self.input_layernorm(x), mask, cache)
-        kernels = self._kernels()
+        kernels = self.kernels()
         mlp = self.mlp
         step = x.shape[0] == 1 and x.shape[1] == 1
         router_logits: mx.array | None = None
@@ -78,7 +78,7 @@ class LagunaBlock(nn.Module):
             return kernels.mlp(h.reshape(-1), attended.reshape(-1)).reshape(attended.shape)
         return attended + mlp(h)
 
-    def _kernels(self) -> _Kernels:
+    def kernels(self) -> _Kernels:
         """Resolved once, at the first step — after load, when the leaves' formats are
         final."""
         kernels = self._resolved

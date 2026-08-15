@@ -9,11 +9,12 @@ own path), and the activation is SiLU over the conv itself. The `ConvStep` deleg
 `__init__.py` resolves which module serves a given shape, once, at construction.
 """
 
-from typing import Protocol
+from typing import Protocol, runtime_checkable
 
 import mlx.core as mx
 
 
+@runtime_checkable
 class ConvStepStrategy(Protocol):
     """One token through the causal depthwise conv, bias and SiLU, returning the
     activated row and the slid window."""

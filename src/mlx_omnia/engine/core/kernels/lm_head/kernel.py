@@ -11,17 +11,19 @@ sampling, a top-k set, a speculative acceptance ratio, a penalty over the row â€
 outside this primitive and must go through the head layer itself.
 """
 
-from typing import Protocol
+from typing import Protocol, runtime_checkable
 
 import mlx.core as mx
 
 
+@runtime_checkable
 class HeadProjection(Protocol):
     """The stock head: (x [..., hidden]) -> logits [..., vocab]."""
 
     def __call__(self, x: mx.array) -> mx.array: ...
 
 
+@runtime_checkable
 class GreedyHeadStrategy(Protocol):
     """The greedy step: (x [..., hidden]) -> token id [...]."""
 

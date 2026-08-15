@@ -59,7 +59,7 @@ def weights(
                 continue
             # A_log stays float32 at every precision: the decay is computed there.
             cast = dtype is not None and not renamed.endswith("A_log")
-            loaded[renamed] = array.astype(dtype) if dtype is not None and cast else array
+            loaded[renamed] = array.astype(dtype) if cast else array
 
     if config.tied:
         drop_tied_head(loaded)

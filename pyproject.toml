@@ -160,12 +160,17 @@ forbidden_modules = [
 allow_indirect_imports = true
 
 [tool.pyright]
-typeCheckingMode = "off"
-#typeCheckingMode = "strict"
+typeCheckingMode = "strict"
 # mlx ships incomplete stubs (mlx.nn has none; array methods take Unknown varargs).
 # Our signatures stay fully annotated; these rules only flag mlx's gap.
 reportMissingTypeStubs = false
 reportUnknownMemberType = false
+reportUnknownVariableType = false
+reportUnknownArgumentType = false
+reportUnknownParameterType = false
+reportUnknownLambdaType = false
+# pytest-describe collects nested functions by name; strict counts every one as unused.
+reportUnusedFunction = false
 pythonVersion = "3.13"
 include = ["src", "tests"]
 exclude = [

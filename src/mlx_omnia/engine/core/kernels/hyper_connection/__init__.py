@@ -25,7 +25,7 @@ __all__ = [
 _STRATEGIES = (FusedHyperConnection, DefaultHyperConnection)
 
 
-class HyperConnection:
+class HyperConnection(HyperConnectionStrategy):
     """Resolves the strategy at construction and delegates; itself a
     `HyperConnectionStrategy`."""
 

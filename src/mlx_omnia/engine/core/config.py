@@ -39,6 +39,4 @@ def _hydrate[T](cls: type[T], data: dict[str, object]) -> T:
         return value
 
     allowed = {field.name for field in fields(cls)}
-    hydrated = cls(**{k: convert(hints[k], v) for k, v in data.items() if k in allowed})
-    assert isinstance(hydrated, cls)
-    return hydrated
+    return cls(**{k: convert(hints[k], v) for k, v in data.items() if k in allowed})

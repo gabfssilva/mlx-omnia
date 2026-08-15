@@ -37,7 +37,7 @@ from typing import Self
 import mlx.core as mx
 import mlx.nn as nn
 
-from mlx_omnia.engine.core.kernels.qmv.kernel import Epilogue, QmvLeaf
+from mlx_omnia.engine.core.kernels.qmv.kernel import Epilogue, QmvLeaf, QmvStrategy
 from mlx_omnia.engine.core.kernels.shared.nvfp4 import LaneMajorScales, lane_major_scales
 from mlx_omnia.engine.core.mxcompat import metal_kernel
 
@@ -226,7 +226,7 @@ def nvfp4_qmv(
 
 
 @dataclass(frozen=True)
-class Nvfp4Qmv:
+class Nvfp4Qmv(QmvStrategy):
     weight: mx.array
     scales: mx.array
     bank: LaneMajorScales

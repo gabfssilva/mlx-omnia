@@ -9,34 +9,23 @@ from dataclasses import replace
 from importlib.metadata import version
 from typing import Annotated, Literal
 
-from fastapi import APIRouter, Depends, FastAPI, Request
+from fastapi import APIRouter, FastAPI, Request
 from fastapi.exceptions import RequestValidationError
 from fastapi.responses import JSONResponse, StreamingResponse
 from pydantic import BaseModel, ConfigDict, Field
 
 from mlx_omnia import (
     Chat,
-    GenerationOptions,
     ImagePart,
-    LogitFilter,
-    Penalty,
-    Sampler,
     TextPart,
     UnsupportedInput,
-    greedy,
-    min_p,
-    repetition_penalty,
-    sampler,
-    temperature,
-    top_k,
-    top_p,
 )
 from mlx_omnia import ChatMessage as Turn
 from mlx_omnia.engine.chat import parser_of
 from mlx_omnia.engine.footprint import ceiling
-from mlx_omnia.engine.generate import Constraint, Meter
+from mlx_omnia.engine.generate import Meter
 from mlx_omnia.engine.grammar import GrammarRefused
-from mlx_omnia.engine.parsers import CallDelta, Segment, ToolCall, ToolFamily, unmarked
+from mlx_omnia.engine.parsers import CallDelta, ToolCall, ToolFamily, unmarked
 from mlx_omnia.engine.schema import MalformedJSON, SchemaViolation
 from mlx_omnia.server import (
     anthropic,
@@ -63,11 +52,10 @@ from mlx_omnia.server import (
     system,
     tokenization,
 )
+from mlx_omnia.server.deps import EngineDep, StoreDep
 from mlx_omnia.server.engine import Engine, Job, NotConstrainable, NotQuantizable
 from mlx_omnia.server.jobs import Jobs
-from mlx_omnia.server.profiles import Sampling, StoreDep
 from mlx_omnia.server.responses import (
-    PROFILE_ONLY,
     Calls,
     Checked,
     Halt,
@@ -76,14 +64,18 @@ from mlx_omnia.server.responses import (
     UnreadableImage,
     called,
     content_of,
+    covers,
     declared,
     document,
+    drain,
     effort_of,
     failed,
     inline_image,
     instruction,
     openai_envelope,
     openai_error,
+    options,
+    preset_of,
     unsupported_reason,
 )
 from mlx_omnia.server.store import Store
@@ -308,72 +300,7 @@ class ChatRequest(BaseModel):
     queue — four generations is the longest one request may hold it."""
 
 
-def _options(
-    request: ChatRequest, sampling: Sampling, constraint: Constraint | None
-) -> GenerationOptions:
-    """The dialect's defaults are OpenAI's, so an unset `temperature` is 1.0 and the answer
-    is drawn, not argmaxed. Filters run in the order below — the cuts read the distribution
-    temperature already shaped, which is what makes `top_p` mean the same here as upstream.
-
-    The constraint composes with all of them and is nobody's filter: the mask is applied
-    before the sampler runs, so what is drawn is drawn from what the grammar left.
-
-    `sampling` is here for the knobs this dialect has no field for — `reasoning_budget` is
-    the only one so far — which `_preset` cannot fill because there is nothing to fill."""
-    repeats = request.repetition_penalty
-    penalty: Penalty | None = None if repeats == 1.0 else repetition_penalty(repeats)
-    limit = catalog.context_of(request.model)
-    thinking = sampling.reasoning_budget
-    if request.temperature == 0.0:
-        # The deterministic end of the dial: no distribution is left to draw from, and
-        # dividing by it would hand the sampler a row of infinities.
-        return GenerationOptions(
-            max_tokens=request.max_tokens,
-            sampler=greedy,
-            penalty=penalty,
-            constraint=constraint,
-            reasoning_budget=thinking,
-            context_limit=limit,
-        )
-
-    filters: list[LogitFilter] = [temperature(request.temperature)]
-    if request.top_k is not None:
-        filters.append(top_k(request.top_k))
-    if request.top_p < 1.0:
-        filters.append(top_p(request.top_p))
-    if request.min_p > 0.0:
-        filters.append(min_p(request.min_p))
-    drawn: Sampler = sampler(*filters, seed=request.seed)
-    return GenerationOptions(
-        max_tokens=request.max_tokens,
-        sampler=drawn,
-        penalty=penalty,
-        constraint=constraint,
-        reasoning_budget=thinking,
-        context_limit=limit,
-    )
-
-
-def _preset(request: ChatRequest, sampling: Sampling) -> ChatRequest:
-    """The preset — the profile, over the sampling defaults the checkpoint declares — fills
-    the knobs the client left out, and only those: a request that names a temperature
-    means it, whatever the profile it also named says. Which knobs were
-    left out is the request's own `model_fields_set` — the dialect's defaults are values
-    like any other, so an unset field cannot be told from an explicit one by its value."""
-    filled = {
-        knob: value
-        for knob, value in sampling.model_dump(exclude_none=True).items()
-        if knob not in request.model_fields_set and knob not in PROFILE_ONLY
-    }
-    return request.model_copy(update=filled)
-
-
-# `model_copy(update=...)` writes the keys straight into the instance: no validation, and the
-# `extra="forbid"` above never sees them. A knob the profile grows and the dialect does not have
-# would be set on the request and read by nobody — silently, and only for requests that name a
-# profile, which is the one path with no dialect-level schema to catch it. `PROFILE_ONLY` is
-# the exception with a reader: those are excluded above and read in `_options`.
-assert set(Sampling.model_fields) - PROFILE_ONLY <= set(ChatRequest.model_fields)
+assert covers(ChatRequest)
 
 
 def _messages(request: ChatRequest, system_prompt: str | None) -> list[ChatMessage]:
@@ -552,14 +479,6 @@ def _correction(output: str, failure: MalformedJSON | SchemaViolation) -> tuple[
     )
 
 
-def _engine(request: Request) -> Engine:
-    engine = request.app.state.engine
-    assert isinstance(engine, Engine)
-    return engine
-
-
-EngineDep = Annotated[Engine, Depends(_engine)]
-
 router = APIRouter()
 
 
@@ -730,13 +649,6 @@ def _finish(job: Job, max_tokens: int, called: bool, halted: bool = False) -> st
     return "length" if job.meter.completion_tokens >= budget else "stop"
 
 
-async def _drain(job: Job) -> list[Segment]:
-    pieces: list[Segment] = []
-    while (piece := await job.chunks.get()) is not None:
-        pieces.append(piece)
-    return pieces
-
-
 async def _events(
     job: Job,
     request_id: str,
@@ -882,7 +794,7 @@ async def chat(
 
     model_id, profile = profiles.resolve(store, request.model)
     preset = profiles.preset(model_id, profile)
-    asked = _preset(request, preset)
+    asked = preset_of(request, preset)
     messages = request.messages if profile is None else _messages(request, profile.system_prompt)
     tools = _tools(request)
     checked = _checked(request)
@@ -935,7 +847,13 @@ async def chat(
                 model_id,
                 conversation,
                 replace(
-                    _options(asked, preset, constrained),
+                    options(
+                        asked,
+                        preset,
+                        constrained,
+                        max_tokens=asked.max_tokens,
+                        context_limit=catalog.context_of(request.model),
+                    ),
                     speculate=profiles.speculating(store, model_id, profile),
                 ),
             )
@@ -986,7 +904,7 @@ async def chat(
             )
 
         try:
-            pieces = await _drain(job)
+            pieces = await drain(job)
         finally:
             job.cancel()
         if job.error is not None:

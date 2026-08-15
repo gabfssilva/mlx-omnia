@@ -29,8 +29,8 @@ from collections.abc import Callable, Mapping
 
 import mlx.core as mx
 
-from mlx_omnia.engine.core.attend import AttentionMask
-from mlx_omnia.engine.core.cache import LayerCache
+from mlx_omnia.engine.core.attend import Attending, AttentionMask
+from mlx_omnia.engine.core.cache import LayerCache, reserve
 from mlx_omnia.engine.quant.quantization import MXFP, NVFP, Affine, Quantization, admits
 
 _BLOCK = 256
@@ -55,7 +55,7 @@ class FormatRefused(Exception):
     """
 
 
-class QuantizedKVCache(LayerCache):
+class QuantizedKVCache(LayerCache, Attending):
     """`KVCache`, with the rows stored under `k_format` and `v_format`.
 
     `start_tokens` keeps the head of the context dense. Below it a conversation never pays
@@ -103,9 +103,7 @@ class QuantizedKVCache(LayerCache):
         compresses and reports the figure the trie budgets against unchanged — which moves no
         ceiling at all."""
         dense = sum(
-            buffer.nbytes
-            for buffer in (self._dense_keys, self._dense_values)
-            if buffer is not None
+            buffer.nbytes for buffer in (self._dense_keys, self._dense_values) if buffer is not None
         )
         packed = sum(held.nbytes for held in (self._keys, self._values) if held is not None)
         return dense + packed
@@ -113,9 +111,7 @@ class QuantizedKVCache(LayerCache):
     @property
     def tensors(self) -> tuple[mx.array, ...]:
         held: list[mx.array] = [
-            buffer
-            for buffer in (self._dense_keys, self._dense_values)
-            if buffer is not None
+            buffer for buffer in (self._dense_keys, self._dense_values) if buffer is not None
         ]
         for packed in (self._keys, self._values):
             if packed is not None:
@@ -209,10 +205,11 @@ class QuantizedKVCache(LayerCache):
         rows = keys.shape[2]
         head = max(0, min(self.start_tokens - self.offset, rows))
         if head:
-            self._dense_keys = _reserve(self._dense_keys, self._dense + head, keys)
-            self._dense_values = _reserve(self._dense_values, self._dense + head, values)
-            self._dense_keys[..., self._dense : self._dense + head, :] = keys[..., :head, :]
-            self._dense_values[..., self._dense : self._dense + head, :] = values[..., :head, :]
+            dense_keys = reserve(self._dense_keys, self._dense + head, keys)
+            dense_values = reserve(self._dense_values, self._dense + head, values)
+            dense_keys[..., self._dense : self._dense + head, :] = keys[..., :head, :]
+            dense_values[..., self._dense : self._dense + head, :] = values[..., :head, :]
+            self._dense_keys, self._dense_values = dense_keys, dense_values
             self._dense += head
         if head < rows:
             self._keys = _append(self._keys, keys[..., head:, :], self.k_format)
@@ -261,9 +258,7 @@ class _Packed:
 
     @property
     def tensors(self) -> tuple[mx.array, ...]:
-        return tuple(
-            held for held in (self.codes, self.scales, self.biases) if held is not None
-        )
+        return tuple(held for held in (self.codes, self.scales, self.biases) if held is not None)
 
     @property
     def nbytes(self) -> int:
@@ -347,30 +342,17 @@ def _append(held: _Packed | None, rows: mx.array, format: Quantization) -> _Pack
             codes, scales = mx.quantize(rows, mode=format.mode, **arguments)
             biases = None
     needed = packed.rows_written + rows.shape[2]
-    packed.codes = _reserve(packed.codes, needed, codes)
-    packed.scales = _reserve(packed.scales, needed, scales)
-    packed.codes[..., packed.rows_written : needed, :] = codes
-    packed.scales[..., packed.rows_written : needed, :] = scales
+    held_codes = reserve(packed.codes, needed, codes)
+    held_scales = reserve(packed.scales, needed, scales)
+    held_codes[..., packed.rows_written : needed, :] = codes
+    held_scales[..., packed.rows_written : needed, :] = scales
+    packed.codes, packed.scales = held_codes, held_scales
     if biases is not None:
-        packed.biases = _reserve(packed.biases, needed, biases)
-        packed.biases[..., packed.rows_written : needed, :] = biases
+        held_biases = reserve(packed.biases, needed, biases)
+        held_biases[..., packed.rows_written : needed, :] = biases
+        packed.biases = held_biases
     packed.rows_written = needed
     return packed
-
-
-def _reserve(buffer: mx.array | None, needed: int, like: mx.array) -> mx.array:
-    """`core.cache._reserving` over the token axis of a `[batch, heads, tokens, width]`
-    buffer. Written again rather than imported because what is grown here is three buffers of
-    different widths under one row count, and the public entry takes one."""
-    if buffer is not None and buffer.shape[2] >= needed:
-        return buffer
-    capacity = (needed + _BLOCK - 1) // _BLOCK * _BLOCK
-    shape = list(like.shape)
-    shape[2] = capacity
-    grown = mx.zeros(shape, dtype=like.dtype)
-    if buffer is not None:
-        grown[..., : buffer.shape[2], :] = buffer
-    return grown
 
 
 def _blocked(

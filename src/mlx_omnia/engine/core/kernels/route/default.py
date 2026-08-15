@@ -17,12 +17,12 @@ from typing import Self
 import mlx.core as mx
 import mlx.nn as nn
 
-from mlx_omnia.engine.core.kernels.route.kernel import Routing, gate_logits
+from mlx_omnia.engine.core.kernels.route.kernel import RouteStrategy, Routing, gate_logits
 from mlx_omnia.engine.core.mxcompat import softmax
 
 
 @dataclass(frozen=True)
-class DefaultRoute:
+class DefaultRoute(RouteStrategy):
     gate: mx.array | None
     routing: Routing
 

@@ -12,7 +12,12 @@ from typing import Self
 import mlx.core as mx
 import mlx.nn as nn
 
-from mlx_omnia.engine.core.kernels.gate_up.kernel import Activation, Layout, OrdinalRouting
+from mlx_omnia.engine.core.kernels.gate_up.kernel import (
+    Activation,
+    GateUpStrategy,
+    Layout,
+    OrdinalRouting,
+)
 from mlx_omnia.engine.core.kernels.shared.mxfp4 import HEADER, applies
 from mlx_omnia.engine.core.layers import QuantizedSwitchLinear, SwitchLinear
 from mlx_omnia.engine.core.mxcompat import metal_kernel
@@ -74,7 +79,7 @@ _KERNEL = metal_kernel(
 
 
 @dataclass(frozen=True)
-class Mxfp4GateUp:
+class Mxfp4GateUp(GateUpStrategy):
     weight: mx.array
     scales: mx.array
     bias: mx.array
