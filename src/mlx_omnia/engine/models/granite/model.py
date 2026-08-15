@@ -1,8 +1,10 @@
+from collections.abc import Sequence
 from typing import NamedTuple
 
 import mlx.core as mx
 import mlx.nn as nn
 
+from mlx_omnia.engine.core.attend import KVStore
 from mlx_omnia.engine.core.cache import KVCache
 from mlx_omnia.engine.models.granite.config import GraniteConfig
 from mlx_omnia.engine.models.granite.layers.block import GraniteBlock
@@ -24,6 +26,8 @@ class GraniteActivations(NamedTuple):
 
 
 class Granite(nn.Module):
+    continuous_batching = True
+
     def __init__(self, config: GraniteConfig) -> None:
         super().__init__()
         self.config = config
@@ -41,7 +45,9 @@ class Granite(nn.Module):
             logits = self.lm_head(normed)
         return logits / self.config.logits_scaling
 
-    def activations(self, ids: mx.array, cache: list[KVCache] | None = None) -> GraniteActivations:
+    def activations(
+        self, ids: mx.array, cache: Sequence[KVStore] | None = None
+    ) -> GraniteActivations:
         cache = cache if cache is not None else self.make_cache()
         x = self.model.embed_tokens(ids) * self.config.embedding_multiplier
         embeddings = x
@@ -52,5 +58,5 @@ class Granite(nn.Module):
         normed = self.model.norm(x)
         return GraniteActivations(embeddings, blocks, normed, self.head(normed))
 
-    def __call__(self, ids: mx.array, cache: list[KVCache] | None = None) -> mx.array:
+    def __call__(self, ids: mx.array, cache: Sequence[KVStore] | None = None) -> mx.array:
         return self.activations(ids, cache).logits

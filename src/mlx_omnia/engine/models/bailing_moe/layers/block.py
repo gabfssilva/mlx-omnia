@@ -1,7 +1,7 @@
 import mlx.core as mx
 import mlx.nn as nn
 
-from mlx_omnia.engine.core.cache import KVCache
+from mlx_omnia.engine.core.attend import KVStore
 from mlx_omnia.engine.core.layers import SwiGLU
 from mlx_omnia.engine.models.bailing_moe.config import BailingMoEConfig
 from mlx_omnia.engine.models.bailing_moe.layers.attention import BailingMoEAttention
@@ -20,6 +20,6 @@ class BailingMoEBlock(nn.Module):
         self.input_layernorm = nn.RMSNorm(config.hidden_size, eps=config.rms_norm_eps)
         self.post_attention_layernorm = nn.RMSNorm(config.hidden_size, eps=config.rms_norm_eps)
 
-    def __call__(self, x: mx.array, cache: KVCache) -> mx.array:
+    def __call__(self, x: mx.array, cache: KVStore) -> mx.array:
         attended = x + self.attention(self.input_layernorm(x), cache)
         return attended + self.mlp(self.post_attention_layernorm(attended))

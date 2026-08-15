@@ -1,12 +1,17 @@
 import mlx.core as mx
 import mlx.nn as nn
 
-from mlx_omnia.engine.core.cache import DeltaCache, KVCache, LayerCache
+from mlx_omnia.engine.core.attend import Attending, KVStore
+from mlx_omnia.engine.core.cache import KVCache, LayerCache
 from mlx_omnia.engine.core.layers import SwiGLU
 from mlx_omnia.engine.models.jamba.config import JambaConfig
 from mlx_omnia.engine.models.jamba.layers.attention import JambaAttention
-from mlx_omnia.engine.models.jamba.layers.mamba import JambaMamba
+from mlx_omnia.engine.models.jamba.layers.mamba import JambaMamba, Recurring
 from mlx_omnia.engine.models.jamba.layers.moe import JambaMoE
+
+type JambaLayer = LayerCache | KVStore | Recurring
+"""A layer's cache, alone or standing for one row each: attention reads it through
+`core.attend`, and the mamba mixer through `window`/`state`."""
 
 
 class JambaBlock(nn.Module):
@@ -25,16 +30,17 @@ class JambaBlock(nn.Module):
         self.input_layernorm = nn.RMSNorm(config.hidden_size, eps=config.rms_norm_eps)
         self.pre_ff_layernorm = nn.RMSNorm(config.hidden_size, eps=config.rms_norm_eps)
 
-    def __call__(self, x: mx.array, cache: LayerCache) -> mx.array:
+    def __call__(self, x: mx.array, cache: JambaLayer) -> mx.array:
         normed = self.input_layernorm(x)
         # One mixer or the other; mlx.nn.Module's __getattr__ is untyped, so the branch
         # is narrowed here.
         if self.attends:
             attention = self.self_attn
-            assert isinstance(attention, JambaAttention) and isinstance(cache, KVCache)
+            assert isinstance(attention, JambaAttention)
+            assert isinstance(cache, (KVCache, Attending))
             mixed = x + attention(normed, cache)
         else:
             mamba = self.mamba
-            assert isinstance(mamba, JambaMamba) and isinstance(cache, DeltaCache)
+            assert isinstance(mamba, JambaMamba) and isinstance(cache, Recurring)
             mixed = x + mamba(normed, cache)
         return mixed + self.feed_forward(self.pre_ff_layernorm(mixed))

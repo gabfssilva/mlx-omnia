@@ -1,8 +1,10 @@
+from collections.abc import Sequence
 from typing import NamedTuple
 
 import mlx.core as mx
 import mlx.nn as nn
 
+from mlx_omnia.engine.core.attend import KVStore
 from mlx_omnia.engine.core.cache import KVCache
 from mlx_omnia.engine.models.cohere.config import CohereConfig
 from mlx_omnia.engine.models.cohere.layers.block import CohereBlock
@@ -26,6 +28,8 @@ class CohereActivations(NamedTuple):
 
 
 class Cohere(nn.Module):
+    continuous_batching = True
+
     def __init__(self, config: CohereConfig) -> None:
         super().__init__()
         self.config = config
@@ -37,7 +41,9 @@ class Cohere(nn.Module):
     def head(self, normed: mx.array) -> mx.array:
         return self.model.embed_tokens.as_linear(normed) * self.config.logit_scale
 
-    def activations(self, ids: mx.array, cache: list[KVCache] | None = None) -> CohereActivations:
+    def activations(
+        self, ids: mx.array, cache: Sequence[KVStore] | None = None
+    ) -> CohereActivations:
         cache = cache if cache is not None else self.make_cache()
         x = self.model.embed_tokens(ids)
         embeddings = x
@@ -48,5 +54,5 @@ class Cohere(nn.Module):
         normed = self.model.norm(x)
         return CohereActivations(embeddings, blocks, normed, self.head(normed))
 
-    def __call__(self, ids: mx.array, cache: list[KVCache] | None = None) -> mx.array:
+    def __call__(self, ids: mx.array, cache: Sequence[KVStore] | None = None) -> mx.array:
         return self.activations(ids, cache).logits

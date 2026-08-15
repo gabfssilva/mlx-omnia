@@ -46,6 +46,7 @@ class Attending(Protocol):
         values: mx.array,
         scale: float,
         mask: AttentionMask,
+        sinks: mx.array | None = None,
     ) -> mx.array: ...
 
 
@@ -60,14 +61,21 @@ def attend(
     values: mx.array,
     scale: float,
     mask: AttentionMask,
+    sinks: mx.array | None = None,
 ) -> mx.array:
     """The step's rows into the cache, and the attention over everything it holds.
 
     `cache is None` is the cacheless forward — a prefill nobody is going to continue, which
     is how the parity fixtures are generated — and it attends the rows it was handed.
+
+    `sinks` rides through because it changes the softmax and not the rows: a cache that
+    cannot honour it must refuse rather than attend without it — attending sinkless is a
+    different model.
     """
     if isinstance(cache, Attending):
-        return cache.attend(queries, keys=keys, values=values, scale=scale, mask=mask)
+        return cache.attend(queries, keys=keys, values=values, scale=scale, mask=mask, sinks=sinks)
     if cache is not None:
         keys, values = cache.update_and_fetch(keys, values)
-    return mx.fast.scaled_dot_product_attention(queries, keys, values, scale=scale, mask=mask)
+    return mx.fast.scaled_dot_product_attention(
+        queries, keys, values, scale=scale, mask=mask, sinks=sinks
+    )

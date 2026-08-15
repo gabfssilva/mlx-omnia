@@ -1,8 +1,10 @@
+from collections.abc import Sequence
 from typing import NamedTuple
 
 import mlx.core as mx
 import mlx.nn as nn
 
+from mlx_omnia.engine.core.attend import KVStore
 from mlx_omnia.engine.core.cache import KVCache
 from mlx_omnia.engine.models.hy3.config import Hy3Config
 from mlx_omnia.engine.models.hy3.layers.block import Hy3Trunk
@@ -14,6 +16,8 @@ class Hy3Activations(NamedTuple):
 
 
 class Hy3(nn.Module):
+    continuous_batching = True
+
     def __init__(self, config: Hy3Config) -> None:
         super().__init__()
         self.config = config
@@ -24,7 +28,9 @@ class Hy3(nn.Module):
     def make_cache(self) -> list[KVCache]:
         return [KVCache() for _ in range(self.config.num_hidden_layers)]
 
-    def activations(self, ids: mx.array, cache: list[KVCache] | None = None) -> Hy3Activations:
+    def activations(
+        self, ids: mx.array, cache: Sequence[KVStore] | None = None
+    ) -> Hy3Activations:
         cache = cache if cache is not None else self.make_cache()
         x = self.model.embed_tokens(ids)
         length = x.shape[1]
@@ -40,5 +46,5 @@ class Hy3(nn.Module):
             logits = self.lm_head(normed)
         return Hy3Activations(blocks, logits)
 
-    def __call__(self, ids: mx.array, cache: list[KVCache] | None = None) -> mx.array:
+    def __call__(self, ids: mx.array, cache: Sequence[KVStore] | None = None) -> mx.array:
         return self.activations(ids, cache).logits

@@ -1,7 +1,7 @@
 import mlx.core as mx
 import mlx.nn as nn
 
-from mlx_omnia.engine.core.cache import KVCache
+from mlx_omnia.engine.core.attend import KVStore
 from mlx_omnia.engine.core.layers import SwiGLU
 from mlx_omnia.engine.core.masks import SLIDING
 from mlx_omnia.engine.models.muse_glimmer.config import MuseGlimmerTextConfig
@@ -19,7 +19,7 @@ class MuseGlimmerBlock(nn.Module):
         self.pre_feedforward_layernorm = nn.RMSNorm(hidden, eps=config.rms_norm_eps)
         self.post_feedforward_layernorm = nn.RMSNorm(hidden, eps=config.post_norm_eps)
 
-    def __call__(self, x: mx.array, cache: KVCache) -> mx.array:
+    def __call__(self, x: mx.array, cache: KVStore) -> mx.array:
         attended = x + self.post_attention_layernorm(self.self_attn(self.input_layernorm(x), cache))
         return attended + self.post_feedforward_layernorm(
             self.mlp(self.pre_feedforward_layernorm(attended))

@@ -1,8 +1,10 @@
+from collections.abc import Sequence
 from typing import NamedTuple
 
 import mlx.core as mx
 import mlx.nn as nn
 
+from mlx_omnia.engine.core.attend import KVStore
 from mlx_omnia.engine.core.cache import KVCache
 from mlx_omnia.engine.models.bailing_moe.config import BailingMoEConfig
 from mlx_omnia.engine.models.bailing_moe.layers.block import BailingMoEBlock
@@ -27,6 +29,8 @@ class BailingMoETrunk(nn.Module):
 
 
 class BailingMoE(nn.Module):
+    continuous_batching = True
+
     def __init__(self, config: BailingMoEConfig) -> None:
         super().__init__()
         self.config = config
@@ -43,7 +47,7 @@ class BailingMoE(nn.Module):
         return self.lm_head(normed)
 
     def activations(
-        self, ids: mx.array, cache: list[KVCache] | None = None
+        self, ids: mx.array, cache: Sequence[KVStore] | None = None
     ) -> BailingMoEActivations:
         cache = cache if cache is not None else self.make_cache()
         x = self.model.word_embeddings(ids)
@@ -55,5 +59,5 @@ class BailingMoE(nn.Module):
         normed = self.model.norm(x)
         return BailingMoEActivations(embeddings, blocks, normed, self.head(normed))
 
-    def __call__(self, ids: mx.array, cache: list[KVCache] | None = None) -> mx.array:
+    def __call__(self, ids: mx.array, cache: Sequence[KVStore] | None = None) -> mx.array:
         return self.activations(ids, cache).logits

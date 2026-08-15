@@ -1,3 +1,4 @@
+from collections.abc import Sequence
 from typing import NamedTuple
 
 import mlx.core as mx
@@ -32,7 +33,7 @@ class Qwen3Next(nn.Module):
         return self.lm_head(normed)
 
     def activations(
-        self, ids: mx.array, cache: list[LayerCache] | None = None
+        self, ids: mx.array, cache: Sequence[LayerCache] | None = None
     ) -> Qwen3NextActivations:
         cache = cache if cache is not None else self.make_cache()
         x = self.model.embed_tokens(ids)
@@ -44,5 +45,7 @@ class Qwen3Next(nn.Module):
         normed = self.model.norm(x)
         return Qwen3NextActivations(embeddings, blocks, normed, self.head(normed))
 
-    def __call__(self, ids: mx.array, cache: list[LayerCache] | None = None) -> mx.array:
+    def __call__(
+        self, ids: mx.array, cache: Sequence[LayerCache] | None = None
+    ) -> mx.array:
         return self.activations(ids, cache).logits

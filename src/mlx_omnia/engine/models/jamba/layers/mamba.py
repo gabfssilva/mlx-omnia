@@ -1,9 +1,21 @@
+from typing import Protocol, runtime_checkable
+
 import mlx.core as mx
 import mlx.nn as nn
 
-from mlx_omnia.engine.core.cache import DeltaCache
 from mlx_omnia.engine.core.layers import swish
 from mlx_omnia.engine.models.jamba.config import JambaConfig
+
+
+@runtime_checkable
+class Recurring(Protocol):
+    """What the mamba mixer reads a cache through: the conv window, the scan state, and the
+    offset it advances. `DeltaCache` answers it, and so does the ragged batch adapter that
+    stands for one `DeltaCache` per row."""
+
+    offset: int
+    window: mx.array | None
+    state: mx.array | None
 
 
 class Conv1dWeight(nn.Module):
@@ -33,7 +45,7 @@ class JambaMamba(nn.Module):
         self.b_layernorm = nn.RMSNorm(self.state_size, eps=config.rms_norm_eps)
         self.c_layernorm = nn.RMSNorm(self.state_size, eps=config.rms_norm_eps)
 
-    def convolve(self, x: mx.array, cache: DeltaCache) -> mx.array:
+    def convolve(self, x: mx.array, cache: Recurring) -> mx.array:
         length = x.shape[1]
         window = cache.window
         if window is None:
@@ -67,7 +79,7 @@ class JambaMamba(nn.Module):
         assert carried is not None
         return mx.stack(outputs, axis=1) + self.D * x, carried
 
-    def __call__(self, x: mx.array, cache: DeltaCache) -> mx.array:
+    def __call__(self, x: mx.array, cache: Recurring) -> mx.array:
         length = x.shape[1]
         mixed, gate = mx.split(self.in_proj(x), 2, axis=-1)
         convolved = swish(self.convolve(mixed, cache))

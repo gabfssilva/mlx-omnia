@@ -1,8 +1,19 @@
+from typing import Protocol, runtime_checkable
+
 import mlx.core as mx
 import mlx.nn as nn
 
-from mlx_omnia.engine.core.cache import ConvCache
 from mlx_omnia.engine.core.kernels.conv_mix import ConvMix
+
+
+@runtime_checkable
+class ConvStore(Protocol):
+    """What a short conv reads its cache through: the token counter it advances and the
+    window it reassigns. `ConvCache` is one; so is the ragged batch's adapter over N of
+    them, which stacks the windows on the batch axis without inheriting from it."""
+
+    offset: int
+    window: mx.array | None
 
 
 class ShortConvWeight(nn.Module):
@@ -50,7 +61,7 @@ class LFM2Conv(nn.Module):
             self._mix = mix
         return mix
 
-    def fused_step(self, x: mx.array, cache: ConvCache) -> mx.array:
+    def fused_step(self, x: mx.array, cache: ConvStore) -> mx.array:
         """in_proj, B·x, the three taps and C's gate in one dispatch; out_proj follows."""
         window = cache.window
         if window is None:
@@ -66,18 +77,19 @@ class LFM2Conv(nn.Module):
         cache.window = slid[None]
         return self.out_proj(gated.reshape(1, 1, self.hidden))
 
-    def __call__(self, x: mx.array, cache: ConvCache) -> mx.array:
+    def __call__(self, x: mx.array, cache: ConvStore) -> mx.array:
         length = x.shape[1]
         # `offset` counts tokens seen, as in every other layer type: the conv keeps only a
         # window, but a layer that never advances breaks the invariant the trunk shares.
         cache.offset += length
-        if length == 1 and self.fused_step_applies():
+        # The fused step is written for one row: it flattens x and the window.
+        if length == 1 and x.shape[0] == 1 and self.fused_step_applies():
             return self.fused_step(x, cache)
         b, c, v = mx.split(self.in_proj(x), 3, axis=-1)
         bx = b * v
         window = cache.window
         if window is None:
-            window = mx.zeros((1, self.kernel - 1, self.hidden), dtype=bx.dtype)
+            window = mx.zeros((bx.shape[0], self.kernel - 1, self.hidden), dtype=bx.dtype)
         padded = mx.concatenate([window, bx], axis=1)
 
         # Accumulated in float32 and rounded once, like the conv kernel: per-tap bfloat16

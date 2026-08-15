@@ -1,3 +1,4 @@
+from collections.abc import Sequence
 from typing import NamedTuple
 
 import mlx.core as mx
@@ -5,7 +6,7 @@ import mlx.nn as nn
 
 from mlx_omnia.engine.core.cache import DeltaCache, KVCache, LayerCache
 from mlx_omnia.engine.models.jamba.config import JambaConfig
-from mlx_omnia.engine.models.jamba.layers.block import JambaBlock
+from mlx_omnia.engine.models.jamba.layers.block import JambaBlock, JambaLayer
 
 
 class JambaActivations(NamedTuple):
@@ -27,6 +28,8 @@ class JambaTrunk(nn.Module):
 
 
 class Jamba(nn.Module):
+    continuous_batching = True
+
     def __init__(self, config: JambaConfig) -> None:
         super().__init__()
         self.config = config
@@ -43,17 +46,19 @@ class Jamba(nn.Module):
         return self.lm_head(normed)
 
     def activations(
-        self, ids: mx.array, cache: list[LayerCache] | None = None
+        self, ids: mx.array, cache: Sequence[JambaLayer] | None = None
     ) -> JambaActivations:
-        cache = cache if cache is not None else self.make_cache()
+        layers: Sequence[JambaLayer] = self.make_cache() if cache is None else cache
         x = self.model.embed_tokens(ids)
         embeddings = x
         blocks: list[mx.array] = []
-        for block, layer_cache in zip(self.model.layers, cache, strict=True):
+        for block, layer_cache in zip(self.model.layers, layers, strict=True):
             x = block(x, layer_cache)
             blocks.append(x)
         normed = self.model.final_layernorm(x)
         return JambaActivations(embeddings, blocks, normed, self.head(normed))
 
-    def __call__(self, ids: mx.array, cache: list[LayerCache] | None = None) -> mx.array:
+    def __call__(
+        self, ids: mx.array, cache: Sequence[JambaLayer] | None = None
+    ) -> mx.array:
         return self.activations(ids, cache).logits

@@ -327,7 +327,12 @@ def test_the_model_concurrency_override_caps_the_global_limit(
         finally:
             engine.stop()
 
-    assert asyncio.run(run()) == ([1, 1, 1, 1, 1, 1], 0)
+    sizes, _ = asyncio.run(run())
+    # Every forward carries one row: the override kept the two requests out of each
+    # other's ticks. `batched_steps` stopped being zero when `stream()` itself became a
+    # batch of 1 — the machinery is shared now, and what the override governs is the
+    # grouping, not the machinery.
+    assert sizes == [1, 1, 1, 1, 1, 1]
 
 
 def test_running_and_kv_bytes_report_the_active_batch(

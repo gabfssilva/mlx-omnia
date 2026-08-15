@@ -13,6 +13,7 @@ from mlx_omnia.engine.core.cache import (
     fit,
     regrow,
 )
+from mlx_omnia.engine.core.decode import DecodePlan, compiled_decode
 from mlx_omnia.engine.core.kernels.add_norm import RowsAddRmsNorm
 from mlx_omnia.engine.models.nemotron_h.config import ATTENTION, MAMBA, NemotronHConfig
 from mlx_omnia.engine.models.nemotron_h.layers.block import NemotronHBlock
@@ -159,15 +160,18 @@ class NemotronH(nn.Module):
         doubling and never per token.
         """
         blocks = self.backbone.layers
+        joins = _joins(blocks, self.backbone.norm_f)
 
-        def build(fitting: int) -> tuple[Callable[[mx.array], mx.array], list[LayerCache], int]:
+        def promote(layers: list[LayerCache], fitting: int) -> list[LayerCache]:
             promoted: list[LayerCache] = []
-            for layer, kind in zip(cache, self.config.pattern, strict=True):
+            for layer, kind in zip(layers, self.config.pattern, strict=True):
                 if kind == ATTENTION:
                     assert isinstance(layer, KVCache | FixedKVCache)
-                    grown = regrow(layer, fitting) if isinstance(
-                        layer, FixedKVCache
-                    ) else FixedKVCache.promote(layer, fitting)
+                    grown = (
+                        regrow(layer, fitting)
+                        if isinstance(layer, FixedKVCache)
+                        else FixedKVCache.promote(layer, fitting)
+                    )
                     promoted.append(grown)
                 elif kind == MAMBA:
                     assert isinstance(layer, DeltaCache)
@@ -178,59 +182,26 @@ class NemotronH(nn.Module):
                     )
                 else:
                     promoted.append(layer)
-            cache[:] = promoted
-            state = [
-                layer.state if isinstance(layer, FixedKVCache) else layer.graph
-                for layer in promoted
-                if isinstance(layer, FixedKVCache | FixedDeltaCache)
-            ]
-            anchor = next(layer for layer in promoted if isinstance(layer, FixedKVCache))
-            columns = mx.arange(fitting)
+            return promoted
 
-            joins = _joins(blocks, self.backbone.norm_f)
-
-            def forward(ids: mx.array) -> mx.array:
-                # Read before any layer advances it: the row this step writes lands at
-                # the pre-update position, so `<=` keeps it attendable and `<` would
-                # drop it.
-                mask = (columns <= anchor.position).reshape(1, 1, 1, fitting)
-                x = self.backbone.embeddings(ids[None])
-                if joins is None:
-                    for block, layer_cache in zip(blocks, promoted, strict=True):
-                        assert isinstance(block, NemotronHBlock)
-                        x = block(x, layer_cache, mask)
-                    return self.lm_head(self.backbone.norm_f(x))[:, -1, :]
-                first = blocks[0]
-                assert isinstance(first, NemotronHBlock)
-                normed = first.norm(x)
-                for block, layer_cache, join in zip(blocks, promoted, joins, strict=True):
+        def step(
+            ids: mx.array, slots: Sequence[LayerCache], mask: mx.array | None
+        ) -> mx.array:
+            x = self.backbone.embeddings(ids[None])
+            if joins is None:
+                for block, layer_cache in zip(blocks, slots, strict=True):
                     assert isinstance(block, NemotronHBlock)
-                    x, normed = join(x, block.mix(normed, layer_cache, mask))
-                return self.lm_head(normed)[:, -1, :]
+                    x = block(x, layer_cache, mask)
+                return self.lm_head(self.backbone.norm_f(x))[:, -1, :]
+            first = blocks[0]
+            assert isinstance(first, NemotronHBlock)
+            normed = first.norm(x)
+            for block, layer_cache, join in zip(blocks, slots, joins, strict=True):
+                assert isinstance(block, NemotronHBlock)
+                x, normed = join(x, block.mix(normed, layer_cache, mask))
+            return self.lm_head(normed)[:, -1, :]
 
-            return mx.compile(forward, inputs=state, outputs=state), promoted, fitting
-
-        offset = cache[0].offset
-        room = capacity if capacity is not None else fit(offset)
-        if offset >= room:
-            room = fit(offset)
-        compiled, promoted, room = build(room)
-        base = offset
-        steps = 0
-
-        def decode(ids: mx.array) -> mx.array:
-            # The python-side offsets are assigned, not incremented: the trace's own pass
-            # through the layers already bumped them once, and only once.
-            nonlocal steps, compiled, promoted, room
-            if base + steps + 1 >= room:
-                compiled, promoted, room = build(fit(base + steps))
-            logits = compiled(ids)
-            steps += 1
-            for layer in promoted:
-                layer.offset = base + steps
-            return logits
-
-        return decode
+        return compiled_decode(DecodePlan(step=step, promote=promote), cache, capacity)
 
     def compile_verify(
         self, cache: list[LayerCache], *, width: int, at: Sequence[int]

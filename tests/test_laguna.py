@@ -196,14 +196,14 @@ def test_compiled_batch_decoders_do_not_retain_retired_cache_groups() -> None:
     for cache in caches:
         model(mx.array([[1, 2]]), cache)
     model.batch_greedy(mx.full((2, 1), 7), caches, capacity=16)
-    decoder = next(iter(model._batch_greedy_decodes.values()))
+    decoder = next(iter(model._batch_buckets._buckets.values()))
 
     joining = model.make_cache()
     model(mx.array([[3, 4]]), joining)
     model.batch_greedy(mx.array([[8], [9]]), [caches[1], joining], capacity=16)
 
-    assert len(model._batch_greedy_decodes) == 1
-    assert next(iter(model._batch_greedy_decodes.values())) is decoder
+    assert len(model._batch_buckets._buckets) == 1
+    assert next(iter(model._batch_buckets._buckets.values())) is decoder
     assert all(isinstance(layer, (FixedKVCache, RingKVCache)) for layer in joining)
 
 
@@ -247,6 +247,25 @@ def test_compiled_batch_can_grow_from_b2_to_b4() -> None:
     )
 
 
+def test_batch_of_three_pads_to_the_four_bucket_and_matches_eager() -> None:
+    """A dead slot fills the fourth row: masked by its own position, discarded on the
+    way out — the three real rows must match the ragged eager batch exactly."""
+    model = Laguna(tiny_config())
+    actual = [model.make_cache() for _ in range(3)]
+    expected = [model.make_cache() for _ in range(3)]
+    for index, (one, two) in enumerate(zip(actual, expected, strict=True)):
+        prompt = mx.arange(index + 2, dtype=mx.int32)[None]
+        model(prompt, one)
+        model(prompt, two)
+
+    ids = mx.array([[7], [8], [9]])
+    padded = model.batch_decode(ids, actual, capacity=16)
+    eager = model(ids, batch(expected))
+    mx.eval(padded, eager)
+    assert padded.shape[0] == 3
+    assert bool(mx.allclose(padded, eager, rtol=1e-4, atol=1e-5))
+
+
 def test_compiled_b2_reuses_one_graph_for_256_steps() -> None:
     model = Laguna(tiny_config())
     caches = [model.make_cache() for _ in range(2)]
@@ -254,13 +273,13 @@ def test_compiled_b2_reuses_one_graph_for_256_steps() -> None:
         model(mx.array([[1, 2]]), cache)
 
     logits = model.batch_decode(mx.full((2, 1), 7), caches, capacity=512)
-    decoder = next(iter(model._batch_decodes.values()))
+    decoder = next(iter(model._batch_buckets._buckets.values()))
     for token in range(255):
         logits = model.batch_decode(mx.full((2, 1), token % 32), caches, capacity=512)
     mx.eval(logits)
 
-    assert len(model._batch_decodes) == 1
-    assert next(iter(model._batch_decodes.values())) is decoder
+    assert len(model._batch_buckets._buckets) == 1
+    assert next(iter(model._batch_buckets._buckets.values())) is decoder
 
 
 @pytest.mark.parametrize("length", [511, 512, 513])

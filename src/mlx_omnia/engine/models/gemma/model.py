@@ -1,9 +1,11 @@
 import math
+from collections.abc import Sequence
 from typing import NamedTuple
 
 import mlx.core as mx
 import mlx.nn as nn
 
+from mlx_omnia.engine.core.attend import KVStore
 from mlx_omnia.engine.core.cache import KVCache
 from mlx_omnia.engine.models.gemma.config import GemmaConfig
 from mlx_omnia.engine.models.gemma.layers.block import GemmaBlock
@@ -25,6 +27,8 @@ class GemmaTrunk(nn.Module):
 
 
 class Gemma(nn.Module):
+    continuous_batching = True
+
     def __init__(self, config: GemmaConfig) -> None:
         super().__init__()
         self.config = config
@@ -41,7 +45,9 @@ class Gemma(nn.Module):
     def head(self, normed: mx.array) -> mx.array:
         return self.model.embed_tokens.as_linear(normed)
 
-    def activations(self, ids: mx.array, cache: list[KVCache] | None = None) -> GemmaActivations:
+    def activations(
+        self, ids: mx.array, cache: Sequence[KVStore] | None = None
+    ) -> GemmaActivations:
         cache = cache if cache is not None else self.make_cache()
         x = self.embed(ids)
         embeddings = x
@@ -52,5 +58,5 @@ class Gemma(nn.Module):
         normed = self.model.norm(x)
         return GemmaActivations(embeddings, blocks, normed, self.head(normed))
 
-    def __call__(self, ids: mx.array, cache: list[KVCache] | None = None) -> mx.array:
+    def __call__(self, ids: mx.array, cache: Sequence[KVStore] | None = None) -> mx.array:
         return self.activations(ids, cache).logits

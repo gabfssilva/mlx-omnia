@@ -1,8 +1,10 @@
+from collections.abc import Sequence
 from typing import NamedTuple
 
 import mlx.core as mx
 import mlx.nn as nn
 
+from mlx_omnia.engine.core.attend import KVStore
 from mlx_omnia.engine.core.cache import KVCache
 from mlx_omnia.engine.models.ernie4_5.config import Ernie45Config
 from mlx_omnia.engine.models.ernie4_5.layers.block import Ernie45Block
@@ -24,6 +26,8 @@ class Ernie45Trunk(nn.Module):
 
 
 class Ernie45(nn.Module):
+    continuous_batching = True
+
     def __init__(self, config: Ernie45Config) -> None:
         super().__init__()
         self.config = config
@@ -39,7 +43,9 @@ class Ernie45(nn.Module):
             return self.model.embed_tokens.as_linear(normed)
         return self.lm_head(normed)
 
-    def activations(self, ids: mx.array, cache: list[KVCache] | None = None) -> Ernie45Activations:
+    def activations(
+        self, ids: mx.array, cache: Sequence[KVStore] | None = None
+    ) -> Ernie45Activations:
         cache = cache if cache is not None else self.make_cache()
         x = self.model.embed_tokens(ids)
         embeddings = x
@@ -50,5 +56,5 @@ class Ernie45(nn.Module):
         normed = self.model.norm(x)
         return Ernie45Activations(embeddings, blocks, normed, self.head(normed))
 
-    def __call__(self, ids: mx.array, cache: list[KVCache] | None = None) -> mx.array:
+    def __call__(self, ids: mx.array, cache: Sequence[KVStore] | None = None) -> mx.array:
         return self.activations(ids, cache).logits

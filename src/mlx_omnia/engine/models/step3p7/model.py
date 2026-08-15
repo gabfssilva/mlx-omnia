@@ -1,10 +1,11 @@
-from collections.abc import Collection, Iterator
+from collections.abc import Collection, Iterator, Sequence
 from typing import NamedTuple, TypeIs, assert_never
 
 import mlx.core as mx
 import mlx.nn as nn
 import numpy as np
 
+from mlx_omnia.engine.core.attend import KVStore
 from mlx_omnia.engine.core.cache import KVCache
 from mlx_omnia.engine.core.prefill import prefill
 from mlx_omnia.engine.generate import Meter, Penalty, Sampler, greedy, stream_ids, stream_text
@@ -54,7 +55,7 @@ class Step3p7(nn.Module):
     def activations(
         self,
         ids: mx.array,
-        cache: list[KVCache] | None = None,
+        cache: Sequence[KVStore] | None = None,
         *,
         embeddings: mx.array | None = None,
     ) -> Step3p7Activations:
@@ -67,6 +68,10 @@ class Step3p7(nn.Module):
         full: mx.array | str | None = None if length == 1 else "causal"
         sliding: mx.array | str | None = None
         if SLIDING in types:
+            if not isinstance(offset, int):
+                raise NotImplementedError(
+                    "step3p7's sliding mask is one scalar offset; a ragged batch has one per row"
+                )
             sliding = self._sliding_mask(length, offset)
 
         blocks: list[mx.array] = []
@@ -84,7 +89,7 @@ class Step3p7(nn.Module):
     def __call__(
         self,
         ids: mx.array,
-        cache: list[KVCache] | None = None,
+        cache: Sequence[KVStore] | None = None,
         *,
         embeddings: mx.array | None = None,
     ) -> mx.array:

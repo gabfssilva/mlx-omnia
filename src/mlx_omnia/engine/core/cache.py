@@ -635,6 +635,18 @@ class RingKVCache(LayerCache):
         self._values = tensors.get("values")
         self.state = None
 
+    def reload(self, rows: int, keys: mx.array, values: mx.array) -> None:
+        """Rewrite a promoted ring's graph-visible state with another sequence's rotation.
+
+        The buffers are taken whole rather than sliced: slot `j` already holds absolute
+        position `j % window`, so the rotation *is* the state, and `rows` is only the
+        position that goes with it."""
+        assert self.state is not None, "reloading a ring that was never promoted"
+        self.state[0] = keys
+        self.state[1] = values
+        self.state[2] = mx.array([rows], dtype=mx.int32)
+        self.offset = rows
+
     def trim(self, length: int) -> None:
         raise NotImplementedError("a ring keeps no history to rewind to")
 

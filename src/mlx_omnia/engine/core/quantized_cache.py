@@ -180,7 +180,12 @@ class QuantizedKVCache(LayerCache):
         values: mx.array,
         scale: float,
         mask: AttentionMask,
+        sinks: mx.array | None = None,
     ) -> mx.array:
+        if sinks is not None:
+            # The blocked read has no sink column, and attending without one is a
+            # different model — the compression probe turns this into a policy refusal.
+            raise TypeError("a compressed cache cannot attend with sinks")
         first = self.offset
         self._write(keys, values)
         return _blocked(

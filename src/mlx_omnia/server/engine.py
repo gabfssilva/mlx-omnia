@@ -16,7 +16,7 @@ import json
 import threading
 import time
 from collections import deque
-from collections.abc import AsyncIterator, Callable, Collection, Mapping, Sequence
+from collections.abc import AsyncIterator, Callable, Collection, Iterator, Mapping, Sequence
 from concurrent.futures import ThreadPoolExecutor
 from contextlib import asynccontextmanager, suppress
 from dataclasses import dataclass, field, replace
@@ -33,11 +33,17 @@ from mlx_omnia.engine.core.prompt_cache import Budget
 from mlx_omnia.engine.footprint import active_bytes_per_token, checkpoint_bytes, resident_bytes
 from mlx_omnia.engine.generate import Constraint, Meter
 from mlx_omnia.engine.grammar import Grammar, Vocabulary
-from mlx_omnia.engine.language import ContinuousLanguageModel, TextBatch, tokenizer_of
+from mlx_omnia.engine.language import (
+    ContinuousLanguageModel,
+    TextBatch,
+    TextPrefill,
+    tokenizer_of,
+)
 from mlx_omnia.engine.model import CompositeModel, Wrapping
 from mlx_omnia.engine.parsers import Segment, ToolFamily
 from mlx_omnia.engine.quant.quantization import Quantization
 from mlx_omnia.engine.quantizing import Quantizing, admits
+from mlx_omnia.server.flow import Clock, Emission, Member, Outlet
 from mlx_omnia.server.metrics import Metrics, RequestState
 from mlx_omnia.server.prefixes import DiskSpill
 from mlx_omnia.server.store import Store
@@ -454,6 +460,46 @@ class Job:
 
     def cancel(self) -> None:
         self.cancelled.set()
+
+
+@dataclass(frozen=True)
+class _Prefilling:
+    """A prompt still being fed, one block per tick. It is the whole reason a joiner no
+    longer freezes the group: the prefill it used to run in one call on the model thread is
+    now spent a block at a time, interleaved with everybody else's decode."""
+
+    prefill: TextPrefill
+
+
+@dataclass(frozen=True)
+class _Decoding:
+    """A sequence in the shared `step_batch`."""
+
+    batch: TextBatch
+
+
+@dataclass(frozen=True)
+class _Streaming:
+    """A request whose family or options do not batch, driven one `next` per tick. The
+    memory it settled at and the load count at that instant travel with it, because
+    `_account` reads both against the peak this generation leaves behind."""
+
+    pieces: Iterator[Segment]
+    settled: int
+    loads: int
+
+
+type _Phase = _Prefilling | _Decoding | _Streaming
+
+
+@dataclass
+class _Generation:
+    job: Job
+    phase: _Phase
+
+
+type _Member = Member[_Generation, Segment]
+type _Emission = Emission[_Generation, Segment]
 
 
 @dataclass
@@ -1141,13 +1187,8 @@ class Engine:
                     if job not in active:
                         job.state = "cancelled"
                         job.chunks.put_nowait(None)
-                if batcher is not None and active:
-                    await self._decode_batch(batcher, active, jobs)
-                else:
-                    for job in active:
-                        await asyncio.get_running_loop().run_in_executor(
-                            self._model_thread, self._decode, job
-                        )
+                if active:
+                    await self._generate(batcher, active, jobs)
             except Exception as error:
                 for job in jobs:
                     if job.state not in ("completed", "cancelled"):
@@ -1176,15 +1217,32 @@ class Engine:
             else None
         )
 
-    @staticmethod
-    def _prepare_batched(model: ContinuousLanguageModel, job: Job) -> TextBatch:
+    def _begin(self, model: ContinuousLanguageModel | None, job: Job) -> _Phase:
+        """The phase this job enters the clock in — on the model thread, because both
+        branches touch MLX: one reads the memory the weights settled at, the other makes the
+        request's cache and takes the trie's match."""
+        if model is None:
+            # Nothing has run yet: `stream` returns a generator, so this is the memory the
+            # weights settled at, with none of this request's own allocation in it.
+            pieces = job.model.stream(job.input, replace(job.options, meter=job.meter))
+            settled = mx.get_active_memory()
+            loads = self._loads
+            mx.reset_peak_memory()
+            return _Streaming(pieces, settled, loads)
         assert isinstance(job.model, CompositeModel)
-        state = model.prepare_batch(
+        prefill = model.begin_batch(
             job.model.prepare(job.input), replace(job.options, meter=job.meter)
         )
-        if state is None:
+        if prefill is None:
             raise TypeError("request became incompatible with continuous batching")
-        return state
+        return _Prefilling(prefill)
+
+    async def _enlist(self, model: ContinuousLanguageModel | None, job: Job) -> _Member:
+        phase = await asyncio.get_running_loop().run_in_executor(
+            self._model_thread, partial(self._begin, model, job)
+        )
+        job.state = "running"
+        return Member(_Generation(job, phase), Outlet(job.loop, job.chunks), job.cancelled)
 
     def _next_batched(
         self, model: ContinuousLanguageModel, exemplar: Job
@@ -1212,108 +1270,113 @@ class Engine:
         self._pending.append(candidate)
         return None
 
-    async def _decode_batch(
-        self, model: ContinuousLanguageModel, initial: Sequence[Job], all_jobs: list[Job]
+    async def _generate(
+        self, model: ContinuousLanguageModel | None, initial: Sequence[Job], all_jobs: list[Job]
     ) -> None:
-        prepared: list[tuple[Job, TextBatch]] = []
-        peak = 0
-        for job in initial:
-            state = await asyncio.get_running_loop().run_in_executor(
-                self._model_thread, partial(self._prepare_batched, model, job)
-            )
-            job.state = "running"
-            prepared.append((job, state))
+        """One group, from the first prompt to the last token, on one clock.
+
+        A batchable group's tick is three things in order: one prefill block for every member
+        still feeding its prompt, one shared `step_batch` over the members that are decoding,
+        and whatever joiners the concurrency has room for — admitted as prompts being fed,
+        never as a whole prefill run in front of everybody else's decode.
+
+        A group the batcher refused is the same clock with one member in it and no room for a
+        second: its tick is one `next` on the generator `stream` returned.
+        """
         entry = self._residency.get(initial[0].model_id)
+        peak = 0
+
+        def tick(members: Sequence[_Member]) -> list[_Emission]:
+            nonlocal peak
+            emissions: list[_Emission] = []
+            decoding: list[tuple[_Member, TextBatch]] = []
+            held = 0
+            for member in members:
+                phase = member.state.phase
+                match phase:
+                    case _Prefilling(prefill=prefill):
+                        batch = prefill.advance()
+                        if batch is not None:
+                            member.state.phase = _Decoding(batch)
+                        emissions.append(Emission(member))
+                    case _Decoding(batch=batch):
+                        held += sum(layer.nbytes for layer in batch.state.cache)
+                        decoding.append((member, batch))
+                    case _Streaming(pieces=pieces):
+                        piece = next(pieces, None)
+                        emissions.append(
+                            Emission(
+                                member,
+                                # Routing, nobody's prose: `<|start|>assistant to=user
+                                # <|message|>` names the channel the next text rides, and no
+                                # API dialect has a field for it. Dropped here once, so the
+                                # four dialects never see one.
+                                ()
+                                if piece is None or piece.channel == "header"
+                                else (piece,),
+                                piece is None,
+                            )
+                        )
+            peak = max(peak, held)
+            if entry is not None and decoding:
+                entry.kv_bytes = held
+            if not decoding:
+                return emissions
+            assert model is not None, "a group with no batcher never reaches a decoding phase"
+            produced = model.step_batch([batch for _, batch in decoding])
+            for (member, batch), pieces in zip(decoding, produced, strict=True):
+                emissions.append(
+                    Emission(
+                        member,
+                        tuple(piece for piece in pieces if piece.channel != "header"),
+                        batch.state.finished,
+                    )
+                )
+            return emissions
+
+        def room() -> int:
+            return 0 if model is None else self._concurrency(initial[0])
+
+        async def join() -> _Member | None:
+            assert model is not None, "no room is admitted for a group with no batcher"
+            joining = self._next_batched(model, initial[0])
+            if joining is None:
+                return None
+            all_jobs.append(joining)
+            self._current.append(joining)
+            record = self._residency.get(joining.model_id)
+            joining.metrics_key = self._metrics.begin(
+                joining.model_id,
+                joining.meter,
+                None if record is None else record.active_bytes,
+                joining.load_seconds,
+            )
+            if joining.cancelled.is_set():
+                joining.state = "cancelled"
+                joining.chunks.put_nowait(None)
+                return None
+            member = await self._enlist(model, joining)
+            self.on_change()
+            return member
+
+        def leave(member: _Member) -> None:
+            job = member.state.job
+            phase = member.state.phase
+            if isinstance(phase, _Streaming):
+                self._account(job.model_id, phase.settled, phase.loads)
+            # Before the sentinel: what the consumer reads after it is a terminal state.
+            job.state = "cancelled" if job.cancelled.is_set() else "completed"
+
+        clock: Clock[_Generation, Segment] = Clock(
+            self._model_thread, tick, room=room, join=join, on_leave=leave
+        )
+        members = [await self._enlist(model, job) for job in initial]
         try:
-            while prepared:
-                current = sum(
-                    layer.nbytes
-                    for _, state in prepared
-                    for layer in state.state.cache
-                )
-                peak = max(peak, current)
-                if entry is not None:
-                    entry.kv_bytes = current
-                active: list[tuple[Job, TextBatch]] = []
-                for job, state in prepared:
-                    if job.cancelled.is_set():
-                        job.state = "cancelled"
-                        job.loop.call_soon_threadsafe(job.chunks.put_nowait, None)
-                    else:
-                        active.append((job, state))
-                if not active:
-                    break
-                segments = await asyncio.get_running_loop().run_in_executor(
-                    self._model_thread,
-                    partial(model.step_batch, [state for _, state in active]),
-                )
-                prepared = []
-                for (job, state), pieces in zip(active, segments, strict=True):
-                    for piece in pieces:
-                        if piece.channel != "header":
-                            job.chunks.put_nowait(piece)
-                    if state.state.finished:
-                        job.state = "completed"
-                        job.chunks.put_nowait(None)
-                    else:
-                        prepared.append((job, state))
-                await asyncio.sleep(0)
-                concurrency = self._concurrency(initial[0])
-                while len(prepared) < concurrency:
-                    joining = self._next_batched(model, initial[0])
-                    if joining is None:
-                        break
-                    all_jobs.append(joining)
-                    self._current.append(joining)
-                    entry = self._residency.get(joining.model_id)
-                    joining.metrics_key = self._metrics.begin(
-                        joining.model_id,
-                        joining.meter,
-                        None if entry is None else entry.active_bytes,
-                        joining.load_seconds,
-                    )
-                    if joining.cancelled.is_set():
-                        joining.state = "cancelled"
-                        joining.chunks.put_nowait(None)
-                        continue
-                    state = await asyncio.get_running_loop().run_in_executor(
-                        self._model_thread,
-                        partial(self._prepare_batched, model, joining),
-                    )
-                    joining.state = "running"
-                    prepared.append((joining, state))
-                    self.on_change()
+            await clock.run(members)
         finally:
-            if entry is not None:
+            if model is not None and entry is not None:
                 entry.kv_bytes = peak
                 entry.last_used = time.time()
-
-    def _decode(self, job: Job) -> None:
-        """The meter rides in the options because the counts live behind `stream`: the
-        conversation is rendered by the checkpoint's own template and tokenized inside the
-        model, so out here there is text and nothing else to count."""
-        job.state = "running"
-        # Nothing has run yet: `stream` returns a generator, so this is the memory the
-        # weights settled at, with none of this request's own allocation in it.
-        stream = job.model.stream(job.input, replace(job.options, meter=job.meter))
-        settled = mx.get_active_memory()
-        loads = self._loads
-        mx.reset_peak_memory()
-        try:
-            for piece in stream:
-                if job.cancelled.is_set():
-                    break
-                if piece.channel == "header":
-                    # Routing, nobody's prose: `<|start|>assistant to=user<|message|>` names
-                    # the channel the next text rides, and no API dialect has a field for
-                    # it. Dropped here once, so the four dialects never see one.
-                    continue
-                job.loop.call_soon_threadsafe(job.chunks.put_nowait, piece)
-        finally:
-            self._account(job.model_id, settled, loads)
-        # Before the sentinel: what the consumer reads after it is a terminal state.
-        job.state = "cancelled" if job.cancelled.is_set() else "completed"
-        job.loop.call_soon_threadsafe(job.chunks.put_nowait, None)
 
     def _account(self, model_id: str, settled: int, loads: int) -> None:
         """The gate serializes generation, so between `settled` and here this job is the

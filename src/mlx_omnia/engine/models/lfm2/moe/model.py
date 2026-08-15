@@ -1,12 +1,14 @@
+from collections.abc import Sequence
 from typing import NamedTuple
 
 import mlx.core as mx
 import mlx.nn as nn
 
-from mlx_omnia.engine.core.cache import ConvCache, KVCache
+from mlx_omnia.engine.core.attend import Attending, KVStore
+from mlx_omnia.engine.core.cache import ConvCache, FixedKVCache, KVCache, RingKVCache
 from mlx_omnia.engine.models.lfm2.config import ATTENTION, LFM2MoEConfig
 from mlx_omnia.engine.models.lfm2.layers.attention import LFM2Attention
-from mlx_omnia.engine.models.lfm2.layers.conv import LFM2Conv
+from mlx_omnia.engine.models.lfm2.layers.conv import ConvStore, LFM2Conv
 from mlx_omnia.engine.models.lfm2.layers.experts import LFM2SparseMLP
 from mlx_omnia.engine.models.lfm2.layers.mlp import LFM2DenseMLP
 
@@ -33,17 +35,18 @@ class LFM2Block(nn.Module):
         self.operator_norm = nn.RMSNorm(config.hidden_size, eps=config.norm_eps)
         self.ffn_norm = nn.RMSNorm(config.hidden_size, eps=config.norm_eps)
 
-    def __call__(self, x: mx.array, cache: KVCache | ConvCache) -> mx.array:
+    def __call__(self, x: mx.array, cache: KVStore | ConvStore) -> mx.array:
         normed = self.operator_norm(x)
         # A block has one mixer or the other; mlx.nn.Module's __getattr__ is untyped, so
         # the branch is narrowed here.
         if self.attends:
             mixer = self.self_attn
-            assert isinstance(mixer, LFM2Attention) and isinstance(cache, KVCache)
+            assert isinstance(mixer, LFM2Attention)
+            assert isinstance(cache, (KVCache, FixedKVCache, RingKVCache, Attending))
             attended = x + mixer(normed, cache)
         else:
             mixer = self.conv
-            assert isinstance(mixer, LFM2Conv) and isinstance(cache, ConvCache)
+            assert isinstance(mixer, LFM2Conv) and isinstance(cache, ConvStore)
             attended = x + mixer(normed, cache)
         return attended + self.feed_forward(self.ffn_norm(attended))
 
@@ -64,6 +67,8 @@ class LFM2MoEActivations(NamedTuple):
 
 
 class LFM2MoE(nn.Module):
+    continuous_batching = True
+
     def __init__(self, config: LFM2MoEConfig) -> None:
         super().__init__()
         self.config = config
@@ -77,7 +82,7 @@ class LFM2MoE(nn.Module):
         ]
 
     def activations(
-        self, ids: mx.array, cache: list[KVCache | ConvCache] | None = None
+        self, ids: mx.array, cache: Sequence[KVStore | ConvStore] | None = None
     ) -> LFM2MoEActivations:
         cache = cache if cache is not None else self.make_cache()
         embeddings = self.model.embed_tokens(ids)
@@ -93,5 +98,7 @@ class LFM2MoE(nn.Module):
             logits = self.lm_head(normed)
         return LFM2MoEActivations(embeddings, blocks, normed, logits)
 
-    def __call__(self, ids: mx.array, cache: list[KVCache | ConvCache] | None = None) -> mx.array:
+    def __call__(
+        self, ids: mx.array, cache: Sequence[KVStore | ConvStore] | None = None
+    ) -> mx.array:
         return self.activations(ids, cache).logits

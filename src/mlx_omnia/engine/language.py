@@ -9,13 +9,13 @@ import mlx.nn as nn
 
 from mlx_omnia.engine.batching import (
     BatchModel,
+    BatchPrefill,
     BatchSequence,
-    prepare_batch_sequence,
 )
 from mlx_omnia.engine.batching import (
     step as batch_step,
 )
-from mlx_omnia.engine.core.cache import KVCache, LayerCache
+from mlx_omnia.engine.core.cache import FixedKVCache, KVCache, LayerCache
 from mlx_omnia.engine.core.prompt_cache import Budget, PromptCache, Spill
 from mlx_omnia.engine.generate import (
     BlockOutputs,
@@ -303,6 +303,14 @@ def prefix_cache[C: LayerCache](
     return PromptCache(budget, spill)
 
 
+def _grown(layer: FixedKVCache) -> KVCache:
+    """The fixed buffer's rows back in the growing form — views of immutable arrays, so
+    holding them costs nothing the entry was not already paying."""
+    fresh = KVCache()
+    fresh.restore(layer.rows, layer.stored())
+    return fresh
+
+
 @dataclass
 class TextBatch:
     """Incremental text and parser state for one batched generation."""
@@ -325,21 +333,55 @@ class TextBatch:
         tail = self.decoder.decode(b"", final=True)
         pieces = (*(() if not tail else self.segmenter.push(tail)), *self.segmenter.flush())
         if self.prefix is not None:
-            mx.eval([tensor for layer in self.state.cache for tensor in layer.tensors])
+            # The rewindable form, never the promoted one: a compiled bucket may have
+            # promoted this sequence's layers to fixed slots, which cannot be trimmed to a
+            # shorter match and which the bucket goes on overwriting for its next member.
+            # `stored()` hands over the rows in use, and a growing cache reads them back
+            # unchanged — the same conversion `FixedKVCache.is_storable` promises.
+            standing = [
+                layer if not isinstance(layer, FixedKVCache) else _grown(layer)
+                for layer in self.state.cache
+            ]
+            mx.eval([tensor for layer in standing for tensor in layer.tensors])
             self.prefix.insert(
                 self.state.tokens,
-                self.state.cache,
+                standing,
                 role="assistant",
-                nbytes=sum(layer.nbytes for layer in self.state.cache),
+                nbytes=sum(layer.nbytes for layer in standing),
             )
         if self.state.meter is not None:
             self.state.meter.kept_prefix = self.prefix is not None
         return pieces
 
 
+@dataclass
+class TextPrefill:
+    """A batched request whose prompt is still being fed, one block per `advance`.
+
+    Everything the finished `TextBatch` needs is decided when the request arrives; what is
+    left to do is the prefill, and it is what the scheduler spends a tick on.
+    """
+
+    prefill: BatchPrefill
+    tokenizer: Tokenizer
+    decoder: codecs.IncrementalDecoder
+    segmenter: Segmenter
+    prefix: PromptCache[KVCache] | None = None
+
+    def advance(self) -> TextBatch | None:
+        state = self.prefill.advance()
+        if state is None:
+            return None
+        return TextBatch(state, self.tokenizer, self.decoder, self.segmenter, self.prefix)
+
+
 @runtime_checkable
 class ContinuousLanguageModel(Protocol):
     def can_batch(self, options: GenerationOptions) -> bool: ...
+
+    def begin_batch(
+        self, input: ModelInput, options: GenerationOptions
+    ) -> TextPrefill | None: ...
 
     def prepare_batch(
         self, input: ModelInput, options: GenerationOptions
@@ -433,14 +475,11 @@ class TextLanguageModel[C: LayerCache]:
         return Chained(self.model, drafter, block=self._block, tap=-1)
 
     def can_batch(self, options: GenerationOptions) -> bool:
-        return (
-            isinstance(self.model, BatchModel)
-            and self._proposer(options) is None
-            and options.reasoning_budget is None
-        )
+        return isinstance(self.model, BatchModel)
 
-    def prepare_batch(self, input: ModelInput, options: GenerationOptions) -> TextBatch | None:
-        """Prepare a text request for continuous batching when its trunk supports it."""
+    def begin_batch(self, input: ModelInput, options: GenerationOptions) -> TextPrefill | None:
+        """Everything `prepare_batch` decides before the first forward, with the prefill left
+        for the caller to spend a block at a time."""
         model = self.model
         if (
             not isinstance(input, Text)
@@ -453,36 +492,51 @@ class TextLanguageModel[C: LayerCache]:
         budget = options.max_tokens
         if options.context_limit is not None:
             budget = min(budget, max(0, options.context_limit - len(encoded)))
-        self.batch_prefix = prefix_cache(
-            self.batch_prefix, options.prefix_budget, options.prefix_spill
-        )
-        cache = model.make_cache()
-        reuse = (
+        # The two do not compose — a round rewinds the cache the trie hands out — and a round
+        # is worth more: the trie saves the prefill of a turn, the head saves a read of the
+        # weights per token of every turn.
+        proposer = self._proposer(options)
+        prefix = (
             None
-            if self.batch_prefix is None
-            else self.batch_prefix.take(encoded, into=cache)
+            if proposer is not None
+            else prefix_cache(self.batch_prefix, options.prefix_budget, options.prefix_spill)
         )
+        if proposer is None:
+            self.batch_prefix = prefix
+        cache = model.make_cache()
+        reuse = None if prefix is None else prefix.take(encoded, into=cache)
         if reuse is not None:
             cache = reuse.caches
-        state = prepare_batch_sequence(
-            model,
-            encoded,
-            max_tokens=budget,
-            sampler=options.sampler,
-            stop=self.stop if options.stop is None else options.stop,
-            penalty=options.penalty,
-            constraint=options.constraint,
-            meter=options.meter,
-            cache=cache,
-            reused=0 if reuse is None else reuse.length,
-        )
-        return TextBatch(
-            state,
+        return TextPrefill(
+            BatchPrefill(
+                model,
+                encoded,
+                cache,
+                0,
+                0 if reuse is None else reuse.length,
+                budget,
+                options.sampler,
+                self.stop if options.stop is None else options.stop,
+                options.penalty,
+                options.constraint,
+                options.meter,
+                reasoning_budget(options.reasoning_budget, prompt, self.tokenizer),
+                proposer,
+            ),
             self.tokenizer,
             codecs.getincrementaldecoder("utf-8")("replace"),
             Segmenter(FALLBACK if input.parser is None else input.parser, prompt=prompt),
-            self.batch_prefix,
+            prefix,
         )
+
+    def prepare_batch(self, input: ModelInput, options: GenerationOptions) -> TextBatch | None:
+        """Prepare a text request for continuous batching when its trunk supports it."""
+        begun = self.begin_batch(input, options)
+        if begun is None:
+            return None
+        while (batch := begun.advance()) is None:
+            pass
+        return batch
 
     def step_batch(self, sequences: Sequence[TextBatch]) -> list[tuple[Segment, ...]]:
         """Advance text requests through one shared decode forward."""
@@ -490,23 +544,50 @@ class TextLanguageModel[C: LayerCache]:
         if not isinstance(model, BatchModel):
             raise TypeError(f"{type(model).__name__} does not support continuous batching")
         active = [index for index, sequence in enumerate(sequences) if not sequence.state.finished]
-        tokens: list[int | None] = [None] * len(sequences)
+        emitted: list[list[int]] = [[] for _ in sequences]
         advanced = (
             batch_step(model, [sequences[index].state for index in active])
             if active
             else []
         )
-        for index, token in zip(active, advanced, strict=True):
-            tokens[index] = token
+        for index, ids in zip(active, advanced, strict=True):
+            emitted[index] = ids
         return [
             (
-                *(() if token is None else sequence.push(token)),
+                *(segment for token in ids for segment in sequence.push(token)),
                 *(() if not sequence.state.finished else sequence.finish()),
             )
-            for sequence, token in zip(sequences, tokens, strict=True)
+            for sequence, ids in zip(sequences, emitted, strict=True)
         ]
 
+    def _stream_batched(self, input: Text, options: GenerationOptions) -> Iterator[Segment]:
+        """One batched generation driven synchronously, a tick at a time.
+
+        The same `prepare_batch`/`step_batch` pair the server's scheduler runs, over a batch
+        of one: the prefix trie, the clamp, the budget and the meter are all decided inside
+        `prepare_batch`, and the final flush is what `step_batch` does when the sequence
+        retires.
+        """
+        state = self.prepare_batch(input, options)
+        if state is None:
+            return
+        while not state.state.finished:
+            yield from self.step_batch([state])[0]
+
     def stream(self, input: Text, options: GenerationOptions) -> Iterator[Segment]:
+        """The generation, as segments.
+
+        A whole-text prompt on a trunk that batches goes through `prepare_batch`/`step_batch`;
+        what still decodes here is what that path does not answer for — a drafted run, a
+        prompt still arriving, and a family with no batched decode.
+        """
+        if (
+            isinstance(input, Text)
+            and isinstance(input.value, str)
+            and self.can_batch(options)
+        ):
+            yield from self._stream_batched(input, options)
+            return
         self.prefix = prefix_cache(self.prefix, options.prefix_budget, options.prefix_spill)
         draft = self._proposer(options)
         # Three options are answers about the whole prompt and are read before its first

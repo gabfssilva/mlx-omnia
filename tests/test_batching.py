@@ -12,7 +12,7 @@ from mlx_omnia.engine.batching import (
 from mlx_omnia.engine.core.attend import KVStore
 from mlx_omnia.engine.core.cache import FixedKVCache, KVCache
 from mlx_omnia.engine.core.prefill import BLOCK
-from mlx_omnia.engine.generate import Meter, greedy
+from mlx_omnia.engine.generate import Meter, ReasoningBlock, ReasoningBudget, greedy
 from mlx_omnia.engine.language import GenerationOptions, Text, TextLanguageModel
 from mlx_omnia.engine.models.qwen3.config import Qwen3Config, Qwen3MoEConfig
 from mlx_omnia.engine.models.qwen3.model import Qwen3, Qwen3MoE
@@ -242,13 +242,30 @@ def test_batch_step_emits_and_retires_sequences_independently() -> None:
 
     while active:
         tokens = step(model, active)
-        for sequence, token in zip(active, tokens, strict=True):
-            if token is not None:
-                emitted[0 if sequence is first else 1].append(token)
+        for sequence, row in zip(active, tokens, strict=True):
+            emitted[0 if sequence is first else 1].extend(row)
         active = [sequence for sequence in active if not sequence.finished]
 
     assert emitted == [[2], [5, 6, 7]]
     assert model.batch_sizes == [1, 1, 2, 2, 1]
+
+
+def test_batch_step_feeds_the_owed_closer_when_the_budget_runs_out() -> None:
+    """The reasoning budget as sequence state: the opener arms it, the spent budget owes
+    the closer, and the closer is fed and emitted the way `stream_ids` does it."""
+    model = CountingModel(16)
+    budget = ReasoningBudget(2, (ReasoningBlock((2,), (9,)),))
+    sequence = prepare_batch_sequence(
+        model, [1], max_tokens=8, sampler=greedy, reasoning=budget
+    )
+
+    emitted: list[int] = []
+    for _ in range(5):
+        emitted.extend(step(model, [sequence])[0])
+
+    # 2 opens the block, 3 and 4 spend the budget, 9 is the owed closer — fed, not
+    # drawn — and the model resumes from it: 10.
+    assert emitted == [2, 3, 4, 9, 10]
 
 
 def test_batch_step_uses_greedy_head_only_for_unfiltered_requests() -> None:
@@ -322,7 +339,7 @@ def test_batch_step_keeps_constraints_per_sequence() -> None:
 
     emitted = step(model, [constrained, free])
 
-    assert emitted == [9, 5]
+    assert emitted == [[9], [5]]
     assert constrained.finished
     assert not free.finished
     assert constraint.accepted == [9]

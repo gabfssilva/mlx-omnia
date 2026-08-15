@@ -5,6 +5,7 @@ import mlx.core as mx
 import mlx.nn as nn
 import numpy as np
 
+from mlx_omnia.engine.core.attend import KVStore
 from mlx_omnia.engine.core.cache import KVCache
 from mlx_omnia.engine.core.prefill import prefill
 from mlx_omnia.engine.core.prompt_cache import PromptCache
@@ -40,6 +41,8 @@ class MuseGlimmerActivations(NamedTuple):
 
 
 class MuseGlimmer(nn.Module):
+    continuous_batching = True
+
     def __init__(self, config: MuseGlimmerConfig) -> None:
         super().__init__()
         self.config = config.text_config
@@ -88,7 +91,7 @@ class MuseGlimmer(nn.Module):
     def activations(
         self,
         ids: mx.array,
-        cache: list[KVCache] | None = None,
+        cache: Sequence[KVStore] | None = None,
         *,
         embeddings: mx.array | None = None,
     ) -> MuseGlimmerActivations:
@@ -105,7 +108,7 @@ class MuseGlimmer(nn.Module):
         return MuseGlimmerActivations(embedded, blocks, normed, self.head(normed))
 
     def block_outputs(
-        self, ids: mx.array, cache: list[KVCache], *, at: Sequence[int]
+        self, ids: mx.array, cache: Sequence[KVStore], *, at: Sequence[int]
     ) -> tuple[mx.array, mx.array]:
         """The forward, plus the output of blocks `at` concatenated on the last dim —
         `generate.BlockOutputs`. What reads it is the DFlash drafter, whose whole input is
@@ -124,7 +127,7 @@ class MuseGlimmer(nn.Module):
     def __call__(
         self,
         ids: mx.array,
-        cache: list[KVCache] | None = None,
+        cache: Sequence[KVStore] | None = None,
         *,
         embeddings: mx.array | None = None,
     ) -> mx.array:

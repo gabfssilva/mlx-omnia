@@ -3,7 +3,7 @@ from typing import assert_never
 import mlx.core as mx
 import mlx.nn as nn
 
-from mlx_omnia.engine.core.cache import KVCache
+from mlx_omnia.engine.core.attend import KVStore
 from mlx_omnia.engine.core.layers import SwiGLU
 from mlx_omnia.engine.models.mimo_v2.config import LayerType, MimoV2Config, MlpType
 from mlx_omnia.engine.models.mimo_v2.layers.attention import MimoV2Attention
@@ -18,7 +18,7 @@ class MimoV2Block(nn.Module):
         self.input_layernorm = nn.RMSNorm(config.hidden_size, eps=config.rms_norm_eps)
         self.post_attention_layernorm = nn.RMSNorm(config.hidden_size, eps=config.rms_norm_eps)
 
-    def __call__(self, x: mx.array, cache: KVCache) -> mx.array:
+    def __call__(self, x: mx.array, cache: KVStore) -> mx.array:
         attended = x + self.self_attn(self.input_layernorm(x), cache)
         return attended + self.mlp(self.post_attention_layernorm(attended))
 

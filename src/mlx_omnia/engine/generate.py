@@ -128,7 +128,7 @@ class ReasoningBudget:
     inside: bool = False
 
 
-class _Budget:
+class ReasoningWalk:
     """One generation's walk through `ReasoningBudget`: the ids seen, and what is owed."""
 
     def __init__(self, spec: ReasoningBudget) -> None:
@@ -545,7 +545,7 @@ def stream_ids[C: LayerCache, D: LayerCache](
             "a reasoning budget and a grammar do not compose: the forced closer bypasses the "
             "mask the matcher is advanced under"
         )
-    budget = None if reasoning_budget is None else _Budget(reasoning_budget)
+    budget = None if reasoning_budget is None else ReasoningWalk(reasoning_budget)
     boundary: list[C] | None = None
     """Bound before the `try`, because the `finally` reads it and a forward that raises on
     the first block never reaches the line that fills it."""

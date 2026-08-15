@@ -14,6 +14,7 @@ from mlx_omnia.engine.core.cache import (
     fit,
     regrow,
 )
+from mlx_omnia.engine.core.decode import DecodePlan, compiled_decode
 from mlx_omnia.engine.core.prefill import prefill
 from mlx_omnia.engine.core.prompt_cache import PromptCache
 from mlx_omnia.engine.generate import (
@@ -106,20 +107,17 @@ class Qwen35(nn.Module):
         if not any(attends):
             raise ValueError("decode compilation needs at least one attention layer to anchor")
 
-        def build(
-            fitting: int,
-        ) -> tuple[Callable[[mx.array], mx.array], list[LayerCache], int, list[int]]:
+        def promote(layers: list[LayerCache], fitting: int) -> list[LayerCache]:
             promoted: list[LayerCache] = []
-            for layer, full in zip(cache, attends, strict=True):
+            for layer, full in zip(layers, attends, strict=True):
                 if full:
                     assert isinstance(layer, KVCache | FixedKVCache)
                     if isinstance(layer, FixedKVCache):
                         # A rebuild that is not a growth (the delegators moved under the
                         # graph, not the buffer) keeps the buffer it already has.
-                        grown = (
+                        promoted.append(
                             layer if layer.state[0].shape[2] >= fitting else regrow(layer, fitting)
                         )
-                        promoted.append(grown)
                     else:
                         promoted.append(FixedKVCache.promote(layer, fitting))
                 else:
@@ -129,72 +127,41 @@ class Qwen35(nn.Module):
                         if isinstance(layer, FixedDeltaCache)
                         else FixedDeltaCache.promote(layer)
                     )
-            cache[:] = promoted
-            state = [
-                layer.state if isinstance(layer, FixedKVCache) else layer.graph
-                for layer in promoted
-                if isinstance(layer, FixedKVCache | FixedDeltaCache)
-            ]
-            anchor = next(layer for layer in promoted if isinstance(layer, FixedKVCache))
-            columns = mx.arange(fitting)
+            return promoted
+
+        def prepare(_: Sequence[LayerCache]) -> None:
             for block in blocks:
                 assert isinstance(block, Qwen35Block)
                 block.prepare_decode()
 
-            def forward(ids: mx.array) -> mx.array:
-                # Read before any layer advances it: the row this step writes lands at the
-                # pre-update position, so `<=` keeps it attendable and `<` would drop it.
-                position = anchor.position
-                mask = (columns <= position).reshape(1, 1, 1, fitting)
-                positions = (
-                    None if rope_delta is None else mx.broadcast_to(position + rope_delta, (3, 1))
-                )
-                x = self.model.embed_tokens(ids[None])
-                for block, layer_cache in zip(blocks, promoted, strict=True):
-                    assert isinstance(block, Qwen35Block)
-                    assert isinstance(layer_cache, FixedKVCache | FixedDeltaCache)
-                    x = block.graph_step(x, layer_cache, positions, mask)
-                normed = self.model.norm(x)
-                logits = (
-                    self.model.embed_tokens.as_linear(normed)
-                    if self.config.tied
-                    else self.lm_head(normed)
-                )
-                return logits[:, -1, :]
+        def epochs() -> tuple[int, ...]:
+            """The delegators this graph baked. A per-block step run in between re-resolves
+            them: streaming with a prefix cache takes that path and streaming without takes
+            this one, so the same resident model alternates."""
+            return tuple(block.epoch for block in blocks if isinstance(block, Qwen35Block))
 
-            epochs = [block.epoch for block in blocks if isinstance(block, Qwen35Block)]
-            return mx.compile(forward, inputs=state, outputs=state), promoted, fitting, epochs
+        def step(ids: mx.array, slots: Sequence[LayerCache], mask: mx.array | None) -> mx.array:
+            anchor = next(layer for layer in slots if isinstance(layer, FixedKVCache))
+            positions = (
+                None
+                if rope_delta is None
+                else mx.broadcast_to(anchor.position + rope_delta, (3, 1))
+            )
+            x = self.model.embed_tokens(ids[None])
+            for block, layer_cache in zip(blocks, slots, strict=True):
+                assert isinstance(block, Qwen35Block)
+                assert isinstance(layer_cache, FixedKVCache | FixedDeltaCache)
+                x = block.graph_step(x, layer_cache, positions, mask)
+            normed = self.model.norm(x)
+            logits = (
+                self.model.embed_tokens.as_linear(normed)
+                if self.config.tied
+                else self.lm_head(normed)
+            )
+            return logits[:, -1, :]
 
-        offset = cache[0].offset
-        room = capacity if capacity is not None else fit(offset)
-        if offset >= room:
-            room = fit(offset)
-        compiled, promoted, room, epochs = build(room)
-        base = offset
-        steps = 0
-
-        def stale() -> bool:
-            """Whether a per-block step ran in between and re-resolved the delegators this
-            graph baked. Streaming with a prefix cache takes that path and streaming
-            without takes this one, so the same resident model alternates."""
-            current = [block.epoch for block in blocks if isinstance(block, Qwen35Block)]
-            return current != epochs
-
-        def decode(ids: mx.array) -> mx.array:
-            # The python-side offsets are assigned, not incremented: the trace's own pass
-            # through the layers already bumped them once, and only once.
-            nonlocal steps, compiled, promoted, room, epochs
-            if base + steps + 1 >= room:
-                compiled, promoted, room, epochs = build(fit(base + steps))
-            elif stale():
-                compiled, promoted, room, epochs = build(room)
-            logits = compiled(ids)
-            steps += 1
-            for layer in promoted:
-                layer.offset = base + steps
-            return logits
-
-        return decode
+        plan = DecodePlan(step=step, promote=promote, prepare=prepare, epochs=epochs)
+        return compiled_decode(plan, cache, capacity)
 
     def raw_embed(self, ids: mx.array) -> mx.array:
         """`speculative.Speculable`. The trunk puts nothing over the lookup, so the raw

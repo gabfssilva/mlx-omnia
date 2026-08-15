@@ -1,13 +1,14 @@
 """Shared contracts and composition for attention implementations."""
 
 import math
+from collections.abc import Sequence
 from dataclasses import dataclass
 from typing import Literal, NamedTuple, NotRequired, Protocol, TypedDict
 
 import mlx.core as mx
 import mlx.nn as nn
 
-from mlx_omnia.engine.core.attend import KVStore, attend
+from mlx_omnia.engine.core.attend import Attending, KVStore, attend
 from mlx_omnia.engine.core.cache import KVCache, LayerCache
 from mlx_omnia.engine.core.kernels.qkv_rope import QkvRope
 from mlx_omnia.engine.core.layers import SwiGLU, split_qkv
@@ -39,6 +40,25 @@ __all__ = [
 ]
 
 type AttentionMask = mx.array | str | None
+
+
+def ragged_mask(length: int, offset: int | mx.array, window: int | None) -> AttentionMask:
+    """What `attention_mask` builds from a fetched span, rebuilt from the store's own
+    positions — an `Attending` store hands no rows back to measure. One row per step:
+    the ragged stores mask validity per row themselves, so full attention needs nothing
+    and a window needs only its band, cut per row by the store."""
+    if length != 1:
+        raise ValueError("a ragged store steps one token at a time")
+    if window is None:
+        return None
+    if isinstance(offset, mx.array):
+        span = int(mx.max(offset).item()) + length
+        columns = mx.arange(span)[None, None, None, :]
+        return columns > offset[:, None, None, None] - window
+    span = offset + length
+    if span <= window:
+        return None
+    return mx.arange(span) > offset - window
 type Position = int | mx.array
 type FusedProjectionName = Literal["qkv_proj", "query_key_value", "c_attn", "fused_proj"]
 type OutputProjectionName = Literal["o_proj", "out_proj", "dense", "c_proj"]
@@ -438,19 +458,29 @@ class NormalizedFusedQKVAttention(FusedQKVAttention):
             queries = self.rope(queries, cache.offset)
             keys = self.rope(keys, cache.offset)
         if self._automatic_mask and isinstance(mask, str) and mask == "causal":
-            # This one branch still fetches. The mask it builds spans the cache *as fetched*,
-            # and a ring reports its whole window rather than what it has seen — so deriving
-            # the span from the offset would be right for a growing cache and wrong for the
-            # others. Until the mask is decoupled from the fetched shape, a family that asks
-            # for the automatic one cannot take a cache that hands no rows back.
-            keys, values = cache.update_and_fetch(keys, values)
-            attended = mx.fast.scaled_dot_product_attention(
-                queries,
-                keys,
-                values,
-                scale=self.scale,
-                mask=self.attention_mask(length, keys.shape[2]),
-            )
+            if isinstance(cache, Attending):
+                # A store that hands no rows back builds nothing to measure a span from:
+                # the mask is rebuilt from its positions, and validity is the store's own.
+                attended = cache.attend(
+                    queries,
+                    keys=keys,
+                    values=values,
+                    scale=self.scale,
+                    mask=ragged_mask(length, cache.offset, self.window),
+                )
+            else:
+                # This branch still fetches. The mask it builds spans the cache *as
+                # fetched*, and a ring reports its whole window rather than what it has
+                # seen — so deriving the span from the offset would be right for a growing
+                # cache and wrong for the others.
+                keys, values = cache.update_and_fetch(keys, values)
+                attended = mx.fast.scaled_dot_product_attention(
+                    queries,
+                    keys,
+                    values,
+                    scale=self.scale,
+                    mask=self.attention_mask(length, keys.shape[2]),
+                )
         else:
             causal_decode = length == 1 and isinstance(mask, str) and mask == "causal"
             attended = attend(
@@ -679,22 +709,37 @@ class SeparateQKVAttention(nn.Module):
         queries = self.rope(queries.transpose(0, 2, 1, 3), cache.offset)
         keys = self.rope(keys.transpose(0, 2, 1, 3), cache.offset)
         values = values.transpose(0, 2, 1, 3) * self.v_scale
-        keys, values = cache.update_and_fetch(keys, values)
         use_automatic = self._automatic_mask and isinstance(mask, str) and mask == "causal"
-        if use_automatic:
-            effective_mask = self.attention_mask(length, keys.shape[2])
+        if isinstance(cache, Attending):
+            if use_automatic:
+                effective_mask = ragged_mask(length, cache.offset, self.window)
+            else:
+                causal_decode = length == 1 and isinstance(mask, str) and mask == "causal"
+                effective_mask = None if causal_decode else mask
+            attended = cache.attend(
+                queries,
+                keys=keys,
+                values=values,
+                scale=self.scale,
+                mask=effective_mask,
+                sinks=self.sinks if self._has_sinks else None,
+            )
         else:
-            causal_decode = length == 1 and isinstance(mask, str) and mask == "causal"
-            effective_mask = None if causal_decode else mask
-        sinks = self.sinks if self._has_sinks else None
-        attended = mx.fast.scaled_dot_product_attention(
-            queries,
-            keys,
-            values,
-            scale=self.scale,
-            mask=effective_mask,
-            sinks=sinks,
-        )
+            keys, values = cache.update_and_fetch(keys, values)
+            if use_automatic:
+                effective_mask = self.attention_mask(length, keys.shape[2])
+            else:
+                causal_decode = length == 1 and isinstance(mask, str) and mask == "causal"
+                effective_mask = None if causal_decode else mask
+            sinks = self.sinks if self._has_sinks else None
+            attended = mx.fast.scaled_dot_product_attention(
+                queries,
+                keys,
+                values,
+                scale=self.scale,
+                mask=effective_mask,
+                sinks=sinks,
+            )
         width = self.heads * self.v_head_dim
         output = attended.transpose(0, 2, 1, 3).reshape(batch, length, width)
         if self._has_output_norm:
@@ -798,7 +843,7 @@ class DenseBlock(nn.Module):
         self.input_layernorm = nn.RMSNorm(config.hidden_size, eps=config.rms_norm_eps)
         self.post_attention_layernorm = nn.RMSNorm(config.hidden_size, eps=config.rms_norm_eps)
 
-    def __call__(self, x: mx.array, cache: KVCache) -> mx.array:
+    def __call__(self, x: mx.array, cache: KVStore) -> mx.array:
         attended = x + self.self_attn(self.input_layernorm(x), cache)
         return attended + self.mlp(self.post_attention_layernorm(attended))
 
@@ -845,7 +890,7 @@ class DenseModel(nn.Module):
         return self.lm_head(normed)
 
     def activations(
-        self, ids: mx.array, cache: list[KVCache] | None = None
+        self, ids: mx.array, cache: Sequence[KVStore] | None = None
     ) -> DenseActivations:
         """Run the model and expose its principal activation boundaries."""
         cache = cache if cache is not None else self.make_cache()
@@ -858,5 +903,5 @@ class DenseModel(nn.Module):
         normed = self.model.norm(x)
         return DenseActivations(embeddings, blocks, normed, self.head(normed))
 
-    def __call__(self, ids: mx.array, cache: list[KVCache] | None = None) -> mx.array:
+    def __call__(self, ids: mx.array, cache: Sequence[KVStore] | None = None) -> mx.array:
         return self.activations(ids, cache).logits

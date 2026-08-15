@@ -1,8 +1,10 @@
+from collections.abc import Sequence
 from typing import NamedTuple
 
 import mlx.core as mx
 import mlx.nn as nn
 
+from mlx_omnia.engine.core.attend import KVStore
 from mlx_omnia.engine.core.cache import KVCache
 from mlx_omnia.engine.models.qwen2_moe.config import Qwen2MoEConfig
 from mlx_omnia.engine.models.qwen2_moe.layers.block import Qwen2MoETrunk
@@ -16,6 +18,8 @@ class Qwen2MoEActivations(NamedTuple):
 
 
 class Qwen2MoE(nn.Module):
+    continuous_batching = True
+
     def __init__(self, config: Qwen2MoEConfig) -> None:
         super().__init__()
         self.config = config
@@ -31,7 +35,9 @@ class Qwen2MoE(nn.Module):
             return self.model.embed_tokens.as_linear(normed)
         return self.lm_head(normed)
 
-    def activations(self, ids: mx.array, cache: list[KVCache] | None = None) -> Qwen2MoEActivations:
+    def activations(
+        self, ids: mx.array, cache: Sequence[KVStore] | None = None
+    ) -> Qwen2MoEActivations:
         cache = cache if cache is not None else self.make_cache()
         x = self.model.embed_tokens(ids)
         embeddings = x
@@ -42,5 +48,5 @@ class Qwen2MoE(nn.Module):
         normed = self.model.norm(x)
         return Qwen2MoEActivations(embeddings, blocks, normed, self.head(normed))
 
-    def __call__(self, ids: mx.array, cache: list[KVCache] | None = None) -> mx.array:
+    def __call__(self, ids: mx.array, cache: Sequence[KVStore] | None = None) -> mx.array:
         return self.activations(ids, cache).logits

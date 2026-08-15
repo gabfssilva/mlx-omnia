@@ -1,8 +1,10 @@
+from collections.abc import Sequence
 from typing import NamedTuple
 
 import mlx.core as mx
 import mlx.nn as nn
 
+from mlx_omnia.engine.core.attend import KVStore
 from mlx_omnia.engine.core.cache import KVCache
 from mlx_omnia.engine.models.bitnet.config import BitNetConfig
 from mlx_omnia.engine.models.bitnet.layers.block import BitNetTrunk
@@ -16,6 +18,8 @@ class BitNetActivations(NamedTuple):
 
 
 class BitNet(nn.Module):
+    continuous_batching = True
+
     def __init__(self, config: BitNetConfig) -> None:
         super().__init__()
         self.config = config
@@ -32,7 +36,7 @@ class BitNet(nn.Module):
         return self.lm_head(normed)
 
     def activations(
-        self, ids: mx.array, cache: list[KVCache] | None = None
+        self, ids: mx.array, cache: Sequence[KVStore] | None = None
     ) -> BitNetActivations:
         cache = cache if cache is not None else self.make_cache()
         x = self.model.embed_tokens(ids)
@@ -44,5 +48,5 @@ class BitNet(nn.Module):
         normed = self.model.norm(x)
         return BitNetActivations(embeddings, blocks, normed, self.head(normed))
 
-    def __call__(self, ids: mx.array, cache: list[KVCache] | None = None) -> mx.array:
+    def __call__(self, ids: mx.array, cache: Sequence[KVStore] | None = None) -> mx.array:
         return self.activations(ids, cache).logits
