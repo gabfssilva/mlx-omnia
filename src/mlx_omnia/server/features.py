@@ -1,10 +1,10 @@
 """The engine's own switches on a model, and the profile's override of them.
 
-Two levels, resolved the way `profiles.preset` resolves sampling: the profile fills over
-the model's settings, and what it leaves unset is what the model already said. There is no
-third level under them — a checkpoint's `generation_config.json` says how it wants to be
-sampled, and nothing in a checkpoint has an opinion about whether this daemon should keep
-a second one in memory.
+Two levels, resolved the way `profiles.preset` resolves the two sampling levels above the
+checkpoint: the profile fills over the model's settings, and what it leaves unset is what
+the model already said. There is no level under them — a checkpoint's
+`generation_config.json` says how it wants to be sampled, and nothing in a checkpoint has an
+opinion about whether this daemon should keep a second one in memory.
 
 `None` is unset and not off, at both levels, which is what lets a profile inherit. Off is
 the feature present with nothing named — `{"speculation": {"kind": null}}` — which a profile
@@ -27,7 +27,7 @@ by something weaker when it cannot hold — speculation skips, a KV policy refus
 
 import asyncio
 import json
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from pathlib import Path
 from typing import Literal
 
@@ -43,7 +43,7 @@ from mlx_omnia.engine.task import MTP_PREFIX, has_mtp, mtp_head
 from mlx_omnia.server import catalog
 from mlx_omnia.server.deps import EngineDep, StoreDep
 from mlx_omnia.server.engine import Compression
-from mlx_omnia.server.store import ModelSettings, Store
+from mlx_omnia.server.store import Store
 
 DRAFTERS: dict[str, str] = {"muse_glimmer_assistant": "muse_glimmer"}
 """Which architecture drafts for which. A drafter's checkpoint does not name its target —
@@ -456,11 +456,15 @@ def _save(model_id: str, body: SettingsBody, store: Store) -> SettingsView:
                 status_code=409,
                 detail=f"{named!r} writes {block} ids a round, not {speculation.block_size}",
             )
+    # Replaced field by field and not rebuilt: the model's sampling shares this row and is
+    # written by another route (`profiles.save_model_sampling`), so a fresh `ModelSettings`
+    # here would clear knobs this body never spoke about.
     store.save_model_settings(
-        ModelSettings(
-            model_id,
-            body.features.model_dump_json(exclude_none=True),
-            body.max_concurrent_requests,
+        replace(
+            store.model_settings(model_id),
+            model=model_id,
+            features=body.features.model_dump_json(exclude_none=True),
+            max_concurrent_requests=body.max_concurrent_requests,
         )
     )
     return _view(model_id, body.features, body.max_concurrent_requests)

@@ -323,7 +323,11 @@ struct Blueprint: Decodable {
     let tokens: Int
 }
 
-struct Sampling: Codable {
+/// The knobs, at whichever level sets them: a request's, a profile's, or the model's own.
+/// The daemon resolves the four the same way at every one — a knob left unset takes the
+/// level below it — so what says "the checkpoint decides" is the field being absent, which
+/// is what `nil` encodes to.
+struct Sampling: Codable, Equatable {
     var temperature: Double?
     var topP: Double?
     var topK: Int?
@@ -558,8 +562,11 @@ struct BenchRequest: Encodable {
     var skipIfMeasured = false
 }
 
+/// A `PUT` replaces the profile rather than patching it, so what this leaves out is what
+/// the profile stops saying — an empty system prompt is `nil` and not `""`.
 struct ProfileBody: Encodable {
     var sampling: Sampling
+    var systemPrompt: String?
 }
 
 struct SettingsBody: Encodable {

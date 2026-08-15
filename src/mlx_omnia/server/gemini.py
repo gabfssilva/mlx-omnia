@@ -614,7 +614,7 @@ async def generate(
         return error("INVALID_ARGUMENT", str(unreadable))
     if checked is not None:
         turns = (*turns, instruction(checked.schema))
-    preset = profiles.preset(model_id, profile)
+    preset = profiles.preset(store, model_id, profile)
     conversation = Chat(turns, tools=tools, reasoning_effort=_thinks(asked, preset))
     try:
         # One walk per generation and never one shared between two: the grammar behind it is

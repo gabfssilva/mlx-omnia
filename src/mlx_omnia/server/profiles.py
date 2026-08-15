@@ -20,9 +20,15 @@ after the checkpoint under it changed, and a wrong template does not fail — it
 fluent, wrong text, which is the same reason a base model gets no guessed template. So the
 `template` column stays unwritten, and a body carrying `template` is refused by name rather
 than accepted and ignored.
+
+Under every profile is the model's own sampling, kept in `store.model_settings` and served
+here too (`/admin/models/{id}/sampling`) because the vocabulary is the same one. It is what
+a person running this daemon says about a checkpoint without writing a preset and without
+every client having to name the same knobs: `preset` resolves request over profile over
+model over checkpoint, each level filling only what the level above left unset.
 """
 
-from dataclasses import dataclass, field
+from dataclasses import dataclass, field, replace
 
 from fastapi import APIRouter, HTTPException
 from pydantic import BaseModel, ConfigDict, Field
@@ -113,25 +119,38 @@ def resolve(store: Store, model: str) -> tuple[str, ProfileView | None]:
     return model, None
 
 
-def preset(model_id: str, profile: ProfileView | None) -> Sampling:
-    """What stands between the request and the dialect's own defaults: the profile where it
-    opines, the checkpoint's `generation_config.json` under it.
+def defaults(store: Store, model_id: str) -> Sampling:
+    """This daemon's own sampling for the model, under every profile of it. Parsed and not
+    cast, for the reason `_view` gives."""
+    return Sampling.model_validate_json(store.model_settings(model_id).sampling)
 
-    Three levels, and each one only fills what the level above left unset — request, then
-    profile, then checkpoint. The checkpoint is the lowest because it is the least specific:
-    it says how the people who trained it meant it to be sampled, which a profile written
-    for a job and a client that named a knob both outrank.
 
-    The dialect's defaults stay where they are, as the floor under all three: a checkpoint
-    that declares nothing changes nothing."""
-    declared = catalog.defaults_of(model_id)
-    asked = Sampling() if profile is None else profile.sampling
+def _under(asked: Sampling, floor: "Sampling | SamplingDefaults") -> Sampling:
+    """`asked` over `floor`: every knob `asked` left unset takes the one below it, and a knob
+    the floor does not name changes nothing."""
     filled = {
         knob: value
-        for knob, value in vars(declared).items()
+        for knob, value in vars(floor).items()
         if value is not None and getattr(asked, knob) is None
     }
     return asked.model_copy(update=filled)
+
+
+def preset(store: Store, model_id: str, profile: ProfileView | None) -> Sampling:
+    """What stands between the request and the dialect's own defaults: the profile where it
+    opines, this daemon's own setting for the model under it, and the checkpoint's
+    `generation_config.json` under that.
+
+    Four levels, and each one only fills what the level above left unset — request, then
+    profile, then model, then checkpoint. The checkpoint is the lowest because it is the
+    least specific: it says how the people who trained it meant it to be sampled, which the
+    person running it here, a profile written for a job, and a client that named a knob all
+    outrank in that order.
+
+    The dialect's defaults stay where they are, as the floor under all four: a checkpoint
+    that declares nothing and a model nobody tuned change nothing."""
+    asked = Sampling() if profile is None else profile.sampling
+    return _under(_under(asked, defaults(store, model_id)), catalog.defaults_of(model_id))
 
 
 assert set(vars(SamplingDefaults())) <= set(Sampling.model_fields)
@@ -240,3 +259,28 @@ def save(model_id: str, name: str, body: ProfileBody, store: StoreDep) -> Profil
 def remove(model_id: str, name: str, store: StoreDep) -> None:
     if not store.delete_profile(model_id, name):
         raise HTTPException(status_code=404, detail=f"no profile {name!r} for {model_id!r}")
+
+
+# Under the profile routes, for the reason `residency` gives about this prefix: `{model_id:path}`
+# matches slashes, so registered above them this pair answers
+# `PUT /admin/models/m/profiles/sampling` as the model `m/profiles`, and a profile may be
+# called `sampling`. The collision does not run the other way — the profile routes need a
+# literal `/profiles/` segment, which `/admin/models/m/sampling` does not have.
+@router.get("/admin/models/{model_id:path}/sampling")
+def model_sampling(model_id: str, store: StoreDep) -> Sampling:
+    """The model's own knobs, which every request for it gets before any profile opines.
+    Empty for a model nobody tuned, which is not the same as one tuned to the dialect's
+    defaults: an unset knob is one the checkpoint still answers for."""
+    return defaults(store, model_id)
+
+
+@router.put("/admin/models/{model_id:path}/sampling")
+def save_model_sampling(model_id: str, body: Sampling, store: StoreDep) -> Sampling:
+    """Replaces rather than patches, like a profile's `PUT`: what the body omits is what
+    this daemon no longer opines on, and clearing a knob is sending it unset.
+
+    The model is not unloaded, unlike the features beside it in the same row — a knob is
+    read per request by the sampler, so the next one already has it."""
+    saved = store.model_settings(model_id)
+    store.save_model_settings(replace(saved, sampling=body.model_dump_json(exclude_none=True)))
+    return body

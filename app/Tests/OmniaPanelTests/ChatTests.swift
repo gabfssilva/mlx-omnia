@@ -76,4 +76,17 @@ final class ChatTests: XCTestCase {
         chat.clear()
         XCTAssertFalse(chat.shouldShowLoadNote(resident: false))
     }
+
+    func testTheModelsOwnKnobsBeatWhatTheCheckpointDeclares() {
+        var declared = Knobs()
+        declared.temperature = 0.6
+        declared.topK = 20
+        var own = Sampling()
+        own.temperature = 0.1
+
+        let made = declared.under(own)
+
+        XCTAssertEqual(made.temperature, 0.1)
+        XCTAssertEqual(made.topK, 20, "a knob the model never named stays the checkpoint's")
+    }
 }

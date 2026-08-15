@@ -1019,7 +1019,7 @@ async def messages(
         )
 
     model_id, profile = profiles.resolve(store, request.model)
-    preset = profiles.preset(model_id, profile)
+    preset = profiles.preset(store, model_id, profile)
     try:
         conversation = _conversation(
             request,

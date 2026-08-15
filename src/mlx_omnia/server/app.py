@@ -793,7 +793,7 @@ async def chat(
         return refused
 
     model_id, profile = profiles.resolve(store, request.model)
-    preset = profiles.preset(model_id, profile)
+    preset = profiles.preset(store, model_id, profile)
     asked = preset_of(request, preset)
     messages = request.messages if profile is None else _messages(request, profile.system_prompt)
     tools = _tools(request)

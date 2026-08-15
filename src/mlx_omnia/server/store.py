@@ -53,13 +53,18 @@ class Profile:
 
 @dataclass(frozen=True)
 class ModelSettings:
-    """What every request for a model gets before any profile opines. Only features so
-    far: sampling defaults already have a home the checkpoint itself writes
-    (`generation_config.json`), and a second one would be a second answer."""
+    """What every request for a model gets before any profile opines.
+
+    `sampling` is JSON text, the same vocabulary a profile's is, and it is a level and not a
+    second answer: `generation_config.json` says how the people who trained the checkpoint
+    meant it to be sampled, and this is how the person running it wants it sampled here. The
+    checkpoint stays underneath — a knob left unset is one this daemon does not opine on, and
+    the file still answers for it."""
 
     model: str
     features: str = "{}"
     max_concurrent_requests: int | None = None
+    sampling: str = "{}"
 
 
 @dataclass(frozen=True)
@@ -562,6 +567,13 @@ _SCHEMA_V8 = """
 ALTER TABLE model_settings ADD COLUMN max_concurrent_requests INTEGER;
 """
 
+# The model's own sampling, under every profile and over the checkpoint's own file. It is
+# text and not a column per knob for the reason the profile's is: the vocabulary belongs to
+# the sampling module, and a knob added there would otherwise be a migration here.
+_SCHEMA_V9 = """
+ALTER TABLE model_settings ADD COLUMN sampling TEXT NOT NULL DEFAULT '{}';
+"""
+
 _MIGRATIONS: tuple[str, ...] = (
     _SCHEMA_V1,
     _SCHEMA_V2,
@@ -571,6 +583,7 @@ _MIGRATIONS: tuple[str, ...] = (
     _SCHEMA_V6,
     _SCHEMA_V7,
     _SCHEMA_V8,
+    _SCHEMA_V9,
 )
 
 SCHEMA_VERSION = len(_MIGRATIONS)
@@ -1004,22 +1017,29 @@ class Store:
         the caller should not have to tell the two apart."""
         with self._connect() as connection:
             row: tuple[object, ...] | None = connection.execute(
-                "SELECT model, features, max_concurrent_requests"
+                "SELECT model, features, max_concurrent_requests, sampling"
                 " FROM model_settings WHERE model = ?",
                 (model,),
             ).fetchone()
         return (
             ModelSettings(model)
             if row is None
-            else ModelSettings(_text(row[0]), _text(row[1]), _optional_integer(row[2]))
+            else ModelSettings(
+                _text(row[0]), _text(row[1]), _optional_integer(row[2]), _text(row[3])
+            )
         )
 
     def save_model_settings(self, settings: ModelSettings) -> None:
         with self._connect() as connection:
             connection.execute(
                 "INSERT OR REPLACE INTO model_settings"
-                " (model, features, max_concurrent_requests) VALUES (?, ?, ?)",
-                (settings.model, settings.features, settings.max_concurrent_requests),
+                " (model, features, max_concurrent_requests, sampling) VALUES (?, ?, ?, ?)",
+                (
+                    settings.model,
+                    settings.features,
+                    settings.max_concurrent_requests,
+                    settings.sampling,
+                ),
             )
 
     def delete_profile(self, model: str, name: str) -> bool:

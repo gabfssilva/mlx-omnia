@@ -326,7 +326,7 @@ def test_the_benchmark_migration_takes_a_file_at_the_previous_head(tmp_path: Pat
     database = Store(path)
 
     assert user_version(path) == SCHEMA_VERSION
-    assert SCHEMA_VERSION == 8
+    assert SCHEMA_VERSION == 9
     assert database.config() == {"port": "8642"}
     assert {"benchmark_runs", "benchmark_speed", "benchmark_datasets"} <= table_names(path)
     assert "prefix_cache" in table_names(path)
@@ -338,6 +338,37 @@ def test_model_settings_keep_the_concurrency_override(tmp_path: Path) -> None:
     database.save_model_settings(ModelSettings("m", max_concurrent_requests=3))
 
     assert database.model_settings("m").max_concurrent_requests == 3
+
+
+def test_a_model_settings_row_written_before_the_sampling_column_reads_as_opining_nothing(
+    tmp_path: Path,
+) -> None:
+    """The migration adds a column to a table that already has rows: a model configured by
+    the last release keeps its features and says nothing about sampling, which is what the
+    checkpoint answering for every knob means here."""
+    path = tmp_path / "server.db"
+    with closing(sqlite3.connect(path)) as connection:
+        connection.executescript(
+            store._SCHEMA_V1
+            + store._SCHEMA_V2
+            + store._SCHEMA_V3
+            + store._SCHEMA_V4
+            + store._SCHEMA_V5
+            + store._SCHEMA_V6
+            + store._SCHEMA_V7
+            + store._SCHEMA_V8
+        )
+        connection.execute("PRAGMA user_version = 8")
+        connection.execute(
+            "INSERT INTO model_settings (model, features) VALUES (?, ?)",
+            ("m", '{"speculation": {"kind": "mtp"}}'),
+        )
+        connection.commit()
+
+    settings = Store(path).model_settings("m")
+
+    assert settings.sampling == "{}"
+    assert settings.features == '{"speculation": {"kind": "mtp"}}'
 
 
 def test_the_features_migration_leaves_a_profile_written_before_it_unchanged(

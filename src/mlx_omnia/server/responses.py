@@ -1309,7 +1309,7 @@ async def respond(
         return openai_error(400, "input must contain non-empty text", "empty_input")
 
     model_id, profile = profiles.resolve(store, request.model)
-    preset = profiles.preset(model_id, profile)
+    preset = profiles.preset(store, model_id, profile)
     asked = preset_of(request, preset)
     turns = _prefixed(
         given, request.instructions, None if profile is None else profile.system_prompt

@@ -478,7 +478,23 @@ private struct Overview: View {
     }
 }
 
-// ── configure: speculation and profiles ──────────────────────────────────
+// ── configure: features, sampling and profiles ───────────────────────────
+//
+// Three sections and two levels of the same knobs. What the daemon resolves for a request
+// is the profile over the model over the checkpoint, so the editor is one view used twice:
+// the Sampling section writes the model's row, and the one inside a profile writes that
+// preset. A knob left empty at either level is one that level does not opine on, which is
+// what leaves the checkpoint's own `generation_config.json` answering for it.
+
+/// A profile being written. The name is a path segment and a `PUT` under a different one
+/// writes a different profile, so an existing profile's name is fixed once it exists —
+/// renaming is deleting and writing, and this screen does not pretend otherwise.
+private struct Editing: Equatable {
+    var name: String
+    var sampling: Sampling
+    var systemPrompt: String
+    var creating: Bool
+}
 
 private struct Configure: View {
     @Environment(\.tokens) private var t
@@ -486,7 +502,11 @@ private struct Configure: View {
     let entry: CatalogEntry
 
     @State private var settings: SettingsView?
-    @State private var profiles: [(name: String, knobs: String)] = []
+    @State private var sampling = Sampling()
+    /// What the daemon last answered with, which is what says the editor is dirty.
+    @State private var saved = Sampling()
+    @State private var profiles: [ProfileView] = []
+    @State private var editing: Editing?
 
     var body: some View {
         VStack(alignment: .leading, spacing: 0) {
@@ -514,33 +534,71 @@ private struct Configure: View {
                 }
             }
 
-            if !profiles.isEmpty {
-                Eyebrow(text: "Profiles")
-                    .padding(.horizontal, 2)
-                    .padding(.top, 12)
-                    .padding(.bottom, 4)
-                ForEach(Array(profiles.enumerated()), id: \.offset) { index, profile in
-                    HStack(spacing: 9) {
-                        Text(profile.name).mono(12.5, t.fg, weight: .medium).lineLimit(1)
-                        Spacer(minLength: 0)
-                        Text(profile.knobs).mono(10, t.fg3).lineLimit(1).truncationMode(.tail)
-                    }
-                    .padding(.horizontal, 2)
-                    .padding(.vertical, 7)
-                    .overlay(alignment: .top) {
-                        if index > 0 { Rectangle().fill(t.hair).frame(height: 1) }
-                    }
+            Eyebrow(text: "Sampling")
+                .padding(.horizontal, 2)
+                .padding(.top, 14)
+                .padding(.bottom, 2)
+            SamplingEditor(sampling: $sampling)
+            if sampling != saved {
+                HStack(spacing: 8) {
+                    PushButton(label: "Save", kind: "primary") { store(sampling) }
+                    PushButton(label: "Revert") { sampling = saved }
+                }
+                .padding(.top, 10)
+            }
+
+            Eyebrow(text: "Profiles")
+                .padding(.horizontal, 2)
+                .padding(.top, 16)
+                .padding(.bottom, 2)
+            ForEach(Array(profiles.enumerated()), id: \.offset) { index, profile in
+                let open = editing?.creating == false && editing?.name == profile.name
+                HStack(spacing: 9) {
+                    Text(profile.name)
+                        .mono(12.5, open ? t.accent : t.fg, weight: .medium)
+                        .lineLimit(1)
+                    Spacer(minLength: 0)
+                    Text(Self.summary(profile)).mono(10, t.fg3)
+                        .lineLimit(1).truncationMode(.tail)
+                }
+                .padding(.horizontal, 2)
+                .padding(.vertical, 7)
+                .contentShape(Rectangle())
+                .onTapGesture { edit(profile) }
+                .overlay(alignment: .top) {
+                    if index > 0 { Rectangle().fill(t.hair).frame(height: 1) }
                 }
             }
 
-            Text("+ New profile").sans(12.5, t.accent, weight: .semibold)
-                .padding(.horizontal, 2)
-                .padding(.top, 10)
-                .contentShape(Rectangle())
-                .onTapGesture { add() }
+            if let editing {
+                // Seeded by identity and never by a binding back into this optional: a
+                // `Binding` projected out of `Optional` force-unwraps on every update, and
+                // the update after the editor closes is one where there is nothing to
+                // unwrap. The `id` is what re-seeds the fields when another profile opens.
+                ProfileEditor(
+                    model: entry.id,
+                    opened: editing,
+                    write: { write($0) },
+                    remove: { remove($0) },
+                    cancel: { self.editing = nil }
+                )
+                .id("\(editing.creating)/\(editing.name)")
+            } else {
+                Text("+ New profile").sans(12.5, t.accent, weight: .semibold)
+                    .padding(.horizontal, 2)
+                    .padding(.top, 10)
+                    .contentShape(Rectangle())
+                    .onTapGesture {
+                        editing = Editing(
+                            name: "", sampling: Sampling(), systemPrompt: "", creating: true
+                        )
+                    }
+            }
         }
         .task(id: entry.id) { await load() }
     }
+
+    // ── features ─────────────────────────────────────────────────────────
 
     @ViewBuilder
     private func choices(_ settings: SettingsView) -> some View {
@@ -548,39 +606,27 @@ private struct Configure: View {
         let drafter = settings.features.speculation?.drafter
         // Wrapping, because a Mac with three drafters on disk has more names than 200 pt.
         FlowRow(spacing: 6) {
-            option("off", on: kind == nil) { choose(nil, nil) }
+            Chip(label: "off", on: kind == nil) { choose(nil, nil) }
             if settings.mtpAvailable {
-                option("mtp", on: kind == "mtp") { choose("mtp", nil) }
+                Chip(label: "mtp", on: kind == "mtp") { choose("mtp", nil) }
             }
             ForEach(settings.available, id: \.self) { candidate in
-                option(
-                    Fmt.displayName(candidate),
+                Chip(
+                    label: Fmt.displayName(candidate),
                     on: kind == "dflash" && drafter == candidate
                 ) { choose("dflash", candidate) }
             }
         }
     }
 
-    private func option(_ label: String, on: Bool, pick: @escaping () -> Void) -> some View {
-        Text(label).sans(11.5, on ? t.fg : t.fg2)
-            .lineLimit(1)
-            .padding(.horizontal, 10)
-            .padding(.vertical, 3)
-            .background(on ? t.accentSoft : .clear)
-            .overlay(Capsule().strokeBorder(on ? t.accent : t.hair, lineWidth: 1))
-            .clipShape(Capsule())
-            .contentShape(Rectangle())
-            .onTapGesture(perform: pick)
-    }
-
     @ViewBuilder
     private func batchChoices(_ settings: SettingsView) -> some View {
         FlowRow(spacing: 6) {
-            option("global", on: settings.maxConcurrentRequests == nil) {
+            Chip(label: "global", on: settings.maxConcurrentRequests == nil) {
                 chooseBatch(nil, settings)
             }
             ForEach([1, 2, 4, 8], id: \.self) { limit in
-                option("\(limit)", on: settings.maxConcurrentRequests == limit) {
+                Chip(label: "\(limit)", on: settings.maxConcurrentRequests == limit) {
                     chooseBatch(limit, settings)
                 }
             }
@@ -614,27 +660,71 @@ private struct Configure: View {
         }
     }
 
-    private func add() {
+    // ── what the screen writes ───────────────────────────────────────────
+
+    /// The model's own knobs. Nothing is unloaded for these — the sampler reads them per
+    /// request, so the next one already has them.
+    private func store(_ asked: Sampling) {
         app.act {
-            let name = "profile-\(profiles.count + 1)"
+            let written: Sampling? = try await Client.send(
+                "PUT", "/admin/models/\(Client.at(entry.id))/sampling", body: asked
+            )
+            saved = written ?? asked
+            sampling = saved
+        }
+    }
+
+    private func write(_ made: Editing) {
+        let name = made.name.trimmingCharacters(in: .whitespacesAndNewlines)
+        app.act {
             let _: ProfileView? = try await Client.send(
                 "PUT", "/admin/models/\(Client.at(entry.id))/profiles/\(Client.at(name))",
-                body: ProfileBody(sampling: Sampling())
+                body: ProfileBody(
+                    sampling: made.sampling,
+                    systemPrompt: made.systemPrompt.isEmpty ? nil : made.systemPrompt
+                )
             )
+            editing = nil
             await load()
         }
+    }
+
+    private func remove(_ name: String) {
+        app.act {
+            try await Client.send(
+                "DELETE", "/admin/models/\(Client.at(entry.id))/profiles/\(Client.at(name))"
+            )
+            editing = nil
+            await load()
+        }
+    }
+
+    private func edit(_ profile: ProfileView) {
+        editing = editing?.name == profile.name && editing?.creating == false
+            ? nil
+            : Editing(
+                name: profile.name,
+                sampling: profile.sampling,
+                systemPrompt: profile.systemPrompt ?? "",
+                creating: false
+            )
     }
 
     private func load() async {
         // A daemon that is down settles for nothing, which is what the row already says.
         settings = try? await Client.get("/admin/models/\(Client.at(entry.id))/settings")
+        let read: Sampling? = try? await Client.get(
+            "/admin/models/\(Client.at(entry.id))/sampling"
+        )
+        saved = read ?? Sampling()
+        sampling = saved
         profiles = await Self.profiles(of: entry.id)
     }
 
     /// There is no route that lists a model's profiles. What does list them is the
     /// dialect's own catalog: a model with a profile `code` is served under `model` and
     /// `model:code`, so the names are the suffixes of the ids under this one.
-    private static func profiles(of model: String) async -> [(name: String, knobs: String)] {
+    private static func profiles(of model: String) async -> [ProfileView] {
         struct Served: Decodable {
             struct Entry: Decodable { let id: String }
             let data: [Entry]
@@ -644,25 +734,188 @@ private struct Configure: View {
         let names = served.data.map(\.id)
             .filter { $0.hasPrefix(prefix) && $0.count > prefix.count }
             .map { String($0.dropFirst(prefix.count)) }
-        var held: [(name: String, knobs: String)] = []
+        var held: [ProfileView] = []
         for name in names {
             let view: ProfileView? = try? await Client.get(
                 "/admin/models/\(Client.at(model))/profiles/\(Client.at(name))"
             )
-            held.append((name, knobs(view?.sampling)))
+            if let view { held.append(view) }
         }
         return held
     }
 
-    /// What this profile actually sets, in the order the window's editor asks for it. A
-    /// profile that sets nothing is served at the engine's defaults, and says so.
-    private static func knobs(_ sampling: Sampling?) -> String {
-        guard let sampling else { return "—" }
+    /// What this profile actually sets. A profile that sets nothing is served at the level
+    /// under it, and says so.
+    private static func summary(_ profile: ProfileView) -> String {
         var said: [String] = []
-        if let value = sampling.temperature { said.append(String(format: "temp %.2f", value)) }
-        if let value = sampling.topP { said.append(String(format: "top-p %.2f", value)) }
-        if let value = sampling.topK { said.append("top-k \(value)") }
-        return said.isEmpty ? "engine defaults" : said.joined(separator: " · ")
+        if let value = profile.sampling.temperature {
+            said.append(String(format: "temp %.2f", value))
+        }
+        if let value = profile.sampling.topP { said.append(String(format: "top-p %.2f", value)) }
+        if let value = profile.sampling.topK { said.append("top-k \(value)") }
+        if profile.systemPrompt != nil { said.append("system prompt") }
+        return said.isEmpty ? "the model's own" : said.joined(separator: " · ")
+    }
+}
+
+/// One profile, open. It holds the fields itself and hands the finished thing back — the
+/// screen above owns which profile is open and nothing else, so closing the editor cannot
+/// leave a binding pointing at a profile that is no longer there.
+private struct ProfileEditor: View {
+    @Environment(\.tokens) private var t
+    let model: String
+    let opened: Editing
+    let write: (Editing) -> Void
+    let remove: (String) -> Void
+    let cancel: () -> Void
+
+    @State private var made: Editing
+
+    init(
+        model: String,
+        opened: Editing,
+        write: @escaping (Editing) -> Void,
+        remove: @escaping (String) -> Void,
+        cancel: @escaping () -> Void
+    ) {
+        self.model = model
+        self.opened = opened
+        self.write = write
+        self.remove = remove
+        self.cancel = cancel
+        _made = State(initialValue: opened)
+    }
+
+    /// The name as a path segment: a profile with none, or one carrying the `:` the daemon
+    /// splits a served id at, is one no request could ever select.
+    private var named: String {
+        let text = made.name.trimmingCharacters(in: .whitespacesAndNewlines)
+        return text.contains(":") ? "" : text
+    }
+
+    var body: some View {
+        VStack(alignment: .leading, spacing: 0) {
+            if made.creating {
+                HStack(spacing: 10) {
+                    Text("name").sans(12, t.fg2).frame(width: 118, alignment: .leading)
+                    TextField("code", text: $made.name)
+                        .textFieldStyle(.plain)
+                        .font(.system(size: 11.5, design: .monospaced))
+                        .foregroundColor(t.fg)
+                        .padding(.horizontal, 10)
+                        .frame(height: 28)
+                        .background(t.field)
+                        .overlay(
+                            RoundedRectangle(cornerRadius: 8).strokeBorder(t.hair2, lineWidth: 1)
+                        )
+                        .clipShape(RoundedRectangle(cornerRadius: 8))
+                }
+                .padding(.vertical, 8)
+            } else {
+                Text("\(model):\(made.name)").mono(11, t.fg3)
+                    .lineLimit(1).truncationMode(.middle)
+                    .padding(.vertical, 8)
+            }
+
+            SamplingEditor(sampling: $made.sampling)
+
+            Text("System prompt").sans(12, t.fg2)
+                .padding(.top, 10)
+                .padding(.bottom, 5)
+            TextField("What the model is told first", text: $made.systemPrompt, axis: .vertical)
+                .textFieldStyle(.plain)
+                .lineLimit(2...4)
+                .font(.system(size: 11.5))
+                .foregroundColor(t.fg)
+                .padding(.horizontal, 10)
+                .padding(.vertical, 7)
+                .background(t.field)
+                .overlay(RoundedRectangle(cornerRadius: 9).strokeBorder(t.hair2, lineWidth: 1))
+                .clipShape(RoundedRectangle(cornerRadius: 9))
+
+            HStack(spacing: 8) {
+                PushButton(
+                    label: "Save",
+                    kind: "primary",
+                    action: named.isEmpty ? nil : { write(made) }
+                )
+                PushButton(label: "Cancel", action: cancel)
+                Spacer(minLength: 0)
+                if !made.creating {
+                    PushButton(label: "Delete", kind: "danger") { remove(made.name) }
+                }
+            }
+            .padding(.top, 12)
+        }
+        .padding(.horizontal, 2)
+        .padding(.top, 4)
+        .overlay(alignment: .top) { Rectangle().fill(t.hair).frame(height: 1) }
+    }
+}
+
+/// The same knobs at whichever level sets them: the model's row, or one profile's. Empty is
+/// unset and not neutral — the level below answers for it.
+private struct SamplingEditor: View {
+    @Environment(\.tokens) private var t
+    @Binding var sampling: Sampling
+
+    static let efforts = ["auto", "off", "on", "low", "medium", "high", "xhigh", "max"]
+
+    var body: some View {
+        VStack(alignment: .leading, spacing: 0) {
+            Knob(name: "temperature", value: $sampling.temperature, low: 0, high: 2, width: 118)
+            Knob(name: "top_p", value: $sampling.topP, low: 0.01, high: 1, width: 118)
+            Knob(name: "top_k", whole: $sampling.topK, low: 1, high: 200, width: 118)
+            Knob(name: "min_p", value: $sampling.minP, low: 0, high: 0.99, width: 118)
+            Knob(
+                name: "repetition_penalty",
+                value: $sampling.repetitionPenalty,
+                low: 0.01, high: 2, width: 118
+            )
+            Knob(name: "seed", whole: $sampling.seed, low: 0, high: 2_147_483_647, width: 118)
+            Knob(
+                name: "reasoning_budget",
+                whole: $sampling.reasoningBudget,
+                low: 0, high: 1_000_000, width: 118
+            )
+            HStack(alignment: .top, spacing: 10) {
+                Text("reasoning_effort").sans(12, t.fg2)
+                    .frame(width: 118, alignment: .leading)
+                    .padding(.top, 3)
+                FlowRow(spacing: 6) {
+                    Chip(label: "unset", on: sampling.reasoningEffort == nil) {
+                        sampling.reasoningEffort = nil
+                    }
+                    ForEach(Self.efforts, id: \.self) { rung in
+                        Chip(label: rung, on: sampling.reasoningEffort == rung) {
+                            sampling.reasoningEffort = rung
+                        }
+                    }
+                }
+            }
+            .padding(.vertical, 8)
+            .overlay(alignment: .top) { Rectangle().fill(t.hair).frame(height: 1) }
+        }
+    }
+}
+
+/// One of a set: the capsule the switches and the rungs are picked from.
+struct Chip: View {
+    @Environment(\.tokens) private var t
+    let label: String
+    let on: Bool
+    let pick: () -> Void
+
+    var body: some View {
+        Text(label).sans(11.5, on ? t.fg : t.fg2)
+            .lineLimit(1)
+            .padding(.horizontal, 10)
+            .padding(.vertical, 3)
+            .background(on ? t.accentSoft : .clear)
+            .overlay(Capsule().strokeBorder(on ? t.accent : t.hair, lineWidth: 1))
+            .clipShape(Capsule())
+            .contentShape(Rectangle())
+            .onTapGesture(perform: pick)
     }
 }
 

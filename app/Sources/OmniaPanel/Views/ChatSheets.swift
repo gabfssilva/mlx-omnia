@@ -157,8 +157,8 @@ struct TuningSheet: View {
             Text("Nothing runs the function.").sans(11.5, t.fg3).padding(.top, 8)
 
             HStack(spacing: 8) {
-                PushButton(label: "Reset to checkpoint", wide: true) {
-                    chat.knobs = Knobs.of(app.store.entry(chat.model))
+                PushButton(label: "Reset to the model's own", wide: true) {
+                    chat.tune(app.store.entry(chat.model))
                 }
             }
             .padding(.top, 12)
@@ -188,10 +188,13 @@ struct Knob: View {
     var whole: Binding<Int?>?
     let low: Double
     let high: Double
+    /// The label's column. Wider where the names are the dialect's own spelling —
+    /// `repetition_penalty` does not fit the chat panel's 78.
+    var width: CGFloat = 78
 
     var body: some View {
         HStack(spacing: 10) {
-            Text(name).sans(12, t.fg2).frame(width: 78, alignment: .leading)
+            Text(name).sans(12, t.fg2).frame(width: width, alignment: .leading)
             Group {
                 if let value {
                     TextField(

@@ -81,9 +81,9 @@ struct Turn: Identifiable, Equatable {
 }
 
 /// The knobs this panel names on a request — its overrides. A named knob beats the profile
-/// the request also names, which beats the checkpoint's own defaults: the daemon's order,
-/// and the reason an unnamed knob has to stay out of the body rather than be restated at
-/// some default.
+/// the request also names, which beats the model's own row, which beats the checkpoint's
+/// defaults: the daemon's order, and the reason an unnamed knob has to stay out of the body
+/// rather than be restated at some default.
 struct Knobs: Equatable {
     var temperature: Double?
     var topP: Double?
@@ -103,6 +103,19 @@ struct Knobs: Equatable {
         made.topP = declared.topP
         made.topK = declared.topK
         made.minP = declared.minP
+        return made
+    }
+
+    /// The model's own row over the checkpoint's file — the same order the daemon resolves
+    /// them in. It matters because the composer *names* what it sends: a panel that opened
+    /// at the checkpoint's temperature would be quietly overriding the one this daemon was
+    /// told to use for the model.
+    func under(_ own: Sampling) -> Knobs {
+        var made = self
+        if let value = own.temperature { made.temperature = value }
+        if let value = own.topP { made.topP = value }
+        if let value = own.topK { made.topK = value }
+        if let value = own.minP { made.minP = value }
         return made
     }
 }
@@ -189,12 +202,29 @@ final class ChatModel {
         model = identifier
         // The knobs belong to the checkpoint they were tuned against, so another model is
         // a clean panel — the same rule the window's picker follows.
-        knobs = Knobs.of(entry)
+        tune(entry)
         refusal = ""
         // And so does the price: the arithmetic is the family's, and a count carried over
         // from the last model is a number about a different tower.
         for index in clips.indices { clips[index].cost = nil }
         price()
+    }
+
+    /// The panel at what the daemon would resolve for this model with nothing named: the
+    /// checkpoint's declaration first, because it arrives with the catalog, and the model's
+    /// own row over it as soon as the daemon answers. The second half is skipped when the
+    /// reader has already touched a knob — theirs is the level above both.
+    func tune(_ entry: CatalogEntry?) {
+        let declared = Knobs.of(entry)
+        knobs = declared
+        let asked = model
+        Task {
+            let own: Sampling? = try? await Client.get(
+                "/admin/models/\(Client.at(asked))/sampling"
+            )
+            guard let own, model == asked, knobs == declared else { return }
+            knobs = declared.under(own)
+        }
     }
 
     // ── the clips ────────────────────────────────────────────────────────
