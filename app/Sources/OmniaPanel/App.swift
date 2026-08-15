@@ -74,6 +74,7 @@ final class AppModel {
     let daemon = Daemon()
     let downloads = Downloads()
     let chat = ChatModel()
+    let integrations = Integrations()
 
     var mode: Mode = .system
     var tab: Tab = .server

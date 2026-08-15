@@ -11,6 +11,9 @@ import SwiftUI
 struct ServerView: View {
     @Bindable var app: AppModel
     @State private var tab: ServerTab = .settings
+    /// Which tier is being answered. Over the scroll rather than pushed into it, the way the
+    /// chat's model sheet covers its transcript: it is the answer to a row that is on screen.
+    @State private var picking: Tier?
 
     var body: some View {
         VStack(spacing: 0) {
@@ -25,20 +28,26 @@ struct ServerView: View {
 
             switch tab {
             case .settings:
-                ScrollView {
-                    VStack(alignment: .leading, spacing: 7) {
-                        if app.store.down {
-                            ServerUnavailable(port: app.store.port)
-                        } else {
-                            DaemonSettings(app: app)
+                ZStack {
+                    ScrollView {
+                        VStack(alignment: .leading, spacing: 7) {
+                            if app.store.down {
+                                ServerUnavailable(port: app.store.port)
+                            } else {
+                                DaemonSettings(app: app, picking: $picking)
+                            }
                         }
+                        .frame(maxWidth: .infinity, alignment: .leading)
+                        .padding(.horizontal, Panel.pad)
+                        .padding(.top, 14)
+                        .padding(.bottom, 12)
                     }
-                    .frame(maxWidth: .infinity, alignment: .leading)
-                    .padding(.horizontal, Panel.pad)
-                    .padding(.top, 14)
-                    .padding(.bottom, 12)
+                    .scrollIndicators(.never)
+
+                    if let tier = picking {
+                        TierSheet(app: app, tier: tier, close: { picking = nil })
+                    }
                 }
-                .scrollIndicators(.never)
             case .status:
                 ServerStatus(app: app)
             }

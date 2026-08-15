@@ -12,6 +12,7 @@ from datetime import datetime
 from pathlib import Path
 from typing import NotRequired, TypedDict, TypeIs, cast
 
+import jinja2
 import numpy as np
 import pytest
 
@@ -485,3 +486,114 @@ def test_a_level_travels_with_the_switch() -> None:
     assert rendered("high") == "on=True;effort=high;strength=high;"
     assert rendered("xhigh") == "on=True;effort=xhigh;strength=xhigh;"
     assert rendered("max") == "on=True;effort=max;strength=max;"
+
+
+# ── where a system turn is allowed to sit ────────────────────────────────
+
+STRICT = ChatTemplate.from_source(
+    "{% for m in messages %}"
+    "{% if m.role == 'system' %}"
+    "{% if not loop.first %}{{ raise_exception('System message must be at the beginning.') }}"
+    "{% endif %}[sys]{{ m.content }}"
+    "{% else %}[{{ m.role }}]{{ m.content }}{% endif %}"
+    "{% endfor %}"
+)
+"""The check the whole Qwen3 family writes by hand (`chat_template.jinja:106` on
+Qwen3.8-27B): a system turn anywhere but first is refused outright."""
+
+LOOSE = ChatTemplate.from_source(
+    "{% for m in messages %}[{{ m.role }}]{{ m.content }}{% endfor %}"
+)
+
+TAIL_ONLY = ChatTemplate.from_source(
+    "{% for m in messages %}"
+    "{% if m.role != 'system' or loop.first or loop.last %}[{{ m.role }}]{{ m.content }}{% endif %}"
+    "{% endfor %}"
+)
+"""Renders a system turn that opens or closes the conversation and drops one in the middle.
+Nothing raises, so only the marker order says which of the two happened."""
+
+INTERIOR: tuple[ChatMessage, ...] = (
+    {"role": "system", "content": "you are an agent"},
+    {"role": "user", "content": "say ok"},
+    {"role": "system", "content": "the tools you may spawn"},
+    {"role": "assistant", "content": "ok"},
+)
+
+MIDWAY: tuple[ChatMessage, ...] = (
+    {"role": "system", "content": "you are an agent"},
+    {"role": "user", "content": "say ok"},
+    {"role": "system", "content": "the tools you may spawn"},
+)
+
+
+def test_a_template_that_keeps_a_mid_conversation_system_turn_gets_it_untouched() -> None:
+    """What Claude Code sends on every request: the system field, the user's words, then an
+    operator instruction after them. A template that renders it there keeps the order — and
+    with it the prefix already in the trie."""
+    assert LOOSE.render(Chat(MIDWAY)) == (
+        "[system]you are an agent[user]say ok[system]the tools you may spawn"
+    )
+
+
+def test_a_strict_template_takes_the_system_turns_merged_at_the_front() -> None:
+    """The alternative is `TemplateError` on every request from that client. What is lost is
+    the placement — the instruction now precedes the words it was written after."""
+    assert STRICT.render(Chat(MIDWAY)) == (
+        "[sys]you are an agent\n\nthe tools you may spawn[user]say ok"
+    )
+
+
+def test_a_conversation_whose_system_turn_is_already_first_is_never_rewritten() -> None:
+    opening: tuple[ChatMessage, ...] = (
+        {"role": "system", "content": "you are an agent"},
+        {"role": "user", "content": "say ok"},
+    )
+    assert STRICT.render(Chat(opening)) == "[sys]you are an agent[user]say ok"
+
+
+def test_a_turn_the_template_drops_counts_as_one_it_cannot_keep() -> None:
+    """Dropping is the failure the probe exists for: nothing raises, and the instruction
+    silently never reaches the model."""
+    assert TAIL_ONLY.render(Chat(INTERIOR)) == (
+        "[system]you are an agent\n\nthe tools you may spawn[user]say ok[assistant]ok"
+    )
+
+
+def test_the_same_template_answers_per_placement() -> None:
+    """`TAIL_ONLY` keeps a system turn that closes the conversation and drops one that does
+    not, so one answer for the template would be wrong for one of the two."""
+    assert TAIL_ONLY.keeps_system(trailing=True, tools=(), effort="auto")
+    assert not TAIL_ONLY.keeps_system(trailing=False, tools=(), effort="auto")
+
+
+def test_a_system_turn_carrying_an_image_is_left_where_it_is() -> None:
+    """Merging it would move the picture out of the order the markers are counted in. Every
+    template that refuses the placement refuses images in a system turn anyway."""
+    held: tuple[ChatMessage, ...] = (
+        {"role": "user", "content": "say ok"},
+        {
+            "role": "system",
+            "content": [{"type": "image", "image": Image(np.zeros((4, 4, 3), dtype=np.uint8))}],
+        },
+    )
+    with pytest.raises(jinja2.TemplateError):
+        STRICT.render(Chat(held))
+
+
+def test_the_probe_is_rendered_once_per_question() -> None:
+    """It costs a render, and what it answers is a property of the template."""
+    template = ChatTemplate.from_source(LOOSE.source)
+    counted = 0
+    original = template.template.render
+
+    def counting(**kwargs: object) -> str:
+        nonlocal counted
+        counted += 1
+        return original(**kwargs)
+
+    object.__setattr__(template.template, "render", counting)
+    template.render(Chat(MIDWAY))
+    template.render(Chat(MIDWAY))
+    # Two conversations, and the one probe they share.
+    assert counted == 3

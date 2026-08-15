@@ -21,7 +21,7 @@ fluent, wrong text.
 
 import json
 from collections.abc import Callable, Iterator, Mapping, Sequence
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from datetime import datetime
 from pathlib import Path
 from typing import Literal, NotRequired, Protocol, TypedDict, runtime_checkable
@@ -300,6 +300,42 @@ def _compile(source: str, now: Callable[[], datetime]) -> jinja2.Template:
     )
 
 
+_PROBE_USER = "omnia:asked"
+_PROBE_SYSTEM = "omnia:told"
+_PROBE_ASSISTANT = "omnia:answered"
+
+
+def _plain(content: str | Sequence[ContentPart]) -> str | None:
+    """The text of a turn, or `None` when it holds a part that is not text."""
+    if isinstance(content, str):
+        return content
+    said: list[str] = []
+    for part in content:
+        if part["type"] != "text":
+            return None
+        said.append(part["text"])
+    return "".join(said)
+
+
+def _merged_system(messages: tuple[ChatMessage, ...]) -> tuple[ChatMessage, ...] | None:
+    """Every system turn as one, at the front. `None` when one of them carries something
+    other than text and cannot be moved."""
+    said: list[str] = []
+    rest: list[ChatMessage] = []
+    for message in messages:
+        if message["role"] != "system":
+            rest.append(message)
+            continue
+        text = _plain(message["content"])
+        if text is None:
+            return None
+        if text:
+            said.append(text)
+    if not said:
+        return tuple(rest)
+    return ({"role": "system", "content": "\n\n".join(said)}, *rest)
+
+
 @dataclass(frozen=True)
 class ChatTemplate:
     template: jinja2.Template
@@ -310,6 +346,12 @@ class ChatTemplate:
     writes the assistant's own calls when it replays a history, so the envelope it spells is
     the envelope the model emits. Guessed from the generated text instead, Qwen3.6's marker
     reads as Qwen's and its XML call goes to a parser that cannot read it."""
+
+    _keeps_system: dict[tuple[bool, bool, Effort], bool] = field(
+        default_factory=dict, compare=False, repr=False
+    )
+    """What the probe below has already answered for this template. Rendering markers costs
+    one render, and the answer is a property of the template rather than of a conversation."""
 
     @classmethod
     def from_source(
@@ -339,6 +381,56 @@ class ChatTemplate:
         """
         return "tool_calls" in self.source
 
+    def keeps_system(
+        self, *, trailing: bool, tools: Sequence[Mapping[str, object]], effort: Effort
+    ) -> bool:
+        """Whether this template renders a system turn where the conversation puts it.
+
+        Answered by rendering markers rather than by reading the source: a template can
+        refuse the turn (`raise_exception('System message must be at the beginning.')`,
+        which the whole Qwen3 family does), drop it, or move it to the front, and only the
+        first of those is visible in the text. What the probe checks is that all three
+        markers came out in the order they went in.
+
+        `trailing` and the presence of tools are separate questions because templates branch
+        on both — Qwen3.8 renders the opening system turn inside its tools block — and the
+        effort is in the key for the same reason: the kwargs it turns into are read by the
+        same branches. What the tools *are* is not in the key; where a system turn lands
+        does not depend on which functions were declared.
+        """
+        key = (trailing, bool(tools), effort)
+        known = self._keeps_system.get(key)
+        if known is not None:
+            return known
+        probe: list[ChatMessage] = [
+            {"role": "user", "content": _PROBE_USER},
+            {"role": "system", "content": _PROBE_SYSTEM},
+        ]
+        marks = [_PROBE_USER, _PROBE_SYSTEM]
+        if not trailing:
+            probe.append({"role": "assistant", "content": _PROBE_ASSISTANT})
+            marks.append(_PROBE_ASSISTANT)
+        try:
+            rendered = self.template.render(
+                messages=probe,
+                tools=list(tools) or None,
+                documents=None,
+                add_generation_prompt=True,
+                **self.special_tokens,
+                **_thinking(effort),
+            )
+        except Exception:
+            # Any failure to render the probe is the same answer: this template cannot be
+            # handed the turn where it sits. Which exception it was is the template's own
+            # business — they raise `TemplateError` by hand, and reach for the undefined and
+            # the wrong type by accident.
+            kept = False
+        else:
+            at = [rendered.find(mark) for mark in marks]
+            kept = all(found >= 0 for found in at) and at == sorted(at)
+        self._keeps_system[key] = kept
+        return kept
+
     def render(self, chat: Chat, *, add_generation_prompt: bool = True) -> str:
         return self.template.render(
             messages=list(self._messages(chat)),
@@ -348,6 +440,42 @@ class ChatTemplate:
             **self.special_tokens,
             **_thinking(chat.reasoning_effort),
         )
+
+    def _placed(self, chat: Chat) -> tuple[ChatMessage, ...]:
+        """The conversation with its system turns where this template can read them.
+
+        A client may put a system turn after the conversation has started — Claude Code
+        sends one on every request, carrying the agents it offers — and upstream keeps it
+        there. Templates disagree about whether that is renderable at all, so the probe is
+        asked and the answer decides: a template that keeps the turn gets the conversation
+        untouched, and the prefix already in the trie stays valid.
+
+        A template that does not gets every system turn merged into one at the front. That
+        moves the instruction ahead of the words it was written after, which is a different
+        prompt — and the alternative is a 500 on every request from that client.
+
+        A system turn carrying anything but text is left alone: merging it would move an
+        image out of the order the markers are counted in, and every template that refuses
+        the placement refuses images in a system turn anyway.
+        """
+        messages = chat.messages
+        loose = [
+            index
+            for index, message in enumerate(messages)
+            if index > 0 and message["role"] == "system"
+        ]
+        if not loose:
+            return messages
+        last = len(messages) - 1
+        if all(
+            self.keeps_system(
+                trailing=index == last, tools=chat.tools, effort=chat.reasoning_effort
+            )
+            for index in loose
+        ):
+            return messages
+        merged = _merged_system(messages)
+        return messages if merged is None else merged
 
     def _messages(self, chat: Chat) -> Iterator[ChatMessage]:
         """The conversation as this template can read it.
@@ -360,7 +488,7 @@ class ChatTemplate:
         gets to see.
         """
         family = None if self.replays_calls or (parser := self.parser) is None else parser.tools
-        for message in chat.messages:
+        for message in self._placed(chat):
             calls = message.get("tool_calls")
             if family is None or not calls:
                 yield message

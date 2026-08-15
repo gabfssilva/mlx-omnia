@@ -531,6 +531,37 @@ def test_the_system_field_becomes_the_first_turn_and_nothing_else_does(
     assert only_text(blocks) == only_text(named)
 
 
+def test_the_billing_header_never_reaches_the_prompt(client: anthropic.Anthropic) -> None:
+    """Claude Code opens `system` with a block addressed to upstream's billing. It instructs
+    this checkpoint in nothing and sits at the front of the prefix every request reuses, so
+    it is dropped — and the blocks after it are joined exactly as they were."""
+    reply = ask(
+        client,
+        "Hello",
+        system=[
+            {
+                "type": "text",
+                "text": "x-anthropic-billing-header: cc_version=2.1.233; cc_entrypoint=sdk-cli;",
+            },
+            {"type": "text", "text": "Answer in one word."},
+        ],
+    )
+    assert only_text(reply) == rendered(("system", "Answer in one word."), ("user", "Hello"))
+
+
+def test_a_system_field_that_is_only_the_billing_header_opens_no_turn(
+    client: anthropic.Anthropic,
+) -> None:
+    """What is left is nothing, and a system turn holding nothing is a turn the template
+    should never have been handed."""
+    reply = ask(
+        client,
+        "Hello",
+        system=[{"type": "text", "text": "x-anthropic-billing-header: cc_version=2.1.233;"}],
+    )
+    assert only_text(reply) == rendered(("user", "Hello"))
+
+
 def test_a_profile_fills_the_system_the_request_left_out(client: anthropic.Anthropic) -> None:
     """`model:profile` is how a dialect with no field for a preset selects one. Its prompt
     becomes the conversation's first turn, and it loses to a request that sent one of its

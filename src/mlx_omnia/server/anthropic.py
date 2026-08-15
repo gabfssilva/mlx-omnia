@@ -397,6 +397,22 @@ def _text(content: str | list[TextBlock]) -> str:
     return content if isinstance(content, str) else "".join(block.text for block in content)
 
 
+_BILLING = "x-anthropic-billing-header:"
+
+
+def _system(content: str | list[TextBlock]) -> str:
+    """The system prompt, without the block that is not one.
+
+    Claude Code opens `system` with `x-anthropic-billing-header: cc_version=…;
+    cc_entrypoint=…;` on every request. It is metadata for upstream's billing, addressed to
+    a server this is not: it instructs a local checkpoint in nothing, and it sits at the
+    front of the system prompt, which is the stretch of the prefix every request reuses.
+    """
+    if isinstance(content, str):
+        return content
+    return "".join(block.text for block in content if not block.text.startswith(_BILLING))
+
+
 class Blocks:
     """The answer as blocks, in the order the model wrote them: one block per run of a
     channel, and consecutive pieces of the same channel in the same block.
@@ -510,9 +526,13 @@ def _shown(request: Conversation) -> bool:
 def _conversation(request: Conversation, preset: str | None, effort: Effort | None = None) -> Chat:
     """The translation this dialect exists for: `system` is a field on the way in and the
     first turn on the way out. The profile's prompt fills it only when the request left it
-    out — the same precedence the sampling knobs below follow, `effort` included."""
-    system = _text(request.system) if request.system is not None else preset
-    turns: list[Turn] = [] if system is None else [{"role": "system", "content": system}]
+    out — the same precedence the sampling knobs below follow, `effort` included.
+
+    A system that comes out empty opens no turn. It is what a request whose whole `system`
+    was the billing header leaves behind, and an empty system turn is a marker pair in the
+    prompt saying nothing."""
+    system = _system(request.system) if request.system is not None else preset
+    turns: list[Turn] = [] if not system else [{"role": "system", "content": system}]
     for message in request.messages:
         turns += _turns(message)
     return Chat(tuple(turns), tools=_tools(request), reasoning_effort=_thinks(request, effort))

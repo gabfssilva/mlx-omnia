@@ -11,11 +11,13 @@ import SwiftUI
 
 struct DaemonSettings: View {
     @Bindable var app: AppModel
+    @Binding var picking: Tier?
 
     var body: some View {
         Engine(app: app)
         Prefixes(app: app)
         Endpoints(app: app)
+        IntegrationsSection(app: app, picking: $picking)
         Storage(app: app)
         Appearance(app: app)
         Fixed(app: app)
