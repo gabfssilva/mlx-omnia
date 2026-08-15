@@ -7,13 +7,6 @@ name: publish
 on:
   release:
     types: [published]
-  workflow_dispatch:
-    inputs:
-      repository:
-        description: "index to publish to"
-        type: choice
-        options: ["testpypi", "pypi"]
-        default: "testpypi"
 
 jobs:
   build:
@@ -30,7 +23,6 @@ jobs:
       - run: uvx twine check dist/*
 
       - name: the built version is the tag
-        if: github.event_name == 'release'
         run: |
           built=$(ls dist/*.whl | sed -E 's|.*/mlx_omnia-(.+)-py3-none-any\.whl|\1|')
           if [ "$built" != "${GITHUB_REF_NAME#v}" ]; then
@@ -49,7 +41,7 @@ jobs:
     # Trusted publishing: PyPI verifies this workflow's OIDC token, so there is no API
     # token to store or rotate. It requires a pending publisher registered on PyPI for
     # the project, pointing at this repository, this file, and this environment.
-    environment: ${{ inputs.repository == 'testpypi' && 'testpypi' || 'pypi' }}
+    environment: pypi
     permissions:
       id-token: write
     steps:
@@ -58,7 +50,4 @@ jobs:
         with:
           name: dist
           path: dist/
-      - run: >
-          uv publish
-          --trusted-publishing always
-          ${{ inputs.repository == 'testpypi' && '--publish-url https://test.pypi.org/legacy/' || '' }}
+      - run: uv publish --trusted-publishing always
