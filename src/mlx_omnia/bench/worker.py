@@ -12,7 +12,10 @@ is a constraint worth stating: the baseline ref has to be source-compatible with
 environment, because `build` can only call an API that both sides have.
 
 A round is rejected and retried when the loaded clock dropped below the floor while it ran,
-up to the configured retry limit. Only a round measured at or above the floor is kept.
+up to the configured retry limit. Only a round measured at or above the floor is kept. That
+rule lives here and not next to the sampler for the reason the paragraph above gives: `gate`
+resolves to the tree under test, so a baseline side would judge its rounds by whatever policy
+its own revision shipped, and the two sides would be rejecting rounds by different rules.
 """
 
 import importlib
@@ -48,6 +51,37 @@ class Result(TypedDict):
     samples: list[dict[str, float | int]]
     clocks: list[int | None]
     modules: dict[str, str]
+
+
+LOADED = 0.5
+"""`gpu_active_ratio` at or above which a sample counts as taken under load."""
+
+
+def settled_mhz(
+    samples: Sequence[tuple[float, int, float]], start: float, end: float
+) -> int | None:
+    """The lowest clock the round *held* between `start` and `end`, or `None` when no sample
+    inside it was taken under load — a round short enough to fall between two samples is not
+    evidence of throttling, and treating it as such would fail good rounds.
+
+    Not the plain minimum over the window. The gate hands every round a cold GPU and a cold
+    GPU is a slow one: it idles at 338 MHz on this machine and takes ~250 ms to reach 1620,
+    so the opening samples describe the climb out of idle rather than the round, and whether
+    one of them lands inside the window at all is the 100 ms sampler's phase against the
+    round's start — luck, measured as throttling. A sample the next one exceeds is part of
+    that climb. What survives it is what the round ran at.
+
+    The last sample survives whatever happens: a window that only ever rises never settled
+    anywhere, and dropping all of it would read the round that ran below the floor from end
+    to end as no evidence at all.
+    """
+    loaded = [mhz for at, mhz, ratio in samples if start <= at <= end and ratio >= LOADED]
+    if not loaded:
+        return None
+    ramp = 0
+    while ramp + 1 < len(loaded) and loaded[ramp + 1] > loaded[ramp]:
+        ramp += 1
+    return min(loaded[ramp:])
 
 
 def entry(build: str) -> object:
@@ -89,7 +123,7 @@ def measure(arm: Arm, payload: Payload) -> Result:
                 start = time.time()
                 sample = arm.timed(prompt, script)
                 end = time.time()
-                mhz = None if clocks is None else clocks.min_loaded_mhz(start, end)
+                mhz = None if clocks is None else settled_mhz(clocks.samples, start, end)
                 if mhz is None or mhz >= payload["floor_mhz"]:
                     samples.append(sample)
                     measured.append(mhz)

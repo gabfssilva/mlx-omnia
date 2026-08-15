@@ -117,9 +117,16 @@ enum Recipes {
             guard !chosen.isEmpty else { return nil }
             // The base URL stops at the dialect and not at its version: the Anthropic SDK
             // appends `/v1/messages` itself.
+            //
+            // The other two are fixed, not a tier: a local checkpoint decodes far slower than
+            // the Anthropic API, so the SDK's own timeout is too short for it, and there is no
+            // Anthropic account behind this token for Claude Code's background traffic to
+            // reach.
             let head = [
                 "ANTHROPIC_BASE_URL=\(shell(wiring.anthropic))",
                 "ANTHROPIC_AUTH_TOKEN=\(shell(wiring.token))",
+                "API_TIMEOUT_MS=3000000",
+                "CLAUDE_CODE_DISABLE_NONESSENTIAL_TRAFFIC=1",
             ]
             return (head + chosen + ["claude"]).joined(separator: " ")
         }

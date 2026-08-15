@@ -10,6 +10,62 @@ final class ChatTests: XCTestCase {
         XCTAssertTrue(body.contains("ScrollGeometry"))
     }
 
+    /// The reader scrolls against the height the scroll view reports, so it has to be the
+    /// height there is. A lazy stack reports what it has built and revises it as the last turn
+    /// grows, and past the end of that number is a viewport with no turn in it.
+    func testTheTranscriptGrowsByWhatTheTurnBeingWrittenGrewBy() {
+        let paragraph = "The decode step reads every active weight once per token, which is "
+            + "what makes it bandwidth-bound.\n\n"
+        let app = AppModel()
+        app.chat.turns = (0..<8).map { index in
+            var made = Turn(role: index.isMultiple(of: 2) ? "user" : "assistant")
+            made.text = "## Turn \(index)\n\n" + String(repeating: paragraph, count: 3)
+            return made
+        }
+        let written = app.chat.turns[7].text
+        let host = hosted(Transcript(app: app, openHistory: {}))
+        let before = content(host)
+
+        app.chat.turns[7].text = written + paragraph
+        settle(host)
+
+        // What the paragraph is worth on its own, so the transcript is held to the thing that
+        // grew rather than to a number written down here.
+        let grew = hosted(Prose(text: written + paragraph)).fittingSize.height
+            - hosted(Prose(text: written)).fittingSize.height
+
+        XCTAssertEqual(content(host) - before, grew, accuracy: 2)
+    }
+
+    /// The scroll view's document, which is the height the reader is scrolling against.
+    private func content(_ host: NSView) -> CGFloat {
+        func scroller(_ view: NSView) -> NSScrollView? {
+            if let found = view as? NSScrollView { return found }
+            return view.subviews.compactMap(scroller).first
+        }
+        return scroller(host)?.documentView?.frame.height ?? -1
+    }
+
+    private func hosted(_ view: some View) -> NSHostingView<AnyView> {
+        let host = NSHostingView(
+            rootView: AnyView(view.frame(width: 392).environment(\.tokens, .dark))
+        )
+        host.frame = NSRect(x: 0, y: 0, width: 392, height: 480)
+        let window = NSWindow(
+            contentRect: host.frame, styleMask: [.borderless], backing: .buffered, defer: false
+        )
+        window.contentView = host
+        settle(host)
+        return host
+    }
+
+    private func settle(_ host: NSView) {
+        for _ in 0..<8 {
+            host.layoutSubtreeIfNeeded()
+            RunLoop.current.run(until: Date().addingTimeInterval(0.02))
+        }
+    }
+
     func testExpandedThinkingControlsItsOwnScrollPosition() {
         var turn = Turn(role: "assistant")
         turn.reasoning = "Reasoning"

@@ -1391,6 +1391,12 @@ class Engine:
         def room() -> int:
             return 0 if model is None else self._concurrency(initial[0])
 
+        def waiting() -> bool:
+            """Whether anything is queued at all — a deque and a queue, no store behind
+            either. `room` is what reads the limits, and this is what keeps it off the path
+            a token takes."""
+            return bool(self._pending) or not self._queue.empty()
+
         async def join() -> _Member | None:
             assert model is not None, "no room is admitted for a group with no batcher"
             joining = self._next_batched(model, initial[0])
@@ -1422,7 +1428,7 @@ class Engine:
             job.state = "cancelled" if job.cancelled.is_set() else "completed"
 
         clock: Clock[_Generation, Segment] = Clock(
-            self._model_thread, tick, room=room, join=join, on_leave=leave
+            self._model_thread, tick, room=room, waiting=waiting, join=join, on_leave=leave
         )
         members = [await self._enlist(model, job) for job in initial]
         try:

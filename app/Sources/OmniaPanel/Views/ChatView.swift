@@ -144,9 +144,20 @@ struct Transcript: View {
         let live = chat.streaming ? app.store.live(chat.model) : nil
         ScrollViewReader { rail in
             ScrollView {
-                // Lazy: a conversation is taller than the panel, and a plain stack measures
-                // every turn ever said on every token of the one being written.
-                LazyVStack(alignment: .leading, spacing: 14) {
+                // Not lazy, though a conversation is taller than the panel and this measures
+                // every turn on every token of the one being written. A lazy stack has no
+                // height for a row it has not built, so what it reports as the content is
+                // whatever it happens to have realised — 2558 pt of a transcript 8346 pt tall,
+                // measured at forty turns — and it revises that while the last turn grows, by
+                // more than the turn grew. The reader scrolls against that number: past the
+                // end of it is a viewport with no row in it, which is the panel going blank
+                // mid-answer and coming back when you scroll up.
+                //
+                // The price is the whole transcript laid out per paint: 12 ms at eight turns,
+                // 24 at forty. Grouping the settled turns behind one `Equatable` view does not
+                // avoid it — measured, no difference — and it is still a fraction of what one
+                // turn cost before `Prose` was cut into pieces.
+                VStack(alignment: .leading, spacing: 14) {
                     Color.clear.frame(height: 1).id(Self.head)
                     if !chat.session.isEmpty { ThreadHead(app: app) }
                     if chat.turns.isEmpty {
@@ -251,7 +262,7 @@ struct TurnView: View {
         } else {
             VStack(alignment: .leading, spacing: 0) {
                 if !turn.reasoning.isEmpty { Thinking(turn: turn) }
-                if !turn.text.isEmpty { Prose(text: turn.text) }
+                if !turn.text.isEmpty { Prose(text: turn.text, writing: turn.writing) }
                 if turn.writing && turn.text.isEmpty && turn.reasoning.isEmpty {
                     Text("…").sans(12.5, t.fg3)
                 }
@@ -306,7 +317,7 @@ struct Thinking: View {
                     ScrollView {
                         // The same renderer the answer gets: a model that numbers its steps and
                         // quotes code while it thinks wrote markdown, whichever channel it went out on.
-                        Prose(text: turn.reasoning, size: 11.5, tone: t.fg2)
+                        Prose(text: turn.reasoning, size: 11.5, tone: t.fg2, writing: turn.writing)
                             .frame(maxWidth: .infinity, alignment: .leading)
                             .padding(10)
                         Color.clear.frame(height: 1).id(Self.foot)

@@ -41,3 +41,5 @@ plans/
 
 # Regenerable test fixtures (see tests/fixtures/generate_*.py)
 tests/fixtures/*.safetensors
+reactive-streams-continous-batching.md
+stateful.md

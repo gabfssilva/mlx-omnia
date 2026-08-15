@@ -76,12 +76,14 @@ class Clock[S, T]:
         tick: Callable[[Sequence[Member[S, T]]], Sequence[Emission[S, T]]],
         *,
         room: Callable[[], int],
+        waiting: Callable[[], bool],
         join: Callable[[], Awaitable[Member[S, T] | None]],
         on_leave: Callable[[Member[S, T]], None],
     ) -> None:
         self._executor = executor
         self._tick = tick
         self._room = room
+        self._waiting = waiting
         self._join = join
         self._on_leave = on_leave
 
@@ -104,7 +106,12 @@ class Clock[S, T]:
             # A joiner queued while this tick ran is only visible to the queue's own
             # consumer after the loop has had a turn.
             await asyncio.sleep(0)
-            while len(active) < self._room():
+            # `waiting` before `room`, and that order is the whole of it: how much room there
+            # is comes out of the store, and asking it once per token — for a queue that is
+            # empty on every one of them — put two SQLite reads on the decode's critical
+            # path. What is cheap is whether anybody is queued at all, and when nobody is,
+            # the size of the group that would take them changes nothing.
+            while self._waiting() and len(active) < self._room():
                 joiner = await self._join()
                 if joiner is None:
                     break

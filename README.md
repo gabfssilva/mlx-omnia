@@ -8,7 +8,7 @@
   <a href="https://github.com/gabfssilva/mlx-omnia/blob/main/LICENSE"><img src="https://img.shields.io/github/license/gabfssilva/mlx-omnia" alt="License"></a>
 </p>
 
-> **Work in progress.** APIs, model coverage, and internals change without notice.
+> **Work in progress.** APIs, model coverage, and internals may (and probably will) change without notice.
 
 mlx-omnia is an open-source inference engine for Apple Silicon. It is written in Python and [Metal Shading Language](https://developer.apple.com/metal/Metal-Shading-Language-Specification.pdf) on top of [MLX](https://github.com/ml-explore/mlx). Models run locally through a Python library, a command-line client, a macOS menu bar app, or APIs compatible with OpenAI, Anthropic and Gemini.
 

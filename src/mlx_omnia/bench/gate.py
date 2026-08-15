@@ -152,12 +152,9 @@ class Cool:
 
 
 class Clocks:
-    """macmon streamed on a thread. A window answers the minimum *loaded* clock inside it, or
-    `None` when no sample in it was under load — a round short enough to fall between two
-    samples is not evidence of throttling, and treating it as such would fail good rounds."""
-
-    LOADED = 0.5
-    """`gpu_active_ratio` at or above which a sample counts as taken under load."""
+    """macmon streamed on a thread: `(when, MHz, active ratio)` per sample, and nothing read
+    off them. What a window of them says about a round is `worker.settled_mhz`, which says
+    there why it is not a method here."""
 
     def __init__(self, path: str, interval_ms: int = 100) -> None:
         self.samples: list[tuple[float, int, float]] = []
@@ -178,12 +175,6 @@ class Clocks:
                 )
             except (ValueError, KeyError, TypeError):
                 continue
-
-    def min_loaded_mhz(self, start: float, end: float) -> int | None:
-        loaded = [
-            mhz for at, mhz, ratio in self.samples if start <= at <= end and ratio >= self.LOADED
-        ]
-        return min(loaded) if loaded else None
 
     def stop(self) -> None:
         self.process.terminate()

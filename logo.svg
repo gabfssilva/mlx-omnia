@@ -1,4 +1,10 @@
 <svg xmlns="http://www.w3.org/2000/svg" width="400" height="190" viewBox="0 0 400 190">
-  <text x="180" y="100" text-anchor="middle" font-family="'SF Mono', Menlo, 'JetBrains Mono', 'Roboto Mono', monospace" font-size="110" letter-spacing="0" fill="currentColor">mlx</text>
-  <text x="190" y="155" text-anchor="middle" font-family="'SF Mono', Menlo, 'JetBrains Mono', 'Roboto Mono', monospace" font-size="40" letter-spacing="19.5" fill="currentColor">omnia</text>
+  <style>
+    .brand { fill: #1f2328; }
+    @media (prefers-color-scheme: dark) {
+      .brand { fill: #e6edf3; }
+    }
+  </style>
+  <text x="180" y="100" text-anchor="middle" font-family="'SF Mono', Menlo, 'JetBrains Mono', 'Roboto Mono', monospace" font-size="110" letter-spacing="0" class="brand">mlx</text>
+  <text x="190" y="155" text-anchor="middle" font-family="'SF Mono', Menlo, 'JetBrains Mono', 'Roboto Mono', monospace" font-size="40" letter-spacing="19.5" class="brand">omnia</text>
 </svg>

@@ -102,7 +102,21 @@ private struct Engine: View {
                     .mono(11.5, key == nil ? t.fg3 : t.fg2)
                     .lineLimit(1).truncationMode(.middle)
             }
+
+            SettingRow(label: "Concurrent requests") {
+                Text("\(Int(concurrency))").mono(11.5, t.fg2)
+                Nudge(
+                    down: concurrency > 1
+                        ? { patch(app, "max_concurrent_requests", .whole(Int(concurrency - 1))) } : nil,
+                    up: { patch(app, "max_concurrent_requests", .whole(Int(concurrency + 1))) }
+                )
+            }
+            SettingNote(text: "The ceiling a model's own batch limit is capped against.")
         }
+    }
+
+    private var concurrency: Double {
+        app.store.config["max_concurrent_requests"]?.value.number ?? 1
     }
 
     /// The ceiling in gibibyte steps: a slider that lands on 119.6 writes a number nobody
@@ -248,8 +262,8 @@ private struct Appearance: View {
 
 // ── what the daemon keeps and does not read ──────────────────────────────
 
-/// Two values the daemon stores and acts on with nothing. They are drawn as facts, beside
-/// the API key, rather than as controls with an apology under them.
+/// One value the daemon stores and acts on with nothing. It is drawn as a fact, rather than
+/// a control with an apology under it.
 private struct Fixed: View {
     @Environment(\.tokens) private var t
     @Bindable var app: AppModel
@@ -258,12 +272,7 @@ private struct Fixed: View {
         let store = app.store
         SectionHead(title: "Fixed")
         SettingsGroup {
-            SettingRow(label: "Concurrent requests", first: true) {
-                Text(store.config["max_concurrent_requests"]?.value.number.map { "\(Int($0))" } ?? "1")
-                    .mono(11.5, t.fg2)
-            }
-            SettingNote(text: "One at a time until continuous batching lands.")
-            SettingRow(label: "Catalog directory") {
+            SettingRow(label: "Catalog directory", first: true) {
                 Text(store.config["catalog_directory"]?.value.text ?? "—")
                     .mono(11.5, t.fg2)
                     .lineLimit(1).truncationMode(.head)

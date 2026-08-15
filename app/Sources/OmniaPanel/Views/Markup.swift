@@ -327,6 +327,162 @@ extension Markup {
     }
 }
 
+// ── a document that is still arriving ────────────────────────────────────
+
+extension Markup {
+    /// The spacing the block styles below declare, font-relative. Named because a document cut
+    /// in pieces has to put back the air between them, and a number spelled in two places is a
+    /// gap that changes in one of them.
+    ///
+    /// Textual collapses the two sides the way CSS margins do — the gap between blocks is the
+    /// larger of what the one above asks below itself and the one below asks above — so what a
+    /// block asks below itself only ever matters where it is the larger of the two, which in
+    /// this set is the rule alone.
+    enum Gap {
+        static let block: CGFloat = 0.64
+        static let heading: CGFloat = 1.1
+        /// Tables and rules, which stand further off what precedes them.
+        static let apart: CGFloat = 0.8
+    }
+
+    /// Every place a document still being written can be cut, so that what is above a cut
+    /// cannot change when the rest of it arrives.
+    ///
+    /// A markdown block ends at a blank line, so a block that starts after one is settled —
+    /// with the three exceptions this takes out. A blank line inside a fence is content and
+    /// not a boundary. A block that *continues* what is above it — a list item, a quote line,
+    /// a table row — would be cut out of the construct it belongs to and drawn as its own: a
+    /// list cut in two is two lists, and an ordered one starts again at 1. And the line the
+    /// answer stops in the middle of is not read at all, because what it is is not settled
+    /// either: `1` is a paragraph and `1.` is a list, and a boundary that was there for one
+    /// token and gone the next would reopen a piece that had closed.
+    static func boundaries(_ text: String) -> [String.Index] {
+        var found: [String.Index] = []
+        var fenced = false
+        var blank = false
+        var index = text.startIndex
+        while index < text.endIndex {
+            let end = text[index...].firstIndex(of: "\n") ?? text.endIndex
+            guard end < text.endIndex else { break }
+            let line = text[index..<end]
+            if line.hasPrefix("```") {
+                if fenced { blank = false } else if blank { found.append(index) }
+                fenced.toggle()
+            } else if fenced {
+                blank = false
+            } else if line.allSatisfy(\.isWhitespace) {
+                blank = true
+            } else {
+                if blank, opens(line) { found.append(index) }
+                blank = false
+            }
+            index = text.index(after: end)
+        }
+        return found
+    }
+
+    /// Whether a line starts a block rather than carrying one on. Four spaces or a tab is an
+    /// indented code block or a nested item, and either way it belongs to what is above it.
+    private static func opens(_ line: Substring) -> Bool {
+        if line.hasPrefix("    ") || line.hasPrefix("\t") { return false }
+        guard let first = line.first(where: { !$0.isWhitespace }) else { return false }
+        if ruled(line) { return true }
+        return !"-*+>|".contains(first) && !ordered(line)
+    }
+
+    /// A line of nothing but the same rule character, three or more: a thematic break, which
+    /// is a block of its own and not a list item however much it looks like three bullets.
+    private static func ruled(_ line: Substring) -> Bool {
+        let marks = line.filter { !$0.isWhitespace }
+        guard let mark = marks.first, marks.count >= 3 else { return false }
+        return "-*_".contains(mark) && marks.allSatisfy { $0 == mark }
+    }
+
+    private static func ordered(_ line: Substring) -> Bool {
+        let body = line.drop(while: \.isWhitespace)
+        let digits = body.prefix(while: \.isNumber)
+        guard !digits.isEmpty else { return false }
+        let after = body[digits.endIndex...]
+        return after.hasPrefix(".") || after.hasPrefix(")")
+    }
+
+    /// The air a document would have left between these two pieces, font-relative.
+    static func gap(after previous: Substring?, before next: Substring) -> CGFloat {
+        guard let previous else { return 0 }
+        return max(under(previous), over(next))
+    }
+
+    /// What the block a piece ends with asks below itself. Only a rule asks for more than the
+    /// block after it does, so only a rule is read here.
+    private static func under(_ piece: Substring) -> CGFloat {
+        let last = piece.split(separator: "\n", omittingEmptySubsequences: true).last ?? ""
+        return ruled(last) ? Gap.apart : 0
+    }
+
+    /// What the block a piece starts with asks above itself.
+    private static func over(_ piece: Substring) -> CGFloat {
+        let lines = piece.split(separator: "\n", omittingEmptySubsequences: false)
+        guard let first = lines.first else { return Gap.block }
+        if first.hasPrefix("#") { return Gap.heading }
+        if ruled(first) { return Gap.apart }
+        // A table whose header row carries no leading pipe is still a table, and the delimiter
+        // row under it is what says so.
+        guard let beneath = lines.dropFirst().first, beneath.contains("-") else { return Gap.block }
+        return beneath.allSatisfy { "-:| \t".contains($0) } ? Gap.apart : Gap.block
+    }
+
+    /// One piece of a document that is still arriving: where it starts — which is its identity,
+    /// because a boundary chosen from the text before it does not move when more lands after —
+    /// and the air that goes above it.
+    struct Piece: Identifiable {
+        let id: Int
+        let text: String
+        let gap: CGFloat
+    }
+
+    /// How long a settled piece grows before the next boundary closes it, in characters.
+    ///
+    /// The two costs it stands between: the open piece is redrawn whenever a block joins it,
+    /// so short pieces are redrawn cheaply — and every closed piece is a view of its own, so
+    /// short pieces mean many. Around a thousand characters that redraw is a few milliseconds,
+    /// which is where making them shorter stops buying anything a reader could see.
+    static let segment = 1200
+
+    /// A document being written, as the pieces it should be drawn in: the settled ones, then
+    /// the block still being written. `nil` when there is no safe boundary yet, which is a
+    /// document drawn whole.
+    ///
+    /// Every piece but the last is closed and will not change again, so drawing the answer
+    /// costs the block arriving rather than the answer so far.
+    static func written(_ text: String) -> (settled: [Piece], writing: Piece)? {
+        let found = boundaries(text)
+        guard let last = found.last else { return nil }
+        var settled: [Piece] = []
+        var start = text.startIndex
+        var at = 0
+        for boundary in found where boundary < last {
+            let length = text.distance(from: start, to: boundary)
+            guard length >= segment else { continue }
+            settled.append(piece(text, start..<boundary, at: at))
+            start = boundary
+            at += length
+        }
+        if start < last {
+            settled.append(piece(text, start..<last, at: at))
+            at += text.distance(from: start, to: last)
+        }
+        return (settled, piece(text, last..<text.endIndex, at: at))
+    }
+
+    private static func piece(_ text: String, _ range: Range<String.Index>, at: Int) -> Piece {
+        Piece(
+            id: at,
+            text: String(text[range]),
+            gap: gap(after: at == 0 ? nil : text[text.startIndex..<range.lowerBound], before: text[range])
+        )
+    }
+}
+
 // ── the drawing ──────────────────────────────────────────────────────────
 
 struct Prose: View {
@@ -338,9 +494,34 @@ struct Prose: View {
     var tone: Color?
     /// Whether a newline in it was meant — see `Markup.readable(_:breaking:)`.
     var breaks = false
+    /// Whether the rest of this text is still arriving.
+    ///
+    /// A turn being written is redrawn as often as the eye reads, and drawing a document costs
+    /// what the document is long: 7 ms at forty tokens and 190 at fourteen hundred, measured
+    /// through `ImageRenderer` at this width. Held as one view that is the answer so far, the
+    /// panel therefore lays out the whole answer twenty-five times a second, which saturates
+    /// the main thread from a few hundred tokens on — and the daemon decoding beside it pays
+    /// for the contention, a token at a time, in the number it reports back.
+    ///
+    /// Drawn in pieces, what is settled is a view whose input did not change, so it is neither
+    /// parsed nor laid out again; what is redrawn per frame is the block being written. The
+    /// same answer measured both ways, over the whole of its stream: 6.1 seconds of drawing
+    /// held as one document, 0.8 in pieces.
+    var writing = false
 
     var body: some View {
-        StructuredText(markdown: Markup.readable(text, breaking: breaks))
+        if writing, let (settled, open) = Markup.written(text) {
+            VStack(alignment: .leading, spacing: 0) {
+                ForEach(settled) { piece in document(piece.text).padding(.top, size * piece.gap) }
+                document(open.text).padding(.top, size * open.gap)
+            }
+        } else {
+            document(text)
+        }
+    }
+
+    private func document(_ part: String) -> some View {
+        StructuredText(markdown: Markup.readable(part, breaking: breaks))
             .font(.system(size: size))
             .foregroundStyle(tone ?? t.fg)
             .textual.structuredTextStyle(PanelStyle(t))
@@ -431,7 +612,7 @@ struct PanelHeadingStyle: StructuredText.HeadingStyle {
             .textual.fontScale(Self.scales[min(configuration.headingLevel, 6) - 1])
             .fontWeight(.semibold)
             .textual.lineSpacing(.fontScaled(0.16))
-            .textual.blockSpacing(.fontScaled(top: 1.1, bottom: 0.2))
+            .textual.blockSpacing(.fontScaled(top: Markup.Gap.heading, bottom: 0.2))
     }
 }
 
@@ -439,7 +620,7 @@ struct PanelParagraphStyle: StructuredText.ParagraphStyle {
     func makeBody(configuration: Configuration) -> some View {
         configuration.label
             .textual.lineSpacing(.fontScaled(0.28))
-            .textual.blockSpacing(.fontScaled(top: 0.64))
+            .textual.blockSpacing(.fontScaled(top: Markup.Gap.block))
     }
 }
 
@@ -458,7 +639,7 @@ struct PanelBlockQuoteStyle: StructuredText.BlockQuoteStyle {
                 .frame(maxWidth: .infinity, alignment: .leading)
         }
         .fixedSize(horizontal: false, vertical: true)
-        .textual.blockSpacing(.fontScaled(top: 0.64, bottom: 0.16))
+        .textual.blockSpacing(.fontScaled(top: Markup.Gap.block, bottom: 0.16))
     }
 }
 
@@ -494,7 +675,7 @@ struct PanelCodeBlockStyle: StructuredText.CodeBlockStyle {
         .background(t.elev)
         .overlay(RoundedRectangle(cornerRadius: 10).strokeBorder(t.hair, lineWidth: 1))
         .clipShape(RoundedRectangle(cornerRadius: 10))
-        .textual.blockSpacing(.fontScaled(top: 0.64, bottom: 0.16))
+        .textual.blockSpacing(.fontScaled(top: Markup.Gap.block, bottom: 0.16))
     }
 }
 
@@ -506,7 +687,7 @@ struct PanelTableStyle: StructuredText.TableStyle {
     func makeBody(configuration: Configuration) -> some View {
         configuration.label
             .textual.tableCellSpacing(horizontal: 1, vertical: 1)
-            .textual.blockSpacing(.fontScaled(top: 0.8, bottom: 0.4))
+            .textual.blockSpacing(.fontScaled(top: Markup.Gap.apart, bottom: 0.4))
             .textual.tableOverlay { layout in
                 Canvas { context, _ in
                     for divider in layout.dividers() {
@@ -540,6 +721,6 @@ struct PanelThematicBreakStyle: StructuredText.ThematicBreakStyle {
 
     func makeBody(configuration _: Configuration) -> some View {
         Rectangle().fill(t.hair).frame(height: 1)
-            .textual.blockSpacing(.fontScaled(top: 0.8, bottom: 0.8))
+            .textual.blockSpacing(.fontScaled(top: Markup.Gap.apart, bottom: 0.8))
     }
 }
