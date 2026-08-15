@@ -1,20 +1,20 @@
 """Bailing hybrid under continuous batching: a batch of rows matches the rows decoded alone.
 
 Tiny randomized weights, no checkpoint: what is under test is that the ragged batch path
-(`BatchedKVCache` over the MLA layers, `BatchedDeltaCache` over the KDA ones) reproduces the
-family's own forward row by row — semantics, not checkpoint numerics."""
+(`BatchedLatentKVCache` over the MLA layers, `BatchedDeltaCache` over the KDA ones)
+reproduces the family's own forward row by row — semantics, not checkpoint numerics."""
 
 import os
 
 os.environ.setdefault("MLX_ENABLE_TF32", "0")
 
 import mlx.core as mx
-import pytest
 from mlx.utils import tree_map
 
 from mlx_omnia.engine.batching import batch
-from mlx_omnia.engine.core.cache import DeltaCache, KVCache
+from mlx_omnia.engine.core.cache import DeltaCache
 from mlx_omnia.engine.models.bailing_hybrid.config import BailingHybridConfig
+from mlx_omnia.engine.models.bailing_hybrid.layers.cache import LatentKVCache
 from mlx_omnia.engine.models.bailing_hybrid.model import BailingHybrid
 
 
@@ -59,10 +59,6 @@ def tiny_model() -> BailingHybrid:
 PROMPTS = ([3, 14, 15, 9, 2], [27, 1, 8])
 
 
-@pytest.mark.xfail(
-    reason="bailing_hybrid MLA composes latent+k_pe at attend time; no adapter covers it",
-    strict=True,
-)
 def test_batched_rows_match_solo_rows() -> None:
     model = tiny_model()
     solo = [model.make_cache() for _ in PROMPTS]
@@ -86,14 +82,10 @@ def test_batched_rows_match_solo_rows() -> None:
         tokens = [mx.argmax(row, axis=-1).reshape(1) for row in rows]
 
 
-@pytest.mark.xfail(
-    reason="bailing_hybrid MLA composes latent+k_pe at attend time; no adapter covers it",
-    strict=True,
-)
 def test_rows_are_isolated() -> None:
     """Corrupting one row's cache must move that row and no other — cross-row leakage is
     the failure continuous batching invites. A hybrid carries two kinds of state, so both
-    the attention rows and the recurrent state of row 0 are poisoned."""
+    the latent rows and the recurrent state of row 0 are poisoned."""
     model = tiny_model()
     batched = [model.make_cache() for _ in PROMPTS]
     control = [model.make_cache() for _ in PROMPTS]
@@ -102,13 +94,14 @@ def test_rows_are_isolated() -> None:
         model(mx.array([prompt]), two)
 
     for layer in batched[0]:
-        if isinstance(layer, KVCache):
-            keys, values = layer.fetch()
-            layer.restore(layer.rows, {"keys": keys + 1.0, "values": values + 1.0})
+        if isinstance(layer, LatentKVCache):
+            latent, k_pe = layer.fetch()
+            layer.restore(layer.offset, {"keys": latent + 1.0, "values": k_pe + 1.0})
         elif isinstance(layer, DeltaCache):
-            state = layer.state
-            assert state is not None
+            state, window = layer.state, layer.window
+            assert state is not None and window is not None
             layer.state = state + 1.0
+            layer.window = window + 1.0
 
     tokens = mx.stack([mx.array([p[-1]]) for p in PROMPTS])
     dirty = model(tokens, batch(batched))[:, -1, :]

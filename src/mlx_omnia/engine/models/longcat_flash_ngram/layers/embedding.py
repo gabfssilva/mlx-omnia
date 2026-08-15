@@ -2,7 +2,7 @@ import mlx.core as mx
 import mlx.nn as nn
 
 from mlx_omnia.engine.models.longcat_flash_ngram.config import LongcatFlashNgramConfig
-from mlx_omnia.engine.models.longcat_flash_ngram.layers.cache import NgramCache
+from mlx_omnia.engine.models.longcat_flash_ngram.layers.cache import NgramStore
 
 
 class NgramEmbedding(nn.Module):
@@ -29,7 +29,7 @@ class NgramEmbedding(nn.Module):
         ]
         self._compute_vocab_mods()
 
-    def __call__(self, ids: mx.array, cache: NgramCache) -> mx.array:
+    def __call__(self, ids: mx.array, cache: NgramStore) -> mx.array:
         seq_len = ids.shape[-1]
         ids64 = ids.astype(mx.int64)
         context = cache.fetch_and_update(ids64)

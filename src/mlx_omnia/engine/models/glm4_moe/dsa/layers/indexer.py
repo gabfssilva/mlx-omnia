@@ -39,12 +39,13 @@ class Indexer(nn.Module):
     ) -> mx.array | None:
         """The columns each query may attend to, or None while the cache is short
         enough that every column survives."""
+        rows = x.shape[0]
         length = x.shape[1]
         offset = cache.offset
-        q = self.wq_b(qr).reshape(1, length, self.heads, self.head_dim).transpose(0, 2, 1, 3)
-        k = self.k_norm(self.wk(x)).reshape(1, 1, length, self.head_dim)
+        q = self.wq_b(qr).reshape(rows, length, self.heads, self.head_dim).transpose(0, 2, 1, 3)
+        k = self.k_norm(self.wk(x)).reshape(rows, 1, length, self.head_dim)
         keys, _ = cache.update_and_fetch(
-            self.rotate(k, offset), mx.zeros((1, 1, length, 0), dtype=k.dtype)
+            self.rotate(k, offset), mx.zeros((rows, 1, length, 0), dtype=k.dtype)
         )
         if keys.shape[2] <= self.topk:
             return None

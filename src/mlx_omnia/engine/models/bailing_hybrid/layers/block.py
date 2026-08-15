@@ -3,16 +3,24 @@ from collections.abc import Callable
 import mlx.core as mx
 import mlx.nn as nn
 
-from mlx_omnia.engine.core.cache import DeltaCache, KVCache, LayerCache
+from mlx_omnia.engine.core.cache import KVCache, LayerCache
 from mlx_omnia.engine.core.layers import SwiGLU, l2norm, swish
 from mlx_omnia.engine.models.bailing_hybrid.config import BailingHybridConfig
 from mlx_omnia.engine.models.bailing_hybrid.layers import flags, kda
-from mlx_omnia.engine.models.bailing_hybrid.layers.attention import BailingHybridLatentAttention
-from mlx_omnia.engine.models.bailing_hybrid.layers.kda import KimiDeltaAttention
+from mlx_omnia.engine.models.bailing_hybrid.layers.attention import (
+    BailingHybridLatentAttention,
+    LatentStore,
+)
+from mlx_omnia.engine.models.bailing_hybrid.layers.cache import BatchedLatentKVCache
+from mlx_omnia.engine.models.bailing_hybrid.layers.kda import KimiDeltaAttention, Recurring
 from mlx_omnia.engine.models.bailing_hybrid.layers.moe import BailingHybridMoE
 
 _DeltaStep = Callable[[mx.array, mx.array, mx.array], tuple[mx.array, mx.array, mx.array]]
 _TailStep = Callable[[mx.array, mx.array], mx.array]
+
+type BailingHybridLayer = LayerCache | LatentStore | Recurring
+"""A layer's cache, alone or standing for one row each: the MLA layers read a latent store,
+the KDA ones read `window`/`state`."""
 
 
 def _trace_key(block: "BailingHybridBlock") -> tuple[object, ...]:
@@ -58,27 +66,30 @@ class BailingHybridBlock(nn.Module):
         mixer = self.attention
         return isinstance(mixer, KimiDeltaAttention) and mixer.fits()
 
-    def __call__(self, x: mx.array, cache: LayerCache) -> mx.array:
+    def __call__(self, x: mx.array, cache: BailingHybridLayer) -> mx.array:
         # One mixer or the other; mlx.nn.Module's __getattr__ is untyped.
         mixer = self.attention
-        if x.shape[1] == 1 and flags.COMPILED_STEP:
+        # The compiled steps bake the batch axis into their trace, so a ragged batch of more
+        # than one row takes the eager path.
+        if x.shape[1] == 1 and x.shape[0] == 1 and flags.COMPILED_STEP:
             if self.attends:
                 # The MLA projections stay eager: mx.fast.rope takes the offset as an op
                 # attribute and a trace would freeze it at the first token.
                 assert isinstance(mixer, BailingHybridLatentAttention)
-                assert isinstance(cache, KVCache)
+                assert isinstance(cache, (KVCache, BatchedLatentKVCache))
                 projected = mixer(self.input_layernorm(x), cache)
                 self._rebuild()
                 return self._tail_step(x, projected)
             if self.delta_fits():
-                assert isinstance(cache, DeltaCache)
+                assert isinstance(cache, Recurring)
                 return self._compiled_delta(x, cache)
         normed = self.input_layernorm(x)
         if self.attends:
-            assert isinstance(mixer, BailingHybridLatentAttention) and isinstance(cache, KVCache)
+            assert isinstance(mixer, BailingHybridLatentAttention)
+            assert isinstance(cache, (KVCache, BatchedLatentKVCache))
             projected = mixer(normed, cache)
         else:
-            assert isinstance(mixer, KimiDeltaAttention) and isinstance(cache, DeltaCache)
+            assert isinstance(mixer, KimiDeltaAttention) and isinstance(cache, Recurring)
             projected = mixer(normed, cache)
         if x.shape[1] == 1:
             return self._tail(x, projected)
@@ -157,7 +168,7 @@ class BailingHybridBlock(nn.Module):
             else:
                 self._step = mx.compile(self._build_step(), inputs=self.state)
 
-    def _compiled_delta(self, x: mx.array, cache: DeltaCache) -> mx.array:
+    def _compiled_delta(self, x: mx.array, cache: Recurring) -> mx.array:
         config = self.config
         window = cache.window
         if window is None:

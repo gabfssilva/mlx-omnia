@@ -37,7 +37,7 @@ class Step3p7Block(nn.Module):
     ) -> mx.array:
         attended = x + self.self_attn(self.input_layernorm(x), cache, mask)
         h = self.post_attention_layernorm(attended)
-        kernels = self._kernels() if x.shape[1] == 1 else None
+        kernels = self._kernels() if x.shape[1] == 1 and x.shape[0] == 1 else None
         if kernels is not None:
             moe = self.moe
             route, gate_up, down = kernels

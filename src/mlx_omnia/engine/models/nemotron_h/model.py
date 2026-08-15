@@ -16,7 +16,7 @@ from mlx_omnia.engine.core.cache import (
 from mlx_omnia.engine.core.decode import DecodePlan, compiled_decode
 from mlx_omnia.engine.core.kernels.add_norm import RowsAddRmsNorm
 from mlx_omnia.engine.models.nemotron_h.config import ATTENTION, MAMBA, NemotronHConfig
-from mlx_omnia.engine.models.nemotron_h.layers.block import NemotronHBlock
+from mlx_omnia.engine.models.nemotron_h.layers.block import NemotronHBlock, NemotronHLayer
 from mlx_omnia.engine.models.nemotron_h.layers.mamba import NemotronHMamba
 
 
@@ -59,6 +59,8 @@ class NemotronHTrunk(nn.Module):
 
 
 class NemotronH(nn.Module):
+    continuous_batching = True
+
     def __init__(self, config: NemotronHConfig) -> None:
         super().__init__()
         self.config = config
@@ -352,17 +354,19 @@ class NemotronH(nn.Module):
         return verify, rewind
 
     def activations(
-        self, ids: mx.array, cache: list[LayerCache] | None = None
+        self, ids: mx.array, cache: Sequence[NemotronHLayer] | None = None
     ) -> NemotronHActivations:
-        cache = cache if cache is not None else self.make_cache()
+        layers: Sequence[NemotronHLayer] = self.make_cache() if cache is None else cache
         x = self.backbone.embeddings(ids)
         embeddings = x
         blocks: list[mx.array] = []
-        for block, layer_cache in zip(self.backbone.layers, cache, strict=True):
+        for block, layer_cache in zip(self.backbone.layers, layers, strict=True):
             x = block(x, layer_cache)
             blocks.append(x)
         normed = self.backbone.norm_f(x)
         return NemotronHActivations(embeddings, blocks, normed, self.lm_head(normed))
 
-    def __call__(self, ids: mx.array, cache: list[LayerCache] | None = None) -> mx.array:
+    def __call__(
+        self, ids: mx.array, cache: Sequence[NemotronHLayer] | None = None
+    ) -> mx.array:
         return self.activations(ids, cache).logits

@@ -1,4 +1,4 @@
-from collections.abc import Callable
+from collections.abc import Callable, Sequence
 
 import mlx.core as mx
 
@@ -172,3 +172,33 @@ class DeepseekV4Cache(LayerCache):
         if self.compressor is not None:
             raise NotImplementedError("a pooled window cannot be recompressed after a trim")
         self.attention.trim(length)
+
+    def batched(self, rows: Sequence[LayerCache]) -> "BatchedDeepseekV4Cache":
+        """This layer's rows as one ragged batch. The pools' state is scalar *per row* —
+        a partial tail, a remainder, a pooled length that differs between rows — so the
+        adapter holds the rows and the forward walks them, rather than stacking anything."""
+        held: list[DeepseekV4Cache] = []
+        for row in rows:
+            if not isinstance(row, DeepseekV4Cache):
+                raise TypeError(f"a batched deepseek_v4 layer mixes in {type(row).__name__}")
+            if (row.compressor is None) != (self.compressor is None) or (
+                row.indexer is None
+            ) != (self.indexer is None):
+                raise TypeError("a batched deepseek_v4 layer mixes compress ratios")
+            held.append(row)
+        return BatchedDeepseekV4Cache(held)
+
+
+class BatchedDeepseekV4Cache:
+    """N `DeepseekV4Cache`s as one ragged layer: the rows, and where each one stands."""
+
+    def __init__(self, caches: Sequence[DeepseekV4Cache]) -> None:
+        self._caches = tuple(caches)
+
+    @property
+    def rows(self) -> tuple[DeepseekV4Cache, ...]:
+        return self._caches
+
+    @property
+    def offset(self) -> mx.array:
+        return mx.array([cache.offset for cache in self._caches], dtype=mx.int32)

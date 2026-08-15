@@ -3,10 +3,9 @@ from collections.abc import Callable
 import mlx.core as mx
 import mlx.nn as nn
 
-from mlx_omnia.engine.core.cache import DeltaCache
 from mlx_omnia.engine.models.mamba2.config import Mamba2Config
 from mlx_omnia.engine.models.mamba2.layers import flags, ssd
-from mlx_omnia.engine.models.mamba2.layers.ssd import Mamba2Mixer
+from mlx_omnia.engine.models.mamba2.layers.ssd import Mamba2Mixer, Recurring
 
 _StepReturn = tuple[mx.array, mx.array, mx.array]
 
@@ -25,10 +24,11 @@ class Mamba2Block(nn.Module):
         if flags.COMPILED_STEP:
             self._step = mx.compile(self._build_step(), inputs=self.state)
 
-    def __call__(self, x: mx.array, cache: DeltaCache) -> mx.array:
+    def __call__(self, x: mx.array, cache: Recurring) -> mx.array:
         config = self.config
         if (
             x.shape[1] == 1
+            and x.shape[0] == 1
             and flags.COMPILED_STEP
             and flags.SSM_KERNEL
             and self._step is not None

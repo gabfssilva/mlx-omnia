@@ -1,9 +1,10 @@
 import math
+from typing import Protocol, runtime_checkable
 
 import mlx.core as mx
 import mlx.nn as nn
 
-from mlx_omnia.engine.core.cache import DeltaCache, FixedDeltaCache
+from mlx_omnia.engine.core.cache import FixedDeltaCache
 from mlx_omnia.engine.core.kernels.gated_delta import (
     GatedDelta,
     GatedDeltaStrategy,
@@ -13,6 +14,17 @@ from mlx_omnia.engine.models.qwen3_5.config import Qwen35TextConfig
 from mlx_omnia.engine.models.qwen3_5.layers import flags
 
 _L2_EPS = 1e-6
+
+
+@runtime_checkable
+class Recurring(Protocol):
+    """What the DeltaNet mixer reads a cache through: the conv window, the recurrent state,
+    and the offset it advances. `DeltaCache` answers it, and so does the ragged batch adapter
+    that stands for one `DeltaCache` per row."""
+
+    offset: int
+    window: mx.array | None
+    state: mx.array | None
 
 
 class Conv1dWeight(nn.Module):
@@ -79,7 +91,7 @@ class Qwen35DeltaNet(nn.Module):
             self._rule, self._rule_key = rule, key
         return rule
 
-    def _conv(self, x: mx.array, cache: DeltaCache) -> mx.array:
+    def _conv(self, x: mx.array, cache: Recurring) -> mx.array:
         """The depthwise causal conv unrolled into taps, then silu. `[1, T, conv_dim]`
         in and out; the window carries the `kernel - 1` rows of history."""
         config = self.config
@@ -87,7 +99,7 @@ class Qwen35DeltaNet(nn.Module):
         length = x.shape[1]
         window = cache.window
         if window is None:
-            window = mx.zeros((1, kernel - 1, config.conv_dim), dtype=x.dtype)
+            window = mx.zeros((x.shape[0], kernel - 1, config.conv_dim), dtype=x.dtype)
         padded = mx.concatenate([window, x], axis=1)
         taps = self.conv1d.weight
         mixed = padded[:, :length] * taps[:, 0]
@@ -180,9 +192,9 @@ class Qwen35DeltaNet(nn.Module):
         gated = (gated * gate * mx.sigmoid(gate)).astype(x.dtype)
         return self.out_proj(gated.reshape(1, length, config.value_dim))
 
-    def __call__(self, x: mx.array, cache: DeltaCache) -> mx.array:
+    def __call__(self, x: mx.array, cache: Recurring) -> mx.array:
         config = self.config
-        length = x.shape[1]
+        rows, length = x.shape[0], x.shape[1]
         heads = config.linear_num_value_heads
         key_heads = config.linear_num_key_heads
         fused = self.fused_proj(x)
@@ -195,9 +207,9 @@ class Qwen35DeltaNet(nn.Module):
 
         mixed = self._conv(qkv, cache)
         q, k, v = mx.split(mixed, (config.key_dim, 2 * config.key_dim), axis=-1)
-        key_shape = (1, length, key_heads, config.linear_key_head_dim)
+        key_shape = (rows, length, key_heads, config.linear_key_head_dim)
         q, k = q.reshape(key_shape), k.reshape(key_shape)
-        v = v.reshape(1, length, heads, config.linear_value_head_dim)
+        v = v.reshape(rows, length, heads, config.linear_value_head_dim)
 
         # g is the log decay: exp(A_log) never leaves float32, or it saturates.
         dt = a.astype(mx.float32) + self.dt_bias.astype(mx.float32)
@@ -210,7 +222,7 @@ class Qwen35DeltaNet(nn.Module):
         scale = 1 / math.sqrt(config.linear_key_head_dim)
         state = cache.state
         if state is None:
-            shape = (1, heads, config.linear_value_head_dim, config.linear_key_head_dim)
+            shape = (rows, heads, config.linear_value_head_dim, config.linear_key_head_dim)
             state = mx.zeros(shape, dtype=mx.float32)
         out, state = self.rule()(
             l2norm(q, scale, dtype=mx.float32),
@@ -233,7 +245,7 @@ class Qwen35DeltaNet(nn.Module):
         normed = lifted * mx.rsqrt(
             (lifted * lifted).mean(axis=-1, keepdims=True) + config.rms_norm_eps
         )
-        gate = z.reshape(1, length, heads, config.linear_value_head_dim).astype(mx.float32)
+        gate = z.reshape(rows, length, heads, config.linear_value_head_dim).astype(mx.float32)
         gated = self.norm.weight * normed.astype(out.dtype)
         gated = (gated * gate * mx.sigmoid(gate)).astype(x.dtype)
-        return self.out_proj(gated.reshape(1, length, config.value_dim))
+        return self.out_proj(gated.reshape(rows, length, config.value_dim))

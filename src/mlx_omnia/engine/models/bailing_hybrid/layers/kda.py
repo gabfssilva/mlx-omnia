@@ -1,7 +1,8 @@
+from typing import Protocol, runtime_checkable
+
 import mlx.core as mx
 import mlx.nn as nn
 
-from mlx_omnia.engine.core.cache import DeltaCache
 from mlx_omnia.engine.core.kernels.gated_delta import GatedDelta, gated_delta, gated_delta_applies
 from mlx_omnia.engine.core.layers import l2norm, swish
 from mlx_omnia.engine.models.bailing_hybrid.config import BailingHybridConfig
@@ -9,7 +10,18 @@ from mlx_omnia.engine.models.bailing_hybrid.layers import flags
 
 # `gated_delta` is re-exported: the compiled one-token step in `block.py` binds the
 # kernel directly, and its trace key reads it from here.
-__all__ = ["ConvWeight", "GatedRMSNorm", "KimiDeltaAttention", "gated_delta"]
+__all__ = ["ConvWeight", "GatedRMSNorm", "KimiDeltaAttention", "Recurring", "gated_delta"]
+
+
+@runtime_checkable
+class Recurring(Protocol):
+    """What KDA reads a cache through: the conv window, the recurrent state, and the offset
+    it advances. `DeltaCache` answers it, and so does the ragged adapter that stands for one
+    `DeltaCache` per row."""
+
+    offset: int
+    window: mx.array | None
+    state: mx.array | None
 
 
 class ConvWeight(nn.Module):
@@ -65,8 +77,8 @@ class KimiDeltaAttention(nn.Module):
             self._rule = rule
         return rule
 
-    def convolve(self, projected: mx.array, cache: DeltaCache) -> mx.array:
-        """q‖k‖v through their depthwise causal conv: `projected` is `[1, length, 3·width]`
+    def convolve(self, projected: mx.array, cache: Recurring) -> mx.array:
+        """q‖k‖v through their depthwise causal conv: `projected` is `[rows, length, 3·width]`
         and each channel multiplies its own tap row, so the three leaves the checkpoint
         keeps are one set of kernels here. The window carries `kernel - 1` rows."""
         config = self.config
@@ -74,7 +86,10 @@ class KimiDeltaAttention(nn.Module):
         length = projected.shape[1]
         window = cache.window
         if window is None:
-            window = mx.zeros((1, kernel - 1, 3 * config.linear_width), dtype=projected.dtype)
+            window = mx.zeros(
+                (projected.shape[0], kernel - 1, 3 * config.linear_width),
+                dtype=projected.dtype,
+            )
         padded = mx.concatenate([window, projected], axis=1)
         taps = self.conv1d.weight
         mixed = padded[:, :length] * taps[:, 0]
@@ -90,7 +105,7 @@ class KimiDeltaAttention(nn.Module):
         config = self.config
         heads, head_dim = config.num_attention_heads, config.head_dim
         gate = projected.astype(mx.float32) + self.dt_bias.astype(mx.float32)
-        gate = gate.reshape(1, length, heads, head_dim)
+        gate = gate.reshape(projected.shape[0], length, heads, head_dim)
         rate = mx.exp(self.A_log.astype(mx.float32)).reshape(1, 1, heads, 1)
         if config.kda_safe_gate:
             return mx.exp(config.kda_decay_lower_bound * mx.sigmoid(rate * gate))
@@ -104,21 +119,21 @@ class KimiDeltaAttention(nn.Module):
             config.head_dim, heads, heads, config.head_dim
         )
 
-    def __call__(self, x: mx.array, cache: DeltaCache) -> mx.array:
+    def __call__(self, x: mx.array, cache: Recurring) -> mx.array:
         config = self.config
-        length = x.shape[1]
+        rows, length = x.shape[0], x.shape[1]
         heads, head_dim = config.num_attention_heads, config.head_dim
         width = config.linear_width
         qkv, f, g, b = mx.split(self.fused_proj(x), self.splits, axis=-1)
         mixed = self.convolve(qkv, cache)
         q, k, v = (
-            part.reshape(1, length, heads, head_dim)
+            part.reshape(rows, length, heads, head_dim)
             for part in mx.split(mixed, (width, 2 * width), axis=-1)
         )
 
         state = cache.state
         if state is None:
-            state = mx.zeros((1, heads, head_dim, head_dim), dtype=mx.float32)
+            state = mx.zeros((rows, heads, head_dim, head_dim), dtype=mx.float32)
         out, state = self.rule()(
             l2norm(q, head_dim**-0.5, dtype=mx.float32),
             l2norm(k, dtype=mx.float32),
@@ -130,5 +145,5 @@ class KimiDeltaAttention(nn.Module):
         cache.state = state
         cache.offset += length
 
-        gated = self.o_norm(out.astype(x.dtype), g.reshape(1, length, heads, head_dim))
-        return self.o_proj(gated.reshape(1, length, width))
+        gated = self.o_norm(out.astype(x.dtype), g.reshape(rows, length, heads, head_dim))
+        return self.o_proj(gated.reshape(rows, length, width))

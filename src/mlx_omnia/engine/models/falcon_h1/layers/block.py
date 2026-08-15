@@ -1,11 +1,16 @@
 import mlx.core as mx
 import mlx.nn as nn
 
+from mlx_omnia.engine.core.attend import KVStore
+from mlx_omnia.engine.core.cache import LayerCache
 from mlx_omnia.engine.core.layers import SwiGLU
 from mlx_omnia.engine.models.falcon_h1.config import FalconH1Config
 from mlx_omnia.engine.models.falcon_h1.layers.attention import FalconH1Attention
-from mlx_omnia.engine.models.falcon_h1.layers.cache import FalconH1LayerCache
-from mlx_omnia.engine.models.falcon_h1.layers.mamba import FalconH1Mixer
+from mlx_omnia.engine.models.falcon_h1.layers.mamba import FalconH1Mixer, Recurring
+
+type FalconH1Layer = LayerCache | KVStore | Recurring
+"""A layer's cache, alone or standing for one row each. A block reads two of them: the
+mamba half through `window`/`state`, the attention half through `core.attend`."""
 
 
 class FalconH1DecoderLayer(nn.Module):
@@ -20,10 +25,10 @@ class FalconH1DecoderLayer(nn.Module):
         self.input_layernorm = nn.RMSNorm(config.hidden_size, eps=config.rms_norm_eps)
         self.pre_ff_layernorm = nn.RMSNorm(config.hidden_size, eps=config.rms_norm_eps)
 
-    def __call__(self, x: mx.array, cache: FalconH1LayerCache) -> mx.array:
+    def __call__(self, x: mx.array, mamba_cache: Recurring, kv_cache: KVStore) -> mx.array:
         h = self.input_layernorm(x)
-        mamba_h = self.mamba(h, cache.mamba)
-        attn_h = self.self_attn(h, cache.kv)
+        mamba_h = self.mamba(h, mamba_cache)
+        attn_h = self.self_attn(h, kv_cache)
         h = x + mamba_h + attn_h
         return h + self.mlp(self.pre_ff_layernorm(h))
 

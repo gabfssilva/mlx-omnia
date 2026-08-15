@@ -1,8 +1,11 @@
+from collections.abc import Sequence
 from typing import NamedTuple
 
 import mlx.core as mx
 import mlx.nn as nn
 
+from mlx_omnia.engine.batching import BatchedKVCache, BatchedSharedKVReader
+from mlx_omnia.engine.core.attend import KVStore
 from mlx_omnia.engine.core.cache import KVCache, SharedKVReader
 from mlx_omnia.engine.models.gemma3n.config import Gemma3nConfig, Gemma3nTextConfig
 from mlx_omnia.engine.models.gemma3n.layers.altup import rescale
@@ -42,6 +45,8 @@ class Gemma3nTrunk(nn.Module):
 
 
 class Gemma3n(nn.Module):
+    continuous_batching = True
+
     def __init__(self, config: Gemma3nConfig) -> None:
         super().__init__()
         self.config = config
@@ -77,7 +82,7 @@ class Gemma3n(nn.Module):
         return mx.tanh(logits / cap) * cap
 
     def activations(
-        self, ids: mx.array, cache: list[KVCache | SharedKVReader] | None = None
+        self, ids: mx.array, cache: Sequence[KVStore | SharedKVReader] | None = None
     ) -> Gemma3nActivations:
         config = self.text
         cache = cache if cache is not None else self.make_cache()
@@ -94,9 +99,13 @@ class Gemma3n(nn.Module):
         ):
             if layer >= config.first_shared_layer:
                 store = cache[config.reads_from(layer)]
-                assert isinstance(store, KVCache) and isinstance(layer_cache, SharedKVReader)
-                layer_cache.keys, layer_cache.values = store.fetch()
-                layer_cache.offset = store.offset - ids.shape[1]
+                if isinstance(layer_cache, BatchedSharedKVReader):
+                    assert isinstance(store, BatchedKVCache)
+                    layer_cache.adopt(store, ids.shape[1])
+                else:
+                    assert isinstance(store, KVCache) and isinstance(layer_cache, SharedKVReader)
+                    layer_cache.keys, layer_cache.values = store.fetch()
+                    layer_cache.offset = store.offset - ids.shape[1]
             x = block(x, layer_cache, per_layer[:, :, layer, :])
             blocks.append(x[config.altup_active_idx])
 
@@ -112,6 +121,6 @@ class Gemma3n(nn.Module):
         return Gemma3nActivations(embedded, blocks, normed, self.head(normed))
 
     def __call__(
-        self, ids: mx.array, cache: list[KVCache | SharedKVReader] | None = None
+        self, ids: mx.array, cache: Sequence[KVStore | SharedKVReader] | None = None
     ) -> mx.array:
         return self.activations(ids, cache).logits

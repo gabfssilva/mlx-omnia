@@ -1,9 +1,11 @@
 import math
-from typing import NamedTuple
+from collections.abc import Sequence
+from typing import NamedTuple, Protocol, runtime_checkable
 
 import mlx.core as mx
 import mlx.nn as nn
 
+from mlx_omnia.engine.core.attend import KVStore
 from mlx_omnia.engine.core.cache import KVCache, SharedKVReader
 from mlx_omnia.engine.models.gemma4.config import Gemma4Config, Gemma4TextConfig
 from mlx_omnia.engine.models.gemma4.layers.block import Gemma4Block
@@ -29,6 +31,15 @@ class Gemma4Trunk(nn.Module):
             self.per_layer_projection_norm = nn.RMSNorm(ple_dim, eps=config.rms_norm_eps)
 
 
+@runtime_checkable
+class Adopting(Protocol):
+    """The batched stand-in for a `SharedKVReader`: it takes its rows from the writer's
+    own batch adapter, one row at a time, because a ragged batch has no single pair of
+    published tensors. Declared structurally so the family does not import `batching`."""
+
+    def adopt(self, store: KVStore, length: int) -> None: ...
+
+
 class Gemma4Activations(NamedTuple):
     embeddings: mx.array
     blocks: list[mx.array]
@@ -37,6 +48,8 @@ class Gemma4Activations(NamedTuple):
 
 
 class Gemma4(nn.Module):
+    continuous_batching = True
+
     def __init__(self, config: Gemma4Config) -> None:
         super().__init__()
         self.config = config
@@ -71,38 +84,47 @@ class Gemma4(nn.Module):
     def activations(
         self,
         ids: mx.array,
-        cache: list[KVCache | SharedKVReader] | None = None,
+        cache: Sequence[KVStore | SharedKVReader] | None = None,
     ) -> Gemma4Activations:
         text = self.config.text_config
         types = text.attention_types
         cache = cache if cache is not None else self.make_cache()
+        length = ids.shape[1]
         x = self.embed(ids)
         embeddings = x
         per_layer_input = self._per_layer_inputs(ids)
         blocks: list[mx.array] = []
 
-        # Track shared KV: for each layer_type, the KVCache and pre-update offset
-        # of the storing layer. The offset is captured BEFORE the store layer runs,
-        # so the shared layer's q is rotated by the correct starting position.
-        shared_kv: dict[str, tuple[KVCache, int]] = {}
+        # Track shared KV: for each layer_type, the storing layer's cache and its
+        # pre-update offset. The offset is captured BEFORE the store layer runs, so the
+        # shared layer's q is rotated by the correct starting position.
+        stores: dict[str, KVStore | SharedKVReader] = {}
+        positions: dict[str, int] = {}
 
         for i, (block, layer_cache) in enumerate(
             zip(self.model.layers, cache, strict=True)
         ):
             # If this is a storing layer, capture its pre-update offset for shared layers.
             if text.store_full_length_kv(i):
-                assert isinstance(layer_cache, KVCache)
-                shared_kv[types[i]] = (layer_cache, layer_cache.offset)
+                stores[types[i]] = layer_cache
+                if isinstance(layer_cache, KVCache):
+                    positions[types[i]] = layer_cache.offset
 
             # If this is a shared layer, publish full-length KV from the store.
             # The keys/values are the store's post-update cache (includes current step);
             # the offset is the store's pre-update offset (the q starting position).
             if text.is_kv_shared_layer(i):
-                store_cache, store_offset = shared_kv[types[i]]
-                assert isinstance(store_cache, KVCache)
-                assert isinstance(layer_cache, SharedKVReader)
-                layer_cache.keys, layer_cache.values = store_cache.fetch()
-                layer_cache.offset = store_offset
+                store_cache = stores[types[i]]
+                if isinstance(layer_cache, Adopting):
+                    # Ragged rows have no one pair of tensors to publish; the adapter
+                    # takes the writer's rows, and derives the same pre-update offset.
+                    assert not isinstance(store_cache, SharedKVReader)
+                    layer_cache.adopt(store_cache, length)
+                else:
+                    assert isinstance(store_cache, KVCache)
+                    assert isinstance(layer_cache, SharedKVReader)
+                    layer_cache.keys, layer_cache.values = store_cache.fetch()
+                    layer_cache.offset = positions[types[i]]
 
             # Extract per-layer slice for this block.
             ple_slice = None
@@ -117,7 +139,7 @@ class Gemma4(nn.Module):
         return Gemma4Activations(embeddings, blocks, normed, logits)
 
     def __call__(
-        self, ids: mx.array, cache: list[KVCache | SharedKVReader] | None = None
+        self, ids: mx.array, cache: Sequence[KVStore | SharedKVReader] | None = None
     ) -> mx.array:
         return self.activations(ids, cache).logits
 
@@ -133,11 +155,12 @@ class Gemma4(nn.Module):
         ple_dim = cfg.hidden_size_per_layer_input
         n = cfg.num_hidden_layers
 
-        # Token-identity: scaled embedding lookup, reshaped to [1, S, n, ple_dim].
+        # Token-identity: scaled embedding lookup, reshaped to [B, S, n, ple_dim].
+        rows = ids.shape[0]
         ple_embed = self.model.embed_tokens_per_layer(ids)
         ple_scale = mx.array(math.sqrt(ple_dim), mx.float32).astype(ple_embed.dtype)
         token_identity = (ple_embed * ple_scale).reshape(
-            1, ple_embed.shape[1], n, ple_dim
+            rows, ple_embed.shape[1], n, ple_dim
         )
 
         # Context: project the SCALED main embedding → n*ple_dim, scale by 1/sqrt(hidden), norm.
@@ -149,7 +172,7 @@ class Gemma4(nn.Module):
         ctx_scale = mx.array(
             1.0 / math.sqrt(cfg.hidden_size), mx.float32
         ).astype(ctx.dtype)
-        ctx = (ctx * ctx_scale).reshape(1, ctx.shape[1], n, ple_dim)
+        ctx = (ctx * ctx_scale).reshape(rows, ctx.shape[1], n, ple_dim)
         ctx = self.model.per_layer_projection_norm(ctx)
 
         # Combine.

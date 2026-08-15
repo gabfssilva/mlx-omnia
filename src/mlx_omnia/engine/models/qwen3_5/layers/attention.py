@@ -5,7 +5,8 @@ import mlx.core as mx
 import mlx.nn as nn
 import numpy as np
 
-from mlx_omnia.engine.core.cache import FixedKVCache, KVCache
+from mlx_omnia.engine.core.attend import KVStore, attend
+from mlx_omnia.engine.core.cache import FixedKVCache
 from mlx_omnia.engine.models.qwen3_5.config import Qwen35TextConfig
 
 
@@ -57,8 +58,8 @@ class Qwen35Attention(nn.Module):
         inspection. A hand-rolled cos/sin would not be: the kernel uses
         `metal::fast::cos` while mlx's elementwise `cos` uses `metal::precise::cos`.
         """
-        _, length, heads, dims = x.shape
-        rows = x.reshape(length, heads, 1, dims)
+        batch, length, heads, dims = x.shape
+        rows = x.reshape(batch * length, heads, 1, dims)
         config = self.config
         rotated = [
             mx.fast.rope(
@@ -69,29 +70,29 @@ class Qwen35Attention(nn.Module):
         ]
         source = _mrope_sources(self.config)
         picked = mx.where(source == 2, rotated[2], mx.where(source == 1, rotated[1], rotated[0]))
-        return picked.reshape(1, length, heads, dims)
+        return picked.reshape(batch, length, heads, dims)
 
     def split_heads(self, x: mx.array) -> tuple[mx.array, mx.array, mx.array, mx.array]:
         config = self.config
-        length = x.shape[1]
+        rows, length = x.shape[0], x.shape[1]
         queries = config.num_attention_heads * config.head_dim
         key_values = config.num_key_value_heads * config.head_dim
         fused = self.fused_proj(x)
         q_gate, k, v = mx.split(fused, (2 * queries, 2 * queries + key_values), axis=-1)
-        q_gate = q_gate.reshape(1, length, config.num_attention_heads, 2 * config.head_dim)
+        q_gate = q_gate.reshape(rows, length, config.num_attention_heads, 2 * config.head_dim)
         q, gate = mx.split(q_gate, (config.head_dim,), axis=-1)
         heads = (config.num_key_value_heads, config.head_dim)
         return (
             self.q_norm(q),
-            self.k_norm(k.reshape(1, length, *heads)),
-            v.reshape(1, length, *heads),
-            gate.reshape(1, length, queries),
+            self.k_norm(k.reshape(rows, length, *heads)),
+            v.reshape(rows, length, *heads),
+            gate.reshape(rows, length, queries),
         )
 
     def __call__(
         self,
         x: mx.array,
-        cache: KVCache | FixedKVCache,
+        cache: KVStore,
         positions: mx.array | None = None,
         mask: mx.array | None = None,
     ) -> mx.array:
@@ -115,14 +116,16 @@ class Qwen35Attention(nn.Module):
         else:
             q = self.mrope(q, positions).transpose(0, 2, 1, 3)
             k = self.mrope(k, positions).transpose(0, 2, 1, 3)
-        keys, values = cache.update_and_fetch(k, v.transpose(0, 2, 1, 3))
-        attended = mx.fast.scaled_dot_product_attention(
-            q, keys, values,
+        attended = attend(
+            cache,
+            q,
+            keys=k,
+            values=v.transpose(0, 2, 1, 3),
             scale=1 / math.sqrt(config.head_dim),
             # An explicit mask wins at any length: the compiled verify feeds `rows` rows
             # over a fixed buffer, where the fill mask is also the causal one. Without
             # one the growing paths keep their answers — all rows at T=1, causal past it.
             mask=mask if mask is not None else (None if length == 1 else "causal"),
         )
-        attended = attended.transpose(0, 2, 1, 3).reshape(1, length, queries)
+        attended = attended.transpose(0, 2, 1, 3).reshape(x.shape[0], length, queries)
         return self.o_proj(attended * mx.sigmoid(gate))

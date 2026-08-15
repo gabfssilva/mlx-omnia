@@ -36,7 +36,7 @@ from mlx_omnia.engine.language import (
 )
 from mlx_omnia.engine.model import ModelInput, ModelSignature
 from mlx_omnia.engine.models.qwen3_5.config import Qwen35Config
-from mlx_omnia.engine.models.qwen3_5.layers.block import Qwen35Block, Qwen35Trunk
+from mlx_omnia.engine.models.qwen3_5.layers.block import Qwen35Block, Qwen35Layer, Qwen35Trunk
 from mlx_omnia.engine.models.qwen3_5.vision import (
     Grid,
     ProcessorConfig,
@@ -57,6 +57,8 @@ class Qwen35Activations(NamedTuple):
 
 
 class Qwen35(nn.Module):
+    continuous_batching = True
+
     def __init__(self, config: Qwen35Config) -> None:
         super().__init__()
         self.config = config
@@ -401,18 +403,18 @@ class Qwen35(nn.Module):
     def activations(
         self,
         ids: mx.array,
-        cache: list[LayerCache] | None = None,
+        cache: Sequence[Qwen35Layer] | None = None,
         *,
         positions: mx.array | None = None,
         embeddings: mx.array | None = None,
     ) -> Qwen35Activations:
         """`embeddings` replaces the token lookup (an image's rows are already spliced
         in) and `positions` is the `[3, L]` MRoPE clock; both default to the text path."""
-        cache = cache if cache is not None else self.make_cache()
+        layers: Sequence[Qwen35Layer] = self.make_cache() if cache is None else cache
         x = embeddings if embeddings is not None else self.model.embed_tokens(ids)
         embedded = x
         blocks: list[mx.array] = []
-        for block, layer_cache in zip(self.model.layers, cache, strict=True):
+        for block, layer_cache in zip(self.model.layers, layers, strict=True):
             x = block(x, layer_cache, positions)
             blocks.append(x)
         normed = self.model.norm(x)
@@ -425,7 +427,7 @@ class Qwen35(nn.Module):
     def __call__(
         self,
         ids: mx.array,
-        cache: list[LayerCache] | None = None,
+        cache: Sequence[Qwen35Layer] | None = None,
         *,
         positions: mx.array | None = None,
         embeddings: mx.array | None = None,

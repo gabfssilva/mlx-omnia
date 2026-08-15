@@ -1,8 +1,8 @@
-"""Qwen3-Next under continuous batching: a batch of rows matches the rows decoded alone.
+"""Mamba2 under continuous batching: a batch of rows matches the rows decoded alone.
 
-Tiny randomized weights, no checkpoint: what is under test is that the ragged batch path
-(`BatchedKVCache` on the attention layers, `BatchedDeltaCache` on the DeltaNet ones)
-reproduces the family's own forward row by row — semantics, not checkpoint numerics."""
+Tiny randomized weights, no checkpoint. The trunk is all delta, so what is under test is
+`BatchedDeltaCache` — the conv window and the recurrent state stacked per row — against the
+family's own single-row forward."""
 
 import os
 
@@ -12,38 +12,25 @@ import mlx.core as mx
 from mlx.utils import tree_map
 
 from mlx_omnia.engine.batching import batch
-from mlx_omnia.engine.core.cache import DeltaCache, KVCache
-from mlx_omnia.engine.models.qwen3_next.config import Qwen3NextConfig
-from mlx_omnia.engine.models.qwen3_next.model import Qwen3Next
+from mlx_omnia.engine.core.cache import DeltaCache
+from mlx_omnia.engine.models.mamba2.config import Mamba2Config
+from mlx_omnia.engine.models.mamba2.model import Mamba2
 
 
-def tiny_model() -> Qwen3Next:
+def tiny_model() -> Mamba2:
     mx.random.seed(11)
-    model = Qwen3Next(
-        Qwen3NextConfig(
+    model = Mamba2(
+        Mamba2Config(
             hidden_size=32,
             num_hidden_layers=2,
-            num_attention_heads=4,
-            num_key_value_heads=2,
-            head_dim=8,
+            num_heads=4,
+            head_dim=16,
+            state_size=32,
+            n_groups=1,
+            conv_kernel=4,
+            expand=2,
             vocab_size=64,
-            rms_norm_eps=1e-6,
-            rope_theta=10000.0,
-            partial_rotary_factor=0.5,
-            intermediate_size=64,
-            linear_num_key_heads=2,
-            linear_num_value_heads=4,
-            linear_key_head_dim=8,
-            linear_value_head_dim=8,
-            linear_conv_kernel_dim=4,
-            moe_intermediate_size=32,
-            shared_expert_intermediate_size=32,
-            num_experts=4,
-            num_experts_per_tok=2,
-            decoder_sparse_step=1,
-            eos_token_id=0,
-            # Two layers, one of each mixer: layer 0 is the DeltaNet, layer 1 attends.
-            full_attention_interval=2,
+            chunk_size=8,
         )
     )
     model.update(tree_map(lambda p: mx.random.normal(p.shape) * 0.05, model.parameters()))
@@ -78,9 +65,8 @@ def test_batched_rows_match_solo_rows() -> None:
 
 
 def test_rows_are_isolated() -> None:
-    """Corrupting one row's cache must move that row and no other — cross-row leakage is
-    the failure continuous batching invites. Both kinds of state are poisoned: the
-    attention layer's KV and the DeltaNet layer's recurrent state."""
+    """Corrupting one row's cache must move that row and no other. Both kinds of state the
+    mixer carries are poisoned: the recurrent state and the conv window."""
     model = tiny_model()
     batched = [model.make_cache() for _ in PROMPTS]
     control = [model.make_cache() for _ in PROMPTS]
@@ -88,19 +74,11 @@ def test_rows_are_isolated() -> None:
         model(mx.array([prompt]), one)
         model(mx.array([prompt]), two)
 
-    recurrent = batched[0][0]
-    assert isinstance(recurrent, DeltaCache)
-    state = recurrent.state
-    assert state is not None
-    recurrent.state = state + 1.0
-    window = recurrent.window
-    assert window is not None
-    recurrent.window = window + 1.0
-
-    poisoned = batched[0][1]
-    assert isinstance(poisoned, KVCache)
-    keys, values = poisoned.fetch()
-    poisoned.restore(poisoned.rows, {"keys": keys + 1.0, "values": values + 1.0})
+    poisoned = batched[0][0]
+    assert isinstance(poisoned, DeltaCache)
+    assert poisoned.state is not None and poisoned.window is not None
+    poisoned.state = poisoned.state + 1.0
+    poisoned.window = poisoned.window + 1.0
 
     tokens = mx.stack([mx.array([p[-1]]) for p in PROMPTS])
     dirty = model(tokens, batch(batched))[:, -1, :]

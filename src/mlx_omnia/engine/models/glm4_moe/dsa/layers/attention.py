@@ -4,7 +4,11 @@ import mlx.nn as nn
 from mlx_omnia.engine.core.masks import causal_mask
 from mlx_omnia.engine.core.rope import Yarn
 from mlx_omnia.engine.models.glm4_moe.dsa.config import GlmMoEDSAConfig
-from mlx_omnia.engine.models.glm4_moe.dsa.layers.cache import DSACache
+from mlx_omnia.engine.models.glm4_moe.dsa.layers.cache import (
+    BatchedDSACache,
+    DSACache,
+    DSAStore,
+)
 from mlx_omnia.engine.models.glm4_moe.dsa.layers.indexer import Indexer
 
 
@@ -50,19 +54,34 @@ class GlmMoEDSAAttention(nn.Module):
             offset=offset, freqs=self.rope.freqs,
         )
 
-    def __call__(self, x: mx.array, cache: DSACache) -> mx.array:
+    def __call__(self, x: mx.array, cache: DSAStore) -> mx.array:
+        """A ragged batch runs the body once per row: the indexer's selection is a function
+        of that row's history length — including whether there is anything to select at all —
+        so there is no shape the rows share. Row by row it is the solo path by construction."""
+        if isinstance(cache, BatchedDSACache):
+            return mx.concatenate(
+                [
+                    self.forward(x[index : index + 1], row)
+                    for index, row in enumerate(cache.rows)
+                ]
+            )
+        return self.forward(x, cache)
+
+    def forward(self, x: mx.array, cache: DSACache) -> mx.array:
+        rows = x.shape[0]
         length = x.shape[1]
         offset = cache.offset
         qr = self.q_a_layernorm(self.q_a_proj(x))
-        q = self.q_b_proj(qr).reshape(1, length, self.heads, self.q_head_dim).transpose(0, 2, 1, 3)
+        lifted = self.q_b_proj(qr).reshape(rows, length, self.heads, self.q_head_dim)
+        q = lifted.transpose(0, 2, 1, 3)
         q_nope, q_pe = mx.split(q, [self.qk_nope_head_dim], axis=-1)
 
         latent = self.kv_a_proj_with_mqa(x)
         compressed, k_pe = mx.split(latent, [self.kv_lora_rank], axis=-1)
-        k_pe = k_pe.reshape(1, length, 1, self.qk_rope_head_dim).transpose(0, 2, 1, 3)
+        k_pe = k_pe.reshape(rows, length, 1, self.qk_rope_head_dim).transpose(0, 2, 1, 3)
         kv = (
             self.kv_b_proj(self.kv_a_layernorm(compressed))
-            .reshape(1, length, self.heads, -1)
+            .reshape(rows, length, self.heads, -1)
             .transpose(0, 2, 1, 3)
         )
         k_nope, v = mx.split(kv, [self.qk_nope_head_dim], axis=-1)
@@ -79,7 +98,7 @@ class GlmMoEDSAAttention(nn.Module):
             mask = dense
         else:
             sparse = mx.put_along_axis(
-                mx.zeros((1, 1, length, total), dtype=mx.bool_),
+                mx.zeros((rows, 1, length, total), dtype=mx.bool_),
                 selected,
                 mx.array(True),
                 axis=-1,
@@ -94,5 +113,5 @@ class GlmMoEDSAAttention(nn.Module):
             mask=mask,
         )
         return self.o_proj(
-            attended.transpose(0, 2, 1, 3).reshape(1, length, self.heads * self.v_head_dim)
+            attended.transpose(0, 2, 1, 3).reshape(rows, length, self.heads * self.v_head_dim)
         )

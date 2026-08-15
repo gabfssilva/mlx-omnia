@@ -135,7 +135,7 @@ class GPTOSSMLP(nn.Module):
         """The whole routed MLP plus the residual in two dispatches, or `None` off the
         T=1 step. Routing stays outside — the pick is a top-k over the raw logits and
         moving it in-kernel flips near-ties."""
-        if not (flags.USE_MXFP4_MOE_GEMV and x.shape[1] == 1):
+        if not (flags.USE_MXFP4_MOE_GEMV and x.shape[0] == 1 and x.shape[1] == 1):
             return None
         gate_up, down = self._kernels()
         chosen, weights = self.route(x)

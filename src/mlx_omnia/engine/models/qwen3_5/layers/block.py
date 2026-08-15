@@ -4,19 +4,25 @@ from collections.abc import Callable
 import mlx.core as mx
 import mlx.nn as nn
 
+from mlx_omnia.engine.core.attend import Attending, KVStore
 from mlx_omnia.engine.core.cache import (
     DeltaCache,
     FixedDeltaCache,
     FixedKVCache,
     KVCache,
+    LayerCache,
 )
 from mlx_omnia.engine.core.kernels.add_norm import AddRmsNorm, AddRmsNormStrategy, DefaultAddRmsNorm
 from mlx_omnia.engine.core.layers import SwiGLU
 from mlx_omnia.engine.models.qwen3_5.config import Qwen35TextConfig
 from mlx_omnia.engine.models.qwen3_5.layers import deltanet, flags, moe
 from mlx_omnia.engine.models.qwen3_5.layers.attention import Qwen35Attention
-from mlx_omnia.engine.models.qwen3_5.layers.deltanet import Qwen35DeltaNet, l2norm
+from mlx_omnia.engine.models.qwen3_5.layers.deltanet import Qwen35DeltaNet, Recurring, l2norm
 from mlx_omnia.engine.models.qwen3_5.layers.moe import Qwen35MoE
+
+type Qwen35Layer = LayerCache | KVStore | Recurring
+"""A layer's cache, alone or standing for one row each: attention reads it through
+`core.attend`, and the DeltaNet mixer through `window`/`state`."""
 
 _DeltaStep = Callable[[mx.array, mx.array, mx.array], tuple[mx.array, mx.array, mx.array]]
 _TailStep = Callable[[mx.array, mx.array], mx.array]
@@ -103,14 +109,14 @@ class Qwen35Block(nn.Module):
     def mix(
         self,
         x: mx.array,
-        cache: KVCache | FixedKVCache | DeltaCache,
+        cache: Qwen35Layer,
         positions: mx.array | None,
         mask: mx.array | None = None,
     ) -> mx.array:
         if self.attends:
-            assert isinstance(cache, KVCache | FixedKVCache)
+            assert isinstance(cache, (KVCache, FixedKVCache, Attending))
             return self.self_attn(self.input_layernorm(x), cache, positions, mask)
-        assert isinstance(cache, DeltaCache)
+        assert isinstance(cache, Recurring)
         return self.linear_attn(self.input_layernorm(x), cache)
 
     def prepare_decode(self) -> None:
@@ -316,20 +322,22 @@ class Qwen35Block(nn.Module):
         return out
 
     def __call__(
-        self, x: mx.array, cache: KVCache | DeltaCache, positions: mx.array | None = None
+        self, x: mx.array, cache: Qwen35Layer, positions: mx.array | None = None
     ) -> mx.array:
-        if x.shape[1] == 1 and flags.COMPILED_STEP:
-            if self.attends:
+        # Both the fused steps and the sparse tail are one row wide; a ragged batch takes
+        # the eager path below instead.
+        single = x.shape[0] == 1 and x.shape[1] == 1
+        if single and flags.COMPILED_STEP:
+            if self.attends and isinstance(cache, KVCache):
                 # Projections stay eager: mx.fast.rope takes the offset as an op
                 # attribute and a trace would freeze it at the first token.
-                assert isinstance(cache, KVCache)
                 projected = self.self_attn(self.input_layernorm(x), cache, positions)
                 self._rebuild()
                 return self._tail_step(x, projected)
-            assert isinstance(cache, DeltaCache)
-            return self._compiled_delta(x, cache)
+            if not self.attends and isinstance(cache, DeltaCache):
+                return self._compiled_delta(x, cache)
         projected = self.mix(x, cache, positions)
-        if x.shape[1] == 1:
+        if single:
             return self._tail(x, projected)
         attended = x + projected
         return attended + self.mlp(self.post_attention_layernorm(attended))

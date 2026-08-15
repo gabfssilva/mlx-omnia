@@ -22,7 +22,6 @@ import pytest
 from huggingface_hub import snapshot_download
 
 from mlx_omnia.engine.models.falcon_h1 import CHECKPOINT, FalconH1, FalconH1Activations
-from mlx_omnia.engine.models.falcon_h1.layers.cache import FalconH1LayerCache
 from tests.conftest import floor, load_golden, relative_diff
 
 FIXTURE = Path(__file__).parent / "fixtures" / "falcon_h1_forward.safetensors"
@@ -151,32 +150,3 @@ def test_mutation_of_grouped_norm_breaks_parity(
         assert relative_diff(logits, golden["logits"]) > floor(golden, "logits")
     finally:
         norm.weight = original
-
-
-def test_the_composite_cache_counts_rows_and_survives_a_round_trip() -> None:
-    """The two halves are what hold the state, and the composite has to answer for both.
-
-    `offset` used to be the attribute the base class writes and nothing else ever advanced,
-    so this cache reported empty to every reader of the contract from outside — the trie, the
-    prefill window, the file. And with no `is_storable`, `generate` kept no prompt boundary
-    for this architecture, which on a trunk that cannot rewind is a whole prefill per turn.
-    """
-    # Mutation: dropping the `offset` property gives 0 below; dropping `is_storable` gives
-    # False, which is the silent form — nothing fails, the conversation is just never kept.
-    cache = FalconH1LayerCache()
-    rows = mx.ones((1, 2, 3, 4), dtype=mx.float32)
-    cache.kv.update_and_fetch(rows, rows)
-    cache.mamba.state = mx.full((1, 2, 4, 4), 7.0, dtype=mx.float32)
-    cache.mamba.offset = cache.kv.offset
-
-    assert cache.offset == 3, "the rows the halves hold"
-    assert cache.is_storable
-
-    read_back = FalconH1LayerCache()
-    read_back.restore(cache.offset, cache.stored())
-
-    assert read_back.offset == cache.offset
-    assert mx.array_equal(read_back.kv.fetch()[0], cache.kv.fetch()[0])
-    state, original = read_back.mamba.state, cache.mamba.state
-    assert state is not None and original is not None
-    assert mx.array_equal(state, original)

@@ -1,6 +1,8 @@
 import mlx.core as mx
 import mlx.nn as nn
 
+from mlx_omnia.engine.core.attend import Attending, KVStore
+from mlx_omnia.engine.core.attention import ragged_mask
 from mlx_omnia.engine.core.cache import KVCache, SharedKVReader
 from mlx_omnia.engine.core.masks import SLIDING, causal_mask
 from mlx_omnia.engine.models.gemma3n.config import Gemma3nTextConfig
@@ -25,7 +27,7 @@ class Gemma3nAttention(nn.Module):
         self.k_norm = nn.RMSNorm(self.head_dim, eps=config.rms_norm_eps)
         self.eps = config.rms_norm_eps
 
-    def rope(self, x: mx.array, offset: int) -> mx.array:
+    def rope(self, x: mx.array, offset: int | mx.array) -> mx.array:
         return mx.fast.rope(
             x, self.head_dim, traditional=False, base=self.rope_base, scale=1.0, offset=offset
         )
@@ -35,31 +37,49 @@ class Gemma3nAttention(nn.Module):
             return None
         return causal_mask(queries, keys, self.window)
 
-    def __call__(self, x: mx.array, cache: KVCache | SharedKVReader) -> mx.array:
-        length = x.shape[1]
+    def __call__(self, x: mx.array, cache: KVStore | SharedKVReader) -> mx.array:
+        rows, length = x.shape[0], x.shape[1]
         offset = cache.offset
-        q = self.q_norm(
-            self.q_proj(x).reshape(1, length, self.heads, self.head_dim)
-        ).transpose(0, 2, 1, 3)
-        if self.shared:
-            assert isinstance(cache, SharedKVReader)
-            assert cache.keys is not None and cache.values is not None
-            keys, values = cache.keys, cache.values
+        queries = self.rope(
+            self.q_norm(
+                self.q_proj(x).reshape(rows, length, self.heads, self.head_dim)
+            ).transpose(0, 2, 1, 3),
+            offset,
+        )
+        if isinstance(cache, Attending):
+            # A ragged store hands no rows back to measure a span from: the mask comes from
+            # its own positions, and a shared reader writes nothing of its own.
+            empty = mx.zeros((0,), dtype=queries.dtype)
+            keys, values = (empty, empty) if self.shared else self.project(x, offset)
+            attended = cache.attend(
+                queries,
+                keys=keys,
+                values=values,
+                scale=1.0,
+                mask=ragged_mask(length, offset, self.window),
+            )
         else:
-            assert isinstance(cache, KVCache)
-            k = self.k_norm(
-                self.k_proj(x).reshape(1, length, self.kv_heads, self.head_dim)
-            ).transpose(0, 2, 1, 3)
-            # v_norm has no learned scale.
-            v = mx.fast.rms_norm(
-                self.v_proj(x).reshape(1, length, self.kv_heads, self.head_dim), None, self.eps
-            ).transpose(0, 2, 1, 3)
-            keys, values = cache.update_and_fetch(self.rope(k, offset), v)
-        attended = mx.fast.scaled_dot_product_attention(
-            self.rope(q, offset), keys, values,
-            scale=1.0,
-            mask=self.mask(length, keys.shape[2]),
-        )
+            if self.shared:
+                assert isinstance(cache, SharedKVReader)
+                assert cache.keys is not None and cache.values is not None
+                keys, values = cache.keys, cache.values
+            else:
+                assert isinstance(cache, KVCache)
+                keys, values = cache.update_and_fetch(*self.project(x, offset))
+            attended = mx.fast.scaled_dot_product_attention(
+                queries, keys, values, scale=1.0, mask=self.mask(length, keys.shape[2])
+            )
         return self.o_proj(
-            attended.transpose(0, 2, 1, 3).reshape(1, length, self.heads * self.head_dim)
+            attended.transpose(0, 2, 1, 3).reshape(rows, length, self.heads * self.head_dim)
         )
+
+    def project(self, x: mx.array, offset: int | mx.array) -> tuple[mx.array, mx.array]:
+        rows, length = x.shape[0], x.shape[1]
+        k = self.k_norm(
+            self.k_proj(x).reshape(rows, length, self.kv_heads, self.head_dim)
+        ).transpose(0, 2, 1, 3)
+        # v_norm has no learned scale.
+        v = mx.fast.rms_norm(
+            self.v_proj(x).reshape(rows, length, self.kv_heads, self.head_dim), None, self.eps
+        ).transpose(0, 2, 1, 3)
+        return self.rope(k, offset), v

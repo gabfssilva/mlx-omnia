@@ -28,9 +28,12 @@ class AltUp(nn.Module):
         return mx.tanh(routed.astype(mx.float32))
 
     def predict(self, x: mx.array) -> mx.array:
+        # `x` is (streams, batch, length, hidden): the coefficients keep batch and length as
+        # their own axes, because flattening the two would let one row's coefficients act on
+        # another's streams.
         coefs = (
             self.prediction_coefs(self.modalities(x[self.active]))
-            .reshape(1, -1, self.streams, self.streams)
+            .reshape(x.shape[1], x.shape[2], self.streams, self.streams)
             .transpose(0, 1, 3, 2)
         )
         lifted = x.astype(mx.float32)

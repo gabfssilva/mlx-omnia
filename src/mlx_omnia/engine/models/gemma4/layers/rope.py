@@ -23,17 +23,22 @@ def cos_sin_tables(
 ) -> tuple[mx.array, mx.array]:
     """Precompute fp32 cos/sin tables for manual RoPE.
 
-    `positions` is `[length]`; returns `[length, head_dim//2]` each.
+    `positions` is `[length]` for one sequence, or `[batch, length]` when the rows of a
+    ragged batch stand at different offsets; the tables come back `[length, head_dim//2]`
+    or `[batch, 1, length, head_dim//2]`, ready to broadcast over heads either way.
     """
-    freqs = mx.outer(positions.astype(mx.float32), inv_freq)
-    # [length, head_dim//2] — freqs for each position, each frequency pair
-    cos = mx.cos(freqs)
-    sin = mx.sin(freqs)
-    return cos, sin
+    if positions.ndim == 1:
+        freqs = mx.outer(positions.astype(mx.float32), inv_freq)
+        # [length, head_dim//2] — freqs for each position, each frequency pair
+        cos = mx.cos(freqs)
+        sin = mx.sin(freqs)
+        return cos, sin
+    freqs = positions.astype(mx.float32)[:, mx.newaxis, :, mx.newaxis] * inv_freq
+    return mx.cos(freqs), mx.sin(freqs)
 
 
 def manual_rope(x: mx.array, cos: mx.array, sin: mx.array) -> mx.array:
-    """Apply RoPE manually to `x` of shape `[1, heads, length, head_dim]`.
+    """Apply RoPE manually to `x` of shape `[batch, heads, length, head_dim]`.
 
     Split-half (transformers `rotate_half` with `emb = cat(freqs, freqs)`): dim `j`
     pairs with `j + head_dim//2` and both share frequency `j`. The zero-frequency
@@ -43,7 +48,11 @@ def manual_rope(x: mx.array, cos: mx.array, sin: mx.array) -> mx.array:
     half = cos.shape[-1]
     x1 = x[..., :half]
     x2 = x[..., half:]
-    # cos/sin are [length, head_dim//2] — broadcast over heads.
-    cos_b = cos[mx.newaxis, mx.newaxis, :, :]
-    sin_b = sin[mx.newaxis, mx.newaxis, :, :]
+    if cos.ndim == 2:
+        # cos/sin are [length, head_dim//2] — broadcast over heads.
+        cos_b = cos[mx.newaxis, mx.newaxis, :, :]
+        sin_b = sin[mx.newaxis, mx.newaxis, :, :]
+    else:
+        # [batch, 1, length, head_dim//2] — one table per row, broadcast over heads.
+        cos_b, sin_b = cos, sin
     return mx.concatenate([x1 * cos_b - x2 * sin_b, x1 * sin_b + x2 * cos_b], axis=-1)

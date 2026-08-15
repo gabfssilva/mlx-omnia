@@ -8,6 +8,10 @@ from mlx_omnia.engine.core.cache import DeltaCache, FixedDeltaCache, LayerCache
 from mlx_omnia.engine.core.decode import DecodePlan, compiled_decode
 from mlx_omnia.engine.models.mamba2.config import Mamba2Config
 from mlx_omnia.engine.models.mamba2.layers.block import Mamba2Trunk
+from mlx_omnia.engine.models.mamba2.layers.ssd import Recurring
+
+type Mamba2Layer = LayerCache | Recurring
+"""A layer's cache, alone or standing for one row each — read through `window`/`state`."""
 
 
 class Mamba2Activations(NamedTuple):
@@ -18,6 +22,8 @@ class Mamba2Activations(NamedTuple):
 
 
 class Mamba2(nn.Module):
+    continuous_batching = True
+
     def __init__(self, config: Mamba2Config) -> None:
         super().__init__()
         self.config = config
@@ -58,14 +64,14 @@ class Mamba2(nn.Module):
     def activations(
         self,
         ids: mx.array,
-        cache: Sequence[LayerCache] | None = None,
+        cache: Sequence[Mamba2Layer] | None = None,
     ) -> Mamba2Activations:
-        cache = cache if cache is not None else self.make_cache()
+        layers: Sequence[Mamba2Layer] = self.make_cache() if cache is None else cache
         x = self.model.embed_tokens(ids)
         embedded = x
         blocks: list[mx.array] = []
-        for block, layer_cache in zip(self.model.layers, cache, strict=True):
-            assert isinstance(layer_cache, DeltaCache)
+        for block, layer_cache in zip(self.model.layers, layers, strict=True):
+            assert isinstance(layer_cache, Recurring)
             x = block(x, layer_cache)
             blocks.append(x)
         normed = self.model.norm(x)
@@ -78,6 +84,6 @@ class Mamba2(nn.Module):
     def __call__(
         self,
         ids: mx.array,
-        cache: Sequence[LayerCache] | None = None,
+        cache: Sequence[Mamba2Layer] | None = None,
     ) -> mx.array:
         return self.activations(ids, cache).logits

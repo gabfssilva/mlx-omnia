@@ -1,3 +1,4 @@
+from collections.abc import Sequence
 from typing import NamedTuple
 
 import mlx.core as mx
@@ -5,7 +6,12 @@ import mlx.nn as nn
 
 from mlx_omnia.engine.models.deepseek_v4.config import OVERLAP, DeepseekV4Config
 from mlx_omnia.engine.models.deepseek_v4.layers.block import DeepseekV4Trunk
-from mlx_omnia.engine.models.deepseek_v4.layers.cache import DeepseekV4Cache
+from mlx_omnia.engine.models.deepseek_v4.layers.cache import (
+    BatchedDeepseekV4Cache,
+    DeepseekV4Cache,
+)
+
+type V4Cache = DeepseekV4Cache | BatchedDeepseekV4Cache
 
 
 class DeepseekV4Activations(NamedTuple):
@@ -14,6 +20,8 @@ class DeepseekV4Activations(NamedTuple):
 
 
 class DeepseekV4(nn.Module):
+    continuous_batching = True
+
     def __init__(self, config: DeepseekV4Config) -> None:
         super().__init__()
         self.config = config
@@ -28,9 +36,47 @@ class DeepseekV4(nn.Module):
         ]
 
     def activations(
-        self, ids: mx.array, cache: list[DeepseekV4Cache] | None = None
+        self, ids: mx.array, cache: Sequence[V4Cache] | None = None
     ) -> DeepseekV4Activations:
         cache = cache if cache is not None else self.make_cache()
+        if isinstance(cache[0], BatchedDeepseekV4Cache):
+            return self._ragged(ids, cache)
+        single: list[DeepseekV4Cache] = []
+        for layer in cache:
+            if not isinstance(layer, DeepseekV4Cache):
+                raise TypeError(f"a deepseek_v4 forward mixes in {type(layer).__name__}")
+            single.append(layer)
+        return self._forward(ids, single)
+
+    def _ragged(self, ids: mx.array, cache: Sequence[V4Cache]) -> DeepseekV4Activations:
+        """A ragged batch, one row at a time.
+
+        Every scalar this family carries per sequence is genuinely per row — the
+        compressor's remainder and partial tail, the pooled length, the sparse selection the
+        indexer makes, the position the local window is cut at — and the trunk below the
+        attention (the fused mHC junction, the MoE's single-token kernels) is written for one
+        row. So the batch is decomposed here and each row runs the forward it already ran
+        alone, which is bit-identical by construction.
+        """
+        layers: list[BatchedDeepseekV4Cache] = []
+        for layer in cache:
+            if not isinstance(layer, BatchedDeepseekV4Cache):
+                raise TypeError("a batched deepseek_v4 forward mixes in a solo layer")
+            layers.append(layer)
+        count = len(layers[0].rows)
+        parts = [
+            self._forward(ids[row : row + 1], [layer.rows[row] for layer in layers])
+            for row in range(count)
+        ]
+        blocks = [
+            mx.concatenate(list(pieces))
+            for pieces in zip(*(part.blocks for part in parts), strict=True)
+        ]
+        return DeepseekV4Activations(blocks, mx.concatenate([part.logits for part in parts]))
+
+    def _forward(
+        self, ids: mx.array, cache: Sequence[DeepseekV4Cache]
+    ) -> DeepseekV4Activations:
         x = self.model.embed_tokens(ids)
         mask = self._window(x.shape[1], cache[0].offset)
         h = mx.contiguous(
@@ -53,7 +99,7 @@ class DeepseekV4(nn.Module):
         normed = self.model.norm(self.model.hc_head(h))
         return DeepseekV4Activations(blocks, self.lm_head(normed))
 
-    def __call__(self, ids: mx.array, cache: list[DeepseekV4Cache] | None = None) -> mx.array:
+    def __call__(self, ids: mx.array, cache: Sequence[V4Cache] | None = None) -> mx.array:
         return self.activations(ids, cache).logits
 
     def _window(self, length: int, offset: int) -> mx.array | str | None:

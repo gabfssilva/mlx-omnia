@@ -1,3 +1,4 @@
+from collections.abc import Sequence
 from typing import NamedTuple
 
 import mlx.core as mx
@@ -5,7 +6,7 @@ import mlx.nn as nn
 
 from mlx_omnia.engine.models.glm4_moe.dsa.config import GlmMoEDSAConfig
 from mlx_omnia.engine.models.glm4_moe.dsa.layers.block import GlmMoEDSATrunk
-from mlx_omnia.engine.models.glm4_moe.dsa.layers.cache import DSACache
+from mlx_omnia.engine.models.glm4_moe.dsa.layers.cache import DSACache, DSAStore
 
 
 class GlmMoEDSAActivations(NamedTuple):
@@ -16,6 +17,8 @@ class GlmMoEDSAActivations(NamedTuple):
 
 
 class GlmMoEDSA(nn.Module):
+    continuous_batching = True
+
     def __init__(self, config: GlmMoEDSAConfig) -> None:
         super().__init__()
         self.config = config
@@ -32,7 +35,7 @@ class GlmMoEDSA(nn.Module):
         return self.lm_head(normed)
 
     def activations(
-        self, ids: mx.array, cache: list[DSACache] | None = None
+        self, ids: mx.array, cache: Sequence[DSAStore] | None = None
     ) -> GlmMoEDSAActivations:
         cache = cache if cache is not None else self.make_cache()
         x = self.model.embed_tokens(ids)
@@ -44,5 +47,5 @@ class GlmMoEDSA(nn.Module):
         normed = self.model.norm(x)
         return GlmMoEDSAActivations(embeddings, blocks, normed, self.head(normed))
 
-    def __call__(self, ids: mx.array, cache: list[DSACache] | None = None) -> mx.array:
+    def __call__(self, ids: mx.array, cache: Sequence[DSAStore] | None = None) -> mx.array:
         return self.activations(ids, cache).logits

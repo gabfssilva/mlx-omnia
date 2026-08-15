@@ -4,14 +4,17 @@ Tiny randomized weights, no checkpoint: what is under test is that the ragged ba
 path (`BatchedKVCache`) reproduces the family's own forward row by row — semantics,
 not checkpoint numerics.
 
-The tiny trunk is dense and full-attention only: the family's MoE decode kernels
-and its sliding mask are both written for a single row, and neither is under test here."""
+Two tiny trunks: one dense and full-attention, one with sliding layers and MoE — the
+ragged sliding mask and the B>1 fallback out of the single-row MoE kernels."""
 
 import os
 
 os.environ.setdefault("MLX_ENABLE_TF32", "0")
 
+from collections.abc import Callable
+
 import mlx.core as mx
+import pytest
 from mlx.utils import tree_map
 
 from mlx_omnia.engine.batching import batch
@@ -23,7 +26,13 @@ from mlx_omnia.engine.models.step3p7.config import (
 from mlx_omnia.engine.models.step3p7.model import Step3p7
 
 
-def tiny_model() -> Step3p7:
+def _model(
+    *,
+    layer_types: tuple[str, ...],
+    use_moe: bool,
+    moe_layers_enum: str,
+    sliding_window: int,
+) -> Step3p7:
     mx.random.seed(11)
     model = Step3p7(
         Step3p7Config(
@@ -34,13 +43,13 @@ def tiny_model() -> Step3p7:
                 vocab_size=64,
                 rope_theta=(10000.0, 10000.0),
                 partial_rotary_factors=(1.0, 1.0),
-                layer_types=("full_attention", "full_attention"),
+                layer_types=layer_types,
                 num_attention_heads=4,
                 num_attention_groups=2,
                 head_dim=16,
-                sliding_window=8,
+                sliding_window=sliding_window,
                 use_head_wise_attn_gate=True,
-                use_moe=False,
+                use_moe=use_moe,
                 moe_num_experts=4,
                 moe_top_k=2,
                 moe_intermediate_size=32,
@@ -50,7 +59,7 @@ def tiny_model() -> Step3p7:
                 use_moe_router_bias=False,
                 need_fp32_gate=False,
                 norm_expert_weight=False,
-                moe_layers_enum="",
+                moe_layers_enum=moe_layers_enum,
                 swiglu_limits=(0.0, 0.0),
                 swiglu_limits_shared=(0.0, 0.0),
                 attention_other_setting=Step3p7AttentionOtherSetting(
@@ -71,11 +80,34 @@ def tiny_model() -> Step3p7:
     return model
 
 
+def tiny_model() -> Step3p7:
+    return _model(
+        layer_types=("full_attention", "full_attention"),
+        use_moe=False,
+        moe_layers_enum="",
+        sliding_window=8,
+    )
+
+
+def tiny_sliding_moe_model() -> Step3p7:
+    """Both layers sliding, both MoE: the window is shorter than the prompts, so the
+    ragged mask actually cuts, and the decode kernels have to stand down at B>1."""
+    return _model(
+        layer_types=("sliding_attention", "sliding_attention"),
+        use_moe=True,
+        moe_layers_enum="0,1",
+        sliding_window=3,
+    )
+
+
+MODELS: tuple[Callable[[], Step3p7], ...] = (tiny_model, tiny_sliding_moe_model)
+
 PROMPTS = ([3, 14, 15, 9, 2], [27, 1, 8])
 
 
-def test_batched_rows_match_solo_rows() -> None:
-    model = tiny_model()
+@pytest.mark.parametrize("build", MODELS, ids=["dense", "sliding_moe"])
+def test_batched_rows_match_solo_rows(build: Callable[[], Step3p7]) -> None:
+    model = build()
     solo = [model.make_cache() for _ in PROMPTS]
     batched = [model.make_cache() for _ in PROMPTS]
     for prompt, one, two in zip(PROMPTS, solo, batched, strict=True):
@@ -97,10 +129,11 @@ def test_batched_rows_match_solo_rows() -> None:
         tokens = [mx.argmax(row, axis=-1).reshape(1) for row in rows]
 
 
-def test_rows_are_isolated() -> None:
+@pytest.mark.parametrize("build", MODELS, ids=["dense", "sliding_moe"])
+def test_rows_are_isolated(build: Callable[[], Step3p7]) -> None:
     """Corrupting one row's cache must move that row and no other — cross-row leakage is
     the failure continuous batching invites."""
-    model = tiny_model()
+    model = build()
     batched = [model.make_cache() for _ in PROMPTS]
     control = [model.make_cache() for _ in PROMPTS]
     for prompt, one, two in zip(PROMPTS, batched, control, strict=True):

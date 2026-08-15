@@ -1,8 +1,10 @@
+from collections.abc import Sequence
 from typing import NamedTuple
 
 import mlx.core as mx
 import mlx.nn as nn
 
+from mlx_omnia.engine.core.attend import KVStore
 from mlx_omnia.engine.core.cache import KVCache
 from mlx_omnia.engine.core.rope import yarn
 from mlx_omnia.engine.models.deepseek_v2.config import DeepseekV2Config
@@ -26,6 +28,8 @@ class DeepseekV2Activations(NamedTuple):
 
 
 class DeepseekV2(nn.Module):
+    continuous_batching = True
+
     def __init__(self, config: DeepseekV2Config) -> None:
         super().__init__()
         self.config = config
@@ -42,7 +46,7 @@ class DeepseekV2(nn.Module):
         return self.lm_head(normed)
 
     def activations(
-        self, ids: mx.array, cache: list[KVCache] | None = None
+        self, ids: mx.array, cache: Sequence[KVStore] | None = None
     ) -> DeepseekV2Activations:
         cache = cache if cache is not None else self.make_cache()
         x = self.model.embed_tokens(ids)
@@ -54,5 +58,5 @@ class DeepseekV2(nn.Module):
         normed = self.model.norm(x)
         return DeepseekV2Activations(embeddings, blocks, normed, self.head(normed))
 
-    def __call__(self, ids: mx.array, cache: list[KVCache] | None = None) -> mx.array:
+    def __call__(self, ids: mx.array, cache: Sequence[KVStore] | None = None) -> mx.array:
         return self.activations(ids, cache).logits

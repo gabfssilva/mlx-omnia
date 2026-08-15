@@ -1,7 +1,8 @@
+from typing import Protocol, runtime_checkable
+
 import mlx.core as mx
 import mlx.nn as nn
 
-from mlx_omnia.engine.core.cache import DeltaCache
 from mlx_omnia.engine.core.kernels.ssm import DefaultSsm, Ssm
 from mlx_omnia.engine.core.kernels.ssm.step import ssm_step
 from mlx_omnia.engine.models.mamba2.config import Mamba2Config
@@ -9,7 +10,18 @@ from mlx_omnia.engine.models.mamba2.layers import flags
 
 # `ssm_step` is re-exported because the compiled one-token step in `block.py` calls
 # it through this module and keys its trace on the binding found here.
-__all__ = ["Conv1dWeight", "Mamba2Mixer", "ssm_step"]
+__all__ = ["Conv1dWeight", "Mamba2Mixer", "Recurring", "ssm_step"]
+
+
+@runtime_checkable
+class Recurring(Protocol):
+    """What the mixer reads a cache through: the conv window, the scan state, and the
+    offset it advances. `DeltaCache` answers it, and so does the ragged batch adapter that
+    stands for one `DeltaCache` per row."""
+
+    offset: int
+    window: mx.array | None
+    state: mx.array | None
 
 
 class Conv1dWeight(nn.Module):
@@ -76,8 +88,9 @@ class Mamba2Mixer(nn.Module):
             self._scan, self._reference = scan, reference
         return scan, reference
 
-    def __call__(self, x: mx.array, cache: DeltaCache) -> mx.array:
+    def __call__(self, x: mx.array, cache: Recurring) -> mx.array:
         config = self.config
+        rows = x.shape[0]
         length = x.shape[1]
         groups_state = config.n_groups * config.state_size
 
@@ -95,14 +108,14 @@ class Mamba2Mixer(nn.Module):
             axis=-1,
         )
 
-        hidden = hidden.reshape(1, length, config.num_heads, config.head_dim)
-        b = b.reshape(1, length, config.n_groups, config.state_size)
-        c = c.reshape(1, length, config.n_groups, config.state_size)
+        hidden = hidden.reshape(rows, length, config.num_heads, config.head_dim)
+        b = b.reshape(rows, length, config.n_groups, config.state_size)
+        c = c.reshape(rows, length, config.n_groups, config.state_size)
 
         state = cache.state
         if state is None:
             state = mx.zeros(
-                (1, config.num_heads, config.head_dim, config.state_size),
+                (rows, config.num_heads, config.head_dim, config.state_size),
                 dtype=mx.float32,
             )
         scan, reference = self._kernels()
@@ -111,7 +124,7 @@ class Mamba2Mixer(nn.Module):
 
         cache.state = state
         cache.offset += length
-        out = out.reshape(1, length, config.intermediate_size)
+        out = out.reshape(rows, length, config.intermediate_size)
 
         # Gated RMSNorm: the gate folds into the norm *input* (silu(gate)·x),
         # then rms_norm in fp32, then round to model dtype and multiply by weight
@@ -122,7 +135,7 @@ class Mamba2Mixer(nn.Module):
         normed = hidden * mx.rsqrt(variance + config.layer_norm_epsilon)
         return self.out_proj((self.norm.weight * normed.astype(out.dtype)).astype(x.dtype))
 
-    def _conv(self, x: mx.array, cache: DeltaCache) -> mx.array:
+    def _conv(self, x: mx.array, cache: Recurring) -> mx.array:
         """Depthwise causal conv unrolled into taps, then silu. `[B, T, conv_dim]`
         in and out; the window carries `kernel - 1` rows of history."""
         config = self.config
@@ -130,7 +143,7 @@ class Mamba2Mixer(nn.Module):
         length = x.shape[1]
         window = cache.window
         if window is None:
-            window = mx.zeros((1, kernel - 1, config.conv_dim), dtype=x.dtype)
+            window = mx.zeros((x.shape[0], kernel - 1, config.conv_dim), dtype=x.dtype)
         padded = mx.concatenate([window, x], axis=1)
         taps = self.conv1d.weight
         mixed = padded[:, :length] * taps[:, 0]

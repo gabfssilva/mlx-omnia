@@ -3,13 +3,17 @@ from typing import assert_never
 import mlx.core as mx
 import mlx.nn as nn
 
-from mlx_omnia.engine.core.attend import AttentionMask
-from mlx_omnia.engine.core.cache import DeltaCache, FixedKVCache, KVCache, LayerCache
+from mlx_omnia.engine.core.attend import Attending, AttentionMask, KVStore
+from mlx_omnia.engine.core.cache import FixedKVCache, KVCache, LayerCache
 from mlx_omnia.engine.models.nemotron_h.config import BlockKind, NemotronHConfig
 from mlx_omnia.engine.models.nemotron_h.layers.attention import NemotronHAttention
-from mlx_omnia.engine.models.nemotron_h.layers.mamba import NemotronHMamba
+from mlx_omnia.engine.models.nemotron_h.layers.mamba import NemotronHMamba, Recurring
 from mlx_omnia.engine.models.nemotron_h.layers.mlp import NemotronHMLP
 from mlx_omnia.engine.models.nemotron_h.layers.moe import NemotronHMoE
+
+type NemotronHLayer = LayerCache | KVStore | Recurring
+"""A layer's cache, alone or standing for one row each: attention reads it through
+`core.attend`, and the mamba mixer through `window`/`state`."""
 
 
 class NemotronHBlock(nn.Module):
@@ -32,12 +36,12 @@ class NemotronHBlock(nn.Module):
                 assert_never(block_type)
 
     def __call__(
-        self, x: mx.array, cache: LayerCache, mask: AttentionMask = "causal"
+        self, x: mx.array, cache: NemotronHLayer, mask: AttentionMask = "causal"
     ) -> mx.array:
         return x + self.mix(self.norm(x), cache, mask)
 
     def mix(
-        self, normed: mx.array, cache: LayerCache, mask: AttentionMask = "causal"
+        self, normed: mx.array, cache: NemotronHLayer, mask: AttentionMask = "causal"
     ) -> mx.array:
         """The mixer alone — no norm in front, no residual behind — so a caller fusing
         the residual join across block boundaries can still reach the middle."""
@@ -47,12 +51,12 @@ class NemotronHBlock(nn.Module):
         match kind:
             case "M":
                 mixer = self.mixer
-                assert isinstance(mixer, NemotronHMamba) and isinstance(cache, DeltaCache)
+                assert isinstance(mixer, NemotronHMamba) and isinstance(cache, Recurring)
                 return mixer(normed, cache)
             case "*":
                 attention = self.mixer
                 assert isinstance(attention, NemotronHAttention) and isinstance(
-                    cache, KVCache | FixedKVCache
+                    cache, KVCache | FixedKVCache | Attending
                 )
                 return attention(normed, cache, mask)
             case "E" | "-":

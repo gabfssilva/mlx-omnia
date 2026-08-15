@@ -1,9 +1,21 @@
+from typing import Protocol, runtime_checkable
+
 import mlx.core as mx
 import mlx.nn as nn
 
-from mlx_omnia.engine.core.cache import DeltaCache
 from mlx_omnia.engine.core.kernels.ssm import Ssm
 from mlx_omnia.engine.models.falcon_h1.config import FalconH1Config
+
+
+@runtime_checkable
+class Recurring(Protocol):
+    """What the mamba mixer reads a cache through: the conv window, the scan state, and the
+    offset it advances. `DeltaCache` answers it, and so does the ragged batch adapter that
+    stands for one `DeltaCache` per row."""
+
+    offset: int
+    window: mx.array | None
+    state: mx.array | None
 
 
 class FalconH1RMSNormGated(nn.Module):
@@ -116,8 +128,8 @@ class FalconH1Mixer(nn.Module):
             self._ssm = ssm
         return ssm
 
-    def __call__(self, x: mx.array, cache: DeltaCache) -> mx.array:
-        length = x.shape[1]
+    def __call__(self, x: mx.array, cache: Recurring) -> mx.array:
+        rows, length = x.shape[0], x.shape[1]
         projected = self.in_proj(x)
         gate, conv_input, dt = mx.split(
             projected,
@@ -137,24 +149,27 @@ class FalconH1Mixer(nn.Module):
         ssm_state = cache.state
         if ssm_state is None:
             ssm_state = mx.zeros(
-                (1, self.num_heads, self.head_dim, self.ssm_state_size), dtype=mx.float32
+                (rows, self.num_heads, self.head_dim, self.ssm_state_size), dtype=mx.float32
             )
 
         y, ssm_state = self._scan()(
-            hidden.reshape(1, length, self.num_heads, self.head_dim),
-            B.reshape(1, length, self.n_groups, self.ssm_state_size),
-            C.reshape(1, length, self.n_groups, self.ssm_state_size),
+            hidden.reshape(rows, length, self.num_heads, self.head_dim),
+            B.reshape(rows, length, self.n_groups, self.ssm_state_size),
+            C.reshape(rows, length, self.n_groups, self.ssm_state_size),
             dt,
             ssm_state,
         )
         cache.state = ssm_state
-        y = y.reshape(1, length, self.intermediate_size)
+        y = y.reshape(rows, length, self.intermediate_size)
 
         y = self.norm(y, gate) if self.mamba_rms_norm else (gate * mx.sigmoid(gate)) * y
+        # The mamba half is its own cache entry now, so it counts its own rows; the
+        # composite that used to read the count off the KV half is gone.
+        cache.offset += length
         return self.out_proj(y)
 
-    def _conv(self, conv_input: mx.array, cache: DeltaCache) -> mx.array:
-        """Depthwise causal conv1d unrolled into taps, then silu. ``[1, T,
+    def _conv(self, conv_input: mx.array, cache: Recurring) -> mx.array:
+        """Depthwise causal conv1d unrolled into taps, then silu. ``[B, T,
         conv_dim]`` in and out; the window carries ``kernel - 1`` rows of
         history."""
         config = self.config
@@ -162,7 +177,9 @@ class FalconH1Mixer(nn.Module):
         length = conv_input.shape[1]
         window = cache.window
         if window is None:
-            window = mx.zeros((1, kernel - 1, self.conv_dim), dtype=conv_input.dtype)
+            window = mx.zeros(
+                (conv_input.shape[0], kernel - 1, self.conv_dim), dtype=conv_input.dtype
+            )
         padded = mx.concatenate([window, conv_input], axis=1)
         taps = self.conv1d.weight
         mixed = padded[:, :length] * taps[:, 0]

@@ -181,11 +181,15 @@ class QuantizedKVCache(LayerCache):
         scale: float,
         mask: AttentionMask,
         sinks: mx.array | None = None,
+        softcap: float | None = None,
     ) -> mx.array:
         if sinks is not None:
             # The blocked read has no sink column, and attending without one is a
             # different model — the compression probe turns this into a policy refusal.
             raise TypeError("a compressed cache cannot attend with sinks")
+        if softcap is not None:
+            # Same refusal: the blocked read runs the fused kernel, which has no cap.
+            raise TypeError("a compressed cache cannot attend with a softcap")
         first = self.offset
         self._write(keys, values)
         return _blocked(

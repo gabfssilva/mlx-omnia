@@ -7,7 +7,10 @@ from mlx_omnia.engine.models.longcat_flash_ngram.config import (
     LongcatFlashNgramConfig,
     LongcatFlashNgramRopeScaling,
 )
-from mlx_omnia.engine.models.longcat_flash_ngram.layers.cache import MLACache
+from mlx_omnia.engine.models.longcat_flash_ngram.layers.cache import (
+    BatchedMLACache,
+    LatentStore,
+)
 
 
 def yarn_rope(
@@ -106,7 +109,7 @@ class LongcatFlashMLA(nn.Module):
         self._freqs = freqs
 
     def __call__(
-        self, x: mx.array, mask: mx.array | None, cache: MLACache
+        self, x: mx.array, mask: mx.array | None, cache: LatentStore
     ) -> mx.array:
         b, length, _ = x.shape
 
@@ -134,6 +137,8 @@ class LongcatFlashMLA(nn.Module):
         )
 
         latent = mx.expand_dims(latent, axis=1)
+        if isinstance(cache, BatchedMLACache):
+            return self._ragged(cache, q_nope, q_pe, latent, k_pe, mask, b, length)
         latent, k_pe = cache.update_and_fetch(latent, k_pe)
 
         pe_scores = (q_pe * self.scale) @ k_pe.swapaxes(-1, -2)
@@ -155,5 +160,40 @@ class LongcatFlashMLA(nn.Module):
         if length == 1:
             output = self.unembed_out(output)
 
+        output = output.transpose(0, 2, 1, 3).reshape(b, length, -1)
+        return self.o_proj(output)
+
+    def _ragged(
+        self,
+        cache: BatchedMLACache,
+        q_nope: mx.array,
+        q_pe: mx.array,
+        latent: mx.array,
+        k_pe: mx.array,
+        mask: mx.array | None,
+        b: int,
+        length: int,
+    ) -> mx.array:
+        """The absorbed decode, one row at a time: the rows hold histories of different
+        lengths, so nothing past the projections is a single dense tensor."""
+        if length != 1:
+            raise ValueError("a ragged latent batch decodes one token per step")
+        pairs = cache.update_and_fetch(latent, k_pe)
+        attended: list[mx.array] = []
+        for index, (row_latent, row_k_pe) in enumerate(pairs):
+            pe_scores = (q_pe[index : index + 1] * self.scale) @ row_k_pe.swapaxes(-1, -2)
+            if mask is not None:
+                row_mask = mask[index : index + 1][..., : row_k_pe.shape[2]]
+                pe_scores = mx.where(
+                    row_mask,
+                    pe_scores,
+                    mx.array(mx.finfo(pe_scores.dtype).min, pe_scores.dtype),
+                )
+            row_q = self.embed_q(q_nope[index : index + 1])
+            row_out = mx.fast.scaled_dot_product_attention(
+                row_q, row_latent, row_latent, scale=self.scale, mask=pe_scores
+            )
+            attended.append(self.unembed_out(row_out))
+        output = mx.concatenate(attended)
         output = output.transpose(0, 2, 1, 3).reshape(b, length, -1)
         return self.o_proj(output)

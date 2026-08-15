@@ -1,8 +1,11 @@
+from collections.abc import Sequence
 from typing import NamedTuple
 
 import mlx.core as mx
 import mlx.nn as nn
 
+from mlx_omnia.engine.core.attend import AttentionMask, KVStore
+from mlx_omnia.engine.core.attention import ragged_mask
 from mlx_omnia.engine.core.cache import KVCache
 from mlx_omnia.engine.models.gpt_oss.config import GPTOSSConfig
 from mlx_omnia.engine.models.gpt_oss.layers.block import GPTOSSBlock
@@ -25,6 +28,8 @@ class GPTOSSActivations(NamedTuple):
 
 
 class GPTOSS(nn.Module):
+    continuous_batching = True
+
     def __init__(self, config: GPTOSSConfig) -> None:
         super().__init__()
         self.config = config
@@ -38,13 +43,15 @@ class GPTOSS(nn.Module):
         which is what an evicting cache would have dropped."""
         return [KVCache() for _ in self.model.layers]
 
-    def activations(self, ids: mx.array, cache: list[KVCache] | None = None) -> GPTOSSActivations:
+    def activations(
+        self, ids: mx.array, cache: Sequence[KVStore] | None = None
+    ) -> GPTOSSActivations:
         cache = cache if cache is not None else self.make_cache()
         x = self.model.embed_tokens(ids)
         length = x.shape[1]
         offset = cache[0].offset
-        full: mx.array | str | None = None if length == 1 else "causal"
-        sliding: mx.array | str | None = None
+        full: AttentionMask = None if length == 1 else "causal"
+        sliding: AttentionMask = None
         if "sliding_attention" in self.config.layer_types:
             sliding = self._sliding_mask(length, offset)
 
@@ -56,15 +63,17 @@ class GPTOSS(nn.Module):
             blocks.append(x)
         return GPTOSSActivations(blocks, self.lm_head(self.model.norm(x)))
 
-    def __call__(self, ids: mx.array, cache: list[KVCache] | None = None) -> mx.array:
+    def __call__(self, ids: mx.array, cache: Sequence[KVStore] | None = None) -> mx.array:
         return self.activations(ids, cache).logits
 
-    def _sliding_mask(self, length: int, offset: int) -> mx.array | str | None:
+    def _sliding_mask(self, length: int, offset: int | mx.array) -> AttentionMask:
         """The band `rows >= columns and rows < columns + window`, built only where it is
         not already something cheaper. No key is old enough for the window to cut while
         `offset + length <= window`, so the band *is* the causal mask there — and at T=1
         the single row is causal by construction, leaving `columns > offset - window`."""
         window = self.config.sliding_window
+        if isinstance(offset, mx.array):
+            return ragged_mask(length, offset, window)
         keys = offset + length
         if keys <= window:
             return None if length == 1 else "causal"

@@ -1,7 +1,7 @@
 import mlx.core as mx
 import mlx.nn as nn
 
-from mlx_omnia.engine.core.cache import KVCache
+from mlx_omnia.engine.core.attend import KVStore, attend
 from mlx_omnia.engine.core.rope import Yarn
 from mlx_omnia.engine.models.deepseek_v2.config import DeepseekV2Config
 
@@ -41,7 +41,7 @@ class DeepseekV2Attention(nn.Module):
             self.heads * config.v_head_dim, hidden, bias=config.attention_bias
         )
 
-    def rotate(self, x: mx.array, offset: int) -> mx.array:
+    def rotate(self, x: mx.array, offset: int | mx.array) -> mx.array:
         if self.rope.freqs is None:
             return mx.fast.rope(
                 x,
@@ -67,31 +67,31 @@ class DeepseekV2Attention(nn.Module):
             return self.q_proj(x)
         return self.q_b_proj(self.q_a_layernorm(self.q_a_proj(x)))
 
-    def __call__(self, x: mx.array, cache: KVCache) -> mx.array:
-        length = x.shape[1]
+    def __call__(self, x: mx.array, cache: KVStore) -> mx.array:
+        rows, length = x.shape[0], x.shape[1]
         offset = cache.offset
-        q = self.queries(x).reshape(1, length, self.heads, self.q_head_dim).transpose(0, 2, 1, 3)
+        q = self.queries(x).reshape(rows, length, self.heads, self.q_head_dim).transpose(0, 2, 1, 3)
         q_nope, q_pe = mx.split(q, [self.qk_nope_head_dim], axis=-1)
 
         latent = self.kv_a_proj_with_mqa(x)
         compressed, k_pe = mx.split(latent, [self.kv_lora_rank], axis=-1)
-        k_pe = k_pe.reshape(1, length, 1, self.qk_rope_head_dim).transpose(0, 2, 1, 3)
+        k_pe = k_pe.reshape(rows, length, 1, self.qk_rope_head_dim).transpose(0, 2, 1, 3)
         kv = (
             self.kv_b_proj(self.kv_a_layernorm(compressed))
-            .reshape(1, length, self.heads, -1)
+            .reshape(rows, length, self.heads, -1)
             .transpose(0, 2, 1, 3)
         )
         k_nope, v = mx.split(kv, [self.qk_nope_head_dim], axis=-1)
 
         rotated = mx.repeat(self.rotate(k_pe, offset), self.heads, axis=1)
-        keys, values = cache.update_and_fetch(mx.concatenate([k_nope, rotated], axis=-1), v)
-        attended = mx.fast.scaled_dot_product_attention(
+        attended = attend(
+            cache,
             mx.concatenate([q_nope, self.rotate(q_pe, offset)], axis=-1),
-            keys,
-            values,
+            keys=mx.concatenate([k_nope, rotated], axis=-1),
+            values=v,
             scale=self.scale,
             mask=None if length == 1 else "causal",
         )
         return self.o_proj(
-            attended.transpose(0, 2, 1, 3).reshape(1, length, self.heads * self.v_head_dim)
+            attended.transpose(0, 2, 1, 3).reshape(rows, length, self.heads * self.v_head_dim)
         )

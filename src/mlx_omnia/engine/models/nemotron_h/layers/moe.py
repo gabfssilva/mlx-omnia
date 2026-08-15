@@ -39,7 +39,7 @@ class NemotronHGate(nn.Module):
 
     def __call__(self, x: mx.array) -> tuple[mx.array, mx.array]:
         length = x.shape[-2]
-        if length <= 4 and self.n_group == 1:
+        if length <= 4 and x.shape[0] == 1 and self.n_group == 1:
             # The logits come from one gemv per row — a batched dense gemm is not
             # row-for-row identical to the gemv (bf16 reduction order), and a verify
             # that rounds differently from the decode it stands in for flips
@@ -120,13 +120,13 @@ class NemotronHMoE(nn.Module):
         chosen, weights = self.gate(x)
         projected = self.fc1_latent_proj(x) if "fc1_latent_proj" in self else x
         length = projected.shape[-2]
-        if length == 1 and "fc2_latent_proj" not in self:
+        if length == 1 and projected.shape[0] == 1 and "fc2_latent_proj" not in self:
             step = self._decode_step()
             routed_row = step(projected[0, 0], chosen[0, 0], weights[0, 0])
             if "shared_experts" in self:
                 routed_row = routed_row + self.shared_experts(x)[0, 0]
             return routed_row[None, None]
-        if 1 < length <= 4 and "fc2_latent_proj" not in self:
+        if 1 < length <= 4 and projected.shape[0] == 1 and "fc2_latent_proj" not in self:
             from mlx_omnia.engine.core.kernels.moe_step import Nvfp4MoeStep
 
             strategy = self._decode_step().strategy

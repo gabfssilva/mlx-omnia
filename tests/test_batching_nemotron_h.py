@@ -1,8 +1,9 @@
-"""Qwen3-Next under continuous batching: a batch of rows matches the rows decoded alone.
+"""Nemotron-H under continuous batching: a batch of rows matches the rows decoded alone.
 
 Tiny randomized weights, no checkpoint: what is under test is that the ragged batch path
-(`BatchedKVCache` on the attention layers, `BatchedDeltaCache` on the DeltaNet ones)
-reproduces the family's own forward row by row — semantics, not checkpoint numerics."""
+(`BatchedDeltaCache` for the mamba layer, `BatchedKVCache` for the attention one and
+`BatchedLayerCache` for the sparse one) reproduces the family's own forward row by row —
+semantics, not checkpoint numerics."""
 
 import os
 
@@ -13,37 +14,34 @@ from mlx.utils import tree_map
 
 from mlx_omnia.engine.batching import batch
 from mlx_omnia.engine.core.cache import DeltaCache, KVCache
-from mlx_omnia.engine.models.qwen3_next.config import Qwen3NextConfig
-from mlx_omnia.engine.models.qwen3_next.model import Qwen3Next
+from mlx_omnia.engine.models.nemotron_h.config import NemotronHConfig
+from mlx_omnia.engine.models.nemotron_h.model import NemotronH
 
 
-def tiny_model() -> Qwen3Next:
+def tiny_model() -> NemotronH:
     mx.random.seed(11)
-    model = Qwen3Next(
-        Qwen3NextConfig(
-            hidden_size=32,
-            num_hidden_layers=2,
+    model = NemotronH(
+        NemotronHConfig(
+            hidden_size=64,
+            num_hidden_layers=3,
             num_attention_heads=4,
             num_key_value_heads=2,
-            head_dim=8,
             vocab_size=64,
-            rms_norm_eps=1e-6,
-            rope_theta=10000.0,
-            partial_rotary_factor=0.5,
+            layer_norm_epsilon=1e-5,
             intermediate_size=64,
-            linear_num_key_heads=2,
-            linear_num_value_heads=4,
-            linear_key_head_dim=8,
-            linear_value_head_dim=8,
-            linear_conv_kernel_dim=4,
+            mamba_num_heads=4,
+            mamba_head_dim=16,
+            ssm_state_size=32,
+            conv_kernel=4,
+            n_groups=1,
+            head_dim=16,
+            hybrid_override_pattern="M*E",
+            chunk_size=256,
             moe_intermediate_size=32,
-            shared_expert_intermediate_size=32,
-            num_experts=4,
+            n_routed_experts=4,
             num_experts_per_tok=2,
-            decoder_sparse_step=1,
-            eos_token_id=0,
-            # Two layers, one of each mixer: layer 0 is the DeltaNet, layer 1 attends.
-            full_attention_interval=2,
+            norm_topk_prob=True,
+            routed_scaling_factor=1.0,
         )
     )
     model.update(tree_map(lambda p: mx.random.normal(p.shape) * 0.05, model.parameters()))
@@ -79,8 +77,8 @@ def test_batched_rows_match_solo_rows() -> None:
 
 def test_rows_are_isolated() -> None:
     """Corrupting one row's cache must move that row and no other — cross-row leakage is
-    the failure continuous batching invites. Both kinds of state are poisoned: the
-    attention layer's KV and the DeltaNet layer's recurrent state."""
+    the failure continuous batching invites. Every species of state this pattern holds is
+    poisoned: the mamba layer's window and recurrent state, the attention layer's KV."""
     model = tiny_model()
     batched = [model.make_cache() for _ in PROMPTS]
     control = [model.make_cache() for _ in PROMPTS]
@@ -90,17 +88,14 @@ def test_rows_are_isolated() -> None:
 
     recurrent = batched[0][0]
     assert isinstance(recurrent, DeltaCache)
-    state = recurrent.state
-    assert state is not None
-    recurrent.state = state + 1.0
-    window = recurrent.window
-    assert window is not None
-    recurrent.window = window + 1.0
+    assert recurrent.state is not None and recurrent.window is not None
+    recurrent.state = recurrent.state + 1.0
+    recurrent.window = recurrent.window + 1.0
 
     poisoned = batched[0][1]
     assert isinstance(poisoned, KVCache)
     keys, values = poisoned.fetch()
-    poisoned.restore(poisoned.rows, {"keys": keys + 1.0, "values": values + 1.0})
+    poisoned.restore(poisoned.offset, {"keys": keys + 1.0, "values": values + 1.0})
 
     tokens = mx.stack([mx.array([p[-1]]) for p in PROMPTS])
     dirty = model(tokens, batch(batched))[:, -1, :]

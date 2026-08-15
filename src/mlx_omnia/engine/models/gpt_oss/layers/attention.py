@@ -3,12 +3,14 @@ import math
 import mlx.core as mx
 import mlx.nn as nn
 
+from mlx_omnia.engine.core.attend import AttentionMask, KVStore, attend
 from mlx_omnia.engine.core.cache import KVCache
 from mlx_omnia.engine.core.kernels.attention import (
     AttentionStep,
     AttentionStepStrategy,
     DefaultAttentionStep,
 )
+from mlx_omnia.engine.core.kernels.attention.default import rotate
 from mlx_omnia.engine.models.gpt_oss.config import GPTOSSConfig
 from mlx_omnia.engine.models.gpt_oss.layers import flags
 
@@ -35,15 +37,59 @@ class GPTOSSAttention(nn.Module):
         self._step_cache: KVCache | None = None
         self._step_sink = flags.USE_SINK_ATTENTION
 
-    def __call__(self, x: mx.array, mask: mx.array | str | None, cache: KVCache) -> mx.array:
-        length = x.shape[1]
+    def __call__(self, x: mx.array, mask: AttentionMask, cache: KVStore) -> mx.array:
+        batch, length = x.shape[0], x.shape[1]
         query_width = self.heads * self.head_dim
         key_value_width = self.kv_heads * self.head_dim
         q, k, v = mx.split(
             self.qkv_proj(x), [query_width, query_width + key_value_width], axis=-1
         )
-        attended = self._attention(cache, x.dtype)(q, k, v, mask)
-        return self.o_proj(attended.transpose(0, 2, 1, 3).reshape(1, length, query_width))
+        if isinstance(cache, KVCache) and batch == 1:
+            attended = self._attention(cache, x.dtype)(q, k, v, mask)
+        else:
+            attended = self._attend(q, k, v, mask, cache, batch, length)
+        return self.o_proj(attended.transpose(0, 2, 1, 3).reshape(batch, length, query_width))
+
+    def _attend(
+        self,
+        q: mx.array,
+        k: mx.array,
+        v: mx.array,
+        mask: AttentionMask,
+        cache: KVStore,
+        batch: int,
+        length: int,
+    ) -> mx.array:
+        """The general path: the rotation the fused step does inside, done in ops here, and
+        the cache read through the door. Same freqs, same mscale, same partial geometry."""
+        offset = cache.offset
+        queries = self._heads(q, self.heads, batch, length)
+        keys = self._heads(k, self.kv_heads, batch, length)
+        values = self._heads(v, self.kv_heads, batch, length)
+        queries = self._rotate(queries, offset)
+        keys = self._rotate(keys, offset)
+        return attend(
+            cache,
+            queries,
+            keys=keys,
+            values=values,
+            scale=self.scale,
+            mask=mask,
+            sinks=self.sinks,
+        )
+
+    def _heads(self, raw: mx.array, count: int, batch: int, length: int) -> mx.array:
+        return raw.reshape(batch, length, count, self.head_dim).transpose(0, 2, 1, 3)
+
+    def _rotate(self, x: mx.array, offset: int | mx.array) -> mx.array:
+        return rotate(
+            x,
+            rotary_pairs=self.head_dim // 2,
+            freqs=self._freqs,
+            base=0.0,
+            mscale=self._mscale,
+            offset=offset,
+        )
 
     def _attention(self, cache: KVCache, dtype: mx.Dtype) -> AttentionStepStrategy:
         """Resolved once, at the first step after load — and again whenever the cache is

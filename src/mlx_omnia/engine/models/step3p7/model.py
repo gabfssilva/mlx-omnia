@@ -6,6 +6,7 @@ import mlx.nn as nn
 import numpy as np
 
 from mlx_omnia.engine.core.attend import KVStore
+from mlx_omnia.engine.core.attention import ragged_mask
 from mlx_omnia.engine.core.cache import KVCache
 from mlx_omnia.engine.core.prefill import prefill
 from mlx_omnia.engine.generate import Meter, Penalty, Sampler, greedy, stream_ids, stream_text
@@ -34,6 +35,8 @@ class Step3p7Activations(NamedTuple):
 class Step3p7(nn.Module):
     """The VLM: step3p5 trunk + perception_encoder vision tower + linear projector.
     Image features are scattered into ``input_ids == image_token_id`` via masked_scatter."""
+
+    continuous_batching = True
 
     def __init__(self, config: Step3p7Config) -> None:
         super().__init__()
@@ -68,11 +71,10 @@ class Step3p7(nn.Module):
         full: mx.array | str | None = None if length == 1 else "causal"
         sliding: mx.array | str | None = None
         if SLIDING in types:
-            if not isinstance(offset, int):
-                raise NotImplementedError(
-                    "step3p7's sliding mask is one scalar offset; a ragged batch has one per row"
-                )
-            sliding = self._sliding_mask(length, offset)
+            if isinstance(offset, mx.array):
+                sliding = ragged_mask(length, offset, text.sliding_window)
+            else:
+                sliding = self._sliding_mask(length, offset)
 
         blocks: list[mx.array] = []
         for block, kind, layer_cache in zip(self.model.layers, types, cache, strict=True):

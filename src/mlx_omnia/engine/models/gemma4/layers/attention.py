@@ -1,6 +1,8 @@
 import mlx.core as mx
 import mlx.nn as nn
 
+from mlx_omnia.engine.core.attend import Attending, KVStore, attend
+from mlx_omnia.engine.core.attention import ragged_mask
 from mlx_omnia.engine.core.cache import KVCache, SharedKVReader
 from mlx_omnia.engine.core.masks import SLIDING, causal_mask
 from mlx_omnia.engine.models.gemma4.config import Gemma4TextConfig
@@ -69,65 +71,91 @@ class Gemma4Attention(nn.Module):
     def __call__(
         self,
         x: mx.array,
-        cache: KVCache | SharedKVReader,
+        cache: KVStore | SharedKVReader,
     ) -> mx.array:
+        rows = x.shape[0]
         length = x.shape[1]
+        offset = cache.offset
 
         if self.kv_shared:
-            assert isinstance(cache, SharedKVReader)
             q = self.q_proj(x).reshape(
-                1, length, self.heads, self.head_dim
+                rows, length, self.heads, self.head_dim
             ).transpose(0, 2, 1, 3)
             q = self.q_norm(q)
-            q = self._apply_rope(q, cache.offset)
-            keys = cache.keys
-            values = cache.values
-            assert keys is not None and values is not None
-            attended = mx.fast.scaled_dot_product_attention(
-                q,
-                keys,
-                values,
-                scale=self.scale,
-                mask=self.mask(length, keys.shape[2]),
-            )
+            q = self._apply_rope(q, offset)
+            if isinstance(cache, Attending):
+                # A shared reader writes nothing of its own; the rows it attends are the
+                # ones its writer published, so `keys`/`values` here are ignored.
+                attended = cache.attend(
+                    q,
+                    keys=q,
+                    values=q,
+                    scale=self.scale,
+                    mask=ragged_mask(length, offset, self.window),
+                )
+            else:
+                assert isinstance(cache, SharedKVReader)
+                keys = cache.keys
+                values = cache.values
+                assert keys is not None and values is not None
+                attended = attend(
+                    None,
+                    q,
+                    keys=keys,
+                    values=values,
+                    scale=self.scale,
+                    mask=self.mask(length, keys.shape[2]),
+                )
             return self.o_proj(
-                attended.transpose(0, 2, 1, 3).reshape(1, length, self.heads * self.head_dim)
+                attended.transpose(0, 2, 1, 3).reshape(
+                    rows, length, self.heads * self.head_dim
+                )
             )
 
         q = self.q_proj(x).reshape(
-            1, length, self.heads, self.head_dim
+            rows, length, self.heads, self.head_dim
         ).transpose(0, 2, 1, 3)
         k = self.k_proj(x).reshape(
-            1, length, self.kv_heads, self.head_dim
+            rows, length, self.kv_heads, self.head_dim
         ).transpose(0, 2, 1, 3)
         if self.k_eq_v:
             v = k
         else:
             v = self.v_proj(x).reshape(
-                1, length, self.kv_heads, self.head_dim
+                rows, length, self.kv_heads, self.head_dim
             ).transpose(0, 2, 1, 3)
 
         q = self.q_norm(q)
         k = self.k_norm(k)
         v = self.v_norm(v)
 
-        q = self._apply_rope(q, cache.offset)
-        k = self._apply_rope(k, cache.offset)
+        q = self._apply_rope(q, offset)
+        k = self._apply_rope(k, offset)
 
-        assert isinstance(cache, KVCache)
-        keys, values = cache.update_and_fetch(k, v)
-        attended = mx.fast.scaled_dot_product_attention(
-            q,
-            keys,
-            values,
-            scale=self.scale,
-            mask=self.mask(length, keys.shape[2]),
-        )
+        if isinstance(cache, Attending):
+            attended = cache.attend(
+                q,
+                keys=k,
+                values=v,
+                scale=self.scale,
+                mask=ragged_mask(length, offset, self.window),
+            )
+        else:
+            assert isinstance(cache, KVCache)
+            keys, values = cache.update_and_fetch(k, v)
+            attended = attend(
+                None,
+                q,
+                keys=keys,
+                values=values,
+                scale=self.scale,
+                mask=self.mask(length, keys.shape[2]),
+            )
         return self.o_proj(
-            attended.transpose(0, 2, 1, 3).reshape(1, length, self.heads * self.head_dim)
+            attended.transpose(0, 2, 1, 3).reshape(rows, length, self.heads * self.head_dim)
         )
 
-    def _rope_sliding(self, x: mx.array, offset: int) -> mx.array:
+    def _rope_sliding(self, x: mx.array, offset: int | mx.array) -> mx.array:
         return mx.fast.rope(
             x,
             self.head_dim,
@@ -137,13 +165,16 @@ class Gemma4Attention(nn.Module):
             offset=offset,
         )
 
-    def _rope_full(self, x: mx.array, offset: int, length: int) -> mx.array:
+    def _rope_full(self, x: mx.array, offset: int | mx.array, length: int) -> mx.array:
         assert self._inv_freq is not None
-        positions = mx.arange(offset, offset + length, dtype=mx.int32)
+        if isinstance(offset, mx.array):
+            positions = offset[:, mx.newaxis] + mx.arange(length, dtype=mx.int32)
+        else:
+            positions = mx.arange(offset, offset + length, dtype=mx.int32)
         cos, sin = cos_sin_tables(self._inv_freq, positions, self.head_dim)
         return manual_rope(x, cos, sin)
 
-    def _apply_rope(self, x: mx.array, offset: int) -> mx.array:
+    def _apply_rope(self, x: mx.array, offset: int | mx.array) -> mx.array:
         length = x.shape[2]
         if self.is_full and self.rope_type == "proportional":
             return self._rope_full(x, offset, length)

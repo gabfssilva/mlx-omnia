@@ -6,7 +6,7 @@ from typing import Protocol, runtime_checkable
 
 import mlx.core as mx
 
-from mlx_omnia.engine.core.attend import AttentionMask, KVStore
+from mlx_omnia.engine.core.attend import AttentionMask, KVStore, softcapped_attention
 from mlx_omnia.engine.core.cache import (
     ConvCache,
     DeltaCache,
@@ -14,6 +14,7 @@ from mlx_omnia.engine.core.cache import (
     KVCache,
     LayerCache,
     RingKVCache,
+    SharedKVReader,
     fit,
     regrow,
 )
@@ -45,15 +46,39 @@ __all__ = [
     "BatchedDeltaCache",
     "BatchedKVCache",
     "BatchedLayer",
+    "BatchedLayerCache",
+    "BatchedSharedKVReader",
+    "RaggedBatchable",
     "batch",
     "prepare_batch_sequence",
     "step",
 ]
 
 
-type BatchedLayer = KVStore | BatchedDeltaCache | BatchedConvCache
-"""What a layer of a ragged batch can be: an attention adapter, or one of the recurrent
-adapters a hybrid's mixer reads through `window`/`state`."""
+@runtime_checkable
+class RaggedAdapter(Protocol):
+    """The least a family-shipped batch adapter must answer: where each row stands."""
+
+    @property
+    def offset(self) -> int | mx.array: ...
+
+
+type BatchedLayer = KVStore | BatchedDeltaCache | BatchedConvCache | RaggedAdapter
+"""What a layer of a ragged batch can be: an attention adapter, one of the recurrent
+adapters a hybrid's mixer reads through `window`/`state`, or a family-shipped adapter."""
+
+
+@runtime_checkable
+class RaggedBatchable(Protocol):
+    """A cache class whose family ships its own ragged adapter.
+
+    Generic code cannot know every family's cache, and must not learn them one import at a
+    time — so the dispatch is inverted: the cache answers for itself. `batched` receives
+    every row of the layer (the receiver is the first) and returns the adapter the layer
+    reads. It must refuse rows of another kind, the way `_adapt`'s own branches do.
+    """
+
+    def batched(self, rows: Sequence["LayerCache"]) -> "BatchedLayer": ...
 
 
 @runtime_checkable
@@ -162,6 +187,10 @@ class BatchedKVCache:
         self._caches = tuple(caches)
 
     @property
+    def rows(self) -> tuple[KVCache | FixedKVCache | RingKVCache, ...]:
+        return self._caches
+
+    @property
     def offset(self) -> mx.array:
         positions = [
             cache.position
@@ -184,6 +213,7 @@ class BatchedKVCache:
         scale: float,
         mask: AttentionMask,
         sinks: mx.array | None = None,
+        softcap: float | None = None,
     ) -> mx.array:
         attended: list[mx.array] = []
         for index, cache in enumerate(self._caches):
@@ -204,13 +234,14 @@ class BatchedKVCache:
                     else valid & effective
                 )
             attended.append(
-                mx.fast.scaled_dot_product_attention(
+                _row_attention(
                     queries[index : index + 1],
                     history_keys,
                     history_values,
                     scale=scale,
                     mask=effective,
                     sinks=sinks,
+                    softcap=softcap,
                 )
             )
         return mx.concatenate(attended)
@@ -294,6 +325,111 @@ def _stack(parts: Sequence[mx.array | None]) -> mx.array | None:
     return mx.concatenate(filled)
 
 
+def _row_attention(
+    queries: mx.array,
+    keys: mx.array,
+    values: mx.array,
+    *,
+    scale: float,
+    mask: mx.array | None,
+    sinks: mx.array | None,
+    softcap: float | None,
+) -> mx.array:
+    if softcap is not None:
+        if sinks is not None:
+            raise ValueError("softcap and sinks do not compose; no family asks for both")
+        return softcapped_attention(queries, keys, values, scale=scale, cap=softcap, mask=mask)
+    return mx.fast.scaled_dot_product_attention(
+        queries, keys, values, scale=scale, mask=mask, sinks=sinks
+    )
+
+
+class BatchedLayerCache:
+    """N stateless layers as one: nothing to stack, only offsets to keep in step.
+
+    A bare `LayerCache` is what a family hands the layers that keep no state — an MLP-only
+    block in a hybrid pattern. The rows are ragged, so what a write propagates is the
+    delta, the same rule as `BatchedConvCache.offset`.
+    """
+
+    def __init__(self, caches: Sequence[LayerCache]) -> None:
+        self._caches = tuple(caches)
+
+    @property
+    def offset(self) -> int:
+        return self._caches[0].offset
+
+    @offset.setter
+    def offset(self, value: int) -> None:
+        advance = value - self._caches[0].offset
+        for cache in self._caches:
+            cache.offset += advance
+
+
+class BatchedSharedKVReader:
+    """N `SharedKVReader`s as one attending layer.
+
+    The single-sequence trunk republishes the writer's `fetch()` into each reader every
+    forward. Ragged rows have no single dense tensor to publish, so the publish becomes
+    per-row: `adopt` walks the writer's rows and hands each reader its own row's
+    post-update tensors and pre-update offset — the same two facts the trunk publishes
+    today, one row at a time. `attend` then reads what was adopted; the step's `keys` and
+    `values` are ignored because a reader writes nothing of its own.
+    """
+
+    def __init__(self, caches: Sequence[SharedKVReader]) -> None:
+        self._caches = tuple(caches)
+
+    @property
+    def rows(self) -> tuple[SharedKVReader, ...]:
+        return self._caches
+
+    @property
+    def offset(self) -> mx.array:
+        return mx.array([cache.offset for cache in self._caches], dtype=mx.int32)
+
+    def adopt(self, store: BatchedKVCache, length: int) -> None:
+        for reader, writer in zip(self._caches, store.rows, strict=True):
+            if not isinstance(writer, KVCache):
+                raise TypeError("a shared reader adopts growing rows; got " + type(writer).__name__)
+            reader.keys, reader.values = writer.fetch()
+            reader.offset = writer.offset - length
+
+    def attend(
+        self,
+        queries: mx.array,
+        *,
+        keys: mx.array,
+        values: mx.array,
+        scale: float,
+        mask: AttentionMask,
+        sinks: mx.array | None = None,
+        softcap: float | None = None,
+    ) -> mx.array:
+        attended: list[mx.array] = []
+        for index, cache in enumerate(self._caches):
+            history_keys, history_values = cache.keys, cache.values
+            if history_keys is None or history_values is None:
+                raise ValueError("a shared reader attended before its writer published")
+            effective: AttentionMask = None if isinstance(mask, str) else mask
+            if isinstance(effective, mx.array):
+                if effective.shape[0] == len(self._caches):
+                    effective = effective[index : index + 1]
+                effective = effective[..., : history_keys.shape[2]]
+            attended.append(
+                _row_attention(
+                    queries[index : index + 1],
+                    history_keys,
+                    history_values,
+                    scale=scale,
+                    mask=effective,
+                    sinks=sinks,
+                    softcap=softcap,
+                )
+            )
+        return mx.concatenate(attended)
+
+
 def batch(caches: Sequence[Sequence[LayerCache]]) -> list[BatchedLayer]:
     """Transpose per-sequence caches into per-layer ragged batch adapters.
 
@@ -315,6 +451,15 @@ def _adapt(layers: tuple[LayerCache, ...]) -> BatchedLayer:
     """The adapter this layer's kind of cache is read through — the kind of the first row,
     with every other row required to match it."""
     head = layers[0]
+    if isinstance(head, RaggedBatchable):
+        return head.batched(layers)
+    if isinstance(head, SharedKVReader):
+        readers: list[SharedKVReader] = []
+        for layer in layers:
+            if not isinstance(layer, SharedKVReader):
+                raise TypeError(_MIXED.format(kind=type(layer).__name__))
+            readers.append(layer)
+        return BatchedSharedKVReader(readers)
     if isinstance(head, (KVCache, FixedKVCache, RingKVCache)):
         stores: list[KVCache | FixedKVCache | RingKVCache] = []
         for layer in layers:
@@ -336,6 +481,13 @@ def _adapt(layers: tuple[LayerCache, ...]) -> BatchedLayer:
                 raise TypeError(_MIXED.format(kind=type(layer).__name__))
             convs.append(layer)
         return BatchedConvCache(convs)
+    if type(head) is LayerCache:
+        stateless: list[LayerCache] = []
+        for layer in layers:
+            if type(layer) is not LayerCache:
+                raise TypeError(_MIXED.format(kind=type(layer).__name__))
+            stateless.append(layer)
+        return BatchedLayerCache(stateless)
     raise TypeError(f"{type(head).__name__} has no ragged batch adapter")
 
 

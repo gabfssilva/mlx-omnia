@@ -1,7 +1,8 @@
 import mlx.core as mx
 import mlx.nn as nn
 
-from mlx_omnia.engine.core.cache import KVCache, SharedKVReader
+from mlx_omnia.engine.core.attend import KVStore
+from mlx_omnia.engine.core.cache import SharedKVReader
 from mlx_omnia.engine.models.gemma4.config import Gemma4TextConfig
 from mlx_omnia.engine.models.gemma4.layers.activation import gelu
 from mlx_omnia.engine.models.gemma4.layers.attention import Gemma4Attention
@@ -32,7 +33,7 @@ class Gemma4Block(nn.Module):
     def __call__(
         self,
         x: mx.array,
-        cache: KVCache | SharedKVReader,
+        cache: KVStore | SharedKVReader,
         per_layer_input: mx.array | None = None,
     ) -> mx.array:
         attended = x + self.post_attention_layernorm(

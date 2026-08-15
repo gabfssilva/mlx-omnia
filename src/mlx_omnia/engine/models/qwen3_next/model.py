@@ -6,7 +6,7 @@ import mlx.nn as nn
 
 from mlx_omnia.engine.core.cache import DeltaCache, KVCache, LayerCache
 from mlx_omnia.engine.models.qwen3_next.config import Qwen3NextConfig
-from mlx_omnia.engine.models.qwen3_next.layers.block import Qwen3NextTrunk
+from mlx_omnia.engine.models.qwen3_next.layers.block import Qwen3NextLayer, Qwen3NextTrunk
 
 
 class Qwen3NextActivations(NamedTuple):
@@ -17,6 +17,8 @@ class Qwen3NextActivations(NamedTuple):
 
 
 class Qwen3Next(nn.Module):
+    continuous_batching = True
+
     def __init__(self, config: Qwen3NextConfig) -> None:
         super().__init__()
         self.config = config
@@ -33,19 +35,19 @@ class Qwen3Next(nn.Module):
         return self.lm_head(normed)
 
     def activations(
-        self, ids: mx.array, cache: Sequence[LayerCache] | None = None
+        self, ids: mx.array, cache: Sequence[Qwen3NextLayer] | None = None
     ) -> Qwen3NextActivations:
-        cache = cache if cache is not None else self.make_cache()
+        layers: Sequence[Qwen3NextLayer] = self.make_cache() if cache is None else cache
         x = self.model.embed_tokens(ids)
         embeddings = x
         blocks: list[mx.array] = []
-        for block, layer_cache in zip(self.model.layers, cache, strict=True):
+        for block, layer_cache in zip(self.model.layers, layers, strict=True):
             x = block(x, layer_cache)
             blocks.append(x)
         normed = self.model.norm(x)
         return Qwen3NextActivations(embeddings, blocks, normed, self.head(normed))
 
     def __call__(
-        self, ids: mx.array, cache: Sequence[LayerCache] | None = None
+        self, ids: mx.array, cache: Sequence[Qwen3NextLayer] | None = None
     ) -> mx.array:
         return self.activations(ids, cache).logits

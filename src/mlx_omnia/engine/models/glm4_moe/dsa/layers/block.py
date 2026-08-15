@@ -5,7 +5,7 @@ from mlx_omnia.engine.core.layers import SwiGLU
 from mlx_omnia.engine.core.rope import Yarn, yarn
 from mlx_omnia.engine.models.glm4_moe.dsa.config import GlmMoEDSAConfig
 from mlx_omnia.engine.models.glm4_moe.dsa.layers.attention import GlmMoEDSAAttention
-from mlx_omnia.engine.models.glm4_moe.dsa.layers.cache import DSACache
+from mlx_omnia.engine.models.glm4_moe.dsa.layers.cache import DSAStore
 from mlx_omnia.engine.models.glm4_moe.layers.moe import Glm4MoEMLP
 
 
@@ -21,7 +21,7 @@ class GlmMoEDSABlock(nn.Module):
         self.input_layernorm = nn.RMSNorm(config.hidden_size, eps=config.rms_norm_eps)
         self.post_attention_layernorm = nn.RMSNorm(config.hidden_size, eps=config.rms_norm_eps)
 
-    def __call__(self, x: mx.array, cache: DSACache) -> mx.array:
+    def __call__(self, x: mx.array, cache: DSAStore) -> mx.array:
         attended = x + self.self_attn(self.input_layernorm(x), cache)
         return attended + self.mlp(self.post_attention_layernorm(attended))
 

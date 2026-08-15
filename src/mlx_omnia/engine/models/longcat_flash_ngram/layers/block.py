@@ -1,9 +1,11 @@
+from collections.abc import Sequence
+
 import mlx.core as mx
 import mlx.nn as nn
 
 from mlx_omnia.engine.models.longcat_flash_ngram.config import LongcatFlashNgramConfig
 from mlx_omnia.engine.models.longcat_flash_ngram.layers.attention import LongcatFlashMLA
-from mlx_omnia.engine.models.longcat_flash_ngram.layers.cache import MLACache
+from mlx_omnia.engine.models.longcat_flash_ngram.layers.cache import LatentStore
 from mlx_omnia.engine.models.longcat_flash_ngram.layers.moe import LongcatFlashMoE
 
 
@@ -41,7 +43,7 @@ class LongcatFlashDecoderLayer(nn.Module):
         ]
 
     def __call__(
-        self, x: mx.array, mask: mx.array | None, cache: list[MLACache]
+        self, x: mx.array, mask: mx.array | None, cache: Sequence[LatentStore]
     ) -> mx.array:
         shortcut = None
         for i in range(2):

@@ -1,4 +1,4 @@
-from typing import TYPE_CHECKING
+from typing import TYPE_CHECKING, Protocol, runtime_checkable
 
 import mlx.core as mx
 import mlx.nn as nn
@@ -11,6 +11,17 @@ if TYPE_CHECKING:
     from mlx_omnia.engine.core.kernels.mamba_step.verify import VerifyMambaStep
 from mlx_omnia.engine.core.kernels.ssm import Ssm
 from mlx_omnia.engine.models.nemotron_h.config import NemotronHConfig
+
+
+@runtime_checkable
+class Recurring(Protocol):
+    """What the mamba mixer reads a cache through: the conv window, the scan state, and the
+    offset it advances. `DeltaCache` answers it, and so does `BatchedDeltaCache`, which
+    stands for one `DeltaCache` per row."""
+
+    offset: int
+    window: mx.array | None
+    state: mx.array | None
 
 
 class Conv1dWeight(nn.Module):
@@ -95,17 +106,17 @@ class NemotronHMamba(nn.Module):
             self._conv = conv
         return conv
 
-    def convolve(self, x: mx.array, cache: DeltaCache) -> mx.array:
+    def convolve(self, x: mx.array, cache: Recurring) -> mx.array:
         config = self.config
         kernel = config.conv_kernel
         length = x.shape[1]
         window = cache.window
-        if length == 1 and window is not None:
+        if length == 1 and x.shape[0] == 1 and window is not None:
             mixed, slid = self._conv_step()(x[0, 0], window[0])
             cache.window = slid[None]
             return mixed.reshape(1, 1, -1)
         if window is None:
-            window = mx.zeros((1, kernel - 1, config.conv_dim), dtype=x.dtype)
+            window = mx.zeros((x.shape[0], kernel - 1, config.conv_dim), dtype=x.dtype)
         padded = mx.concatenate([window, x], axis=1)
         taps = self.conv1d.weight
         mixed = padded[:, :length] * taps[:, 0]
@@ -176,11 +187,11 @@ class NemotronHMamba(nn.Module):
         cache.offset += x.shape[1]
         return self.out_proj(normed)[None]
 
-    def __call__(self, x: mx.array, cache: DeltaCache) -> mx.array:
+    def __call__(self, x: mx.array, cache: Recurring) -> mx.array:
         config = self.config
-        length = x.shape[1]
+        batch, length = x.shape[0], x.shape[1]
         window, state = cache.window, cache.state
-        if length == 1 and window is not None and state is not None:
+        if length == 1 and batch == 1 and window is not None and state is not None:
             normed, slid, advanced = self._mamba_step()(
                 self.in_proj(x)[0, 0], window[0], state[0]
             )
@@ -196,16 +207,23 @@ class NemotronHMamba(nn.Module):
         hidden, b, c = mx.split(
             self.convolve(conv_input, cache), [inner, inner + groups_state], axis=-1
         )
-        hidden = hidden.reshape(1, length, config.mamba_num_heads, config.mamba_head_dim)
-        b = b.reshape(1, length, config.n_groups, config.ssm_state_size)
-        c = c.reshape(1, length, config.n_groups, config.ssm_state_size)
+        hidden = hidden.reshape(batch, length, config.mamba_num_heads, config.mamba_head_dim)
+        b = b.reshape(batch, length, config.n_groups, config.ssm_state_size)
+        c = c.reshape(batch, length, config.n_groups, config.ssm_state_size)
         state = cache.state
         if state is None:
             state = mx.zeros(
-                (1, config.mamba_num_heads, config.mamba_head_dim, config.ssm_state_size),
+                (
+                    batch,
+                    config.mamba_num_heads,
+                    config.mamba_head_dim,
+                    config.ssm_state_size,
+                ),
                 dtype=mx.float32,
             )
         out, state = self._scan()(hidden, b, c, dt, state)
         cache.state = state
         cache.offset += length
-        return self.out_proj(self.norm(out.reshape(1, length, inner).astype(x.dtype), gate))
+        return self.out_proj(
+            self.norm(out.reshape(batch, length, inner).astype(x.dtype), gate)
+        )

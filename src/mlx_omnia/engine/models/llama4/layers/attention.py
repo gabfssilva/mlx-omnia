@@ -3,7 +3,7 @@ import math
 import mlx.core as mx
 import mlx.nn as nn
 
-from mlx_omnia.engine.core.cache import KVCache
+from mlx_omnia.engine.core.attend import KVStore, attend
 from mlx_omnia.engine.core.layers import split_qkv
 from mlx_omnia.engine.models.llama4.config import Llama4TextConfig
 
@@ -38,7 +38,7 @@ class Llama4Attention(nn.Module):
         self.o_proj = nn.Linear(queries, hidden, bias=False)
         self._freqs = freqs
 
-    def _rope(self, x: mx.array, offset: int) -> mx.array:
+    def _rope(self, x: mx.array, offset: int | mx.array) -> mx.array:
         return mx.fast.rope(
             x,
             self.head_dim,
@@ -49,7 +49,7 @@ class Llama4Attention(nn.Module):
             freqs=self._freqs,
         )
 
-    def __call__(self, x: mx.array, mask: mx.array | str | None, cache: KVCache) -> mx.array:
+    def __call__(self, x: mx.array, mask: mx.array | str | None, cache: KVStore) -> mx.array:
         length = x.shape[1]
         offset = cache.offset
         query_width = self.heads * self.head_dim
@@ -66,13 +66,20 @@ class Llama4Attention(nn.Module):
                 q = mx.fast.rms_norm(q, weight=None, eps=QK_NORM_EPS)
                 k = mx.fast.rms_norm(k, weight=None, eps=QK_NORM_EPS)
         elif self.attn_temperature_tuning:
-            positions = mx.arange(offset + 1, offset + length + 1, dtype=mx.float32)
-            attn_scales = (
-                mx.log(mx.floor(positions / self.floor_scale) + 1.0) * self.attn_scale + 1.0
-            )
-            q = (q * attn_scales[:, None]).astype(q.dtype)
-        keys, values = cache.update_and_fetch(k, v)
-        attended = mx.fast.scaled_dot_product_attention(
-            q, keys, values, scale=self.scale, mask=mask
+            if isinstance(offset, mx.array):
+                # Ragged decode: one position per row, broadcast over heads and head_dim.
+                positions = (offset + 1).astype(mx.float32).reshape(-1, 1, 1, 1)
+                attn_scales = (
+                    mx.log(mx.floor(positions / self.floor_scale) + 1.0) * self.attn_scale + 1.0
+                )
+                q = (q * attn_scales).astype(q.dtype)
+            else:
+                positions = mx.arange(offset + 1, offset + length + 1, dtype=mx.float32)
+                attn_scales = (
+                    mx.log(mx.floor(positions / self.floor_scale) + 1.0) * self.attn_scale + 1.0
+                )
+                q = (q * attn_scales[:, None]).astype(q.dtype)
+        attended = attend(cache, q, keys=k, values=v, scale=self.scale, mask=mask)
+        return self.o_proj(
+            attended.transpose(0, 2, 1, 3).reshape(x.shape[0], length, query_width)
         )
-        return self.o_proj(attended.transpose(0, 2, 1, 3).reshape(1, length, query_width))

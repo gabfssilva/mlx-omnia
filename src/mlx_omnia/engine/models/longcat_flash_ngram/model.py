@@ -1,3 +1,4 @@
+from collections.abc import Sequence
 from typing import NamedTuple
 
 import mlx.core as mx
@@ -7,7 +8,14 @@ from mlx_omnia.engine.core.cache import LayerCache
 from mlx_omnia.engine.models.longcat_flash_ngram.config import LongcatFlashNgramConfig
 from mlx_omnia.engine.models.longcat_flash_ngram.layers.attention import yarn_rope
 from mlx_omnia.engine.models.longcat_flash_ngram.layers.block import LongcatFlashDecoderLayer
-from mlx_omnia.engine.models.longcat_flash_ngram.layers.cache import MLACache, NgramCache
+from mlx_omnia.engine.models.longcat_flash_ngram.layers.cache import (
+    BatchedMLACache,
+    BatchedNgramCache,
+    LatentStore,
+    LongcatLayer,
+    MLACache,
+    NgramCache,
+)
 from mlx_omnia.engine.models.longcat_flash_ngram.layers.embedding import NgramEmbedding
 
 
@@ -32,6 +40,8 @@ class LongcatFlashNgramActivations(NamedTuple):
 
 
 class LongcatFlashNgram(nn.Module):
+    continuous_batching = True
+
     def __init__(self, config: LongcatFlashNgramConfig) -> None:
         super().__init__()
         self.config = config
@@ -46,14 +56,14 @@ class LongcatFlashNgram(nn.Module):
         return caches
 
     def activations(
-        self, ids: mx.array, cache: list[LayerCache] | None = None
+        self, ids: mx.array, cache: Sequence[LongcatLayer] | None = None
     ) -> LongcatFlashNgramActivations:
-        cache = cache if cache is not None else self.make_cache()
-        ngram_cache = cache[0]
-        assert isinstance(ngram_cache, NgramCache)
-        mla_caches: list[MLACache] = []
-        for c in cache[1:]:
-            assert isinstance(c, MLACache)
+        layers: Sequence[LongcatLayer] = self.make_cache() if cache is None else cache
+        ngram_cache = layers[0]
+        assert isinstance(ngram_cache, (NgramCache, BatchedNgramCache))
+        mla_caches: list[LatentStore] = []
+        for c in layers[1:]:
+            assert isinstance(c, (MLACache, BatchedMLACache))
             mla_caches.append(c)
 
         x = self.model.ngram_embeddings(ids, ngram_cache)
@@ -74,12 +84,16 @@ class LongcatFlashNgram(nn.Module):
         return LongcatFlashNgramActivations(blocks, logits)
 
     def __call__(
-        self, ids: mx.array, cache: list[LayerCache] | None = None
+        self, ids: mx.array, cache: Sequence[LongcatLayer] | None = None
     ) -> mx.array:
         return self.activations(ids, cache).logits
 
-    def _causal_mask(self, length: int, offset: int) -> mx.array | None:
+    def _causal_mask(self, length: int, offset: int | mx.array) -> mx.array | None:
         if length == 1:
+            # Every row attends its own history whole: the ragged rows are sliced by the
+            # adapter, not padded into one buffer, so there is nothing to mask out.
             return None
+        if not isinstance(offset, int):
+            raise ValueError("a ragged latent batch decodes one token per step")
         keys = offset + length
         return mx.arange(length)[:, None] + offset >= mx.arange(keys)[None, :]

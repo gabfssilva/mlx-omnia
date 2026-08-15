@@ -4,6 +4,10 @@ import mlx.nn as nn
 from mlx_omnia.engine.core.cache import KVCache
 from mlx_omnia.engine.core.layers import MultiLinear
 from mlx_omnia.engine.models.bailing_hybrid.config import BailingHybridConfig
+from mlx_omnia.engine.models.bailing_hybrid.layers.cache import BatchedLatentKVCache
+
+type LatentStore = KVCache | BatchedLatentKVCache
+"""The latent cache a layer reads: one sequence's, or one per row of a ragged batch."""
 
 
 class BailingHybridLatentAttention(nn.Module):
@@ -31,7 +35,7 @@ class BailingHybridLatentAttention(nn.Module):
         self.g_proj = nn.Linear(hidden, self.heads, bias=False)
         self.dense = nn.Linear(self.heads * config.v_head_dim, hidden, bias=False)
 
-    def rotate(self, x: mx.array, offset: int) -> mx.array:
+    def rotate(self, x: mx.array, offset: int | mx.array) -> mx.array:
         return mx.fast.rope(
             x,
             self.qk_rope_head_dim,
@@ -41,12 +45,12 @@ class BailingHybridLatentAttention(nn.Module):
             offset=offset,
         )
 
-    def __call__(self, x: mx.array, cache: KVCache) -> mx.array:
-        length = x.shape[1]
+    def __call__(self, x: mx.array, cache: LatentStore) -> mx.array:
+        rows, length = x.shape[0], x.shape[1]
         offset = cache.offset
         q = (
             self.q_proj(x)
-            .reshape(1, length, self.heads, self.qk_head_dim)
+            .reshape(rows, length, self.heads, self.qk_head_dim)
             .transpose(0, 2, 1, 3)
         )
         q_nope, q_pe = mx.split(q, [self.qk_nope_head_dim], axis=-1)
@@ -55,34 +59,56 @@ class BailingHybridLatentAttention(nn.Module):
         projected = self.kv_a_proj_with_mqa(x)
         compressed, k_pe = mx.split(projected, [self.kv_lora_rank], axis=-1)
         k_pe = self.rotate(
-            k_pe.reshape(1, length, 1, self.qk_rope_head_dim).transpose(0, 2, 1, 3), offset
+            k_pe.reshape(rows, length, 1, self.qk_rope_head_dim).transpose(0, 2, 1, 3), offset
         )
         latent = mx.expand_dims(self.kv_a_layernorm(compressed), axis=1)
-        latent, k_pe = cache.update_and_fetch(latent, k_pe)
 
-        if length == 1:
-            # Absorbed: the query moves into the latent's space, so nothing expands and
-            # the whole prefix is read once, 576 columns wide.
-            keys = mx.concatenate([latent, k_pe], axis=-1)
+        if isinstance(cache, BatchedLatentKVCache):
+            if length != 1:
+                raise ValueError("a ragged batch decodes one token at a time")
             queries = mx.concatenate([self.embed_q(q_nope), q_pe], axis=-1)
-            attended = mx.fast.scaled_dot_product_attention(
-                queries, keys, latent, scale=self.scale, mask=None
+            attended = mx.concatenate(
+                [
+                    mx.fast.scaled_dot_product_attention(
+                        queries[index : index + 1],
+                        mx.concatenate([row_latent, row_pe], axis=-1),
+                        row_latent,
+                        scale=self.scale,
+                        mask=None,
+                    )
+                    for index, (row_latent, row_pe) in enumerate(
+                        cache.update_and_fetch(latent, k_pe)
+                    )
+                ]
             )
             attended = self.unembed_out(attended)
         else:
-            k_nope = self.embed_q(latent, transpose=False)
-            values = self.unembed_out(latent)
-            keys = mx.concatenate([k_nope, mx.repeat(k_pe, self.heads, axis=1)], axis=-1)
-            attended = mx.fast.scaled_dot_product_attention(
-                mx.concatenate([q_nope, q_pe], axis=-1),
-                keys,
-                values,
-                scale=self.scale,
-                mask="causal",
-            )
+            history, history_pe = cache.update_and_fetch(latent, k_pe)
+            if length == 1:
+                # Absorbed: the query moves into the latent's space, so nothing expands and
+                # the whole prefix is read once, 576 columns wide.
+                keys = mx.concatenate([history, history_pe], axis=-1)
+                queries = mx.concatenate([self.embed_q(q_nope), q_pe], axis=-1)
+                attended = mx.fast.scaled_dot_product_attention(
+                    queries, keys, history, scale=self.scale, mask=None
+                )
+                attended = self.unembed_out(attended)
+            else:
+                k_nope = self.embed_q(history, transpose=False)
+                values = self.unembed_out(history)
+                keys = mx.concatenate(
+                    [k_nope, mx.repeat(history_pe, self.heads, axis=1)], axis=-1
+                )
+                attended = mx.fast.scaled_dot_product_attention(
+                    mx.concatenate([q_nope, q_pe], axis=-1),
+                    keys,
+                    values,
+                    scale=self.scale,
+                    mask="causal",
+                )
 
         gate = mx.sigmoid(self.g_proj(x).astype(mx.float32)).astype(attended.dtype)
         attended = attended * gate.transpose(0, 2, 1)[..., None]
         return self.dense(
-            attended.transpose(0, 2, 1, 3).reshape(1, length, self.heads * self.v_head_dim)
+            attended.transpose(0, 2, 1, 3).reshape(rows, length, self.heads * self.v_head_dim)
         )

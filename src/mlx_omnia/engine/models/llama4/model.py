@@ -1,8 +1,10 @@
+from collections.abc import Sequence
 from typing import NamedTuple
 
 import mlx.core as mx
 import mlx.nn as nn
 
+from mlx_omnia.engine.core.attend import KVStore
 from mlx_omnia.engine.core.cache import KVCache
 from mlx_omnia.engine.models.llama4.config import CHUNKED, FULL, Llama4Config, Llama4TextConfig
 from mlx_omnia.engine.models.llama4.layers.block import Llama4Block
@@ -23,6 +25,8 @@ class Llama4Activations(NamedTuple):
 
 
 class Llama4(nn.Module):
+    continuous_batching = True
+
     def __init__(self, config: Llama4Config) -> None:
         super().__init__()
         self.config = config
@@ -37,7 +41,9 @@ class Llama4(nn.Module):
     def make_cache(self) -> list[KVCache]:
         return [KVCache() for _ in self.model.layers]
 
-    def activations(self, ids: mx.array, cache: list[KVCache] | None = None) -> Llama4Activations:
+    def activations(
+        self, ids: mx.array, cache: Sequence[KVStore] | None = None
+    ) -> Llama4Activations:
         cache = cache if cache is not None else self.make_cache()
         x = self.model.embed_tokens(ids)
         length = x.shape[1]
@@ -59,14 +65,22 @@ class Llama4(nn.Module):
             logits = self.lm_head(normed)
         return Llama4Activations(blocks, logits)
 
-    def __call__(self, ids: mx.array, cache: list[KVCache] | None = None) -> mx.array:
+    def __call__(self, ids: mx.array, cache: Sequence[KVStore] | None = None) -> mx.array:
         return self.activations(ids, cache).logits
 
-    def _chunked_mask(self, length: int, offset: int) -> mx.array | str | None:
+    def _chunked_mask(self, length: int, offset: int | mx.array) -> mx.array | str | None:
         """Block-local mask over a full cache: `kv_idx // chunk == q_idx // chunk`
         ANDed with causal. Not a sliding window — the window starts at the chunk
         boundary, not at `p - chunk`."""
         chunk = self.text.attention_chunk_size
+        if isinstance(offset, mx.array):
+            # Ragged decode: one band per row. Causality needs no term — each row's mask is
+            # trimmed to its own key span before it is applied.
+            span = int(mx.max(offset).item()) + 1
+            if span <= chunk:
+                return None
+            band = mx.arange(span) >= (offset[:, None, None, None] // chunk) * chunk
+            return band
         keys = offset + length
         if keys <= chunk:
             return None if length == 1 else "causal"
