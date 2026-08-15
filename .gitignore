@@ -43,3 +43,4 @@ plans/
 tests/fixtures/*.safetensors
 reactive-streams-continous-batching.md
 stateful.md
+simplifying.md
