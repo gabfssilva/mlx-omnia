@@ -30,7 +30,7 @@ from collections.abc import Callable, Mapping
 import mlx.core as mx
 
 from mlx_omnia.engine.core.attend import Attending, AttentionMask
-from mlx_omnia.engine.core.cache import LayerCache, reserve
+from mlx_omnia.engine.core.cache import LayerCache, Layout, Rows, reserve
 from mlx_omnia.engine.quant.quantization import MXFP, NVFP, Affine, Quantization, admits
 
 _BLOCK = 256
@@ -123,11 +123,23 @@ class QuantizedKVCache(LayerCache, Attending):
         self._dense = min(self._dense, self.offset)
 
     @property
-    def is_storable(self) -> bool:
-        """The codes are the state. Writing them out is writing the compression itself, which
-        is the whole reason it is worth a file: the bytes on disk are already the small ones,
-        and reading them back needs no quantizer to run again."""
-        return True
+    def layout(self) -> Mapping[str, Layout]:
+        """Rows, every one of them, and the two regions declared apart.
+
+        The codes are the state: a span holds the compression itself, which is the whole
+        reason it is worth storing — the bytes are already the small ones, and reading them
+        back needs no quantizer to run again. The dense head and the packed tail are separate
+        tensors because they are separate row spaces, and a span contributes to whichever of
+        the two its own tokens fall in — the first span of a conversation to both, every span
+        after `start_tokens` to only one, and the concatenation does not care.
+        """
+        held: dict[str, Layout] = {"dense_keys": Rows(), "dense_values": Rows()}
+        for side, format in (("keys", self.k_format), ("values", self.v_format)):
+            held[f"{side}.codes"] = Rows()
+            held[f"{side}.scales"] = Rows()
+            if isinstance(format, Affine):
+                held[f"{side}.biases"] = Rows()
+        return held
 
     @property
     def signature(self) -> dict[str, object]:
@@ -142,17 +154,27 @@ class QuantizedKVCache(LayerCache, Attending):
             "start_tokens": self.start_tokens,
         }
 
-    def stored(self) -> dict[str, mx.array]:
-        """The rows in use of both regions, cut the way `KVCache.stored` cuts: the packed
-        buffers grow by the same block and the padding is not state."""
+    def stored(self, start: int, stop: int) -> dict[str, mx.array]:
+        """The two regions' share of `[start, stop)`.
+
+        A row's region is decided by its absolute position and never by anything else — the
+        same rule `_write` follows — so the split of a range is arithmetic over
+        `start_tokens` and needs nothing read back."""
         held: dict[str, mx.array] = {}
-        if self._dense and self._dense_keys is not None and self._dense_values is not None:
-            held["dense_keys"] = self._dense_keys[..., : self._dense, :]
-            held["dense_values"] = self._dense_values[..., : self._dense, :]
-        for side, packed in (("keys", self._keys), ("values", self._values)):
-            if packed is None:
-                continue
-            held |= {f"{side}.{name}": tensor for name, tensor in packed.stored().items()}
+        head, tail = min(start, self._dense), min(stop, self._dense)
+        if tail > head and self._dense_keys is not None and self._dense_values is not None:
+            held["dense_keys"] = self._dense_keys[..., head:tail, :]
+            held["dense_values"] = self._dense_values[..., head:tail, :]
+        first = max(0, start - self.start_tokens)
+        last = max(0, stop - self.start_tokens)
+        if last > first:
+            for side, packed in (("keys", self._keys), ("values", self._values)):
+                if packed is None:
+                    continue
+                held |= {
+                    f"{side}.{name}": tensor
+                    for name, tensor in packed.stored(first, last).items()
+                }
         return held
 
     def restore(self, offset: int, tensors: Mapping[str, mx.array]) -> None:
@@ -264,18 +286,19 @@ class _Packed:
     def nbytes(self) -> int:
         return sum(held.nbytes for held in self.tensors)
 
-    def stored(self) -> dict[str, mx.array]:
-        """The triple cut to the rows written. Named here rather than assembled by the cache
-        because which of the three exist is the format's business: `biases` is present for
-        `Affine` and absent for the others, and that absence is the format, not a gap."""
+    def stored(self, start: int, stop: int) -> dict[str, mx.array]:
+        """The triple, cut to the rows of `[start, stop)`. Named here rather than assembled
+        by the cache because which of the three exist is the format's business: `biases` is
+        present for `Affine` and absent for the others, and that absence is the format, not
+        a gap."""
         if self.codes is None or self.scales is None:
             return {}
         held = {
-            "codes": self.codes[..., : self.rows_written, :],
-            "scales": self.scales[..., : self.rows_written, :],
+            "codes": self.codes[..., start:stop, :],
+            "scales": self.scales[..., start:stop, :],
         }
         if self.biases is not None:
-            held["biases"] = self.biases[..., : self.rows_written, :]
+            held["biases"] = self.biases[..., start:stop, :]
         return held
 
     def rows(self, start: int, stop: int) -> mx.array:

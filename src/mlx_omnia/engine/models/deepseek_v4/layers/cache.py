@@ -1,10 +1,18 @@
-from collections.abc import Callable, Sequence
+from collections.abc import Callable, Mapping, Sequence
 
 import mlx.core as mx
 
 from mlx_omnia.engine.batching import RaggedAdapter, RaggedBatchable
-from mlx_omnia.engine.core.cache import KVCache, LayerCache, reserve
-from mlx_omnia.engine.models.deepseek_v4.config import LOCAL
+from mlx_omnia.engine.core.cache import (
+    Composite,
+    KVCache,
+    LayerCache,
+    Layout,
+    Rows,
+    Snapshot,
+    reserve,
+)
+from mlx_omnia.engine.models.deepseek_v4.config import LOCAL, OVERLAP
 
 
 class PoolCache(LayerCache):
@@ -111,8 +119,51 @@ class PoolCache(LayerCache):
         rows = mx.arange(offset + 1, offset + length + 1).reshape(-1, 1)
         return mx.arange(self.pooled_rows).reshape(1, -1) < rows // self.ratio
 
+    @property
+    def layout(self) -> Mapping[str, Layout]:
+        """The pooled rows compose at one row per `ratio` tokens; the overlap carry does not.
 
-class DeepseekV4Cache(LayerCache, RaggedBatchable):
+
+        The tail is neither, and it is nowhere: on a boundary that is a multiple of `ratio` —
+        which the span is required to be — `remainder` is zero and the tail buffer holds
+        nothing a next call will read. `pooled_rows` is `offset // ratio` and is recomputed
+        on the way in rather than carried, for the same reason `QuantizedKVCache` recomputes
+        its split: a second copy of a rule is a second rule, free to disagree.
+        """
+        held: dict[str, Layout] = {"pooled": Rows(stride=self.ratio)}
+        if self.ratio == OVERLAP:
+            # Only the overlapping ratio carries anything across a window: each of its windows
+            # pools its own lane B with the previous one's lane A, so the last raw window is
+            # state. Every other ratio pools a window out of its own tokens and keeps nothing
+            # — and declaring a carry it never produces would be a trunk that claims an anchor
+            # and hands over none, which is silent zero reuse for the whole model.
+            held["carry.kv"] = Snapshot()
+            held["carry.gate"] = Snapshot()
+        return held
+
+    def stored(self, start: int, stop: int) -> dict[str, mx.array]:
+        if start % self.ratio or stop % self.ratio:
+            raise ValueError(
+                f"a pool of {self.ratio} cannot cut [{start}, {stop}): a span has to close "
+                "the window, or its last row is built from tokens on both sides of the cut"
+            )
+        held: dict[str, mx.array] = {}
+        if self.pooled is not None:
+            held["pooled"] = self.pooled[..., start // self.ratio : stop // self.ratio, :]
+        if self.previous is not None:
+            held["carry.kv"], held["carry.gate"] = self.previous
+        return held
+
+    def restore(self, offset: int, tensors: Mapping[str, mx.array]) -> None:
+        self.offset = offset
+        self.remainder = 0
+        self.pooled = tensors.get("pooled")
+        self.pooled_rows = offset // self.ratio
+        kv, gate = tensors.get("carry.kv"), tensors.get("carry.gate")
+        self.previous = None if kv is None or gate is None else (kv, gate)
+
+
+class DeepseekV4Cache(Composite, RaggedBatchable):
     """One layer's histories: the local keys (K == V, one buffer), the compressor's pooled
     rows and — on the indexed layers — the indexer's own pooled rows. They advance
     together and the layer presents a single `offset`."""
@@ -126,6 +177,18 @@ class DeepseekV4Cache(LayerCache, RaggedBatchable):
         super().__init__()
 
     @property
+    def parts(self) -> Mapping[str, LayerCache]:
+        """The local window always, the two pools when this layer carries them. Absent and
+        not empty: a layer with no compressor has no compressed rows to name, and a name
+        that is sometimes empty is a name a resume would look for and not find."""
+        held: dict[str, LayerCache] = {"attention": self.attention}
+        if self.compressor is not None:
+            held["compressor"] = self.compressor
+        if self.indexer is not None:
+            held["indexer"] = self.indexer
+        return held
+
+    @property
     def offset(self) -> int:
         return self.attention.offset
 
@@ -136,41 +199,6 @@ class DeepseekV4Cache(LayerCache, RaggedBatchable):
     @property
     def is_trimmable(self) -> bool:
         return self.compressor is None and self.attention.is_trimmable
-
-    @property
-    def is_replayable(self) -> bool:
-        """The pools answer for themselves — a layer that carries one cannot be rewound by
-        either road, and saying otherwise is what lets speculation run off a pooled window
-        that was built from tokens the sequence never had."""
-        pools = (self.compressor, self.indexer)
-        return self.attention.is_replayable and all(
-            pool.is_replayable for pool in pools if pool is not None
-        )
-
-    @property
-    def nbytes(self) -> int:
-        pools = (self.compressor, self.indexer)
-        return self.attention.nbytes + sum(pool.nbytes for pool in pools if pool is not None)
-
-    @property
-    def tensors(self) -> tuple[mx.array, ...]:
-        pools = (self.compressor, self.indexer)
-        held = self.attention.tensors
-        for pool in pools:
-            if pool is not None:
-                held += pool.tensors
-        return held
-
-    def checkpoint(self) -> Callable[[], None]:
-        pools = (self.compressor, self.indexer)
-        restores = [self.attention.checkpoint()]
-        restores.extend(pool.checkpoint() for pool in pools if pool is not None)
-
-        def restore() -> None:
-            for undo in restores:
-                undo()
-
-        return restore
 
     def trim(self, length: int) -> None:
         if self.compressor is not None:

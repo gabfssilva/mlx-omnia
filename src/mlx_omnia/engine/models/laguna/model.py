@@ -1,4 +1,4 @@
-from collections.abc import Callable, Sequence
+from collections.abc import Callable, Mapping, Sequence
 from typing import NamedTuple
 
 import mlx.core as mx
@@ -7,7 +7,15 @@ import mlx.nn as nn
 from mlx_omnia.engine.batching import BatchedKVCache, batch
 from mlx_omnia.engine.checkpoint import wire_resident
 from mlx_omnia.engine.core.attend import KVStore
-from mlx_omnia.engine.core.cache import FixedKVCache, KVCache, LayerCache, RingKVCache, fit
+from mlx_omnia.engine.core.cache import (
+    FixedKVCache,
+    KVCache,
+    LayerCache,
+    Layout,
+    RingKVCache,
+    Rows,
+    fit,
+)
 from mlx_omnia.engine.core.decode import Buckets, DecodePlan, SlotBucket, compiled_decode
 from mlx_omnia.engine.core.kernels.attention.sdpa import SCALED_DOT_PRODUCT_ATTENTION
 from mlx_omnia.engine.core.kernels.lm_head.argmax import (
@@ -96,6 +104,23 @@ class Laguna(nn.Module):
         Held back with the fused sliding reader: correct only once the reader owns the
         append, and the per-step slice writes here cost more than the growing cache."""
         return [KVCache() for _ in self.config.layer_types]
+
+    def cache_layouts(self) -> list[Mapping[str, Layout]] | None:
+        """Which layers slide, which the cache classes cannot say.
+
+        `make_cache` hands every layer a plain `KVCache` — the prefill keeps the whole history
+        and the mask is what makes a layer sliding — so the window lives in the config and
+        nowhere in the cache. Declaring it is what lets a resume skip the spans the mask
+        proves are never read again: a sliding layer attends `columns > position - window`,
+        so the rows before that carry zero weight for every query that will ever run.
+        """
+        return [
+            {"keys": Rows(keep=window), "values": Rows(keep=window)}
+            if kind == SLIDING
+            else {"keys": Rows(), "values": Rows()}
+            for kind in self.config.layer_types
+            for window in (self.config.sliding_window,)
+        ]
 
     def compile_decode(
         self, cache: list[KVCache | FixedKVCache | RingKVCache], capacity: int | None = None
@@ -293,19 +318,14 @@ class Laguna(nn.Module):
                 elif isinstance(source, RingKVCache):
                     keys, values = source.fetch()
                     target = RingKVCache(self.config.sliding_window)
-                    target.restore(
+                    # `reload` and not `restore`: the rotation *is* the state here, and the
+                    # two rings share it. `restore` takes rows in absolute order and would
+                    # unrotate and rotate the same buffer for nothing.
+                    target.reload(
                         source.rows,
-                        {
-                            "keys": keys + mx.zeros_like(keys),
-                            "values": values + mx.zeros_like(values),
-                        },
+                        keys + mx.zeros_like(keys),
+                        values + mx.zeros_like(values),
                     )
-                    target_keys, target_values = target.fetch()
-                    target.state = [
-                        target_keys,
-                        target_values,
-                        mx.array([source.rows], dtype=mx.int32),
-                    ]
                 else:
                     raise TypeError("sliding layer requires a growing or ring KV cache")
             else:

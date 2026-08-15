@@ -425,6 +425,12 @@ class BlockProposer:
     def width(self) -> int:
         return self._width
 
+    @property
+    def resumes(self) -> bool:
+        """No, and for the reason `Persistent` says no: it keeps a row per position, and a
+        resumed prompt produced none of them."""
+        return False
+
     def absorb(self, features: mx.array) -> None:
         assert features.shape[-1] == len(self._taps)
         rows = features[0, :, 0].tolist()

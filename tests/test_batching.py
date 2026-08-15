@@ -1,4 +1,5 @@
 from collections.abc import Callable, Sequence
+from typing import cast
 
 import mlx.core as mx
 import pytest
@@ -8,14 +9,16 @@ from mlx_omnia.engine.batching import (
     BatchedLayer,
     BatchGreedyDecoder,
     BatchModel,
+    BatchPrefill,
     PreparedSingleGreedyDecoder,
     SingleGreedyDecoder,
     batch,
     prepare_batch_sequence,
     step,
 )
-from mlx_omnia.engine.core.cache import FixedKVCache, KVCache, RingKVCache
+from mlx_omnia.engine.core.cache import DeltaCache, FixedKVCache, KVCache, RingKVCache
 from mlx_omnia.engine.core.prefill import BLOCK
+from mlx_omnia.engine.core.prefix import Prefixes, PrefixStore
 from mlx_omnia.engine.generate import (
     Constraint,
     Meter,
@@ -132,6 +135,22 @@ class CountingModel(BatchModel):
         targets = (ids + 1) % self.vocab
         vocabulary = mx.arange(self.vocab)
         return -mx.abs(vocabulary - targets[..., None]).astype(mx.float32)
+
+
+class StoringModel(CountingModel):
+    """`CountingModel` that actually writes its cache. A span is the rows a forward produced,
+    so a double that never writes one has nothing to store — which is the right answer and
+    not the one a test about storing wants."""
+
+    def __call__(self, ids: mx.array, cache: Sequence[BatchedLayer]) -> mx.array:
+        rows = mx.ones((ids.shape[0], 1, ids.shape[1], 4), dtype=mx.float32)
+        for layer in cache:
+            if isinstance(layer, KVCache | FixedKVCache | RingKVCache):
+                layer.update_and_fetch(rows, rows)
+            elif isinstance(layer, BatchedKVCache):
+                for index, row in enumerate(layer.rows):
+                    row.update_and_fetch(rows[index : index + 1], rows[index : index + 1])
+        return super().__call__(ids, cache)
 
 
 class GreedyCountingModel(CountingModel, BatchGreedyDecoder):
@@ -383,18 +402,187 @@ def test_text_language_model_emits_nothing_when_the_prompt_exhausts_context() ->
 
 
 def test_batched_generation_returns_its_cache_to_prefix_reuse() -> None:
-    model = TextLanguageModel(CountingModel(128), AsciiTokenizer())
-    first = model.prepare_batch(
-        Text("A"), GenerationOptions(max_tokens=1, prefix_budget=1024**2)
-    )
+    """The batched path is the served one — every family with continuous batching goes
+    through it — so the spans a prefill closes have to be its own, not the single loop's."""
+    prefix = Prefixes(PrefixStore(1 << 30, span=2), "a-model", "a-stamp")
+    model = TextLanguageModel(StoringModel(128), AsciiTokenizer())
+    first = model.prepare_batch(Text("ABCD"), GenerationOptions(max_tokens=1, prefix=prefix))
     assert first is not None
     model.step_batch([first])
     meter = Meter()
 
     second = model.prepare_batch(
-        Text("ABC"),
-        GenerationOptions(max_tokens=1, prefix_budget=1024**2, meter=meter),
+        Text("ABCDEF"),
+        GenerationOptions(max_tokens=1, prefix=prefix, meter=meter),
     )
 
     assert second is not None
-    assert meter.reused_tokens == 2
+    assert meter.reused_tokens == 4
+    assert meter.kept_prefix
+
+
+def test_a_batched_prefill_closes_a_span_as_soon_as_a_block_finishes_it() -> None:
+    """A block of prefill is where the trunk stands still, so it is where the spans it
+    finished are stored. Waiting for the last forward would hold every intermediate block's
+    graph alive behind them, and a request cancelled mid-prefill would leave nothing.
+
+    Mutation: dropping `_close` from the block branch leaves the store empty until the last
+    forward, and the assertion below sees zero.
+    """
+    prefix = Prefixes(PrefixStore(1 << 30, span=2), "a-model", "a-stamp")
+    model = StoringModel(128)
+    cache = list[KVCache | FixedKVCache | RingKVCache](model.make_cache())
+    prompt = [65, 66, 67, 68, 69, 70, 71, 72, 73]
+    walk = prefix.begin(cache, model)
+    assert walk is not None
+    prefill = BatchPrefill(model, prompt, cache, 0, 0, 1, greedy, prefix=walk, block=2)
+
+    assert prefill.advance() is None, "one block of nine ids is not the last"
+
+    assert walk.covered == 2, "the first block's span is stored, not held for the end"
+    while prefill.advance() is None:
+        pass
+    assert walk.covered == 8
+    warm = list[KVCache | FixedKVCache | RingKVCache](model.make_cache())
+    second = prefix.begin(warm, model)
+    assert second is not None
+    assert second.resume(prompt, warm) == 8
+
+
+def test_the_clock_starts_on_the_first_block_of_the_prefill() -> None:
+    """A prompt of twenty blocks is twenty scheduler ticks, and a clock started on the last
+    of them reports the tail of the prefill as the whole of it — a TTFT that cannot be
+    compared with anything, least of all with the same prompt resumed.
+
+    Mutation: moving `prefill()` back to the final branch makes the two marks equal and the
+    assertion below fails on a `ttft` that measured one block out of five.
+    """
+    model = CountingModel(128)
+    meter = Meter()
+    prompt = list(range(65, 85))
+    prefill = BatchPrefill(
+        model,
+        prompt,
+        list[KVCache | FixedKVCache | RingKVCache](model.make_cache()),
+        0,
+        0,
+        1,
+        greedy,
+        meter=meter,
+        block=4,
+    )
+
+    assert prefill.advance() is None
+    assert meter.prefill_started is not None, "the clock waited for the last block"
+    started = meter.prefill_started
+    while prefill.advance() is None:
+        pass
+
+    assert meter.prefill_started == started, "the clock restarted mid-prefill"
+    assert meter.prompt_tokens == len(prompt)
+    assert len(model.widths) == 5, "five blocks of four, and the clock covers all of them"
+
+
+def test_the_meter_reports_the_prefill_while_it_is_still_being_fed() -> None:
+    """A twenty-block prompt is twenty scheduler ticks in which `ttft` is `None`, so every
+    rate a dashboard draws is `None` too and a long prefill is indistinguishable from a
+    stalled request. The rows fed are written on the boundaries the prefill already stops at,
+    which is what makes it legible while it runs.
+
+    Mutation: dropping `meter.fed` from `_stopped` leaves `prefilled_tokens` at zero for the
+    whole prefill, and the first assertion below fails.
+    """
+    model = CountingModel(128)
+    meter = Meter()
+    prompt = list(range(65, 85))
+    prefill = BatchPrefill(
+        model,
+        prompt,
+        list[KVCache | FixedKVCache | RingKVCache](model.make_cache()),
+        0,
+        0,
+        1,
+        greedy,
+        meter=meter,
+        block=4,
+    )
+
+    assert prefill.advance() is None
+    assert meter.prefilled_tokens == 4, "the first block reported nothing"
+    assert meter.ttft is None, "no token has been drawn yet"
+    assert meter.prefill_seconds is not None and meter.prefill_seconds > 0
+
+    assert prefill.advance() is None
+    assert meter.prefilled_tokens == 8, "the second block did not move the count"
+
+    while prefill.advance() is None:
+        pass
+    assert meter.prefilled_tokens == len(prompt), "the last block is prefill too"
+
+
+def test_a_prompt_that_generates_nothing_still_leaves_its_spans() -> None:
+    """The prefill's own commit, and the one case where nothing else makes it: a request
+    that retires before its first decode step. It is also what lets a concurrent request
+    adopt the spans of a prompt this one is still generating from."""
+    prefix = Prefixes(PrefixStore(1 << 30, span=2), "a-model", "a-stamp")
+    model = StoringModel(128)
+    cache = list[KVCache | FixedKVCache | RingKVCache](model.make_cache())
+    prompt = [65, 66, 67, 68, 69]
+    walk = prefix.begin(cache, model)
+    assert walk is not None
+    prefill = BatchPrefill(model, prompt, cache, 0, 0, 0, greedy, prefix=walk)
+
+    while prefill.advance() is None:
+        pass
+
+    assert walk.covered == 4
+
+
+class RecurrentBatchModel(BatchModel):
+    """A batched trunk whose layer keeps a recurrent state — the `nemotron_h` shape in
+    miniature. Its state exists only where the layer is stopped, which is what makes the
+    prefill's cut on the last boundary the difference between a resumable turn and a turn
+    that leaves nothing."""
+
+    continuous_batching = True
+
+    def __init__(self, vocab: int) -> None:
+        self.vocab = vocab
+        self.widths: list[int] = []
+
+    def make_cache(self) -> list[KVCache]:
+        return cast(list[KVCache], [DeltaCache()])
+
+    def __call__(self, ids: mx.array, cache: Sequence[BatchedLayer]) -> mx.array:
+        self.widths.append(ids.shape[1])
+        layer = cache[0]
+        assert isinstance(layer, DeltaCache)
+        layer.offset += ids.shape[1]
+        layer.state = mx.full((1, 4), layer.offset, dtype=mx.float32)
+        layer.window = mx.full((1, 4), layer.offset, dtype=mx.float32)
+        targets = (ids + 1) % self.vocab
+        vocabulary = mx.arange(self.vocab)
+        return -mx.abs(vocabulary - targets[..., None]).astype(mx.float32)
+
+
+def test_a_batched_prefill_stops_on_a_boundary_so_a_recurrent_turn_can_be_resumed() -> None:
+    """The cut that makes the second turn free for a hybrid. The prefill loop feeds the last
+    partial block whole, so a prompt ending mid-span leaves the trunk standing nowhere — and
+    a request asking for one token, which is what a replay sends, would leave no anchor at
+    all. Mutation: skipping the cut drops `reused` to zero on the turn after."""
+    prefix = Prefixes(PrefixStore(1 << 30, span=4), "a-model", "a-stamp")
+    model = RecurrentBatchModel(128)
+    prompt = list(range(65, 76))
+    cache = list[KVCache | FixedKVCache | RingKVCache](model.make_cache())
+    walk = prefix.begin(cache, model)
+    assert walk is not None
+    prefill = BatchPrefill(model, prompt, cache, 0, 0, 1, greedy, prefix=walk)
+    while prefill.advance() is None:
+        pass
+
+    warm = list[KVCache | FixedKVCache | RingKVCache](model.make_cache())
+    second = prefix.begin(warm, model)
+    assert second is not None
+
+    assert second.resume([*prompt, 200, 201], warm) == 8
+    assert model.widths == [8, 3], "the last block was cut on the boundary before its end"

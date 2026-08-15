@@ -46,8 +46,8 @@ struct EngineState: Decodable {
     let queue: Queue
     let residentBytes: Int
     let kvBytes: Int
-    /// The two tiers of the prefix cache, as they stand: what the resident tries hold, and
-    /// what the conversations they evicted weigh on disk.
+    /// The two tiers of the prefix cache, as they stand: what the store holds in memory, and
+    /// what the spans it pushed out weigh on disk.
     let prefixMemoryBytes: Int
     let prefixDiskBytes: Int
 }
@@ -235,10 +235,15 @@ struct Speculation: Decodable {
     let accepted: Int
 }
 
-struct Sample: Decodable {
+struct Sample: Decodable, Identifiable {
     let model: String
     let state: String
     let promptTokens: Int
+    let reusedTokens: Int
+    /// Fresh prompt rows the trunk has taken. It is the whole prompt once the prefill is
+    /// over, and while it runs it is where the prefill is — the only number that moves
+    /// during a 40k prompt, which is a minute in which there is no ttft to divide by.
+    let prefilledTokens: Int
     let completionTokens: Int
     let startedAt: Double
     let loadSeconds: Double?
@@ -247,19 +252,44 @@ struct Sample: Decodable {
     let prefillTokensPerSecond: Double?
     let ceilingFraction: Double?
     let speculation: Speculation?
+
+    /// The request is still reading its prompt: no first token, and rows left to feed.
+    var prefilling: Bool { ttft == nil && state == "running" }
+
+    var id: String { "\(model)-\(startedAt)" }
 }
 
-struct Aggregate: Decodable {
+struct Aggregate: Decodable, Identifiable {
     let model: String
     let requests: Int
+    let promptTokens: Int
+    let completionTokens: Int
+    let ttft: Double?
+    let prefillTokensPerSecond: Double?
+    let tokensPerSecond: Double?
+    let ceilingFraction: Double?
+
+    var id: String { model }
+}
+
+/// Every request this daemon has served, whatever model answered it.
+struct Totals: Decodable {
+    let requests: Int
+    let running: Int
+    let promptTokens: Int
+    let completionTokens: Int
+    let ttft: Double?
+    let prefillTokensPerSecond: Double?
     let tokensPerSecond: Double?
     let ceilingFraction: Double?
 }
 
 struct Snapshot: Decodable {
-    let live: Sample?
+    /// Every request being served, newest first: the engine batches, so one is not enough.
+    let live: [Sample]
     let requests: [Sample]
     let models: [Aggregate]
+    let totals: Totals
 }
 
 // ── the Hub, settings and profiles ───────────────────────────────────────

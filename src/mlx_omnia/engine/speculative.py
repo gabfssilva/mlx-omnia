@@ -20,7 +20,8 @@ import mlx.core as mx
 import mlx.nn as nn
 
 from mlx_omnia.engine.core.cache import LayerCache
-from mlx_omnia.engine.core.prefill import prefill
+from mlx_omnia.engine.core.prefill import landing, prefill
+from mlx_omnia.engine.core.prefix import Prefix, Prefixes
 
 if TYPE_CHECKING:
     # `generate` imports this module to reach the speculative path; the names below are
@@ -133,6 +134,21 @@ class Proposer(Protocol):
         """Ids proposed per round."""
         ...
 
+    @property
+    def resumes(self) -> bool:
+        """Whether this can start against a target whose prompt was resumed from a prefix
+        store instead of prefilled.
+
+        The question is what the proposer needed out of the prefill. One that reads no blocks
+        needed nothing; one that keeps only the target's last row gets it from the tail the
+        resumed prompt still runs. One that accumulates a row per *position* did not: the
+        resumed positions produced no features and never will, short of a forward over them,
+        which is the prefill the resume just avoided. That one answers `False`, and the
+        caller drops the prefix rather than the draft — a round saves a read of the weights
+        on every token of every turn, and a prefix saves one turn's prefill.
+        """
+        ...
+
     def absorb(self, features: mx.array) -> None:
         """The target's reading of the positions its cache has just taken and kept, in
         order, `[1, new, len(taps) * hidden]`. Exactly the positions this has not been
@@ -190,6 +206,13 @@ class Autoregressive[D: LayerCache]:
     @property
     def width(self) -> int:
         return self._width
+
+    @property
+    def resumes(self) -> bool:
+        """Yes: its whole input is ids, and round one feeds it whatever the target's cache
+        already covers. That catch-up is a prefill of the draft's own small checkpoint, and
+        it happens after the first token — outside the TTFT the prefix exists to cut."""
+        return True
 
     def absorb(self, features: mx.array) -> None:
         raise AssertionError("an autoregressive draft reads no blocks of the target")
@@ -364,6 +387,13 @@ class Chained[S: LayerCache]:
     def width(self) -> int:
         return self._width
 
+    @property
+    def resumes(self) -> bool:
+        """Yes: the one row it carries is the target's reading of the last position, and a
+        resumed prompt still runs a forward over its tail — one row is the least that
+        forward can produce."""
+        return True
+
     def absorb(self, features: mx.array) -> None:
         """Only the last row is kept. The step conditions on the position right before the
         token it is given, and the round hands over exactly the positions the target's cache
@@ -450,6 +480,16 @@ class Persistent[S: LayerCache]:
     def width(self) -> int:
         return self._width
 
+    @property
+    def resumes(self) -> bool:
+        """No. Its cache holds one pair per committed position and every one of them is built
+        from the target's hidden at that position — which a resumed prompt never produced.
+        The way out is a chain of its own, keyed on the target's plus this head's: one layer
+        against the target's dozens, resumed beside it, with `absorb` then handed only the
+        tail. Until that exists the assert in `propose` is the guard, and this is what keeps
+        it from ever being reached."""
+        return False
+
     def absorb(self, features: mx.array) -> None:
         """Every row is kept, not the last one: each is the hidden half of a pair the
         cache does not have yet, and the next catch-up runs over all of them."""
@@ -499,12 +539,21 @@ def stream_speculative_ids[C: LayerCache, D: LayerCache](
     stop: Collection[int] = (),
     meter: "Meter | None" = None,
     acceptance: Acceptance | None = None,
+    prefix: "Prefixes | None" = None,
 ) -> Iterator[int]:
     """The target's greedy stream, token for token, with the draft only paying for speed.
 
     A `Proposer` says for itself how many ids a round proposes; a plain language model is
     wrapped in `Autoregressive` and `lookahead` is what it proposes. `acceptance` collects
     what the rounds actually accepted, for whoever is measuring.
+
+    `prefix` composes with the rounds, and the invariant that makes it compose is the one the
+    rounds already keep: between them the target's rows are the settled ids and never a
+    proposal, so the spans a boundary closes are this conversation's. Nothing is ever stored
+    inside a round — the verification forward writes `width + 1` rows before it knows how
+    many survive — and a round that would step over a boundary the anchor needs is shortened
+    to stop on it. A proposer that cannot start from a resumed target says so itself
+    (`Proposer.resumes`) and the caller drops the prefix instead of the draft.
     """
     from mlx_omnia.engine.generate import BlockOutputs
 
@@ -519,8 +568,17 @@ def stream_speculative_ids[C: LayerCache, D: LayerCache](
     # step, so this loop needs the whole prompt before its first forward whatever shape it
     # arrived in — there is no block for a lazy one to overlap against.
     committed = list(prompt)
+    walk = (
+        prefix.begin(target_cache, target)
+        if prefix is not None and proposer.resumes
+        else None
+    )
+    reused = 0 if walk is None else walk.resume(committed, target_cache)
     if meter is not None:
-        meter.prefill(len(committed))
+        meter.prefill(len(committed), reused)
+        meter.kept_prefix = walk is not None
+        if walk is not None:
+            meter.prefix = walk.reuse
 
     def forward(ids: mx.array) -> tuple[mx.array, mx.array | None]:
         """One forward of the target: its logits, and what the proposer reads of it when it
@@ -545,11 +603,37 @@ def stream_speculative_ids[C: LayerCache, D: LayerCache](
             proposer.absorb(features)
         return logits
 
+    def close(rows: int) -> None:
+        if walk is not None:
+            walk.commit(committed, target_cache, rows)
+
+    def stopped(at: int) -> None:
+        close(reused + at)
+        if meter is not None:
+            meter.fed(at)
+
     # The first token is the target's alone: the prompt's own forward already yields one
     # (that is ttft), and the draft has nothing to propose before it.
-    ids = mx.array(committed)
-    window = prefill(lambda block: feed(ids[block][None]), ids.size, target_cache)
+    ids = mx.array(committed[reused:])
+    window = prefill(
+        lambda block: feed(ids[block][None]),
+        ids.size,
+        target_cache,
+        after=stopped,
+    )
+    if walk is not None and walk.chain.anchored:
+        # The last block cut on the last span boundary, so the trunk stops on one — the same
+        # cut the plain loop makes, and for the same reason: a recurrent state exists only
+        # while the layer is stopped.
+        cut = landing(reused + window.start, len(committed), walk.chain.span) - reused
+        if cut > window.start:
+            feed(ids[window.start : cut][None])
+            mx.eval([tensor for layer in target_cache for tensor in layer.tensors])
+            stopped(cut)
+            window = slice(cut, window.stop)
     pending = _ints(mx.argmax(feed(ids[window][None])[:, -1, :], axis=-1))
+    if meter is not None:
+        meter.fed(ids.size)
     committed += pending
 
     compiled: tuple[Callable[[mx.array], tuple[mx.array, mx.array]], Callable[[int], None]] | None
@@ -562,17 +646,27 @@ def stream_speculative_ids[C: LayerCache, D: LayerCache](
     emitted = 0
     while emitted < max_tokens:
         if not pending:
-            if compiled is not None and target_cache[0].offset == len(committed) - 1:
+            settled = len(committed) - 1
+            limit = room(walk, settled, proposer.width)
+            if (
+                compiled is not None
+                and limit is None
+                and target_cache[0].offset == settled
+            ):
                 pending, accepted = _compiled_round(compiled, proposer, committed)
             else:
                 pending, accepted = one_round(
-                    verify, forward, proposer, target_cache, committed, replays
+                    verify, forward, proposer, target_cache, committed, replays, limit=limit
                 )
             committed += pending
             if acceptance is not None:
                 acceptance.rounds += 1
                 acceptance.proposed += proposer.width
                 acceptance.accepted += accepted
+            if walk is not None:
+                # Between rounds, and never inside one: the rows are the settled ids exactly
+                # here and nowhere else in the loop.
+                close(len(committed) - 1)
         token = pending.pop(0)
         if token in stop:
             return
@@ -580,6 +674,8 @@ def stream_speculative_ids[C: LayerCache, D: LayerCache](
             meter.token()
         yield token
         emitted += 1
+    if walk is not None:
+        close(len(committed) - 1)
 
 
 def _compiled_round(
@@ -611,6 +707,26 @@ def _compiled_round(
     return [*proposed[:accepted], predicted[accepted]], accepted
 
 
+def room(walk: "Prefix | None", settled: int, width: int) -> int | None:
+    """How many proposals a round may make without stepping over a boundary the anchor needs,
+    or `None` for a round nothing constrains.
+
+    Only a trunk with recurrent layers constrains one. A span of rows can be cut out of the
+    buffers at any later moment, so a round that runs past a boundary loses nothing; a
+    snapshot cannot, because the state it would capture only exists while the layer is
+    stopped, and a round walks `1 + accepted` positions in one forward.
+
+    A shortened round is still a round: at zero it feeds the gap alone and settles one token,
+    landing exactly on the boundary. One round per span at four wide and three accepted on
+    average is one in eighty-five, which is what the cap costs.
+    """
+    if walk is None or not walk.chain.anchored:
+        return None
+    span = walk.chain.span
+    boundary = settled // span * span + span
+    return None if boundary - settled - 1 >= width else max(0, boundary - settled - 1)
+
+
 def one_round[C: LayerCache](
     verify: Callable[[mx.array], tuple[mx.array, mx.array | None, Callable[[int], None] | None]],
     forward: Callable[[mx.array], tuple[mx.array, mx.array | None]],
@@ -618,8 +734,14 @@ def one_round[C: LayerCache](
     target_cache: list[C],
     committed: list[int],
     replays: bool,
+    *,
+    limit: int | None = None,
 ) -> tuple[list[int], int]:
     """One round, returning the tokens it settled and how many of them were the draft's.
+
+    `limit` cuts the draft down so the round stops on a boundary a snapshot needs (`_room`).
+    It is applied to the proposal and not to the acceptance: the proposer wrote what it wrote,
+    and the rows the target never sees are rows it never has to undo.
 
     The target is fed whatever committed ids its cache has not seen, then the proposals.
     Row j of its logits predicts the token after `verified[j]`, so the last `width + 1`
@@ -638,6 +760,8 @@ def one_round[C: LayerCache](
     the rows already in hand.
     """
     drafted = proposer.propose(committed)
+    if limit is not None and limit < drafted.size:
+        drafted = drafted[:limit]
     width = drafted.size
     gap = mx.array(committed[target_cache[0].offset :], dtype=drafted.dtype)
     verified = mx.concatenate([gap, drafted])

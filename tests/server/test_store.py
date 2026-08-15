@@ -326,7 +326,7 @@ def test_the_benchmark_migration_takes_a_file_at_the_previous_head(tmp_path: Pat
     database = Store(path)
 
     assert user_version(path) == SCHEMA_VERSION
-    assert SCHEMA_VERSION == 9
+    assert SCHEMA_VERSION == 10
     assert database.config() == {"port": "8642"}
     assert {"benchmark_runs", "benchmark_speed", "benchmark_datasets"} <= table_names(path)
     assert "prefix_cache" in table_names(path)

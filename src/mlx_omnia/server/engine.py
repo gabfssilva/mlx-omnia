@@ -44,7 +44,7 @@ import mlx.nn as nn
 
 from mlx_omnia import GenerationOptions, LanguageModel, ModelInput, UnsupportedInput
 from mlx_omnia.engine.core.cache import LayerCache
-from mlx_omnia.engine.core.prompt_cache import Budget
+from mlx_omnia.engine.core.prefix import Prefixes, PrefixStore
 from mlx_omnia.engine.footprint import active_bytes_per_token, checkpoint_bytes, resident_bytes
 from mlx_omnia.engine.generate import Constraint, Meter
 from mlx_omnia.engine.grammar import Grammar, Vocabulary
@@ -60,7 +60,7 @@ from mlx_omnia.engine.quant.quantization import Quantization
 from mlx_omnia.engine.quantizing import Quantizing, admits
 from mlx_omnia.server.flow import Clock, Emission, Member, Outlet
 from mlx_omnia.server.metrics import Metrics, RequestState
-from mlx_omnia.server.prefixes import DiskSpill
+from mlx_omnia.server.prefixes import FileVault
 from mlx_omnia.server.store import Store
 
 Loader = Callable[[str], LanguageModel[ModelInput]]
@@ -69,12 +69,6 @@ _SPILL_JOIN_SECONDS = 30.0
 """How long a shutdown waits on a write in flight. Long enough for half a gigabyte on any
 disk that is not failing, and bounded because a daemon that cannot exit is worse than a cache
 entry that was not written."""
-
-_SPILL_FLOOR = 16 * 1024**2
-"""Below this an evicted prefix is not written out. A file is a row in an index every lookup
-walks and an inode the ceiling has to account for, and what it buys is the prefill it saves:
-at 8 KB a token this is a two-thousand-token conversation, which prefills in well under the
-time the write costs."""
 
 # Defined with the record it ends up in: what a request became is read from `/admin/metrics`.
 JobState = RequestState
@@ -159,6 +153,7 @@ class _Settings:
     ttl: int | None
     prefix_budget: int
     disk_budget: int
+    span: int
     not_resident: Literal["load", "fail"]
     """`config.Policy`, spelled out rather than imported: that module reads this one."""
     concurrency: int
@@ -176,9 +171,18 @@ def _config(store: Store) -> _Settings:
         ttl=config.idle_ttl_seconds,
         prefix_budget=config.prefix_cache_bytes,
         disk_budget=config.prefix_disk_bytes,
+        span=config.prefix_span,
         not_resident=config.not_resident,
         concurrency=config.max_concurrent_requests,
     )
+
+
+def _residency_stamp(resident: "Residency | None") -> str | None:
+    """A stand-in for a checkpoint the catalog cannot stamp: when this residency began. It
+    changes on every load, which is what keeps a reload of different weights under one id from
+    reading the last one's spans, and it is stable while the model is up, which is as long as
+    a memory-only tier lasts."""
+    return None if resident is None else f"loaded:{resident.loaded_at}"
 
 
 def _measured() -> int:
@@ -549,15 +553,16 @@ class Engine:
         vocabulary would each pay the 0.27 s, and the loser's table would stay alive for as
         long as the grammar it compiled sits in the cache."""
         self._residency: dict[str, Residency] = {}
-        self._spills: dict[str, tuple[int, DiskSpill | None]] = {}
+        self._vaults: dict[str, tuple[int, FileVault | None]] = {}
         """One disk tier per model, and the ceiling it was built with. Kept rather than made
-        per request because it is what the trie is constructed against: a new object every
-        time would be a new trie every time, and the reuse would never survive one turn."""
-        self._prefixes: Budget | None = None
-        """The one memory ceiling every resident model's trie answers to. Here and not on the
-        model for the reason the residency table is here: what it arbitrates is two models
-        against each other, and neither of them can see the other. It holds no cache — the
-        tries it weighs do, by weak reference — so an unload gives its bytes back on its own."""
+        per request because it holds the index it read at construction and the thread that
+        writes behind: a new one per request would re-read the index every turn."""
+        self._prefixes: tuple[tuple[int, int], PrefixStore] | None = None
+        """The one prefix store every resident model reads and writes, with the ceiling it was
+        built for. Here and not on the model for the reason the residency table is here: what
+        it arbitrates is two models against each other, and neither of them can see the other.
+        Which checkpoint a span came from is inside its key, so a model unloaded and loaded
+        again finds its spans where it left them."""
         self._quantizable: dict[tuple[str, Compression], str | None] = {}
         """What a `(model, KV policy)` pair was found to be — `None` for one that holds, the
         refusal in words for one that does not. It outlives residency on purpose: the answer is
@@ -660,19 +665,20 @@ class Engine:
         for task in self._loading.values():
             task.cancel()
         self._loading.clear()
-        # Before the models go, not after: the tries hang off them and the budget holds them
-        # weakly, so a cleared table is a budget with nothing left to drain.
+        # Before the models go: the store outlives them, but the anchors it holds are only
+        # written on the way out, and a shutdown that skipped this would lose exactly the
+        # conversations somebody is in the middle of.
         if self._prefixes is not None:
-            self._prefixes.drain()
+            self._prefixes[1].drain()
         self._models.clear()
         self._residency.clear()
-        # A spill in flight is a file half written under a staging name and a row that will
+        # A write in flight is a file half written under a staging name and a row that will
         # never be inserted. Nothing else waits for it — that is the whole point of writing
-        # off the request thread — so shutdown is where it is waited for.
-        for _, spill in self._spills.values():
-            if spill is not None:
-                spill.flush(_SPILL_JOIN_SECONDS)
-        self._spills.clear()
+        # behind the request — so shutdown is where it is waited for.
+        for _, vault in self._vaults.values():
+            if vault is not None:
+                vault.flush(_SPILL_JOIN_SECONDS)
+        self._vaults.clear()
         self._model_thread.shutdown(wait=False, cancel_futures=True)
 
     async def resolve(self, model_id: str) -> LanguageModel[ModelInput]:
@@ -1019,7 +1025,7 @@ class Engine:
         # and it is a ceiling rather than the cache because the cache's element type is the
         # trunk's own, which nothing holding a `LanguageModel[ModelInput]` can name. An engine
         # with no store passes 0, the cold path every suite that is not about reuse runs on.
-        options = replace(options, prefix_budget=self._budget(), prefix_spill=self._spill(model_id))
+        options = replace(options, prefix=self._prefixing(model_id))
         job = Job(
             model_id,
             model,
@@ -1088,32 +1094,26 @@ class Engine:
 
     @property
     def prefix_bytes(self) -> int:
-        """What the resident tries hold between them, out of `prefix_cache_bytes`. Zero
-        before any request has been served: the budget is built on the first one."""
-        return 0 if self._prefixes is None else self._prefixes.nbytes
+        """What the store holds in memory, out of `prefix_cache_bytes`. Zero before any
+        request has been served: the store is built on the first one."""
+        return 0 if self._prefixes is None else self._prefixes[1].nbytes
 
     def discard_prefixes(self) -> None:
-        """Hand the memory tier back. The models keep their tries — the objects go on living
-        on them — and what goes is what those tries were holding."""
+        """Hand the memory tier back, and write none of it out. The opposite of a drain, and
+        not a variant of it: a discard that filed would answer "free this memory" by filling
+        the disk tier with what was just freed."""
         if self._prefixes is not None:
-            self._prefixes.discard()
+            self._prefixes[1].discard()
 
-    def _budget(self) -> Budget | int:
-        """The shared ceiling, rebuilt when the config moved it. Rebuilt and not adjusted:
-        `prefix_cache` reads identity to decide whether the trie it holds is still the right
-        one, so a new object is how a PATCH reaches models that are already resident."""
-        if self._store is None:
-            return 0
-        total = _config(self._store).prefix_budget
-        if self._prefixes is None or self._prefixes.total != total:
-            self._prefixes = Budget(total)
-        return self._prefixes
+    def _prefixing(self, model_id: str) -> Prefixes | None:
+        """What this request reuses spans through, or `None` when there is no store or the
+        ceiling is zero.
 
-    def _spill(self, model_id: str) -> DiskSpill | None:
-        """This model's disk tier, or `None` when there is nowhere to put one: no store, the
-        ceiling at zero, or an id the catalog does not list — a checkpoint with no stamp has
-        no key, and a key that cannot name the checkpoint is a file that outlives the weights
-        it was written from.
+        A checkpoint the catalog cannot stamp keeps its spans in memory and none on disk. The
+        stamp is what separates two checkpoints filed under one id, and without one a file
+        would outlive the weights it was written from — but this residency's own load time
+        separates them for as long as the process runs, which is exactly as long as the
+        memory tier lasts.
 
         The catalog import is inside for the reason `_config`'s and `_checkpoint_size`'s are:
         that module reads this one. `prefixes` does not, so it comes in at the top.
@@ -1122,25 +1122,48 @@ class Engine:
 
         if self._store is None:
             return None
-        ceiling = _config(self._store).disk_budget
-        held = self._spills.get(model_id)
-        if held is not None and held[0] == ceiling:
-            return held[1] if ceiling > 0 else None
-        if ceiling <= 0:
-            self._spills[model_id] = (ceiling, None)
+        settings = _config(self._store)
+        if settings.prefix_budget <= 0:
             return None
-        stamp = stamp_of(model_id)
+        filed = stamp_of(model_id)
+        resident = self._residency.get(model_id)
+        stamp = filed if filed is not None else _residency_stamp(resident)
         if stamp is None:
             return None
-        spill = DiskSpill(
-            self._store,
-            model_id,
-            stamp=stamp,
-            ceiling=ceiling,
-            floor=_SPILL_FLOOR,
-        )
-        self._spills[model_id] = (ceiling, spill)
-        return spill
+        store = self._prefix_store(settings, model_id, filed=filed is not None)
+        return None if store is None else Prefixes(store, model_id, stamp)
+
+    def _prefix_store(
+        self, settings: "_Settings", model_id: str, *, filed: bool
+    ) -> PrefixStore | None:
+        """The shared store, rebuilt when the config moved its ceiling or its span. Rebuilt
+        and not adjusted: that is what makes the settings `applied` rather than `restart`, and
+        what it costs is one prefill.
+
+        The vault is per model — one directory, one index — and joins whichever store is
+        current, so a PATCH of the memory ceiling does not re-read the disk index.
+        """
+        assert self._store is not None
+        vault = self._vault(model_id, settings.disk_budget if filed else 0)
+        held = self._prefixes
+        if held is None or held[0] != (settings.prefix_budget, settings.span):
+            held = (
+                (settings.prefix_budget, settings.span),
+                PrefixStore(settings.prefix_budget, vault, span=settings.span),
+            )
+            self._prefixes = held
+            return held[1]
+        held[1].attach(vault)
+        return held[1]
+
+    def _vault(self, model_id: str, ceiling: int) -> FileVault | None:
+        held = self._vaults.get(model_id)
+        if held is not None and held[0] == ceiling:
+            return held[1]
+        assert self._store is not None
+        vault = None if ceiling <= 0 else FileVault(self._store, model_id, ceiling=ceiling)
+        self._vaults[model_id] = (ceiling, vault)
+        return vault
 
     def _concurrency(self, job: Job) -> int:
         if job.batch_limit is not None:

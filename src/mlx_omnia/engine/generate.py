@@ -15,10 +15,9 @@ from typing import Protocol, runtime_checkable
 import mlx.core as mx
 
 from mlx_omnia.engine.core.cache import LayerCache
-from mlx_omnia.engine.core.cache_file import policy
 from mlx_omnia.engine.core.mxcompat import softmax
-from mlx_omnia.engine.core.prefill import ARRIVING, BLOCK, pulled
-from mlx_omnia.engine.core.prompt_cache import PromptCache
+from mlx_omnia.engine.core.prefill import ARRIVING, BLOCK, landing, pulled
+from mlx_omnia.engine.core.prefix import Prefixes, Reuse
 from mlx_omnia.engine.parsers import FALLBACK, Parser, Segment, Segmenter
 from mlx_omnia.engine.speculative import (
     Acceptance,
@@ -313,6 +312,11 @@ class Meter:
     prefill — `ttft` covers the tail alone, so dividing the whole prompt by it measures
     nothing — and it is the only number that says whether the reuse hit at all: a near miss
     and a cold conversation are the same request from the outside."""
+    prefix: Reuse = field(default_factory=Reuse)
+    """What the store answered with, for whoever is measuring it. Beside `reused_tokens` and
+    not instead of it: the count is what a usage report carries, and this is which tier
+    answered, how deep the anchor was and what the run wrote back — the difference between a
+    30 ms read off an SSD and a 0 ms hit, which no rate distinguishes."""
     kept_prefix: bool = False
     """Whether this run left anything the next turn can start from. Beside `reused_tokens`
     because zero reuse has three causes that look identical from outside — the budget is off,
@@ -321,6 +325,12 @@ class Meter:
     nothing anywhere said so: the request answered normally and the next one prefilled whole,
     for ever."""
     completion_tokens: int = 0
+    prefilled_tokens: int = 0
+    """Fresh prompt rows the trunk has taken, block by block, while it is still taking them.
+    Written on the boundaries the prefill already stops at, so it costs no synchronization
+    and no extra eval. It is what makes a long prompt legible while it is being read: until
+    the first token exists there is no `ttft` to divide by, and a 40k prefill is a minute in
+    which every rate below is `None`."""
     prefill_started: float | None = None
     first_token: float | None = None
     last_token: float | None = None
@@ -335,6 +345,11 @@ class Meter:
         self.prompt_tokens = prompt_tokens
         self.reused_tokens = reused
         self.prefill_started = time.perf_counter()
+
+    def fed(self, rows: int) -> None:
+        """`rows` fresh prompt rows are now in the cache. Absolute and not a delta: every
+        prefill in this engine already carries the position it stands at."""
+        self.prefilled_tokens = rows
 
     def token(self) -> None:
         """One id emitted. Counted before it is yielded: a consumer that walks away has
@@ -353,6 +368,15 @@ class Meter:
         return self.first_token - self.prefill_started
 
     @property
+    def prefill_seconds(self) -> float | None:
+        """The span `ttft` measures while it is still being measured: the clock since the
+        prefill started, ending at the first token once there is one."""
+        if self.prefill_started is None:
+            return None
+        end = time.perf_counter() if self.first_token is None else self.first_token
+        return end - self.prefill_started
+
+    @property
     def decode_seconds(self) -> float | None:
         if self.first_token is None or self.last_token is None:
             return None
@@ -368,37 +392,6 @@ class Meter:
         return (self.completion_tokens - 1) / elapsed
 
 
-def _boundary[C: LayerCache](model: CausalLM[C], cache: list[C]) -> list[C] | None:
-    """A second cache standing where this one stands now, or `None` when the trunk has no
-    use for one — every layer rewinds, so the trie can cut a longer entry back to this point
-    whenever it needs to.
-
-    Nothing is copied. `stored()` hands over the rows in use, and they are rows nobody writes
-    again: `KVCache` only ever writes at `offset` and past it, and the recurrent layers
-    reassign their state rather than filling it in place — which is what `LayerCache
-    .checkpoint` already relies on. What this costs is holding those buffers alive, which is
-    exactly what storing a prefix means.
-
-    The `mx.eval` is the house rule about lazy arrays and not a formality: unevaluated, the
-    entry would keep the whole prefill graph alive until some later request read it.
-    """
-    if all(layer.is_trimmable for layer in cache):
-        return None
-    if not all(layer.is_storable for layer in cache):
-        return None
-    standing = model.make_cache()
-    if policy(standing) != policy(cache):
-        # The same check the disk key makes, made here because in memory there is no key to
-        # make it: a cache the live trunk is not the shape of any more — a ring promoted for
-        # a compiled decode is the case — hands over bytes a fresh layer would read under its
-        # own rules. Same names, same shapes, a rotation taken for a history.
-        return None
-    for target, source in zip(standing, cache, strict=True):
-        target.restore(source.rows, source.stored())
-    mx.eval([tensor for layer in standing for tensor in layer.tensors])
-    return standing
-
-
 def stream_ids[C: LayerCache, D: LayerCache](
     model: CausalLM[C],
     prompt: Iterable[int],
@@ -411,7 +404,7 @@ def stream_ids[C: LayerCache, D: LayerCache](
     draft: CausalLM[D] | Proposer | None = None,
     lookahead: int = 4,
     acceptance: Acceptance | None = None,
-    prefix: PromptCache[C] | None = None,
+    prefix: Prefixes | None = None,
     constraint: Constraint | None = None,
     reasoning_budget: ReasoningBudget | None = None,
 ) -> Generator[int]:
@@ -422,18 +415,20 @@ def stream_ids[C: LayerCache, D: LayerCache](
     `meter`, when someone is counting, is filled as the loop runs: the prompt before the
     first step, then one mark per id emitted.
 
-    `prefix` is where the cache comes from and where it goes back: the longest stored prefix
-    of `prompt` is taken over and only the rest is prefilled, and at the end — the end a
-    consumer that walks away imposes included — the cache is inserted back under the ids
-    that in fact entered it. The match is here because here is where the ids are: above this
-    the prompt is still a conversation the chat template has to render, which is the same
-    wall the `meter` met. Nothing is taken until the first `next`: the generator's body runs
-    then, so building the iterator and dropping it leaves the trie untouched.
+    `prefix` is where the spans come from and where they go: the longest run of stored spans
+    of `prompt` is copied in and only the rest is prefilled, and every span this run closes —
+    in the prefill, on each boundary the decode crosses, and at the end a consumer that walks
+    away imposes — is stored. Nothing is copied out of the store into anybody's ownership: a
+    span is immutable, and two requests over the same system prompt read the same one. The
+    match is here because here is where the ids are: above this the prompt is still a
+    conversation the chat template has to render, which is the same wall the `meter` met.
+    Nothing is read until the first `next`: the generator's body runs then, so building the
+    iterator and dropping it touches nothing.
 
     Keying on the ids is what makes the template, the effort asked for and the declared tools
     part of the key without this ever naming them: they change the render, the render changes
-    the ids, and the match ends where the ids do. One trie belongs to one model — the ids of
-    two checkpoints are two alphabets, and nothing in a cache says which one wrote it.
+    the ids, and the match ends where the ids do. The checkpoint is in the key as well, so
+    two resident models never read each other's spans.
 
     A `reasoning_budget` takes the ids over instead of shaping them: when the block runs out
     of budget the closer is fed the way a drawn id is, so the cache gets its rows and the
@@ -468,11 +463,6 @@ def stream_ids[C: LayerCache, D: LayerCache](
                 "speculation and `penalty` do not compose: a verification row would have to "
                 "be penalized against a history the round has not committed yet"
             )
-        if prefix is not None:
-            raise SpeculationRefused(
-                "speculation and prefix reuse are not wired together: a round rewinds the "
-                "target's cache and the draft's in step, and the trie holds one of the two"
-            )
         if constraint is not None:
             raise SpeculationRefused(
                 "speculation and a grammar are not wired together: every draft id would "
@@ -498,38 +488,40 @@ def stream_ids[C: LayerCache, D: LayerCache](
             # answer exists. An explicit one still wins — it is a caller with somewhere
             # else to put them.
             acceptance=acceptance if acceptance is not None or meter is None else meter.speculation,
+            prefix=prefix,
         )
         return
 
     cache = model.make_cache()
-    whole: Sequence[int] | None = None
-    reuse = None
+    walk = None
     if prefix is not None:
-        # The trie descends the ids one by one and `take` sizes its match against the whole
-        # list, so a prompt still being produced is waited for here rather than matched
-        # against a piece of itself — a match cut short at a block boundary would be reuse
-        # silently lost on exactly the long conversations the trie exists for.
-        whole = prompt if isinstance(prompt, Sequence) else list(prompt)
-        prompt = whole
-        # The fresh cache goes in as well as out: a trie backed by disk fills *this* list
-        # rather than handing one back, because a file has no cache in it — only the rows
-        # one would hold, and which class holds them is the trunk's answer and nobody
-        # else's.
-        reuse = prefix.take(whole, into=cache)
-    if reuse is not None:
-        cache = reuse.caches
-    # What the cache holds, row for row, for the insert at the end: the prompt, whether its
-    # head was reused or prefilled, plus every id the loop feeds back in. It is filled as the
-    # prompt arrives, which for a sequence is all at once.
+        # The chain is over ids it has to have, so a prompt still being produced is waited
+        # for here rather than matched against a piece of itself — a match cut short at a
+        # block boundary would be reuse silently lost on exactly the long conversations this
+        # exists for.
+        prompt = prompt if isinstance(prompt, Sequence) else list(prompt)
+        walk = prefix.begin(cache, model)
+    # What the cache holds, row for row: the prompt, whether its head was resumed or
+    # prefilled, plus every id the loop feeds back in. It is filled as the prompt arrives,
+    # which for a sequence is all at once.
     covered: list[int] = []
     prompt_length = 0
+    reused = 0
+    fed = 0
+    """Rows the trunk has actually taken. The spans are cut against this and never against
+    `len(covered)`: the two differ by the one id a constrained step has drawn and not yet
+    fed, and a span claiming a row no layer wrote is the bug that reads as a wrong answer a
+    turn later."""
     history = mx.array([], dtype=mx.int32)
+    if walk is not None and isinstance(prompt, Sequence):
+        reused = walk.resume(prompt, cache)
+        fed = reused
     if meter is not None:
         # The clock starts here whatever shape the prompt is in: for one still arriving, the
         # wait for its producer is part of the TTFT this measures. The count is set below,
         # where it exists.
         known = len(prompt) if isinstance(prompt, Sequence) else 0
-        meter.prefill(known, 0 if reuse is None else reuse.length)
+        meter.prefill(known, reused)
 
     decode: Callable[[mx.array], mx.array] | None = None
 
@@ -544,10 +536,11 @@ def stream_ids[C: LayerCache, D: LayerCache](
         return sampler(logits)[0]
 
     def advance(drawn: mx.array) -> mx.array:
-        nonlocal history
+        nonlocal history, fed
         if penalty is not None:
             history = mx.concatenate([history, drawn[None]])
         queued = step(drawn[None], history)
+        fed += 1
         mx.async_eval(queued)
         return queued
 
@@ -558,33 +551,56 @@ def stream_ids[C: LayerCache, D: LayerCache](
         # the document from the first step, so the block a template opened never closes.
         raise ConstraintConflict(BUDGET_WITH_GRAMMAR)
     budget = None if reasoning_budget is None else ReasoningWalk(reasoning_budget)
-    boundary: list[C] | None = None
-    """Bound before the `try`, because the `finally` reads it and a forward that raises on
-    the first block never reaches the line that fills it."""
-    standing: list[C] | None = None
-    """The growing layers as they stood at the end of the prompt, kept aside when a compile
-    below promotes `cache` in place. Promotion copies the rows into fixed buffers and never
-    writes these again, so holding them is the prompt's entry for free — the trie stores
-    this, rewindable, and never the promoted shape it cannot rewind."""
-    promoted = False
     owed: list[int] = []
     """The closer, between the step the budget armed on and the steps that feed it out."""
 
+    def close(rows: int) -> None:
+        """Store every span the trunk has finished, standing where it stands.
+
+        Called only where the trunk *is* standing — between prefill blocks, on the cut
+        before the last one, between decode steps — because a recurrent layer's state has no
+        expression in the middle of a forward.
+        """
+        if walk is not None:
+            walk.commit(covered, cache, rows)
+
     try:
-        # What the reuse did not already cover, fed in blocks: only the last block's logits
+        # What the resume did not already cover, fed in blocks: only the last block's logits
         # are read, and the blocks before it never compute the head at all.
         arriving = iter(prompt)
-        if reuse is not None:
-            covered.extend(islice(arriving, reuse.length))
+        covered.extend(islice(arriving, reused))
 
         def feed(ids: list[int]) -> object:
+            nonlocal fed
             covered.extend(ids)
+            fed += len(ids)
             return model(mx.array(ids)[None], cache)
 
+        def stopped(_: int) -> None:
+            close(fed)
+            if meter is not None:
+                meter.fed(fed - reused)
+
         head = pulled(
-            feed, arriving, cache, block=BLOCK if isinstance(prompt, Sequence) else ARRIVING
+            feed,
+            arriving,
+            cache,
+            block=BLOCK if isinstance(prompt, Sequence) else ARRIVING,
+            after=stopped,
         )
+        if walk is not None and walk.chain.anchored:
+            # The last block is cut on the last span boundary so the trunk stops on one. A
+            # recurrent state exists only while the layer is stopped, and without this cut a
+            # turn whose prefill ends mid-span — which is nearly every turn, and every turn
+            # of a replay asking for one token — would leave no resume point at all.
+            cut = landing(fed, fed + len(head), walk.chain.span) - fed
+            if cut > 0:
+                feed(head[:cut])
+                mx.eval([tensor for layer in cache for tensor in layer.tensors])
+                stopped(fed)
+                head = head[cut:]
         covered.extend(head)
+        fed += len(head)
         prompt_length = len(covered)
         history = mx.array(covered)
         if meter is not None:
@@ -594,13 +610,11 @@ def stream_ids[C: LayerCache, D: LayerCache](
             meter.prompt_tokens = prompt_length
         y = step(mx.array(head), history)
         mx.async_eval(y)
-        # The cut the next turn will actually match, on a trunk that cannot be rewound to it
-        # later. The entry this loop leaves behind ends in the ids the model wrote, and a
-        # client re-rendering the conversation reproduces them only when it echoes every one
-        # back — a reasoning block that the template reopens empty diverges at the first id
-        # past the prompt. `KVCache` recovers by rewinding; recurrent state has nothing to
-        # rewind to, so the boundary is taken while the cache is standing on it.
-        boundary = None if prefix is None else _boundary(model, cache)
+        # After the last block's forward — `pulled` hands that one back rather than feeding
+        # it — and before the compile below. A promotion turns a sliding layer into a ring,
+        # and a ring has already dropped every row outside its window: a span left
+        # uncommitted here is a span the next boundary the decode crosses cannot be cut from.
+        stopped(fed)
         compile_step: Callable[[list[C]], Callable[[mx.array], mx.array]] | None = None
         if (
             sampler is greedy
@@ -611,23 +625,11 @@ def stream_ids[C: LayerCache, D: LayerCache](
             compile_step = model.compile_greedy_decode
         elif isinstance(model, CompiledDecode):
             compile_step = model.compile_decode
-        # With a prefix the compile is conditional on the trie having something to keep: a
-        # promotion hands the decode a shape the trie cannot rewind, so the prompt's state
-        # must stand somewhere else first — `boundary` for a trunk that cannot rewind at
-        # all, the pre-promotion layers for one that can. A trunk with neither stays on the
-        # eager step, which is the one whose cache the inserts below still describe.
-        if compile_step is not None and (
-            prefix is None
-            or boundary is not None
-            or all(layer.is_trimmable for layer in cache)
-        ):
-            before = list(cache)
+        if compile_step is not None:
+            # Unconditional now. A promotion hands the decode a fixed buffer or a ring, and
+            # both answer for their rows in absolute order — the shape the spans are cut in —
+            # so there is nothing left for a compile to be conditional on.
             decode = compile_step(cache)
-            promoted = prefix is not None and any(
-                source is not target for source, target in zip(before, cache, strict=True)
-            )
-            if promoted and boundary is None:
-                standing = before
         for emitted in range(max_tokens):
             # Free, step n+1 is queued before n is read back and the GPU never idles;
             # constrained, n+1's mask needs the value of n, so the queue waits behind the
@@ -657,6 +659,12 @@ def stream_ids[C: LayerCache, D: LayerCache](
                 # decode step will need again; the ones after it keep the pool from drifting
                 # up over a long generation.
                 mx.clear_cache()
+            if walk is not None and fed // walk.chain.span > walk.covered // walk.chain.span:
+                # A boundary crossed between steps, which is the only place the decode ever
+                # stands still. What it buys is the client that echoes the ids it was sent:
+                # for one that re-renders them, the span this closes is on a branch the next
+                # turn never walks, and the prompt's own anchor is untouched by it.
+                close(fed)
             if owed:
                 # The next id is not drawn but owed. `token` still has to be fed — the cache
                 # owes it a row either way — so the free path's queued step is spent and its
@@ -668,72 +676,23 @@ def stream_ids[C: LayerCache, D: LayerCache](
             y = advance(y) if following is None else following
     except Exception:
         # A forward that raised leaves the trunk at disagreeing offsets — some layers wrote
-        # the row, some did not — and no length describes that cache. It is dropped instead
-        # of stored.
-        prefix = None
+        # the row, some did not — and no length describes that cache. Nothing more is stored.
+        walk = None
         raise
     finally:
-        if prefix is not None:
-            # An entry outlives the thread that generated it, and a stream belongs to the
-            # thread that made it: an array still carrying queued work can only be evaluated
-            # here. Whoever writes it out later — an eviction on the request thread, a drain
-            # on the way down — would otherwise meet `no Stream(gpu, 1) in current thread`.
-            # The last steps are what this is really for: `advance` queues one the loop never
-            # reads back, and its rows are in the cache all the same.
-            mx.eval(
-                [
-                    tensor
-                    for layers in (cache, standing if standing is not None else [])
-                    for layer in layers
-                    for tensor in layer.tensors
-                ]
-            )
         if meter is not None:
-            # A trunk that neither rewinds nor stands still is one the entry below can never
-            # be matched against: the next prompt would have to rewind into it, and it has no
-            # answer for that. It is stored anyway — the byte count is honest either way —
-            # but a caller reading zero reuse deserves to know which zero it is.
-            meter.kept_prefix = prefix is not None and (
-                boundary is not None
-                or standing is not None
-                or all(layer.is_trimmable for layer in cache)
-            )
-        if prefix is not None and whole is not None and boundary is not None:
-            # The prompt, as a `user` entry: it is where the conversation stopped being the
-            # model's own writing, and it outranks an assistant turn under eviction for the
-            # same reason. Beside the longer one below and not instead of it — which of the
-            # two the next turn matches is the client's business, not this loop's — and the
-            # two share their buffers, so what the second one really costs is the recurrent
-            # state. The byte count double-counts what they share, which evicts early and
-            # never over-promises.
-            prefix.insert(
-                whole,
-                boundary,
-                role="user",
-                nbytes=sum(layer.nbytes for layer in boundary),
-            )
-        if prefix is not None and whole is not None and standing is not None:
-            # The prompt's entry, out of the layers the promotion abandoned. The trim is for
-            # a promotion that replaced only some of them: a layer still live in `cache` had
-            # the decode's rows written into it, past the prompt this entry claims.
-            for layer in standing:
-                layer.trim(prompt_length)
-            prefix.insert(
-                whole,
-                standing,
-                role="user",
-                nbytes=sum(layer.nbytes for layer in standing),
-            )
-        if prefix is not None and not promoted:
-            # One entry, and an `assistant` one: what a generation leaves behind ends in ids
-            # it wrote itself, which is the role the trie drains first. Cutting the prompt at
-            # its role boundaries would take boundaries the render does not hand out here.
-            prefix.insert(
-                covered,
-                cache,
-                role="assistant",
-                nbytes=sum(layer.nbytes for layer in cache),
-            )
+            meter.reused_tokens = reused
+            meter.kept_prefix = walk is not None
+            if walk is not None:
+                meter.prefix = walk.reuse
+        if walk is not None:
+            # The last spans, and the `mx.eval` inside them is what makes them portable: a
+            # span outlives the thread that generated it, and a stream belongs to the thread
+            # that made it. Whoever writes it out later — an eviction on the request thread,
+            # a drain on the way down — would otherwise meet `no Stream(gpu, 1) in current
+            # thread`. The last steps are what this is really for: `advance` queues one the
+            # loop never reads back, and its rows are in the cache all the same.
+            close(fed)
 
 
 def stream_text(

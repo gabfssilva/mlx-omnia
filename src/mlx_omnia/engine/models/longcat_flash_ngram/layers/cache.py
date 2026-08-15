@@ -1,9 +1,9 @@
-from collections.abc import Callable, Sequence
+from collections.abc import Callable, Mapping, Sequence
 
 import mlx.core as mx
 
 from mlx_omnia.engine.batching import RaggedAdapter, RaggedBatchable
-from mlx_omnia.engine.core.cache import LayerCache, reserve
+from mlx_omnia.engine.core.cache import LayerCache, Layout, Rows, Snapshot, reserve
 
 type LatentStore = MLACache | BatchedMLACache
 type NgramStore = NgramCache | BatchedNgramCache
@@ -75,6 +75,20 @@ class NgramCache(LayerCache, RaggedBatchable):
             # leaves the n-gram conditioned on ids the sequence no longer contains.
             remaining = self._context.shape[-1] - dropped
             self._context = None if remaining <= 0 else self._context[..., :remaining]
+
+    @property
+    def layout(self) -> Mapping[str, Layout]:
+        """State, not history: what it holds is the last `n-1` ids of the sequence, which is
+        a window and not a record — the ids before it are gone, and the next embedder reads
+        exactly this. Tens of bytes, so the span it rides on costs nothing to keep."""
+        return {"context": Snapshot()}
+
+    def stored(self, start: int, stop: int) -> dict[str, mx.array]:
+        return {} if self._context is None else {"context": self._context}
+
+    def restore(self, offset: int, tensors: Mapping[str, mx.array]) -> None:
+        self.offset = offset
+        self._context = tensors.get("context")
 
     def batched(self, rows: Sequence[LayerCache]) -> "BatchedNgramCache":
         return BatchedNgramCache(_rows(NgramCache, rows))
@@ -164,6 +178,25 @@ class MLACache(LayerCache, RaggedBatchable):
 
     def trim(self, length: int) -> None:
         self.offset = min(self.offset, length)
+
+    @property
+    def layout(self) -> Mapping[str, Layout]:
+        """`KVCache`'s answer over two tensors of its own widths: both grow on axis 2, one
+        row per token, and spans of them concatenate the same way."""
+        return {"latent": Rows(), "k_pe": Rows()}
+
+    def stored(self, start: int, stop: int) -> dict[str, mx.array]:
+        if self._latent is None or self._k_pe is None:
+            return {}
+        return {
+            "latent": self._latent[..., start:stop, :],
+            "k_pe": self._k_pe[..., start:stop, :],
+        }
+
+    def restore(self, offset: int, tensors: Mapping[str, mx.array]) -> None:
+        self.offset = offset
+        self._latent = tensors.get("latent")
+        self._k_pe = tensors.get("k_pe")
 
     def batched(self, rows: Sequence[LayerCache]) -> "BatchedMLACache":
         return BatchedMLACache(_rows(MLACache, rows))

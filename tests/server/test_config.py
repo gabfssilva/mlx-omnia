@@ -38,6 +38,7 @@ FIELDS = {
     "max_concurrent_requests",
     "prefix_cache_bytes",
     "prefix_disk_bytes",
+    "prefix_span",
     "port",
     "api_key",
     "catalog_directory",

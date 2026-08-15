@@ -4,6 +4,7 @@ from dataclasses import dataclass
 import mlx.core as mx
 
 from mlx_omnia import GPT2Tokenizer, KVCache, greedy, stream_generate
+from mlx_omnia.engine.core.prefix import Prefixes, PrefixStore
 from mlx_omnia.engine.language import (
     GenerationOptions,
     LanguageModel,
@@ -50,6 +51,13 @@ class ScriptedLM:
     def __call__(self, ids: mx.array, cache: list[KVCache] | None = None) -> mx.array:
         token = self.ids[min(self.step, len(self.ids) - 1)]
         self.step += 1
+        if cache is not None:
+            # Rows the script does not read, and has to write all the same: a span *is* the
+            # rows a forward produced, so a trunk that fills no cache has nothing to store —
+            # which is the right answer and not the one these tests are about.
+            rows = mx.ones((1, 1, ids.shape[1], 4), dtype=mx.float32)
+            for layer in cache:
+                layer.update_and_fetch(rows, rows)
         row = -mx.abs(mx.arange(self.vocab) - token).astype(mx.float32)
         return mx.broadcast_to(row, (1, ids.shape[1], self.vocab))
 
@@ -199,58 +207,47 @@ def test_matches_stream_generate_for_the_same_causal_model() -> None:
     assert actual == expected
 
 
-def _budgeted(budget: int) -> GenerationOptions:
-    return GenerationOptions(max_tokens=2, sampler=greedy, prefix_budget=budget)
+def _prefixed(store: PrefixStore | None) -> GenerationOptions:
+    handle = None if store is None else Prefixes(store, "a-model", "a-stamp")
+    return GenerationOptions(max_tokens=2, sampler=greedy, prefix=handle)
 
 
-def test_the_budget_is_what_decides_whether_this_model_keeps_a_prefix() -> None:
-    """The engine hands over a number of bytes and this is what it buys: with one the model
-    holds a trie between requests, with zero it holds nothing. The number cannot be the cache
-    itself — `PromptCache[KVCache]` and `PromptCache[DeltaCache]` are two types, and the
-    caller is holding a model whose trunk it cannot name."""
+def test_the_handle_is_what_decides_whether_this_run_keeps_a_prefix() -> None:
+    """The engine hands over a store and an identity, and this is what it buys: with one the
+    run stores the spans it closed, without one it stores nothing. It is a handle and not a
+    number of bytes because the ceiling is the daemon's — one store for every resident model —
+    and what belongs to the model is which checkpoint wrote the bytes."""
     model = TextLanguageModel(ScriptedLM([2, 2]), Tokenizer({2: b"x"}))
+    store = PrefixStore(1 << 20, span=2)
 
-    list(model.stream(Text("prompt"), _budgeted(0)))
-    assert model.prefix is None, "a budget of zero is no cache, not an empty one"
+    list(model.stream(Text("prompt"), _prefixed(None)))
+    assert store.nbytes == 0, "no handle is no cache, not an empty one"
 
-    list(model.stream(Text("prompt"), _budgeted(1 << 20)))
-    assert model.prefix is not None
-    assert len(model.prefix) == 1, "the generation went back into the trie"
-
-
-def test_a_budget_that_moves_rebuilds_the_trie_and_one_that_does_not_keeps_it() -> None:
-    """What makes the setting `applied` and not `restart`. The ceiling is fixed when the trie
-    is built, so honouring a PATCH means building again — and the request that follows an
-    unchanged number must not pay for a rebuild, which is the whole of the reuse."""
-    model = TextLanguageModel(ScriptedLM([2, 2, 2, 2]), Tokenizer({2: b"x"}))
-
-    list(model.stream(Text("prompt"), _budgeted(1 << 20)))
-    first = model.prefix
-    list(model.stream(Text("prompt"), _budgeted(1 << 20)))
-    kept = model.prefix
-    list(model.stream(Text("prompt"), _budgeted(2 << 20)))
-    rebuilt = model.prefix
-
-    assert first is not None and kept is first, "an unchanged budget is the same trie"
-    assert rebuilt is not None and rebuilt is not first
-    assert rebuilt.budget.total == 2 << 20
-    assert len(rebuilt) == 1, "the run that resized it filled it again, and only it"
+    list(model.stream(Text("prompt"), _prefixed(store)))
+    assert store.nbytes > 0, "the generation's spans went into the store"
 
 
 def test_two_models_do_not_share_a_prefix_for_the_same_prompt() -> None:
-    """One trie per model instance, which is what "it dies with the model on an unload"
-    means — and what a trie held anywhere above the model would break. The same ids in two
-    trunks are two alphabets, and nothing inside a cache says which one wrote it: the second
-    model reading the first one's rows would answer with another checkpoint's attention."""
-    one, two = ScriptedLM([2, 2]), ScriptedLM([2, 2])
+    """One store for every resident model, and the checkpoint inside every key — which is what
+    lets them share a ceiling without sharing a conversation. The same ids in two trunks are
+    two alphabets, and nothing inside a span says which one wrote it: the second model reading
+    the first one's rows would answer with another checkpoint's attention."""
+    one, two = ScriptedLM([2, 2, 2, 2]), ScriptedLM([2, 2, 2, 2])
     first = TextLanguageModel(one, Tokenizer({2: b"x"}))
     second = TextLanguageModel(two, Tokenizer({2: b"x"}))
+    store = PrefixStore(1 << 20, span=2)
 
-    list(first.stream(Text("prompt"), _budgeted(1 << 20)))
-    list(second.stream(Text("prompt"), _budgeted(1 << 20)))
+    list(first.stream(Text("prompt"), _prefixed(store)))
+    list(
+        second.stream(
+            Text("prompt"),
+            GenerationOptions(
+                max_tokens=2, sampler=greedy, prefix=Prefixes(store, "other", "a-stamp")
+            ),
+        )
+    )
 
-    assert first.prefix is not second.prefix
-    assert two.step == one.step, "the second trunk read its own prompt instead of a cache"
+    assert two.step == one.step, "the second trunk read a cache another checkpoint wrote"
 
 
 class _Clock:

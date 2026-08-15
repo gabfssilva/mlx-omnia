@@ -13,6 +13,7 @@ import mlx.core as mx
 import pytest
 from mlx.utils import tree_map
 
+from mlx_omnia.engine.core.prefix import PrefixStore
 from mlx_omnia.engine.models.deepseek_v4.config import DeepseekV4Config
 from mlx_omnia.engine.models.deepseek_v4.model import DeepseekV4
 
@@ -86,3 +87,58 @@ def test_stepwise_decode_matches_prefill(model: DeepseekV4, config: DeepseekV4Co
 
     pools = [layer.compressor for layer in cache if layer.compressor is not None]
     assert [pool.pooled_rows for pool in pools] == [LENGTH // ratio for ratio in RATIOS if ratio]
+
+
+SPAN = 128
+"""The narrowest span this family admits: a pooled layer writes one row per `ratio` tokens and
+the widest ratio here is 128, so a shorter span would end inside a row nobody can cut."""
+
+
+def test_a_resumed_prefill_reproduces_a_cold_one(
+    model: DeepseekV4, config: DeepseekV4Config
+) -> None:
+    """The family's own parity, on the branch the prefix opened. Two pooled ratios and an
+    indexer on the `4`s: the pooled rows compose at one row per `ratio` tokens, the
+    overlapping ratio's carry is the anchor, and a `128` keeps nothing to anchor with.
+
+    Full logits and not the argmax: a cache off by one pooled row answers the same greedy
+    token while already predicting a different distribution.
+    """
+    mx.random.seed(1)
+    ids = mx.random.randint(0, config.vocab_size, (1, 3 * SPAN))
+    tokens = [int(value) for value in ids[0].tolist()]
+
+    store = PrefixStore(1 << 30, span=SPAN)
+    warm = model.make_cache()
+    writing = store.begin("deepseek", "a-stamp", warm, model)
+    assert writing is not None
+    edge = 2 * SPAN
+    model(ids[:, :edge], warm)
+    mx.eval([tensor for layer in warm for tensor in layer.tensors])
+    writing.commit(tokens, warm, edge)
+
+    resumed = model.make_cache()
+    walk = store.begin("deepseek", "a-stamp", resumed, model)
+    assert walk is not None
+    assert walk.resume(tokens, resumed) == edge
+    # Counted before the tail runs: `pooled_rows` is what came back, and one forward later it
+    # is what came back plus what the forward wrote.
+    pools = [layer.compressor for layer in resumed if layer.compressor is not None]
+    assert [pool.pooled_rows for pool in pools] == [edge // ratio for ratio in RATIOS if ratio]
+    assert all(pool.remainder == 0 for pool in pools), "a span ended inside a window"
+    # The rows themselves, element for element. The logits below would survive a cut that
+    # kept the right prefix and padded the rest — `pooled_rows` truncates the read — so what
+    # catches a span cut in tokens instead of in pooled rows is this.
+    for live, back in zip(warm, resumed, strict=True):
+        for one, other in ((live.compressor, back.compressor), (live.indexer, back.indexer)):
+            if one is None or other is None:
+                assert one is other
+                continue
+            rows = one.fetch(config.head_dim, mx.float32)
+            assert mx.array_equal(rows, other.fetch(config.head_dim, mx.float32)).item()
+    tail = model(ids[:, edge:], resumed)
+
+    cold = model(ids)
+    reference = cold[:, edge:].astype(mx.float32)
+    diff = mx.max(mx.abs(tail.astype(mx.float32) - reference)) / mx.max(mx.abs(reference))
+    assert float(diff) < 1e-5, "the resumed pools do not reproduce the prefill"

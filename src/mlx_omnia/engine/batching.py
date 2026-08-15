@@ -19,7 +19,8 @@ from mlx_omnia.engine.core.cache import (
     regrow,
 )
 from mlx_omnia.engine.core.decode import Buckets, SlotBucket
-from mlx_omnia.engine.core.prefill import BLOCK
+from mlx_omnia.engine.core.prefill import BLOCK, landing
+from mlx_omnia.engine.core.prefix import Prefix
 from mlx_omnia.engine.generate import (
     BUDGET_WITH_GRAMMAR,
     BlockOutputs,
@@ -37,6 +38,7 @@ from mlx_omnia.engine.speculative import (
     Verifiable,
     one_round,
     rewinds,
+    room,
     taps_refused,
 )
 
@@ -177,6 +179,11 @@ class BatchSequence:
 
     `tokens` is the history the round reads — prompt plus everything committed — and
     `pending` is the one id past it the cache has not seen, which is the round's gap."""
+    prefix: Prefix | None = None
+    """This sequence's walk along its conversation's chain, when the daemon keeps one. The
+    decode closes a span on every boundary it crosses, which is the only moment it stands
+    still; `tokens` is both the ids and the row count, because the forward feeds `pending`
+    before the commit appends it."""
 
 
 class BatchedKVCache(Attending):
@@ -649,6 +656,7 @@ class BatchPrefill:
     meter: Meter | None = None
     reasoning: ReasoningBudget | None = None
     proposer: Proposer | None = None
+    prefix: Prefix | None = None
     block: int = BLOCK
     history: mx.array = field(init=False)
     _remaining: mx.array = field(init=False)
@@ -675,15 +683,34 @@ class BatchPrefill:
 
     def advance(self) -> BatchSequence | None:
         """Feed one block; return the sequence once the last block has been read."""
+        if self.meter is not None and self.meter.prefill_started is None:
+            # On the *first* block and not the last. A 40k prompt is twenty blocks spread over
+            # twenty scheduler ticks; a clock started at the last one reports the tail of the
+            # prefill as the whole of it, which is a TTFT that cannot be compared with
+            # anything — least of all with the same prompt resumed.
+            self.meter.prefill(len(self.prompt), self.reused)
+            self.meter.kept_prefix = self.prefix is not None
+            if self.prefix is not None:
+                self.meter.prefix = self.prefix.reuse
         length = self._remaining.shape[1]
         if length - self.at > self.block:
             part = self._remaining[:, self.at : self.at + self.block]
             self._feed(part)
             mx.eval([tensor for layer in self.cache for tensor in layer.tensors])
+            self._stopped(self.at + self.block)
             # Back to the system rather than into MLX's own pool, as `core.prefill` does.
             mx.clear_cache()
-            self.at += self.block
             return None
+        if self.prefix is not None and self.prefix.chain.anchored:
+            # The last block cut on the last span boundary before the forward that reads the
+            # logits, so the trunk stops on one. Without it a prompt whose end falls
+            # mid-span — nearly every prompt, and every request asking for one token — leaves
+            # a recurrent trunk no resume point at all, and the next turn prefills whole.
+            cut = landing(self.reused + self.at, len(self.prompt), self.prefix.chain.span)
+            if cut - self.reused > self.at:
+                self._feed(self._remaining[:, self.at : cut - self.reused])
+                mx.eval([tensor for layer in self.cache for tensor in layer.tensors])
+                self._stopped(cut - self.reused)
         logits = self._feed(self._remaining[:, self.at : length])[:, -1, :]
         if self.penalty is not None:
             logits = self.penalty(logits, self.history)
@@ -691,11 +718,9 @@ class BatchPrefill:
             logits = self.constraint.mask(logits, self.max_tokens)
         pending = self.sampler(logits)[0]
         mx.async_eval(pending)
-        if self.meter is not None:
-            self.meter.prefill(len(self.prompt), self.reused)
         required = self.cache[0].offset + self.max_tokens
         capacity = (required + 255) // 256 * 256
-        self.at = length
+        self._stopped(length)
         return BatchSequence(
             self.cache,
             pending,
@@ -711,7 +736,21 @@ class BatchPrefill:
             finished=self.max_tokens <= 0,
             budget=None if self.reasoning is None else ReasoningWalk(self.reasoning),
             proposer=self.proposer,
+            prefix=self.prefix,
         )
+
+    def _stopped(self, at: int) -> None:
+        """The trunk now stands at `at` fresh rows: what the prefix store can close on, and
+        what a reader watching a long prompt being read is told."""
+        self.at = at
+        if self.meter is not None:
+            self.meter.fed(at)
+        self._close()
+
+    def _close(self) -> None:
+        """The spans this prefill has finished, stored while the trunk is stopped."""
+        if self.prefix is not None:
+            self.prefix.commit(self.prompt, self.cache, self.reused + self.at)
 
 
 def prepare_batch_sequence(
@@ -843,7 +882,13 @@ def _speculative_tick(model: BatchModel, sequence: BatchSequence) -> list[int]:
 
     gap = _int(sequence.pending)
     settled, accepted = one_round(
-        verify, forward, proposer, cache, [*sequence.tokens, gap], replays
+        verify,
+        forward,
+        proposer,
+        cache,
+        [*sequence.tokens, gap],
+        replays,
+        limit=room(sequence.prefix, len(sequence.tokens), proposer.width),
     )
     if sequence.meter is not None:
         sequence.meter.speculation.rounds += 1
@@ -863,6 +908,7 @@ def _speculative_tick(model: BatchModel, sequence: BatchSequence) -> list[int]:
         if sequence.remaining == 0:
             sequence.finished = True
             break
+    _close(sequence)
     return emitted
 
 
@@ -1033,9 +1079,25 @@ def _advance(
     the whole cost of arming.
     """
     emitted = _commit(sequence, drawn, queued, accepted)
+    _close(sequence)
     if sequence.owed and not sequence.finished:
         sequence.pending = mx.array(sequence.owed.pop(0))
     return emitted
+
+
+def _close(sequence: BatchSequence) -> None:
+    """The span a step just closed, or the last of them when the sequence retires.
+
+    Between steps and nowhere else: the forward has fed `pending` and the commit has recorded
+    it, so the rows are exactly `tokens` — which is also why the count is host-side and this
+    costs no synchronization per token.
+    """
+    prefix = sequence.prefix
+    if prefix is None:
+        return
+    rows = len(sequence.tokens)
+    if sequence.finished or rows // prefix.chain.span > prefix.covered // prefix.chain.span:
+        prefix.commit(sequence.tokens, sequence.cache, rows)
 
 
 def _commit(

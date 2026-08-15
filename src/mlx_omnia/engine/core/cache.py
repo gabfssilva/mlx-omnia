@@ -5,9 +5,55 @@ Rows are written into a preallocated buffer, not concatenated: concat copies
 Swift port). Growth copies once per block of 256 rows.
 """
 
-from collections.abc import Callable, Mapping
+from collections.abc import Callable, Mapping, Sequence
+from dataclasses import dataclass
+from typing import Protocol, runtime_checkable
 
 import mlx.core as mx
+
+
+@dataclass(frozen=True)
+class Rows:
+    """History: a span holds the rows its own tokens produced, and spans concatenate.
+
+    `stride` is tokens per row — 1 for a KV buffer, the compression ratio for a pooled one —
+    and it is what a span length has to be a multiple of, or a span would end in the middle
+    of a row nobody can cut.
+
+    `keep` is the suffix that suffices to resume: the sliding window of a layer whose mask
+    proves the rows before it are never read again. Spans deeper than that are not fetched at
+    all and come back as zeros of the right shape, which keeps every row at its absolute
+    position — the only thing the mask and the rotary tables are written against.
+    """
+
+    axis: int = 2
+    stride: int = 1
+    keep: int | None = None
+
+
+@dataclass(frozen=True)
+class Snapshot:
+    """State: the whole value as it stood on a span's boundary.
+
+    It does not compose — resuming reads the last one and nothing before it — and it only
+    exists while the layer is stopped on the boundary, because a recurrence in the middle of
+    a forward has no state outside the kernel.
+    """
+
+
+type Layout = Rows | Snapshot
+
+
+@runtime_checkable
+class Layouts(Protocol):
+    """A trunk that knows more about its own cache than the cache classes do.
+
+    The one case is a sliding layer: `laguna` builds every layer as a plain `KVCache` and the
+    window lives in the config, so the class cannot answer `keep` and the family can. `None`
+    means the classes' own answers stand.
+    """
+
+    def cache_layouts(self) -> Sequence[Mapping[str, Layout]] | None: ...
 
 
 class LayerCache:
@@ -94,24 +140,40 @@ class LayerCache:
         return {}
 
     @property
-    def is_storable(self) -> bool:
-        """Whether this layer can be written out and read back whole. Tested by the caller
-        over the entire list, the way `is_trimmable` is: one layer that cannot answer makes
-        the trunk's state unwritable, and a list restored short of one layer is a cache that
-        decodes fluently off state that never existed."""
-        return False
+    def layout(self) -> Mapping[str, Layout]:
+        """How each tensor of `stored()` composes along the spans of one conversation.
 
-    def stored(self) -> dict[str, mx.array]:
-        """This layer's tensors, named, cut to `offset` — the rows a buffer reserved past it
-        are not state. Named rather than positional because the file outlives the process
-        that wrote it, and a tuple's order is not a contract anybody can read back."""
-        raise NotImplementedError("this cache cannot be written out")
+        Empty for a layer with no bytes of its own — a shared reader, a stateless block in a
+        hybrid's pattern — which is not the same as a layer that cannot be stored: it still
+        takes the offset back, and a trunk restored short of one layer's offset is a cache
+        that decodes fluently off state that never existed.
+        """
+        return {}
+
+    def stored(self, start: int, stop: int) -> dict[str, mx.array]:
+        """This layer's tensors, named, for the absolute token range `[start, stop)`.
+
+        The range is in tokens and never in rows, because the two are the same number only
+        for a plain KV buffer: a pooled cache writes one row per `ratio` tokens, a compressed
+        one splits the range between a dense head and packed codes, and a ring holds the last
+        window of it rotated. Each class does that arithmetic itself — nothing generic can,
+        and a caller that guessed would be reading another layer's rows.
+
+        A `Snapshot` tensor ignores the range: it is the whole value, and it is only valid
+        while the layer stands on `stop`.
+
+        Named rather than positional because the bytes outlive the process that wrote them,
+        and a tuple's order is not a contract anybody can read back.
+        """
+        return {}
 
     def restore(self, offset: int, tensors: Mapping[str, mx.array]) -> None:
-        """The inverse, into a layer a model has just made. It raises on the base rather than
-        accepting nothing quietly: a subclass that forgot to answer would restore an empty
-        state and report the offset of a full one."""
-        raise NotImplementedError("this cache cannot be read back")
+        """The inverse, into a layer a model has just made: the tensors of one conversation's
+        spans, already composed, and the position they leave the layer at.
+
+        The base takes the offset and nothing else, which is the whole of what a layer with no
+        tensors has to come back to."""
+        self.offset = offset
 
     def trim(self, length: int) -> None:
         raise NotImplementedError("this cache keeps no history to rewind to")
@@ -143,10 +205,10 @@ class ConvCache(LayerCache):
         return restore
 
     @property
-    def is_storable(self) -> bool:
-        return True
+    def layout(self) -> Mapping[str, Layout]:
+        return {"window": Snapshot()}
 
-    def stored(self) -> dict[str, mx.array]:
+    def stored(self, start: int, stop: int) -> dict[str, mx.array]:
         return {} if self.window is None else {"window": self.window}
 
     def restore(self, offset: int, tensors: Mapping[str, mx.array]) -> None:
@@ -186,8 +248,12 @@ class DeltaCache(ConvCache):
 
         return restore
 
-    def stored(self) -> dict[str, mx.array]:
-        return super().stored() | ({} if self.state is None else {"state": self.state})
+    @property
+    def layout(self) -> Mapping[str, Layout]:
+        return {"window": Snapshot(), "state": Snapshot()}
+
+    def stored(self, start: int, stop: int) -> dict[str, mx.array]:
+        return super().stored(start, stop) | ({} if self.state is None else {"state": self.state})
 
     def restore(self, offset: int, tensors: Mapping[str, mx.array]) -> None:
         super().restore(offset, tensors)
@@ -225,18 +291,18 @@ class KVCache(LayerCache):
         return tuple(buffer for buffer in (self._keys, self._values) if buffer is not None)
 
     @property
-    def is_storable(self) -> bool:
-        return True
+    def layout(self) -> Mapping[str, Layout]:
+        return {"keys": Rows(), "values": Rows()}
 
-    def stored(self) -> dict[str, mx.array]:
-        """The rows in use, not the buffers. `reserve` rounds up to the 256-row block, so
-        writing them whole would put up to 255 rows of zero per layer in the file — and read
-        them back as state the model never wrote."""
+    def stored(self, start: int, stop: int) -> dict[str, mx.array]:
+        """The rows of `[start, stop)`, not the buffers. `reserve` rounds up to the 256-row
+        block, so handing them over whole would pass up to 255 rows of zero per layer on as
+        state the model never wrote."""
         if self._keys is None or self._values is None:
             return {}
         return {
-            "keys": self._keys[..., : self.offset, :],
-            "values": self._values[..., : self.offset, :],
+            "keys": self._keys[..., start:stop, :],
+            "values": self._values[..., start:stop, :],
         }
 
     def restore(self, offset: int, tensors: Mapping[str, mx.array]) -> None:
@@ -323,22 +389,20 @@ class FixedKVCache(LayerCache):
         return int(self.position.item())
 
     @property
-    def is_storable(self) -> bool:
+    def layout(self) -> Mapping[str, Layout]:
         """What it holds is a dense KV in absolute order — the fixed buffer is a `KVCache`
-        that stopped growing, not another representation — so it needs no signature and a
-        growing cache reads its file back unchanged. Which is the case worth having: a
-        conversation whose decode was compiled would otherwise be the one conversation that
-        cannot be filed."""
-        return True
+        that stopped growing, not another representation — so a growing cache reads its spans
+        back unchanged. Which is the case worth having: a conversation whose decode was
+        compiled would otherwise be the one conversation that keeps nothing."""
+        return {"keys": Rows(), "values": Rows()}
 
-    def stored(self) -> dict[str, mx.array]:
-        """`rows` and not `offset`: the position moved inside the compiled decode and only
-        the state tensor followed it. Writing `offset` rows here would file the prompt and
-        drop everything the compiled decode wrote after it."""
-        rows = self.rows
+    def stored(self, start: int, stop: int) -> dict[str, mx.array]:
+        """The rows of `[start, stop)` out of the fixed buffer. The caller cuts against
+        `rows` and not `offset`: the position moved inside the compiled decode and only the
+        state tensor followed it."""
         return {
-            "keys": self.state[0][..., :rows, :],
-            "values": self.state[1][..., :rows, :],
+            "keys": self.state[0][..., start:stop, :],
+            "values": self.state[1][..., start:stop, :],
         }
 
     def restore(self, offset: int, tensors: Mapping[str, mx.array]) -> None:
@@ -462,17 +526,11 @@ class SharedKVReader(LayerCache):
         self.offset = min(self.offset, length)
 
     @property
-    def is_storable(self) -> bool:
-        return True
-
-    def stored(self) -> dict[str, mx.array]:
+    def layout(self) -> Mapping[str, Layout]:
         """Nothing of its own. What it reads is the storing layer's, republished on every
-        forward before the block runs, so a restored trunk gets the link back from the first
-        step rather than from the file — and the file never carries the same rows twice."""
+        forward before the block runs, so a resumed trunk gets the link back from the first
+        step rather than from the store — and no span carries the same rows twice."""
         return {}
-
-    def restore(self, offset: int, tensors: Mapping[str, mx.array]) -> None:
-        self.offset = offset
 
 
 class RingKVCache(LayerCache):
@@ -496,25 +554,19 @@ class RingKVCache(LayerCache):
 
     @classmethod
     def promote(cls, cache: KVCache, window: int) -> "RingKVCache":
-        """Copy the live tail of a growing cache into its absolute ring slots."""
+        """Copy the live tail of a growing cache into its absolute ring slots.
+
+        Two concatenates and not a row-at-a-time loop: the rotation is one cut, and a Python
+        loop over the window is a dispatch per row on the promotion of every long prompt."""
         source_keys, source_values = cache.fetch()
+        rows = cache.offset
+        start = max(0, rows - window)
         ring = cls(window)
-        shape = list(source_keys.shape)
-        shape[2] = window
-        ring_keys = mx.zeros(shape, dtype=source_keys.dtype)
-        ring_values = mx.zeros(shape, dtype=source_values.dtype)
-        count = min(cache.offset, window)
-        start = cache.offset - count
-        for absolute in range(start, cache.offset):
-            target = absolute % window
-            ring_keys[..., target : target + 1, :] = source_keys[..., absolute : absolute + 1, :]
-            ring_values[..., target : target + 1, :] = source_values[
-                ..., absolute : absolute + 1, :
-            ]
-        mx.eval(ring_keys, ring_values)
-        ring._keys, ring._values = ring_keys, ring_values
-        ring.offset = cache.offset
-        ring.state = [ring_keys, ring_values, mx.array([cache.offset], dtype=mx.int32)]
+        ring._keys = _rotated(source_keys[..., start:rows, :], rows, window)
+        ring._values = _rotated(source_values[..., start:rows, :], rows, window)
+        mx.eval(ring._keys, ring._values)
+        ring.offset = rows
+        ring.state = [ring._keys, ring._values, mx.array([rows], dtype=mx.int32)]
         return ring
 
     @property
@@ -596,48 +648,70 @@ class RingKVCache(LayerCache):
         return int(self.position.item())
 
     @property
-    def is_storable(self) -> bool:
-        """A ring can be written out whole, and what comes back is exact — the buffer *is*
-        the state, since the rows it dropped are the ones its reader is defined never to
-        attend. What it cannot do is come back as anything else: slot `j` holds absolute
-        position `j % window`, so a growing cache reading these bytes would take a rotation
-        for a history. That is what the signature below is for."""
-        return True
+    def layout(self) -> Mapping[str, Layout]:
+        """Rows, in absolute order, of the window it still holds.
 
-    @property
-    def signature(self) -> dict[str, object]:
-        """The window, because it is the rotation. A file written by a ring of 512 read into
-        a ring of 1024 puts every row at the wrong absolute position — same shapes, same
-        names, silently wrong — and the digest is where that is caught, before the mmap."""
-        return {"ring": self.window}
+        The rotation is not in what it hands over — `stored` undoes it and `restore` puts it
+        back — so a ring and the growing cache the same sliding layer was prefilled as trade
+        the same bytes. That is the case that matters: `laguna` prefills into `KVCache` and
+        promotes to a ring for the compiled decode, and a rotation that leaked into the span
+        would be a history read at the wrong absolute positions.
 
-    def stored(self) -> dict[str, mx.array]:
+        `keep` is the window, because past it there is nothing to hand over: a ring that has
+        wrapped has already dropped those rows, which is exactly what its reader's mask says
+        it will never look at again.
+        """
+        return {"keys": Rows(keep=self.window), "values": Rows(keep=self.window)}
+
+    def stored(self, start: int, stop: int) -> dict[str, mx.array]:
+        """The rows of `[start, stop)` in absolute order, unrotated.
+
+        Only the window it still holds can be asked for; the rows before it were overwritten
+        by their own successors, which is what a ring is. A caller reaching past that is a
+        span longer than the window, refused at resolution rather than here."""
         keys, values = (
             (self.state[0], self.state[1]) if self.state is not None else (self._keys, self._values)
         )
         if keys is None or values is None:
             return {}
-        return {"keys": keys, "values": values}
+        rows = self.rows
+        if start < rows - self.window or stop > rows:
+            raise ValueError(
+                f"a ring of {self.window} standing at {rows} cannot hand over [{start}, {stop})"
+            )
+        return {
+            "keys": _unrotated(keys, start, stop, self.window),
+            "values": _unrotated(values, start, stop, self.window),
+        }
 
     def restore(self, offset: int, tensors: Mapping[str, mx.array]) -> None:
-        """Back into the un-promoted form: `state` stays `None`, because a promotion is a
-        decision about compiling a decode and not a property of the rows. Whoever compiles
-        again promotes again."""
+        """Rows in absolute order, back into the rotation, and into the un-promoted form:
+        `state` stays `None`, because a promotion is a decision about compiling a decode and
+        not a property of the rows. Whoever compiles again promotes again."""
         self.offset = offset
-        self._keys = tensors.get("keys")
-        self._values = tensors.get("values")
+        keys, values = tensors.get("keys"), tensors.get("values")
+        self._keys = None if keys is None else _rotated(keys, offset, self.window)
+        self._values = None if values is None else _rotated(values, offset, self.window)
         self.state = None
 
     def reload(self, rows: int, keys: mx.array, values: mx.array) -> None:
-        """Rewrite a promoted ring's graph-visible state with another sequence's rotation.
+        """Take another sequence's rotation whole, into the graph-visible state.
 
-        The buffers are taken whole rather than sliced: slot `j` already holds absolute
-        position `j % window`, so the rotation *is* the state, and `rows` is only the
-        position that goes with it."""
-        assert self.state is not None, "reloading a ring that was never promoted"
-        self.state[0] = keys
-        self.state[1] = values
-        self.state[2] = mx.array([rows], dtype=mx.int32)
+        The buffers are taken as they are rather than sliced or reordered: slot `j` already
+        holds absolute position `j % window`, so the rotation *is* the state, and `rows` is
+        only the position that goes with it. That is what separates this from `restore`,
+        which takes rows in absolute order and has to put the rotation back.
+
+        The slots are written **into** the list and the list is never replaced: a compiled
+        decode captured this very object as its `inputs`/`outputs`, so a new one would leave
+        the graph writing to a container the cache no longer reads. A ring that was never
+        promoted has no such list, and gets one."""
+        position = mx.array([rows], dtype=mx.int32)
+        if self.state is None:
+            self.state = [keys, values, position]
+        else:
+            self.state[0], self.state[1], self.state[2] = keys, values, position
+        self._keys, self._values = keys, values
         self.offset = rows
 
     def trim(self, length: int) -> None:
@@ -648,3 +722,108 @@ class RingKVCache(LayerCache):
             return self.state[0], self.state[1]
         assert self._keys is not None and self._values is not None
         return self._keys, self._values
+
+
+def _rotated(rows: mx.array, offset: int, window: int) -> mx.array:
+    """Rows in absolute order, ending at `offset`, into a ring of `window` slots.
+
+    Always the ring's own buffer, never a view of the caller's: a ring that shared storage
+    with the growing cache it was promoted from is a compiled decode writing through to a
+    buffer somebody else still holds, which reads as a fluent wrong answer four tokens in.
+    The full-window case is copied explicitly for that reason — a slice assignment that covers
+    the whole array is elided, and what comes back is the source.
+
+    One allocation and at most two writes, against the row-at-a-time loop this replaces: a
+    dispatch per row of the window on the promotion of every long prompt.
+    """
+    count = rows.shape[2]
+    head = (offset - count) % window
+    if count == window and head == 0:
+        return rows + mx.zeros_like(rows)
+    shape = list(rows.shape)
+    shape[2] = window
+    ring = mx.zeros(shape, dtype=rows.dtype)
+    split = min(count, window - head)
+    ring[..., head : head + split, :] = rows[..., :split, :]
+    if split < count:
+        ring[..., : count - split, :] = rows[..., split:, :]
+    return ring
+
+
+def _unrotated(buffer: mx.array, start: int, stop: int, window: int) -> mx.array:
+    """The ring's rows for absolute `[start, stop)`, back in order."""
+    head = start % window
+    count = stop - start
+    if head + count <= window:
+        return buffer[..., head : head + count, :]
+    return mx.concatenate(
+        [buffer[..., head:, :], buffer[..., : count - (window - head), :]], axis=2
+    )
+
+
+class Composite(LayerCache):
+    """A layer whose state is several named caches advancing together.
+
+    A hybrid's attention beside its indexer, a compressor beside its local window: the layer
+    presents one offset and one set of tensors, and the parts answer for their own. Written
+    once here because the delegation is the same every time — the families that carry it
+    differ in which parts they hold and in nothing else, and four hand-written copies of it
+    is four places for a part to be forgotten out of exactly one of them.
+    """
+
+    @property
+    def parts(self) -> Mapping[str, LayerCache]:
+        raise NotImplementedError("a composite cache names its parts")
+
+    @property
+    def is_replayable(self) -> bool:
+        return all(part.is_replayable for part in self.parts.values())
+
+    @property
+    def nbytes(self) -> int:
+        return sum(part.nbytes for part in self.parts.values())
+
+    @property
+    def tensors(self) -> tuple[mx.array, ...]:
+        return tuple(tensor for part in self.parts.values() for tensor in part.tensors)
+
+    @property
+    def signature(self) -> dict[str, object]:
+        held: dict[str, object] = {}
+        for name, part in self.parts.items():
+            held |= {f"{name}.{key}": value for key, value in part.signature.items()}
+        return held
+
+    @property
+    def layout(self) -> Mapping[str, Layout]:
+        held: dict[str, Layout] = {}
+        for name, part in self.parts.items():
+            held |= {f"{name}.{key}": value for key, value in part.layout.items()}
+        return held
+
+    def checkpoint(self) -> Callable[[], None]:
+        restores = [part.checkpoint() for part in self.parts.values()]
+
+        def restore() -> None:
+            for undo in restores:
+                undo()
+
+        return restore
+
+    def stored(self, start: int, stop: int) -> dict[str, mx.array]:
+        held: dict[str, mx.array] = {}
+        for name, part in self.parts.items():
+            held |= {f"{name}.{key}": value for key, value in part.stored(start, stop).items()}
+        return held
+
+    def restore(self, offset: int, tensors: Mapping[str, mx.array]) -> None:
+        for name, part in self.parts.items():
+            prefix = f"{name}."
+            part.restore(
+                offset,
+                {
+                    key.removeprefix(prefix): value
+                    for key, value in tensors.items()
+                    if key.startswith(prefix)
+                },
+            )

@@ -109,6 +109,17 @@ private struct ServerStatus: View {
                         }
                     }
 
+                    if let snapshot = store.metrics, !snapshot.live.isEmpty || snapshot.totals.requests > 0 {
+                        SectionHead(title: "Metrics")
+                        TotalsCard(totals: snapshot.totals)
+                        ForEach(snapshot.live) { sample in
+                            InFlight(sample: sample)
+                        }
+                        ForEach(snapshot.models.sorted { $0.requests > $1.requests }) { model in
+                            Served(model: model)
+                        }
+                    }
+
                     if !recent.isEmpty {
                         SectionHead(title: "Recent")
                         ForEach(Array(recent.enumerated()), id: \.offset) { _, sample in
@@ -167,6 +178,136 @@ private struct ServerUnavailable: View {
                 .multilineTextAlignment(.center)
                 .padding(.vertical, 12)
         }
+    }
+}
+
+/// The daemon's own row: every request it has served, whatever model answered it.
+///
+/// The rates are the register's ratios of totals and not this panel's arithmetic — a decode
+/// rate averaged over requests would let a four-token turn weigh as much as a four-hundred
+/// one, and the daemon already divides them the other way.
+private struct TotalsCard: View {
+    @Environment(\.tokens) private var t
+    let totals: Totals
+
+    var body: some View {
+        Card {
+            HStack(spacing: 10) {
+                FactView(label: "Requests", value: "\(totals.requests)")
+                FactView(label: "Prefill", value: rate(totals.prefillTokensPerSecond))
+                FactView(label: "Decode", value: rate(totals.tokensPerSecond))
+                FactView(
+                    label: "Ceiling",
+                    value: totals.ceilingFraction.map { Fmt.percent($0) } ?? "—"
+                )
+            }
+            HStack(spacing: 8) {
+                Text(counts).mono(10, t.fg3).lineLimit(1)
+                Spacer(minLength: 0)
+                if totals.running > 0 {
+                    Text("\(totals.running) running").mono(10, t.accent).lineLimit(1)
+                }
+            }
+            .padding(.top, 8)
+        }
+    }
+
+    private var counts: String {
+        var said = [
+            "\(Fmt.tokens(totals.promptTokens)) in",
+            "\(Fmt.tokens(totals.completionTokens)) out",
+        ]
+        if let ttft = totals.ttft { said.append("\(Fmt.duration(ttft)) ttft") }
+        return said.joined(separator: " · ")
+    }
+
+    private func rate(_ value: Double?) -> String {
+        value.map { "\(Fmt.grouped($0)) t/s" } ?? "—"
+    }
+}
+
+/// One request being served, as it is being served: the prompt while the trunk is reading
+/// it, and the decode once there is one. Both come off the same beat, half a second apart.
+private struct InFlight: View {
+    @Environment(\.tokens) private var t
+    let sample: Sample
+
+    var body: some View {
+        Card {
+            HStack(spacing: 8) {
+                DotView(state: "run")
+                Text(Fmt.displayName(sample.model)).sans(12.5, t.fg, weight: .semibold)
+                    .lineLimit(1).truncationMode(.tail)
+                Spacer(minLength: 0)
+                Text(sample.prefilling ? "prefill" : "decode").mono(10, t.fg3)
+            }
+            if sample.prefilling {
+                TrackBar(fraction: read)
+                    .padding(.top, 6)
+                    .padding(.bottom, 5)
+            }
+            Text(line).mono(10, t.fg3).lineLimit(1).truncationMode(.tail)
+                .padding(.top, sample.prefilling ? 0 : 6)
+        }
+    }
+
+    /// How much of the prompt the trunk has taken. The rows a prefix cache handed over are
+    /// out of both sides: they were never going to be read, and a bar that started at a
+    /// third full for a resumed turn would be measuring the cache and not the prefill.
+    private var read: Double {
+        let fresh = Double(sample.promptTokens - sample.reusedTokens)
+        return fresh > 0 ? min(1, Double(sample.prefilledTokens) / fresh) : 0
+    }
+
+    private var line: String {
+        var said: [String] = []
+        if sample.prefilling {
+            said.append(
+                "\(Fmt.grouped(Double(sample.prefilledTokens)))"
+                    + " / \(Fmt.grouped(Double(sample.promptTokens - sample.reusedTokens))) prompt"
+            )
+        } else {
+            said.append("\(sample.completionTokens) tokens")
+        }
+        if let prefill = sample.prefillTokensPerSecond {
+            said.append("\(Fmt.grouped(prefill)) prefill")
+        }
+        if let rate = sample.tokensPerSecond { said.append(String(format: "%.1f tok/s", rate)) }
+        if let share = sample.ceilingFraction { said.append("\(Fmt.percent(share)) ceil") }
+        if let ttft = sample.ttft { said.append("\(Fmt.duration(ttft)) ttft") }
+        if sample.reusedTokens > 0 { said.append("\(Fmt.tokens(sample.reusedTokens)) reused") }
+        return said.joined(separator: " · ")
+    }
+}
+
+/// One model, every request it has answered since the daemon came up.
+private struct Served: View {
+    @Environment(\.tokens) private var t
+    let model: Aggregate
+
+    var body: some View {
+        HStack(spacing: 10) {
+            Text(Fmt.displayName(model.model)).sans(12.5, t.fg2)
+                .lineLimit(1).truncationMode(.tail)
+            Spacer(minLength: 0)
+            Text(line).mono(10, t.fg3).lineLimit(1)
+        }
+        .padding(.horizontal, 2)
+        .padding(.vertical, 6)
+        .overlay(alignment: .top) {
+            Rectangle().fill(t.hair).frame(height: 1)
+        }
+    }
+
+    private var line: String {
+        var said = ["\(model.requests) req"]
+        if let prefill = model.prefillTokensPerSecond {
+            said.append("\(Fmt.grouped(prefill)) prefill")
+        }
+        if let rate = model.tokensPerSecond { said.append(String(format: "%.1f tok/s", rate)) }
+        if let share = model.ceilingFraction { said.append(Fmt.percent(share)) }
+        if let ttft = model.ttft { said.append(Fmt.duration(ttft)) }
+        return said.joined(separator: " · ")
     }
 }
 

@@ -75,10 +75,12 @@ final class EngineStore {
 
     func aggregate(_ model: String) -> Aggregate? { metrics?.models.first { $0.model == model } }
 
-    func live(_ model: String) -> Sample? {
-        guard let sample = metrics?.live, sample.model == model else { return nil }
-        return sample
-    }
+    /// Every request in flight, newest first.
+    var live: [Sample] { metrics?.live ?? [] }
+
+    /// The newest request in flight on this model. Newest and not the only one: two
+    /// conversations on one checkpoint are one batch, and the card has room for one rate.
+    func live(_ model: String) -> Sample? { live.first { $0.model == model } }
 
     /// The newest numbers this model has: the live register while it generates, else the
     /// most recent completed request. The wire carries requests newest first.
@@ -170,12 +172,16 @@ final class EngineStore {
     func pulse() async {
         while !Task.isCancelled {
             if let snapshot = metrics {
-                for aggregate in snapshot.models {
-                    let point = (live(aggregate.model)?.ceilingFraction ?? 0) * 100
-                    var held = trace[aggregate.model] ?? []
+                // The models that have finished a request and the ones generating their
+                // first: a trace that waited for an aggregate would start after the run it
+                // was opened to watch.
+                let watched = Set(snapshot.models.map(\.model)).union(snapshot.live.map(\.model))
+                for model in watched {
+                    let point = (live(model)?.ceilingFraction ?? 0) * 100
+                    var held = trace[model] ?? []
                     held.append(point)
                     if held.count > Self.traceLength { held.removeFirst(held.count - Self.traceLength) }
-                    trace[aggregate.model] = held
+                    trace[model] = held
                 }
             }
             tick &+= 1

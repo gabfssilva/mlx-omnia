@@ -1,10 +1,10 @@
-"""The disk tier under the prefix trie: an evicted conversation becomes a file, and a miss
-in memory looks here before paying for a prefill.
+"""The cold floor under the prefix store: a span the ceiling pushed out becomes a file, and a
+miss in memory looks here before paying for a prefill.
 
 Why it is worth a file at all is arithmetic. On `Ling-3.0-flash` a 62k-token conversation is
 ~573 MB of cache; read once at NVMe speed that is a fraction of a second, against tens of
-seconds of prefill. What it is emphatically *not* is streaming the live cache: attention
-reads the whole KV per token, so serving decode off disk would be ~80 ms a token against the
+seconds of prefill. What it is emphatically *not* is streaming the live cache: attention reads
+the whole KV per token, so serving decode off disk would be ~80 ms a token against the
 610 GB/s of unified memory — the decode would fall from ~65 tok/s to ~11.
 
 Where: `~/.cache/mlx_omnia/prefixes/<model-slug>/<digest>.safetensors`, following the two
@@ -18,31 +18,28 @@ inconsistency; if it is to be honoured, all three change together.
 Unlike both of them, what is written here is derived from the user's own conversation, so the
 directory is created `0700`. It is the first state of that kind the daemon puts on disk.
 
-Writing happens on eviction and off the request thread: the queue is serialized at depth one,
-so half a gigabyte written inside a request is half a gigabyte the next request waits for.
+Spans are written behind the request: a span closes, the write is queued, and the thread that
+generated it goes on. Anchors are not. A conversation supersedes its anchor every turn, so a
+write-behind of one would be hundreds of megabytes per turn for a file that dies with the next
+one; an anchor reaches disk only when the ceiling evicts it or when the daemon drains on its
+way out. What that costs is stated where it is paid: a clean restart keeps a hybrid warm, and
+a crash loses its anchors and keeps its rows.
+
+Which model a span belongs to is not in the key — the key is a digest, and the digest already
+folds the checkpoint — so the directory carries it instead, and "forget this model's
+conversations" stays one `rmtree` rather than a scan that opens every file to find out whose
+it is.
 """
 
 import contextlib
 import os
+import queue
 import threading
 import time
-from array import array
-from collections.abc import Sequence
 from pathlib import Path
 
-import mlx.core as mx
-
-from mlx_omnia.engine.core.cache import LayerCache
-from mlx_omnia.engine.core.cache_file import (
-    UnreadableCache,
-    dump,
-    key,
-    policy,
-    restore,
-    storable,
-    written,
-)
-from mlx_omnia.engine.core.prompt_cache import Role, Spill
+from mlx_omnia.engine.core.cache_file import UnreadableCache, dump, load
+from mlx_omnia.engine.core.prefix import Payload, Slot, Vault
 from mlx_omnia.server.store import PrefixCacheFile, Store
 
 CACHE = Path.home() / ".cache" / "mlx_omnia" / "prefixes"
@@ -50,6 +47,11 @@ CACHE = Path.home() / ".cache" / "mlx_omnia" / "prefixes"
 _MODE = 0o700
 """The content is derived from what the user said to the model. Every other cache directory
 the daemon keeps holds weights, which are already on disk in the open."""
+
+_QUEUE = 64
+"""Spans a write-behind may fall behind by. Bounded rather than unbounded: a disk slower than
+the prefill it is saving would otherwise grow a queue holding every span of every request
+alive in memory, which is the ceiling this tier exists under, inverted."""
 
 
 def directory(model_id: str) -> Path:
@@ -59,145 +61,132 @@ def directory(model_id: str) -> Path:
     return CACHE / model_id.replace("/", "--")
 
 
-class DiskSpill(Spill[LayerCache]):
-    """One model's disk tier: the trie hands it evictions and asks it about misses.
+class FileVault(Vault):
+    """One model's disk tier, addressed by the store's own keys.
 
-    It holds the model's identity rather than being told it per call, because a `PromptCache`
-    knows nothing about checkpoints and must not learn: the trie's business is tokens and
-    caches, and which model wrote them is what makes the key.
+    It holds the model's identity rather than being told it per call, because the store knows
+    nothing about checkpoints and must not learn: its business is keys and payloads, and which
+    model wrote them is already inside the key it was handed.
     """
 
-    def __init__(
-        self,
-        store: Store,
-        model_id: str,
-        *,
-        stamp: str,
-        ceiling: int,
-        floor: int,
-    ) -> None:
+    def __init__(self, store: Store, model_id: str, *, ceiling: int) -> None:
         self._store = store
         self._model = model_id
-        self._stamp = stamp
         self._ceiling = ceiling
-        self._floor = floor
-        """Below this many bytes an entry is not written: a short prefix costs more in a file
-        than the prefill it saves, and every one of them is a row in an index that a lookup
-        walks."""
-        self._writing = threading.Lock()
-        self._pending: list[threading.Thread] = []
+        self._known: dict[Slot, Path] = {}
+        """What this vault has on disk, read from the index once and kept: a lookup per span
+        of a 62k conversation is 242 sqlite round trips on the path of a hit."""
+        self._loaded = False
+        self._queue: queue.Queue[tuple[Slot, Payload, int] | None] = queue.Queue(_QUEUE)
+        self._writer: threading.Thread | None = None
+        self._lock = threading.Lock()
 
-    def flush(self, timeout: float | None = None) -> None:
-        """Wait for the writes in flight. The daemon never calls it — a spill is fire and
-        forget, and what it is for is exactly not making a request wait on an SSD — but a
-        caller that wants to read back what it evicted has to, and so does a shutdown that
-        would otherwise leave a staging file behind."""
-        for thread in list(self._pending):
-            thread.join(timeout)
-        self._pending = [thread for thread in self._pending if thread.is_alive()]
+    def holds(self, key: Slot) -> bool:
+        self._index()
+        return key in self._known
 
-    def keep(self, tokens: Sequence[int], caches: Sequence[LayerCache], *, role: Role) -> None:
-        """Not on the caller's thread. The eviction that triggers this happens inside a
-        request — `insert` is what overruns the budget — and the queue behind it is
-        serialized, so writing here would be the next request waiting on an SSD."""
-        if self._ceiling <= 0 or not storable(caches):
-            return
-        size = written(caches)
-        if size < self._floor:
-            return
-        # Materialized here and not in the thread below, because a stream belongs to the
-        # thread that made it: an array still carrying the decode thread's work cannot be
-        # evaluated anywhere else, and at shutdown that thread is already gone —
-        # `save_safetensors` then raises `no Stream(gpu, 1) in current thread` and the
-        # conversation is lost with no request to report it to.
-        mx.eval([tensor for layer in caches for tensor in layer.tensors])
-        digest = key(self._model, self._stamp, policy(caches), tokens)
-        target = directory(self._model) / f"{digest}.safetensors"
-        entry = PrefixCacheFile(
-            key=digest,
-            model=self._model,
-            path=str(target),
-            ids=_packed(tokens),
-            tokens=len(tokens),
-            bytes=size,
-            created_at=time.time(),
-            used_at=time.time(),
-        )
-        thread = threading.Thread(
-            target=self._write, args=(entry, list(caches)), daemon=True, name="prefix-spill"
-        )
-        self._pending = [held for held in self._pending if held.is_alive()]
-        self._pending.append(thread)
-        thread.start()
-
-    def _write(self, entry: PrefixCacheFile, caches: list[LayerCache]) -> None:
-        with self._writing:
-            try:
-                target = Path(entry.path)
-                target.parent.mkdir(parents=True, exist_ok=True, mode=_MODE)
-                dump(caches, target)
-            except OSError:
-                # A disk that is full or a directory that cannot be made is a cache that does
-                # not exist, which is the state the daemon was in before this feature. The
-                # row is not written, so nothing will look for the file.
-                return
-            self._store.save_prefix_file(entry)
-            self._enforce()
-
-    def recall(self, tokens: Sequence[int], into: Sequence[LayerCache]) -> int | None:
-        """The most of `tokens` any stored file covers, read into `into`.
-
-        The same rule the trie's `take` follows, and for the same reason: a stored cache
-        *longer* than the match is rewound to it rather than thrown away, and a trunk whose
-        layers keep no history to rewind to is skipped instead. Which is why the ids are in
-        the index — a digest answers "is this the same" and never "how much of this is the
-        same", and a conversation whose last turn re-renders one token differently would go
-        from a hit to a whole prefill.
-        """
-        if self._ceiling <= 0 or not storable(into):
+    def read(self, key: Slot) -> Payload | None:
+        self._index()
+        path = self._known.get(key)
+        if path is None:
             return None
-        # The policy of the trunk about to read, which is the one that decides: a file written
-        # by a cache of another format holds bytes this one would take for its own.
-        reading = policy(into)
-        rewinds = all(layer.is_trimmable for layer in into)
-        limit = len(tokens) - 1
-        best: tuple[int, PrefixCacheFile] | None = None
-        for candidate in self._store.prefix_files(self._model):
-            ids = _unpacked(candidate.ids)
-            # The stamp and the policy are checked through the key rather than beside it:
-            # they are what the digest of these very ids was taken over, so one comparison
-            # answers both.
-            if candidate.key != key(self._model, self._stamp, reading, ids):
-                continue
-            # One row is always left to prefill: a forward needs one, and the logits of the
-            # last position are what the sampler reads.
-            usable = min(_common(ids, tokens), limit)
-            if usable == 0 or (usable < candidate.tokens and not rewinds):
-                continue
-            # Same reuse for less read: the shorter file is the one to open.
-            if best is None or (usable, -candidate.tokens) > (best[0], -best[1].tokens):
-                best = (usable, candidate)
-        if best is None:
-            return None
-        covered, entry = best
         try:
-            restore(into, Path(entry.path))
+            payload = load(path)
         except (UnreadableCache, OSError):
             # A truncated or vanished file is a miss and a prefill, which is always correct.
             # The row goes with it: an index that points at nothing would make every lookup
             # pay for the same failure, and the ceiling would count bytes nobody holds.
-            self._forget(entry)
+            self.forget(key)
             return None
-        if entry.tokens > covered:
-            for layer in into:
-                layer.trim(covered)
-        self._store.touch_prefix_file(entry.key, time.time())
-        return covered
+        self._store.touch_prefix_file(key[1], key[0], time.time())
+        return payload
+
+    def write(self, key: Slot, payload: Payload, nbytes: int) -> None:
+        """Queue the write and return. The caller is on the request's own thread — a span
+        closes inside a prefill block or between two decode steps — and half a gigabyte
+        written there is half a gigabyte the next token waits for.
+
+        The tensors were evaluated where they were cut (`core.prefix`), which is the only
+        thread that could: an array still carrying the decode's queued work meets
+        `no Stream(gpu, 1) in current thread` anywhere else.
+        """
+        if self._ceiling <= 0:
+            return
+        self._index()
+        if key in self._known:
+            return
+        with self._lock:
+            if self._writer is None or not self._writer.is_alive():
+                self._writer = threading.Thread(
+                    target=self._drain, daemon=True, name="prefix-vault"
+                )
+                self._writer.start()
+        try:
+            self._queue.put_nowait((key, payload, nbytes))
+        except queue.Full:
+            # A disk that cannot keep up is a cache that does not have this span, which is
+            # the state the daemon was in before the feature. Dropping is the only answer
+            # that does not make a request wait on it.
+            return
+
+    def forget(self, key: Slot) -> None:
+        path = self._known.pop(key, None)
+        if path is not None:
+            with contextlib.suppress(OSError):
+                os.unlink(path)
+        self._store.delete_prefix_file(key[1], key[0])
+
+    def flush(self, timeout: float | None = None) -> None:
+        """Wait for the writes in flight. The daemon never calls it on the request path —
+        that is the whole point of writing behind — but a caller that wants to read back what
+        it stored has to, and so does a shutdown that would otherwise leave a staging file
+        behind."""
+        self._queue.put(None)
+        writer = self._writer
+        if writer is not None:
+            writer.join(timeout)
+
+    def _drain(self) -> None:
+        while True:
+            item = self._queue.get()
+            if item is None:
+                return
+            key, payload, nbytes = item
+            path = directory(self._model) / f"{_digest(key)}.safetensors"
+            try:
+                path.parent.mkdir(parents=True, exist_ok=True, mode=_MODE)
+                dump(payload, path)
+            except OSError:
+                # A full disk or a directory that cannot be made is a cache that does not
+                # exist. No row is written, so nothing will look for the file.
+                continue
+            self._known[key] = path
+            self._store.save_prefix_file(
+                PrefixCacheFile(
+                    key=key[1],
+                    kind=key[0],
+                    model=self._model,
+                    path=str(path),
+                    bytes=nbytes,
+                    created_at=time.time(),
+                    used_at=time.time(),
+                )
+            )
+            self._enforce()
+
+    def _index(self) -> None:
+        """The rows for this model, once. Rebuilt from sqlite and not from the directory:
+        `stat` on every file of a full cache is the cost that table exists to avoid."""
+        if self._loaded:
+            return
+        self._loaded = True
+        for entry in self._store.prefix_files(self._model):
+            slot = _slot(entry)
+            if slot is not None:
+                self._known[slot] = Path(entry.path)
 
     def _enforce(self) -> None:
-        """Least recently used out until the total is under the ceiling. Read from the index
-        rather than by walking the directory: `stat` on every file of a full cache is the
-        cost this table exists to avoid."""
+        """Least recently used out until the total is under the ceiling."""
         total = self._store.prefix_bytes()
         if total <= self._ceiling:
             return
@@ -205,34 +194,9 @@ class DiskSpill(Spill[LayerCache]):
             if total <= self._ceiling:
                 return
             total -= entry.bytes
-            self._forget(entry)
-
-    def _forget(self, entry: PrefixCacheFile) -> None:
-        with contextlib.suppress(OSError):
-            os.unlink(entry.path)
-        self._store.delete_prefix_file(entry.key)
-
-
-def _packed(tokens: Sequence[int]) -> bytes:
-    """Ids as int32, which is four bytes a token against the 8 KB a token the file beside them
-    weighs. A JSON list would be three times that and would still have to be parsed."""
-    return array("i", tokens).tobytes()
-
-
-def _unpacked(raw: bytes) -> list[int]:
-    held = array("i")
-    held.frombytes(raw)
-    return held.tolist()
-
-
-def _common(one: Sequence[int], other: Sequence[int]) -> int:
-    """How much of a prefix the two share."""
-    length = 0
-    for left, right in zip(one, other, strict=False):
-        if left != right:
-            break
-        length += 1
-    return length
+            slot = _slot(entry)
+            if slot is not None:
+                self.forget(slot)
 
 
 def forget(store: Store, model_id: str) -> int:
@@ -243,7 +207,7 @@ def forget(store: Store, model_id: str) -> int:
     for entry in entries:
         with contextlib.suppress(OSError):
             os.unlink(entry.path)
-        store.delete_prefix_file(entry.key)
+        store.delete_prefix_file(entry.key, entry.kind)
     with contextlib.suppress(OSError):
         directory(model_id).rmdir()
     return len(entries)
@@ -256,6 +220,26 @@ def sweep(store: Store) -> int:
     dropped = 0
     for entry in store.prefix_files():
         if not Path(entry.path).exists():
-            store.delete_prefix_file(entry.key)
+            store.delete_prefix_file(entry.key, entry.kind)
             dropped += 1
     return dropped
+
+
+def _slot(entry: PrefixCacheFile) -> Slot | None:
+    """A row back as the key it was written under, or `None` for a kind this release does not
+    know. Unknown rather than an error: the column is text, and a row a later version wrote
+    is a file this one has no reader for."""
+    match entry.kind:
+        case "rows" | "anchor":
+            return (entry.kind, entry.key)
+        case _:
+            return None
+
+
+def _digest(key: Slot) -> str:
+    """A slot as one name. The kind is a prefix and not a column of the file name because a
+    span and the state that stood on its far boundary are two payloads of one key, and a
+    directory listing should show which is which."""
+    kind, digest = key
+    return digest if kind == "rows" else f"{kind}-{digest}"
+

@@ -41,7 +41,6 @@ from mlx_omnia import (
 from mlx_omnia.engine.parsers import FALLBACK, Segment, Segmenter
 from mlx_omnia.engine.schema import json_instruction
 from mlx_omnia.server import Engine, create_app, prefixes
-from mlx_omnia.server import engine as engine_module
 from mlx_omnia.server.engine import Job, Loader
 from mlx_omnia.server.store import Store
 
@@ -596,22 +595,35 @@ def test_a_turn_with_nothing_stored_says_zero_instead_of_saying_nothing(client: 
     assert usage.prompt_tokens_details.cached_tokens == 0
 
 
+_LONG_QUESTION = (
+    "Name one river in Brazil, and before you answer, consider that the country has a very "
+    "large number of them across several basins, that the Amazon and the Paraná are the two "
+    "best known, and that a good answer names one and says where it runs. "
+) * 3
+"""Long enough that the conversation closes a span. A prompt shorter than one is a
+conversation with nothing to reuse, which is the right answer and not the one this asks."""
+
+
 def test_a_second_turn_reports_the_prefix_the_first_one_left(tmp_path: Path) -> None:
-    """The trie seen from the dialect, on a real checkpoint: the second request repeats the
-    first conversation and adds to it, so a stored cache covers its head. `cached_tokens` is
-    the only thing that says so — a near miss and a hit produce the same answer at the same
-    `prompt_tokens`, and differ only in what the prefill actually read.
+    """The store seen from the dialect, on a real checkpoint: the second request repeats the
+    first conversation and adds to it, so its head is spans the daemon already holds.
+    `cached_tokens` is the only thing that says so — a near miss and a hit produce the same
+    answer at the same `prompt_tokens`, and differ only in what the prefill actually read.
 
     Its own stand, because the module's engine is built with no store and a store is what
-    hands `prefix_budget` down (`engine.py:708`). An engine without one runs the cold path,
-    which is what every test here that is not about reuse wants.
+    hands the prefix handle down. An engine without one runs the cold path, which is what
+    every test here that is not about reuse wants.
 
-    A floor and not an equality: how much is covered depends on whether the template
-    re-renders the assistant turn into the ids the model itself wrote, which is the
-    checkpoint's business. What the daemon owes is the number, and that it is not zero.
+    A floor and not an equality: reuse lands on a span boundary, and how far the chain matches
+    depends on whether the template re-renders the assistant turn into the ids the model
+    itself wrote — the checkpoint's business. What the daemon owes is the number, and that it
+    is not zero.
     """
     store = Store(tmp_path / "server.db")
-    opening = [{"role": "user", "content": "Name one river in Brazil."}]
+    # 64 is the narrowest span the config admits, so the turns have to be long enough to
+    # close one: reuse lands on a boundary, and a conversation shorter than a span has none.
+    store.set_config({"prefix_span": "64"})
+    opening = [{"role": "user", "content": _LONG_QUESTION}]
     door = "/api/openai/v1/chat/completions"
 
     with TestClient(create_app(Engine(loader, store), store)) as running:
@@ -637,22 +649,24 @@ def test_a_second_turn_reports_the_prefix_the_first_one_left(tmp_path: Path) -> 
 def test_a_conversation_survives_the_daemon_it_was_warm_in(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
-    """What the disk tier is for. The trie hangs on the model and dies with it, so without a
-    file every conversation that was warm pays a whole prefill again after a restart.
+    """What the disk tier is for. The store dies with the process, so without a file every
+    conversation that was warm pays a whole prefill again after a restart.
 
     The restart is a second app over the same store and the same cache directory, which is
     what a restart is from the state's point of view — a new process finding what the last
-    one left. The memory budget is one byte, so every entry is evicted the moment it is
-    inserted and the second turn can only be answered off disk.
+    one left. The memory ceiling is one byte, so every span is pushed to the vault the moment
+    it is stored and the second turn can only be answered off disk.
     """
     monkeypatch.setattr(prefixes, "CACHE", tmp_path / "prefixes")
-    # A 0.6B's cache is ~115 KB a token, so the conversation below is a few megabytes and
-    # sits under the floor a real one clears in its first thousand tokens. The floor is about
-    # whether a file pays for itself, and that is not what this test is about.
-    monkeypatch.setattr(engine_module, "_SPILL_FLOOR", 0)
     store = Store(tmp_path / "server.db")
-    store.set_config({"prefix_cache_bytes": "1", "prefix_disk_bytes": str(4 * 1024**3)})
-    opening = [{"role": "user", "content": "Name one river in Brazil."}]
+    store.set_config(
+        {
+            "prefix_cache_bytes": "1",
+            "prefix_disk_bytes": str(4 * 1024**3),
+            "prefix_span": "64",
+        }
+    )
+    opening = [{"role": "user", "content": _LONG_QUESTION}]
     door = "/api/openai/v1/chat/completions"
 
     with TestClient(create_app(Engine(loader, store), store)) as first:

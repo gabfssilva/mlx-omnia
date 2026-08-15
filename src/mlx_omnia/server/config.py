@@ -36,6 +36,7 @@ from typing import Annotated, Literal
 from fastapi import APIRouter, Depends, HTTPException, Request
 from pydantic import BaseModel, ConfigDict, Field, ValidationError, model_validator
 
+from mlx_omnia.engine.core.prefix import SPAN
 from mlx_omnia.server import catalog
 from mlx_omnia.server.deps import StoreDep
 from mlx_omnia.server.events import announce
@@ -106,10 +107,9 @@ class Config(BaseModel):
 
     Across all of them, like `prefix_disk_bytes`: it is one machine's memory, and split per
     model the same number would mean twice as much with two resident and half as much
-    available to one. Each model still holds its own trie — the element type is the trunk's
-    own cache, and it dies with the model, which is what keeps one prompt in two resident
-    models from crossing caches — and the accountant that weighs them against each other is
-    `prompt_cache.Budget`, on the engine.
+    available to one. One store holds them all, and which checkpoint a span came out of is
+    inside its own key — so two resident models never read each other's spans, and a model
+    unloaded and loaded again finds its own where it left them.
     """
     prefix_disk_bytes: int = Field(default=8 * 1024**3, ge=0)
     """How much of `~/.cache/mlx_omnia/prefixes` the daemon may fill with conversations the
@@ -122,8 +122,20 @@ class Config(BaseModel):
     disk, because a free disk is a fact about the machine at this instant and a ceiling that
     moved with it would grow into whatever was just freed.
 
-    What it buys is the turn after a restart: the trie dies with the process, so without this
+    What it buys is the turn after a restart: the store dies with the process, so without this
     every conversation that was warm pays a whole prefill again."""
+    prefix_span: int = Field(default=SPAN, ge=64, le=4096, multiple_of=64)
+    """Tokens per span — the granularity a conversation is stored and resumed at.
+
+    Both directions are real, which is why it is bounded rather than free. Below it, resuming
+    a 62k conversation means tens of thousands of Python-side arrays per request; above it,
+    the partial tail that is never stored is TTFT thrown away on every turn, a second of
+    prefill at 4096.
+
+    It rides in the key, so moving it does not corrupt anything: the spans written under the
+    old one stop matching and fall to the LRU by being, by definition, the least used. What it
+    cannot do is move under a request in flight, and it does not — the chain is resolved when
+    the request starts."""
     port: int = Field(default=8642, ge=1, le=65535)
     api_key: str | None = None
     catalog_directory: str = Field(default_factory=lambda: str(catalog.HUB_CACHE))
@@ -161,6 +173,7 @@ class ConfigPatch(BaseModel):
     max_concurrent_requests: int | None = None
     prefix_cache_bytes: int | None = None
     prefix_disk_bytes: int | None = None
+    prefix_span: int | None = None
     port: int | None = None
     api_key: str | None = None
     catalog_directory: str | None = None
@@ -171,12 +184,16 @@ _EFFECTS: dict[str, Effect] = {
     "memory_limit_bytes": "applied",
     "idle_ttl_seconds": "applied",
     "max_concurrent_requests": "applied",
-    # Read per request in `Engine.submit` and carried into the model, which rebuilds its trie
-    # when the number moves — so a PATCH counts for the next request on a model already up.
+    # Read per request in `Engine.submit` and carried into the model: the engine rebuilds the
+    # store when the number moves, so a PATCH counts for the next request on a model
+    # already up.
     "prefix_cache_bytes": "applied",
-    # Read per request too, and by the same path: the spill the engine hands down carries the
+    # Read per request too, and by the same path: the vault the engine hands down carries the
     # ceiling it was built with, and the engine rebuilds it when the number moves.
     "prefix_disk_bytes": "applied",
+    # In the key, so what a PATCH costs is one prefill: the spans of the old granularity stop
+    # matching and leave through the LRU.
+    "prefix_span": "applied",
     "port": "restart",
     # `auth.ApiKey` reads the store per request, so a rotation — and a revocation, which is
     # the one that matters — is in force on the next call.

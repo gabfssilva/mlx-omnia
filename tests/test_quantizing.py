@@ -11,8 +11,9 @@ import pytest
 
 from mlx_omnia.engine.core.attend import Attending, attend
 from mlx_omnia.engine.core.cache import DeltaCache, KVCache, LayerCache
+from mlx_omnia.engine.core.prefix import PrefixStore
 from mlx_omnia.engine.core.quantized_cache import QuantizedKVCache
-from mlx_omnia.engine.generate import BlockOutputs, CausalLM, CompiledDecode, _boundary
+from mlx_omnia.engine.generate import BlockOutputs, CausalLM, CompiledDecode
 from mlx_omnia.engine.quant.quantization import Affine
 from mlx_omnia.engine.quantizing import Quantizing, admits
 
@@ -73,42 +74,54 @@ def test_a_wrapped_trunk_quantizes_attention_and_leaves_recurrence_alone() -> No
     assert compressed.start_tokens == 4
 
 
-def test_the_boundary_guard_accepts_a_promotion_under_a_wrapped_trunk() -> None:
-    """`_boundary` builds a fresh cache and refuses unless it means the same thing as the live
-    one. Under a wrapped trunk both sides are quantized under one policy, so the guard passes
-    and a hybrid conversation keeps its prefix — which is the entire reason the policy lives in
-    `make_cache` instead of being substituted downstream of it."""
+def test_a_wrapped_trunk_keeps_its_prefix_under_one_policy() -> None:
+    """The chain's seed folds every layer's policy, so a compressed trunk and a dense one are
+    two conversations that never meet. Under a wrapper both the fresh cache and the live one
+    are compressed under the same policy — which is the entire reason the policy lives in
+    `make_cache` instead of being substituted downstream of it — so the seeds agree and a
+    hybrid conversation keeps its spans."""
     model: CausalLM[LayerCache] = Quantizing(HybridLM(), K_FORMAT, V_FORMAT)
+    store = PrefixStore(1 << 30, span=4)
+    tokens = list(range(1, 12))
     cache = model.make_cache()
-    model(mx.array([[1, 2, 3, 4, 5]]), cache)
-    assert not all(layer.is_trimmable for layer in cache), "otherwise the guard is never reached"
+    walk = store.begin("m", "sha", cache, model)
+    assert walk is not None
+    model(mx.array([tokens[:8]]), cache)
+    walk.commit(tokens, cache, 8)
 
-    standing = _boundary(model, cache)
+    warm = model.make_cache()
+    second = store.begin("m", "sha", warm, model)
 
-    assert standing is not None
-    assert [type(layer) for layer in standing] == [QuantizedKVCache, DeltaCache]
-    assert [layer.rows for layer in standing] == [5, 5]
-    restored, live = standing[0], cache[0]
+    assert second is not None
+    assert second.resume(tokens, warm) == 8
+    restored, live = warm[0], cache[0]
     assert isinstance(restored, QuantizedKVCache) and isinstance(live, QuantizedKVCache)
-    for name, tensor in live.stored().items():
-        assert mx.array_equal(restored.stored()[name], tensor).item()
+    for name, tensor in live.stored(0, 8).items():
+        assert mx.array_equal(restored.stored(0, 8)[name], tensor).item()
 
 
-def test_a_wrapper_that_does_not_override_make_cache_loses_every_promotion(
+def test_a_wrapper_that_does_not_override_make_cache_loses_every_prefix(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    """The mutation this module exists to fail. With `make_cache` delegated, the fresh cache is
-    dense while the live one is compressed: same layer count, same shapes, two different
-    meanings — and `policy` is what tells them apart. The failure is silent otherwise, since a
-    refused boundary is a prefix that is simply never kept."""
+    """The mutation this module exists to fail. With `make_cache` delegated, the fresh cache
+    is dense while the live one is compressed: same layer count, same shapes, two different
+    meanings — and the policy inside the seed is what tells them apart. The failure is silent
+    otherwise, since a chain that never matches is a prefix that is simply never reused."""
     model: CausalLM[LayerCache] = Quantizing(HybridLM(), K_FORMAT, V_FORMAT)
+    store = PrefixStore(1 << 30, span=4)
+    tokens = list(range(1, 12))
     cache = model.make_cache()
-    model(mx.array([[1, 2, 3, 4, 5]]), cache)
-    assert _boundary(model, cache) is not None
+    walk = store.begin("m", "sha", cache, model)
+    assert walk is not None
+    model(mx.array([tokens[:8]]), cache)
+    walk.commit(tokens, cache, 8)
 
     monkeypatch.setattr(Quantizing, "make_cache", _dense_make_cache)
+    dense = model.make_cache()
+    second = store.begin("m", "sha", dense, model)
 
-    assert _boundary(model, cache) is None
+    assert second is not None
+    assert second.resume(tokens, dense) == 0
 
 
 def test_the_wrapper_declares_neither_compiled_decode_nor_block_outputs() -> None:

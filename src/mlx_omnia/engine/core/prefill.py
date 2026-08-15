@@ -39,6 +39,7 @@ def prefill(
     cache: Sequence[LayerCache],
     *,
     block: int = BLOCK,
+    after: Callable[[int], None] | None = None,
 ) -> slice:
     """Feed every block but the last through `feed`; return the last for the caller's own
     forward.
@@ -46,16 +47,40 @@ def prefill(
     `feed` may return whatever the model returns — it is dropped here, which is the point.
     Between blocks only `LayerCache.tensors` is evaluated, so what is forced is the trunk
     and never the head.
+
+    `after` is called with the absolute position the trunk now stands at, on every block
+    boundary and after the caches are evaluated. It is where a prefix store closes the spans
+    a block just finished: the trunk is stopped, its rows exist, and nothing else in the
+    prefill offers both.
     """
     at = 0
     while length - at > block:
         feed(slice(at, at + block))
         mx.eval([tensor for layer in cache for tensor in layer.tensors])
+        at += block
+        if after is not None:
+            after(at)
         # Back to the system rather than into MLX's own pool: a block's transients are the
         # peak this split exists to bound, and a pool that keeps them holds the peak too.
         mx.clear_cache()
-        at += block
     return slice(at, length)
+
+
+def landing(at: int, length: int, span: int) -> int:
+    """Where to cut the last block so the trunk stops on a span boundary before reading its
+    logits, or `at` when there is no cut worth making.
+
+    A recurrent layer's state only exists while the layer is stopped, so a prompt whose last
+    block is fed whole leaves no boundary to anchor on — and a turn of one token, which is
+    what a replay measures and what a client asking for a continuation sends, would leave
+    nothing at all for the turn after it.
+
+    Two rows are left for the forward that reads the logits and not one: a single-row prefill
+    is the decode regime, and swapping regimes at the last prompt position moves the logits
+    more than shortening a block does.
+    """
+    boundary = max(0, length - 2) // span * span
+    return boundary if boundary > at else at
 
 
 def pulled(
@@ -64,6 +89,7 @@ def pulled(
     cache: Sequence[LayerCache],
     *,
     block: int = BLOCK,
+    after: Callable[[int], None] | None = None,
 ) -> list[int]:
     """The same split over a prompt that arrives instead of one that is already there: feed
     every block but the last as its ids turn up, and hand the last back.
@@ -78,10 +104,14 @@ def pulled(
     empty, which is knowable only once it has.
     """
     held: list[int] = []
+    at = 0
     while chunk := list(islice(ids, block)):
         if held:
             feed(held)
             mx.eval([tensor for layer in cache for tensor in layer.tensors])
+            at += len(held)
+            if after is not None:
+                after(at)
             mx.clear_cache()
         held = chunk
     return held

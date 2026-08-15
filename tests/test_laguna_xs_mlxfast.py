@@ -15,8 +15,7 @@ import mlx.nn as nn
 import pytest
 
 from mlx_omnia import stream_ids
-from mlx_omnia.engine.core.cache import LayerCache
-from mlx_omnia.engine.core.prompt_cache import PromptCache
+from mlx_omnia.engine.core.prefix import Prefixes, PrefixStore
 from mlx_omnia.engine.generate import Meter
 from mlx_omnia.engine.models.laguna import CHECKPOINT, Laguna
 from mlx_omnia.engine.models.laguna.layers.moe import LagunaSparseMoe
@@ -111,30 +110,31 @@ def test_compiled_greedy_decode_matches_eager_across_sliding_window(
 def test_prefix_reuse_compiles_and_the_next_turn_matches_a_cold_run(
     model: Laguna, case: dict[str, list[int]]
 ) -> None:
-    """The server's single-stream shape: greedy under a prefix trie, two turns. The first
-    turn must still match the golden with the trie in hand — the compile now runs under a
-    prefix — and the second must reuse the first prompt and reproduce a cold run id for id.
-    The entry the promotion leaves behind has to be the growing layers standing on the
-    prompt: a promoted ring stored instead cannot be prefilled past, and a mutation that
-    stores it fails here on the reuse."""
-    trie = PromptCache[LayerCache](budget=1 << 34)
+    """The server's single-stream shape: greedy under a prefix store, two turns. The first
+    turn must still match the golden with the store in hand — the compile runs under a prefix
+    now, unconditionally — and the second must reuse the spans and reproduce a cold run id
+    for id.
+
+    This is the sliding-window arm. Thirty of these forty layers are windowed, the decode
+    promotes them to rings, and a span is cut out of a ring in absolute order: a rotation
+    stored as a history would come back as a shuffled context, which greedy ids do catch here
+    because the second turn's answer is compared against a cold one.
+    """
+    span = 256
+    prefix = Prefixes(PrefixStore(1 << 34, span=span), "laguna", "a-stamp")
     prompt = case["prompt_tokens"]
-    first = list(stream_ids(model, prompt, max_tokens=24, prefix=trie))
+    first = list(stream_ids(model, prompt, max_tokens=24, prefix=prefix))
     assert first == case["expected_tokens"][:24]
 
     second_prompt = [*prompt, *first, *prompt[:8]]
     meter = Meter()
-    warm = list(stream_ids(model, second_prompt, max_tokens=8, prefix=trie, meter=meter))
+    warm = list(stream_ids(model, second_prompt, max_tokens=8, prefix=prefix, meter=meter))
     cold = list(stream_ids(model, second_prompt, max_tokens=8))
 
     assert warm == cold
-    assert meter.reused_tokens == len(prompt)
+    assert meter.reused_tokens == (len(second_prompt) - 1) // span * span
+    assert meter.reused_tokens > 0, "a prompt shorter than one span proves nothing here"
     assert meter.kept_prefix
-
-    reuse = trie.take([*second_prompt, *warm, 0])
-    assert reuse is not None
-    assert reuse.length == len(second_prompt)
-    assert all(layer.is_trimmable for layer in reuse.caches)
 
 
 @requires_checkpoint(REPO, REVISION)

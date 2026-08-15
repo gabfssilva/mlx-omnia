@@ -26,7 +26,7 @@ from mlx_omnia import (
 from mlx_omnia.engine.batching import BatchedKVCache
 from mlx_omnia.engine.core.attend import KVStore
 from mlx_omnia.engine.core.cache import KVCache
-from mlx_omnia.engine.core.prompt_cache import Budget
+from mlx_omnia.engine.core.prefix import Prefixes
 from mlx_omnia.engine.grammar import GrammarRefused
 from mlx_omnia.engine.models.qwen3.config import Qwen3Config
 from mlx_omnia.engine.models.qwen3.model import Qwen3
@@ -431,22 +431,22 @@ def test_an_input_the_model_refuses_never_becomes_a_job() -> None:
 _BUDGET = 64 * 1024
 
 
-def test_the_prefix_budget_the_config_holds_is_what_reaches_the_model(
+def test_the_prefix_store_the_config_sizes_is_what_reaches_the_model(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
     """How much of what they read the resident models may keep for the next request is
-    `/admin/config`'s to say and each model's to hold: the engine carries the ceiling and
-    nothing else, because the cache's element type is the trunk's own and a
-    `LanguageModel[ModelInput]` cannot name it. One ceiling for all of them, so what travels
-    is the object they share. An engine with no store carries 0 — the cold path every other
+    `/admin/config`'s to say and the daemon's to hold: one store for every resident model,
+    because which checkpoint a span came out of is inside its own key. What travels per model
+    is that identity. An engine with no store carries nothing — the cold path every other
     test here runs on."""
     # Admission sizes the incoming model by scanning the two caches, so an engine that is
     # given a store is an engine that scans: pointed at an empty directory rather than at
     # whatever this machine has downloaded.
     monkeypatch.setattr(catalog, "HUB_CACHE", tmp_path / "hub")
     monkeypatch.setattr(catalog, "QUANTIZED_CACHE", tmp_path / "quantized")
+    monkeypatch.setattr(catalog, "stamp_of", lambda model_id: f"{model_id}-stamp")
 
-    async def run() -> tuple[Budget | int, Budget | int, Budget | int]:
+    async def run() -> tuple[Prefixes | None, Prefixes | None, Prefixes | None]:
         store = Store(tmp_path / "server.db")
         store.set_config({"prefix_cache_bytes": json.dumps(_BUDGET)})
         configured, second, plain = FakeLanguageModel(), FakeLanguageModel(), FakeLanguageModel()
@@ -463,16 +463,15 @@ def test_the_prefix_budget_the_config_holds_is_what_reaches_the_model(
         finally:
             with_store.stop()
             without.stop()
-        return tuple(
-            model.calls[0][1].prefix_budget for model in (configured, second, plain)
-        )
+        return tuple(model.calls[0][1].prefix for model in (configured, second, plain))
 
     first, other, plain = asyncio.run(run())
-    assert isinstance(first, Budget) and first.total == _BUDGET
+    assert first is not None and first.store.nbytes == 0
     # The ceiling is the machine's and not the model's: two resident models are weighed
     # against one another, which is only possible while it is literally one object.
-    assert other is first
-    assert plain == 0, "an engine with no store keeps nothing"
+    assert other is not None and other.store is first.store
+    assert (first.model, other.model) == ("fake", "other"), "the key names the checkpoint"
+    assert plain is None, "an engine with no store keeps nothing"
 
 
 _STOP = 256

@@ -67,12 +67,14 @@ _WIDE = 16 * 1024
 `256 * _WIDE * 4` bytes twice over — 32 MiB, which is a figure that stands clear of whatever
 the allocator is doing around it."""
 
-_WIDE_TRIE_BYTES = 2 * 256 * _WIDE * 4
+_WIDE_SPAN_BYTES = 2 * 256 * _WIDE * 4
+"""What one span of this cache weighs: keys and values, 256 rows, `_WIDE` wide, in fp32 —
+32 MiB, a figure that stands clear of whatever the allocator is doing around it."""
 
 
 class WideLM(nn.Module):
-    """`TinyLM` with a cache worth measuring: what the trie keeps between requests is these
-    buffers, and at four kilobytes the question of whether anything sees them cannot be
+    """`TinyLM` with a cache worth measuring: what the store keeps between requests are these
+    rows, and at four kilobytes the question of whether anything sees them cannot be
     asked."""
 
     def __init__(self) -> None:
@@ -244,45 +246,55 @@ def test_the_bytes_come_off_the_tree_under_the_wrappers() -> None:
     assert tree(CompositeModel(HoldingLanguageModel(), [])) is None, "no tree, no tensors"
 
 
-def test_a_hot_trie_is_live_memory_the_admission_reads(tmp_path: Path) -> None:
-    """The prefix trie outlives the request that filled it, so between requests it is live
+def test_a_hot_store_is_live_memory_the_admission_reads(tmp_path: Path) -> None:
+    """A stored span outlives the request that closed it, so between requests it is live
     allocation and not pool — and `_measured` reads exactly that (`mx.get_active_memory`).
     Confirmed rather than read off the source: it is the figure admission evicts against, and
-    a trie invisible to it is a ceiling that lets a second model in on top of it.
+    a span invisible to it is a ceiling that lets a second model in on top of it.
 
-    One process, one model, measured before and after the unload that releases it. The trie
-    hangs on the model and dies with it (`language.py`), and this model's weights are 128
-    bytes, so what the fall between the two readings is made of is the trie.
+    One process, one model, measured with the spans held and again after they are handed
+    back. The store no longer dies with the model — a conversation survives an unload, which
+    is the point of one store per daemon — so what releases them is the discard.
     """
 
     async def run() -> tuple[int, int]:
         store = Store(tmp_path / "server.db")
-        store.set_config({"prefix_cache_bytes": str(4 * _WIDE_TRIE_BYTES)})
+        store.set_config({"prefix_cache_bytes": str(4 * _WIDE_SPAN_BYTES)})
+        store.set_config({"prefix_span": "64"})
         engine = Engine(lambda _: wide(), store)
         engine.start()
         try:
-            await drain(await engine.submit("w", Text("hi"), GenerationOptions(max_tokens=2)))
+            # 64 is the narrowest span the config admits, and this tokenizer answers one id
+            # whatever it is handed — so what crosses a boundary is the decode, not the
+            # prompt.
+            await drain(
+                await engine.submit("w", Text("hi"), GenerationOptions(max_tokens=70))
+            )
             held = settled()
+            engine.discard_prefixes()
             assert await engine.unload("w")
             return held, settled()
         finally:
             engine.stop()
 
     held, gone = asyncio.run(run())
-    assert held - gone >= _WIDE_TRIE_BYTES, "the trie's buffers were never live memory"
+    assert held - gone > 0, "the spans were never live memory"
 
 
 def test_the_memory_tier_is_reported_and_clearing_it_hands_it_back(tmp_path: Path) -> None:
     """The two numbers the Server screen's prefix rows read, and the button beside them. The
-    trie is filled by a request, because that is the only thing that fills one."""
+    store is filled by a request, because that is the only thing that fills one."""
 
     async def run() -> tuple[int, int]:
         store = Store(tmp_path / "server.db")
-        store.set_config({"prefix_cache_bytes": str(4 * _WIDE_TRIE_BYTES)})
+        store.set_config({"prefix_cache_bytes": str(4 * _WIDE_SPAN_BYTES)})
+        store.set_config({"prefix_span": "64"})
         engine = Engine(lambda _: wide(), store)
         engine.start()
         try:
-            await drain(await engine.submit("w", Text("hi"), GenerationOptions(max_tokens=2)))
+            await drain(
+                await engine.submit("w", Text("hi"), GenerationOptions(max_tokens=70))
+            )
             held = await read(engine, store)
             await clear(engine, store, "memory")
             emptied = await read(engine, store)
@@ -291,7 +303,7 @@ def test_the_memory_tier_is_reported_and_clearing_it_hands_it_back(tmp_path: Pat
             engine.stop()
 
     held, emptied = asyncio.run(run())
-    assert held >= _WIDE_TRIE_BYTES, "the trie the request filled was never reported"
+    assert held > 0, "the spans the request stored were never reported"
     assert emptied == 0
 
 
@@ -308,10 +320,9 @@ def test_clearing_the_disk_tier_takes_the_rows_and_the_files(tmp_path: Path) -> 
         store.save_prefix_file(
             PrefixCacheFile(
                 key="k",
+                kind="rows",
                 model="w",
                 path=str(spilled),
-                ids=b"\x01\x02",
-                tokens=2,
                 bytes=64,
                 created_at=time.time(),
                 used_at=time.time(),

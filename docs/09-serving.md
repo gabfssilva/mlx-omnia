@@ -27,17 +27,38 @@ Loading is exposed as a **job** because cold loads can outlive an HTTP request. 
 
 Consecutive requests in a conversation share a long prefix: the system prompt, then the whole history. Re-prefilling it every turn is the largest avoidable cost in a chat workload.
 
-`src/mlx_omnia/engine/core/prompt_cache.py` stores materialized caches in a **per-token trie**, under a byte budget.
+`src/mlx_omnia/engine/core/prefix.py` stores it as a chain of **immutable spans**, 256 tokens
+each, under one byte ceiling for the whole daemon.
 
-Each token gets a node rather than using a compressed radix, which makes every node a legal cut point. If a stored cache extends past the common prefix, `LayerCache.trim` rewinds it to that point instead of discarding it.
+Span `i` is keyed by the digest of the span before it plus its own ids, so a key names the
+entire prefix that produced it. Reuse is the longest run of keys the store still has, which
+makes a conversation edited in the middle keep everything before the edit and prefill the
+rest — no rewinding, and nothing handed over: a span is immutable, so two requests over the
+same system prompt read the same one.
+
+What a layer contributes is what its `layout` declares (`core/cache.py`). `Rows` compose —
+the span holds the rows its tokens produced, and resuming concatenates them. `Snapshot` does
+not: recurrent state and convolution windows cannot be recomputed from a later position
+(chapter 05), so what is stored is the whole value as it stood, *stopped*, on a boundary.
 
 Three rules that generalize to any such cache:
 
-- **Non-trimmable caches are skipped.** Recurrent state and convolution windows cannot be reconstructed backwards (chapter 05), and a wrong cache can survive greedy decoding.
-- **Role controls eviction order.** `assistant` drains before `user`, then `system`. The system prompt is shared by every request, so it is evicted last.
-- **`take` transfers ownership of the cache.** Generation writes past the prefix and invalidates the trie's record. The caller re-inserts it under the full sequence when the request finishes.
+- **A trunk with any `Snapshot` layer resumes only to a boundary it also has an anchor for.**
+  The rows may reach further; a cache half at one position and half at another decodes
+  fluently off a sequence that never happened.
+- **Two anchors per conversation, and they supersede only their own kind.** The last boundary
+  of the prompt is what the next turn extends — a client that drops reasoning blocks and
+  re-serializes tool calls does not reproduce the ids the model wrote — and the last boundary
+  the decode crossed is what a client that echoes its ids extends.
+- **Memory and disk are one abstraction.** A span is held until the ceiling pushes it out and
+  filed after; a read that lands in `server/prefixes.py` is promoted on the way through, so
+  VRAM is the hot path as a consequence of use and the caller never learns where the bytes
+  came from.
 
-One subtlety worth keeping: `take` always leaves at least one token to prefill. A forward pass needs a row, and the logits the sampler reads are the ones of the last prompt position.
+One subtlety worth keeping: the chain always leaves at least one token to prefill. A forward
+pass needs a row, and the logits the sampler reads are the ones of the last prompt position.
+For a trunk with an anchor the prefill also stops on the last boundary before that row, which
+is the only moment a recurrent state exists to be captured at all.
 
 ## Jobs
 
@@ -76,5 +97,5 @@ Reading a value back to the CPU is a synchronization point. Doing it before enqu
 - `residency.py`: the two model-screen buttons, and a routing-order note worth reading before adding a path under `/admin/models/{model_id:path}`.
 - `store.py`: persistence.
 - `app.py`, `anthropic.py`, `gemini.py`, `responses.py`: the dialects.
-- `src/mlx_omnia/engine/core/prompt_cache.py`: prefix reuse, in the engine rather than the server.
+- `src/mlx_omnia/engine/core/prefix.py`: prefix reuse, in the engine rather than the server; `prefixes.py` is its disk floor.
 - `metrics.py`: per-request state and counters.

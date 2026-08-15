@@ -1,15 +1,15 @@
-from collections.abc import Callable, Sequence
+from collections.abc import Mapping, Sequence
 
 import mlx.core as mx
 
 from mlx_omnia.engine.batching import BatchedKVCache, RaggedAdapter, RaggedBatchable
-from mlx_omnia.engine.core.cache import KVCache, LayerCache
+from mlx_omnia.engine.core.cache import Composite, KVCache, LayerCache
 
 type DSAStore = DSACache | BatchedDSACache
 """What one DSA layer reads: its own cache, or a row of a ragged batch of them."""
 
 
-class DSACache(LayerCache, RaggedBatchable):
+class DSACache(Composite, RaggedBatchable):
     """One layer's two histories: the attention's keys/values and the indexer's keys.
 
     They advance together and rewind together, so the layer presents a single `offset`
@@ -24,6 +24,10 @@ class DSACache(LayerCache, RaggedBatchable):
         super().__init__()
 
     @property
+    def parts(self) -> Mapping[str, LayerCache]:
+        return {"attention": self.attention, "index": self.index}
+
+    @property
     def offset(self) -> int:
         return self.attention.offset
 
@@ -34,23 +38,6 @@ class DSACache(LayerCache, RaggedBatchable):
     @property
     def is_trimmable(self) -> bool:
         return self.attention.is_trimmable and self.index.is_trimmable
-
-    @property
-    def nbytes(self) -> int:
-        return self.attention.nbytes + self.index.nbytes
-
-    @property
-    def tensors(self) -> tuple[mx.array, ...]:
-        return self.attention.tensors + self.index.tensors
-
-    def checkpoint(self) -> Callable[[], None]:
-        restores = (self.attention.checkpoint(), self.index.checkpoint())
-
-        def restore() -> None:
-            for undo in restores:
-                undo()
-
-        return restore
 
     def trim(self, length: int) -> None:
         self.attention.trim(length)

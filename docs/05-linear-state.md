@@ -56,7 +56,7 @@ The cache chapter's warning, stated in full, because it is the practical consequ
 
 **A recurrent state cannot be rewound.** `state_t` is a lossy function of everything before `t`. There is no inverse. So every engine feature built on rewinding a cache is unavailable on a linear-state layer:
 
-- **Prefix reuse across requests** (chapter 09) trims a stored cache back to the common prefix. `PromptCache.take` skips the entire entry if any layer cannot be trimmed. Recurrent state and convolution windows keep no history from which to reconstruct an earlier state; partial reuse would create a wrong cache that greedy decoding may fail to expose.
+- **Prefix reuse across requests** (chapter 09) resumes a conversation from stored spans. A layer that keeps rows hands over the ones its span's tokens produced; recurrent state and convolution windows keep no history from which to reconstruct an earlier position, so what they store is an *anchor* — the whole state as it stood, stopped, on a span boundary — and the trunk resumes no further than one. Resuming past it would create a wrong cache that greedy decoding may fail to expose.
 
 - **Speculative decoding** (chapter 07) requires discarding the state of rejected proposals. `DeltaCache` says so directly: speculation is off for that architecture.
 

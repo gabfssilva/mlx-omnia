@@ -245,6 +245,13 @@ class MuseGlimmerDFlash:
         proposes 15."""
         return self._block - 1
 
+    @property
+    def resumes(self) -> bool:
+        """No: its own cache holds a row per position, written from the target's blocks at
+        that position, and a resumed prompt produced none of them. A drafter cache of its
+        own in the prefix store is what would change the answer."""
+        return False
+
     def absorb(self, features: mx.array) -> None:
         self._drafter.absorb(features, self._cache)
         # The prompt arrives in prefill blocks and a round adds a handful of rows; without

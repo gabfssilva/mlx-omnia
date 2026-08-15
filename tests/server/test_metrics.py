@@ -43,6 +43,7 @@ from mlx_omnia import (
     Text,
     TextLanguageModel,
 )
+from mlx_omnia.engine.footprint import SUSTAINED_GBS
 from mlx_omnia.engine.generate import Meter
 from mlx_omnia.engine.parsers import Segment
 from mlx_omnia.server import metrics as metrics_module
@@ -56,9 +57,10 @@ TINY_ACTIVE_BYTES = _VOCAB * _WIDTH * 4
 """The embedding and nothing else: 8 rows of 4 float32. There is no `lm_head` in the tree, so
 the table is the head too and a decode step reads all of it."""
 
-TINY_CEILING = 490.0 * 1e9 / TINY_ACTIVE_BYTES
-"""The tok/s the bandwidth allows for a model that size. Written out here rather than imported
-so the test does not divide by whatever `footprint` divides by."""
+TINY_CEILING = SUSTAINED_GBS * 1e9 / TINY_ACTIVE_BYTES
+"""The tok/s the bandwidth allows for a model that size. The bandwidth is imported and the
+arithmetic is not: what the test pins is the ratio the register publishes, and a house that
+remeasures its ceiling should not have to remember this file."""
 
 BIG_ACTIVE_BYTES = 1_711_000_000
 """Qwen3-30B-A3B 4-bit's measured active bytes per token (CLAUDE.md), so the percentage the
@@ -260,8 +262,10 @@ def wait_for_a_token(stand: Stand, seconds: float = 30.0) -> dict[str, object]:
     deadline = time.monotonic() + seconds
     while True:
         live = snapshot(stand)["live"]
-        if isinstance(live, dict) and number(entry(live), "completion_tokens") >= 1:
-            return entry(live)
+        assert isinstance(live, list)
+        for record in live:
+            if number(entry(record), "completion_tokens") >= 1:
+                return entry(record)
         assert time.monotonic() < deadline, "no running request ever reported a token"
         time.sleep(0.01)
 
@@ -356,8 +360,8 @@ def test_a_client_that_subscribes_mid_generation_is_told_where_the_request_is(
         "the first frame waited for a tick instead of carrying the state"
     )
     live = first["live"]
-    assert isinstance(live, dict), "the first frame carried no running request"
-    record = entry(live)
+    assert isinstance(live, list) and len(live) == 1, "the first frame carried no running request"
+    record = entry(live[0])
     assert record["model"] == "paced"
     assert record["state"] == "running"
     assert record["bytes_per_token"] == TINY_ACTIVE_BYTES
@@ -424,7 +428,7 @@ def test_closing_the_stream_neither_cancels_nor_slows_the_generation(stand: Stan
             httpx.Client() as http,
             http.stream("GET", f"{stand.base_url}/admin/metrics/events", timeout=30) as response,
         ):
-            assert isinstance(next(frames(response))["live"], dict)
+            assert next(frames(response))["live"] != []
         finished = running.result(timeout=60)
 
     assert finished["state"] == "completed"
@@ -465,9 +469,22 @@ def test_the_aggregate_weighs_each_request_by_what_it_generated() -> None:
     assert counts == (2, 12, 104)
     assert aggregate.tokens_per_second == pytest.approx(20.4)
     assert aggregate.ttft == pytest.approx(1.0)
+    # The prefill is the other ratio of totals: twelve fresh rows over the two seconds of
+    # prefill that read them, and not the mean of 10 and 4.67 tok/s.
+    assert aggregate.prefill_tokens_per_second == pytest.approx(12 / 2.0)
     assert aggregate.bytes_per_token == BIG_ACTIVE_BYTES
-    # 490 GB/s over 1.711 GB/token is 286.4 tok/s, and 20.4 of those is 7.12%.
-    assert aggregate.ceiling_fraction == pytest.approx(0.07123, rel=1e-3)
+    assert aggregate.ceiling_fraction == pytest.approx(
+        20.4 / (SUSTAINED_GBS * 1e9 / BIG_ACTIVE_BYTES), rel=1e-3
+    )
+
+    # The daemon-wide totals are the same arithmetic over every model, and with one model
+    # they are that model's: what a global row must not do is average the two rates.
+    overall = register.snapshot().totals
+    assert (overall.requests, overall.running) == (2, 0)
+    assert (overall.prompt_tokens, overall.completion_tokens) == (12, 104)
+    assert overall.ttft == pytest.approx(1.0)
+    assert overall.tokens_per_second == pytest.approx(20.4)
+    assert overall.ceiling_fraction == pytest.approx(aggregate.ceiling_fraction)
 
 
 def test_a_reused_prefix_does_not_inflate_the_prefill_rate() -> None:
@@ -531,14 +548,95 @@ def test_a_request_that_is_running_is_the_live_entry_and_then_a_record() -> None
     meter.prefill(4)
     meter.token()
     live = register.snapshot().live
-    assert live is not None
-    assert (live.state, live.prompt_tokens, live.completion_tokens) == ("running", 4, 1)
+    assert len(live) == 1
+    assert (live[0].state, live[0].prompt_tokens, live[0].completion_tokens) == ("running", 4, 1)
+    assert register.snapshot().totals.running == 1
 
     register.end("cancelled")
     ended = register.snapshot()
-    assert ended.live is None
+    assert ended.live == []
     assert ended.requests[0].state == "cancelled"
     assert ended.requests[0].completion_tokens == 1
+
+
+def test_a_prefill_still_running_publishes_the_rate_it_has_reached() -> None:
+    """A 40k prompt is a minute in which `ttft` does not exist, and every rate defined
+    against it is `None`: from outside, a request reading its prompt and a request stuck are
+    the same row. The rows the trunk has taken are published instead, and divided by the
+    clock they were taken in — the same ratio the settled rate is, measured where it has got
+    to.
+
+    Mutation: dropping the live branch of `_prefill_rate` leaves the sample at `None` until
+    the first token, and the first assertion below fails.
+    """
+    register = Metrics()
+    meter = Meter()
+    register.begin("m", meter, None)
+    meter.prefill(4096)
+    meter.fed(2048)
+
+    running = register.snapshot().live[0]
+    assert running.prefilled_tokens == 2048
+    assert running.ttft is None
+    assert running.prefill_tokens_per_second is not None
+    assert running.prefill_tokens_per_second > 0
+
+    # And once there is a first token the settled definition takes over: the whole fresh
+    # prompt over `ttft`, and not the blocks counted on the way.
+    meter.prefill_started = 0.0
+    meter.first_token = 2.0
+    meter.completion_tokens = 1
+    settled = register.snapshot().live[0]
+    assert settled.prefill_tokens_per_second == pytest.approx(4096 / 2.0)
+
+
+def test_the_totals_are_every_model_at_once() -> None:
+    """The global row. Two models with different ceilings: the requests and the tokens add
+    up, the rate is the ratio of the totals rather than the mean of the two, and the share of
+    the ceiling is weighted by what each model decoded — bytes per token is the checkpoint's,
+    so there is no single denominator to divide one sum by."""
+    register = Metrics()
+    slow = Meter(
+        prompt_tokens=5, completion_tokens=3, prefill_started=0.0, first_token=0.5, last_token=1.5
+    )
+    fast = Meter(
+        prompt_tokens=7, completion_tokens=101, prefill_started=0.0, first_token=1.5, last_token=5.5
+    )
+    register.begin("slow", slow, BIG_ACTIVE_BYTES)
+    register.end("completed")
+    register.begin("fast", fast, TINY_ACTIVE_BYTES)
+    register.end("completed")
+
+    overall = register.snapshot().totals
+    assert (overall.requests, overall.running) == (2, 0)
+    assert (overall.prompt_tokens, overall.completion_tokens) == (12, 104)
+    assert overall.ttft == pytest.approx(1.0)
+    assert overall.prefill_tokens_per_second == pytest.approx(12 / 2.0)
+    assert overall.tokens_per_second == pytest.approx(102 / 5)
+    shares = [
+        (2, 2 / 1.0 / (SUSTAINED_GBS * 1e9 / BIG_ACTIVE_BYTES)),
+        (100, 100 / 4.0 / TINY_CEILING),
+    ]
+    assert overall.ceiling_fraction == pytest.approx(
+        sum(tokens * share for tokens, share in shares) / 102
+    )
+
+
+def test_the_totals_count_every_request_in_flight() -> None:
+    """Two conversations at once is what the engine batches for, and `live` is a list for the
+    same reason: a register that published one of them would be describing the other's
+    screen."""
+    register = Metrics()
+    first = register.begin("m", Meter(prompt_tokens=2), None)
+    register.begin("n", Meter(prompt_tokens=5), None)
+
+    current = register.snapshot()
+    assert [record.model for record in current.live] == ["n", "m"], "newest first"
+    assert current.totals.running == 2
+
+    register.end("completed", first)
+    assert [record.model for record in register.snapshot().live] == ["n"]
+    assert register.snapshot().totals.running == 1
 
 
 def test_the_beat_republishes_a_running_request_and_nothing_else() -> None:
@@ -560,7 +658,7 @@ def test_the_beat_republishes_a_running_request_and_nothing_else() -> None:
     register.beat()
     assert len(raised) == edges + 1
     live = register.snapshot().live
-    assert live is not None and live.completion_tokens == 1
+    assert len(live) == 1 and live[0].completion_tokens == 1
 
     register.end("completed")
     after = len(raised)

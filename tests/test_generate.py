@@ -8,8 +8,8 @@ from huggingface_hub import hf_hub_download, snapshot_download
 
 from mlx_omnia import GPT2, GPT2Tokenizer, KVCache, sampler, stream_generate, stream_ids, top_k
 from mlx_omnia.engine.core.cache import DeltaCache, LayerCache, RingKVCache
-from mlx_omnia.engine.core.prompt_cache import PromptCache
-from mlx_omnia.engine.generate import CausalLM, Constraint, Meter, _boundary
+from mlx_omnia.engine.core.prefix import Prefixes, PrefixStore
+from mlx_omnia.engine.generate import CausalLM, Constraint, Meter
 from mlx_omnia.engine.models.gpt2 import CHECKPOINT
 from mlx_omnia.engine.speculative import SpeculationRefused
 from tests.conftest import load_golden, relative_diff
@@ -135,6 +135,13 @@ class ScriptedLM(CausalLM[KVCache]):
     def __call__(self, ids: mx.array, cache: list[KVCache] | None = None) -> mx.array:
         token = self.ids[min(self.step, len(self.ids) - 1)]
         self.step += 1
+        if cache is not None:
+            # Rows the script does not read, and has to write all the same: a span *is* the
+            # rows a forward produced, so a trunk that fills no cache has nothing to store —
+            # which is the right answer and not the one these tests are about.
+            rows = mx.ones((1, 1, ids.shape[1], 4), dtype=mx.float32)
+            for layer in cache:
+                layer.update_and_fetch(rows, rows)
         row = -mx.abs(mx.arange(self.vocab) - token).astype(mx.float32)
         return mx.broadcast_to(row, (1, ids.shape[1], self.vocab))
 
@@ -208,38 +215,49 @@ class PromotingScriptedLM(GreedyCompiledScriptedLM):
         return super().compile_greedy_decode(cache)
 
 
+def prefixes(span: int = 4, ceiling: int = 1 << 30) -> Prefixes:
+    """A store small enough that a handful of ids closes a span. Nothing about the span is a
+    property of the checkpoint — 256 is the daemon's default and 4 is what makes a four-token
+    prompt legible."""
+    return Prefixes(PrefixStore(ceiling, span=span), "a-model", "a-stamp")
+
+
 def test_a_compiling_model_still_compiles_under_a_prefix() -> None:
     """The gate this covers: a prefix used to force the eager step, which is where the app's
-    single-stream decode lost its compiled path."""
+    single-stream decode lost its compiled path. The condition is gone — a promoted layer
+    hands over its rows in absolute order like any other — so what is left to assert is that
+    both happen at once."""
     model = GreedyCompiledScriptedLM([1, 2, 3, 4], vocab=5)
-    trie = PromptCache[KVCache](budget=1 << 30)
+    prefix = prefixes()
 
-    assert list(stream_ids(model, [0], max_tokens=4, prefix=trie)) == [1, 2, 3, 4]
+    assert list(stream_ids(model, [0, 0, 0], max_tokens=4, prefix=prefix)) == [1, 2, 3, 4]
 
     assert model.greedy_compiled_calls == 4
-    # Nothing was promoted, so the entry is the classic one: the whole turn.
-    reuse = trie.take([0, 1, 2, 3, 4, 0])
-    assert reuse is not None and reuse.length == 5
+    assert prefix.store.nbytes > 0
 
 
-def test_a_promotion_leaves_the_trie_the_prompt_and_the_growing_layers() -> None:
-    """The promoted shape cannot rewind and cannot be prefilled past, so the trie must get
-    the layers the promotion abandoned — standing on the prompt, still trimmable."""
+def test_a_promoted_decode_still_stores_its_spans() -> None:
+    """The promoted shape used to be the one conversation that could keep nothing: it cannot
+    rewind, and the trie's whole road back was rewinding. A span is cut out of it in absolute
+    order instead, which the fixed buffer answers for exactly as the growing one does."""
     model = PromotingScriptedLM([1, 2, 3, 4], vocab=5)
-    trie = PromptCache[KVCache](budget=1 << 30)
+    prefix = prefixes()
     meter = Meter()
-    prompt = [0, 7]
+    prompt = [0, 7, 7, 7, 7]
 
-    assert list(stream_ids(model, prompt, max_tokens=4, prefix=trie, meter=meter)) == [1, 2, 3, 4]
+    assert list(stream_ids(model, prompt, max_tokens=4, prefix=prefix, meter=meter)) == [
+        1,
+        2,
+        3,
+        4,
+    ]
 
     assert model.greedy_compiled_calls == 4
     assert meter.kept_prefix
-    reuse = trie.take([*prompt, 1, 2, 3, 4, 0])
-    assert reuse is not None
-    assert reuse.length == len(prompt)
-    assert model.abandoned is not None
-    assert reuse.caches == model.abandoned
-    assert all(layer.is_trimmable for layer in reuse.caches)
+    warm = PromotingScriptedLM([1, 2, 3, 4], vocab=5)
+    second = Recording(warm)
+    list(stream_ids(second, [*prompt, 1, 2, 3, 4, 0], max_tokens=1, prefix=prefix))
+    assert second.fed[0] == len(prompt) + 5 - 8, "two spans of four came out of the store"
 
 
 class PartiallyPromotingLM(CausalLM[KVCache]):
@@ -274,19 +292,23 @@ class PartiallyPromotingLM(CausalLM[KVCache]):
         return decode
 
 
-def test_a_partially_promoted_cache_is_trimmed_back_to_the_prompt() -> None:
-    """A layer the promotion left live carries the decode's rows past the prompt the entry
-    claims — stored untrimmed, the next reuse would append behind rows it never claimed."""
+def test_a_partially_promoted_cache_stores_both_halves_at_the_same_rows() -> None:
+    """A compile that replaces only some layers leaves the trunk holding two shapes of the
+    same history. A span is the same span out of either: the promoted layer answers for the
+    absolute rows the growing one answers for, and a resume that disagreed between them would
+    be a trunk at two positions at once."""
     model = PartiallyPromotingLM([1, 2, 3, 4], vocab=5)
-    trie = PromptCache[KVCache](budget=1 << 30)
-    prompt = [0, 7, 7]
+    prefix = prefixes()
+    prompt = [0, 7, 7, 7, 7]
 
-    assert list(stream_ids(model, prompt, max_tokens=4, prefix=trie)) == [1, 2, 3, 4]
+    assert list(stream_ids(model, prompt, max_tokens=4, prefix=prefix)) == [1, 2, 3, 4]
 
-    reuse = trie.take([*prompt, 1, 2, 3, 4, 0])
-    assert reuse is not None
-    assert reuse.length == len(prompt)
-    assert [layer.offset for layer in reuse.caches] == [len(prompt), len(prompt)]
+    fresh = PartiallyPromotingLM([1, 2, 3, 4], vocab=5)
+    cache = fresh.make_cache()
+    walk = prefix.begin(cache, fresh)
+    assert walk is not None
+    assert walk.resume([*prompt, 1, 2, 3, 4, 0], cache) == 8
+    assert [layer.offset for layer in cache] == [8, 8]
 
 
 def test_stream_generate_flushes_partial_utf8(tokenizer: GPT2Tokenizer) -> None:
@@ -362,7 +384,7 @@ CONVERSATION = "The quick brown fox jumps over the lazy dog. " * 60
 NEXT_TURN = " And then?"
 
 
-class Recording(CausalLM[KVCache]):
+class Recording[C: LayerCache](CausalLM[C]):
     """The model with a tape: how many rows each forward was fed, and the row of logits the
     sampler read from it.
 
@@ -371,15 +393,15 @@ class Recording(CausalLM[KVCache]):
     identical — which is the whole reason CLAUDE.md puts the full comparison in the rule.
     """
 
-    def __init__(self, model: GPT2) -> None:
+    def __init__(self, model: CausalLM[C]) -> None:
         self.model = model
         self.fed: list[int] = []
         self.logits: list[mx.array] = []
 
-    def make_cache(self) -> list[KVCache]:
+    def make_cache(self) -> list[C]:
         return self.model.make_cache()
 
-    def __call__(self, ids: mx.array, cache: list[KVCache] | None = None) -> mx.array:
+    def __call__(self, ids: mx.array, cache: list[C] | None = None) -> mx.array:
         out = self.model(ids, cache)
         self.fed.append(ids.shape[1])
         self.logits.append(out[:, -1, :])
@@ -431,31 +453,39 @@ class MixedLM(CausalLM[LayerCache]):
             if isinstance(layer, KVCache):
                 layer.update_and_fetch(rows, rows)
             else:
+                assert isinstance(layer, DeltaCache)
                 layer.offset += ids.shape[1]
+                layer.state = mx.full((1, 4), layer.offset, dtype=mx.float32)
         return _from_offset(cache[0].offset, ids.shape[1])
 
 
-def primed(model: GPT2, tokenizer: GPT2Tokenizer) -> tuple[PromptCache[KVCache], list[int]]:
-    """One turn generated with the trie in hand, and the prompt of the turn after it — the
+def primed(model: GPT2, tokenizer: GPT2Tokenizer) -> tuple[Prefixes, list[int]]:
+    """One turn generated with the store in hand, and the prompt of the turn after it — the
     agent's shape: the second request repeats the first prompt, the ids the model wrote, and
     a new tail."""
-    trie = PromptCache[KVCache](budget=1 << 30)
+    prefix = prefixes(span=64)
     first = list(tokenizer.encode(CONVERSATION))
-    grown = list(stream_ids(model, first, max_tokens=4, prefix=trie))
-    return trie, [*first, *grown, *list(tokenizer.encode(NEXT_TURN))]
+    grown = list(stream_ids(model, first, max_tokens=4, prefix=prefix))
+    return prefix, [*first, *grown, *list(tokenizer.encode(NEXT_TURN))]
 
 
-def test_the_second_turn_prefills_only_what_the_stored_cache_does_not_cover(
+def covered_by(tokens: list[int], span: int = 64) -> int:
+    """What a chain of `span` reaches over `tokens`: whole spans, and one id always left for
+    the forward whose logits the sampler reads."""
+    return (len(tokens) - 1) // span * span
+
+
+def test_the_second_turn_prefills_only_what_the_stored_spans_do_not_cover(
     model: GPT2, tokenizer: GPT2Tokenizer
 ) -> None:
-    """The stored cache covers the first prompt and the four ids the run wrote, and the next
-    turn repeats all of it: what reaches the forward is the new tail and nothing else."""
-    trie, second = primed(model, tokenizer)
+    """The stored spans cover the first prompt and the four ids the run wrote, and the next
+    turn repeats all of it: what reaches the forward is the tail past the last whole span."""
+    prefix, second = primed(model, tokenizer)
     warm = Recording(model)
 
-    list(stream_ids(warm, second, max_tokens=2, prefix=trie))
+    list(stream_ids(warm, second, max_tokens=2, prefix=prefix))
 
-    assert warm.fed == [len(list(tokenizer.encode(NEXT_TURN))), 1, 1]
+    assert sum(warm.fed[:-2]) == len(second) - covered_by(second)
 
 
 def test_the_reused_prefix_reproduces_the_logits_of_a_cold_prefill(
@@ -463,10 +493,10 @@ def test_the_reused_prefix_reproduces_the_logits_of_a_cold_prefill(
 ) -> None:
     """fp32 at 1e-5, and on every row the sampler read: a cache off by one row survives a
     greedy decode with the same ids, so ids are not evidence here."""
-    trie, second = primed(model, tokenizer)
+    prefix, second = primed(model, tokenizer)
     warm, cold = Recording(model), Recording(model)
 
-    reused = list(stream_ids(warm, second, max_tokens=3, prefix=trie))
+    reused = list(stream_ids(warm, second, max_tokens=3, prefix=prefix))
 
     assert reused == list(stream_ids(cold, second, max_tokens=3))
     assert warm.fed[0] < cold.fed[0], "the second run prefilled the whole prompt again"
@@ -474,25 +504,25 @@ def test_the_reused_prefix_reproduces_the_logits_of_a_cold_prefill(
         assert relative_diff(hot, fresh) < 1e-5
 
 
-def test_a_stored_cache_longer_than_the_match_is_rewound_and_still_matches(
+def test_a_conversation_edited_in_the_middle_keeps_the_spans_before_the_edit(
     model: GPT2, tokenizer: GPT2Tokenizer
 ) -> None:
-    """The branch the trie exists for: the conversation is edited in the middle, so the entry
-    covering the whole first turn is rewound to the common prefix instead of thrown away —
-    and the run over the rewound cache has to be the cold run, row for row."""
-    trie, _ = primed(model, tokenizer)
-    shared = 20
+    """The branch the chain exists for: the conversation is edited in the middle, so the spans
+    before the edit are adopted and the rest is prefilled — nothing is rewound and nothing is
+    thrown away. The run over the resumed spans has to be the cold run, row for row."""
+    prefix, _ = primed(model, tokenizer)
+    shared = 200
     edited = [
         *list(tokenizer.encode(CONVERSATION))[:shared],
         *tokenizer.encode(" but the dog moved."),
     ]
-    rewound, fresh = Recording(model), Recording(model)
+    resumed_run, fresh = Recording(model), Recording(model)
 
-    resumed = list(stream_ids(rewound, edited, max_tokens=3, prefix=trie))
+    resumed = list(stream_ids(resumed_run, edited, max_tokens=3, prefix=prefix))
 
     assert resumed == list(stream_ids(fresh, edited, max_tokens=3))
-    assert rewound.fed[0] == len(edited) - shared
-    for hot, cold in zip(rewound.logits, fresh.logits, strict=True):
+    assert sum(resumed_run.fed[:-3]) == len(edited) - 192, "three spans of 64 came back"
+    for hot, cold in zip(resumed_run.logits, fresh.logits, strict=True):
         assert relative_diff(hot, cold) < 1e-5
 
 
@@ -503,12 +533,12 @@ def test_the_reused_prefix_pays_ttft_for_the_tail_alone(
     the same first step; the only difference is how many rows the prefill reads. Measured on
     an M5 Max at 601 prompt ids: 3.5 ms against 15.4 ms, a factor of 4 — the assertion stays
     at the direction, because the factor is the machine's and the direction is the cache's."""
-    trie, second = primed(model, tokenizer)
+    prefix, second = primed(model, tokenizer)
     list(stream_ids(model, second, max_tokens=2))
     warm, cold = Meter(), Meter()
 
     list(stream_ids(model, second, max_tokens=2, meter=cold))
-    list(stream_ids(model, second, max_tokens=2, prefix=trie, meter=warm))
+    list(stream_ids(model, second, max_tokens=2, prefix=prefix, meter=warm))
 
     assert warm.ttft is not None and cold.ttft is not None
     assert warm.ttft < cold.ttft
@@ -525,14 +555,13 @@ def test_the_meter_counts_what_the_stored_prefix_covered(
     `prompt_tokens` is untouched by it: the reuse is a fact about the prefill, and the prompt
     is what the caller sent.
     """
-    trie, second = primed(model, tokenizer)
-    stored = len(list(tokenizer.encode(CONVERSATION))) + 4
+    prefix, second = primed(model, tokenizer)
     warm, cold = Meter(), Meter()
 
-    list(stream_ids(model, second, max_tokens=2, prefix=trie, meter=warm))
+    list(stream_ids(model, second, max_tokens=2, prefix=prefix, meter=warm))
     list(stream_ids(model, second, max_tokens=2, meter=cold))
 
-    assert (warm.reused_tokens, cold.reused_tokens) == (stored, 0)
+    assert (warm.reused_tokens, cold.reused_tokens) == (covered_by(second), 0)
     assert warm.prompt_tokens == cold.prompt_tokens == len(second)
 
 
@@ -542,148 +571,155 @@ def test_a_cancelled_run_stores_exactly_the_ids_that_entered_the_cache(
     """A consumer that walks away leaves the cache mid-conversation, and the length the trie
     records has to be the rows the layers hold: the ids the loop fed, which are the prompt
     plus everything it emitted, and not the `max_tokens` it was asked for."""
-    trie = PromptCache[KVCache](budget=1 << 30)
+    prefix = prefixes(span=64)
     prompt = list(tokenizer.encode(CONVERSATION))
-    stream = stream_ids(model, prompt, max_tokens=16, prefix=trie)
+    stream = stream_ids(model, prompt, max_tokens=16, prefix=prefix)
     taken = list(islice(stream, 3))
 
     stream.close()
 
-    reuse = trie.take([*prompt, *taken, 0])
-    assert reuse is not None
-    assert reuse.length == len(prompt) + len(taken)
-    assert [layer.offset for layer in reuse.caches] == [reuse.length] * len(model.h)
+    conversation = [*prompt, *taken, 0]
+    cache = model.make_cache()
+    walk = prefix.begin(cache, model)
+    assert walk is not None
+    assert walk.resume(conversation, cache) == covered_by(conversation)
+    assert [layer.offset for layer in cache] == [covered_by(conversation)] * len(model.h)
 
 
-def test_a_recurrent_trunk_reuses_an_exact_extension() -> None:
-    """A conversation only grows, so the stored entry is a prefix of the next prompt and
-    `take` hands it over whole. There is no `trim` in that path — which is the operation a
-    recurrent state has no answer for — so the refusal has nothing to refuse here.
+def test_a_recurrent_trunk_reuses_a_turn_it_never_could_before() -> None:
+    """The whole point of the anchor. A recurrent state cannot be rewound and cannot be
+    recomputed from a later position, so the old trie could only reuse an exact extension and
+    threw everything else away. What replaces it is a state captured while the layer stands on
+    a span boundary — and the next turn starts from that boundary whatever the client sent
+    after it.
 
-    A client that echoes every id back is what this one is: it matches the longer of the two
-    entries a recurrent run leaves, and the whole conversation comes back. The other entry —
-    the prompt boundary — is what
-    `test_a_recurrent_trunk_reuses_the_prompt_a_client_did_not_echo_back` is about."""
-    trie = PromptCache[DeltaCache](budget=1 << 30)
-    first = [1, 2, 3]
-    grown = list(stream_ids(RecurrentLM(), first, max_tokens=4, prefix=trie))
-    assert len(trie) == 2 and trie.nbytes > 0
-    second = [*first, *grown, 40, 50]
-    warm, cold = RecurrentLM(), RecurrentLM()
-
-    reused = list(stream_ids(warm, second, max_tokens=3, prefix=trie))
-
-    assert reused == list(stream_ids(cold, second, max_tokens=3))
-    assert warm.fed[0] == 2, "the stored entry covered everything but the new tail"
-    assert cold.fed[0] == len(second)
-
-
-def test_a_recurrent_trunk_reuses_the_prompt_a_client_did_not_echo_back() -> None:
-    """The case the daemon actually meets. A checkpoint whose template opens a reasoning
-    block writes ids the client drops before sending the conversation back, so the next
-    prompt diverges at the first position past the prompt — not at the end of the entry.
-    Reusing what is still common means cutting the stored cache back to the boundary, and a
-    recurrent state cannot be cut back to anything.
-
-    So the boundary is stored while the cache is standing on it, which is what makes the
-    reuse below the length of the first prompt rather than zero.
+    A client that keeps the answer and drops the reasoning is the case: the second prompt
+    diverges at the first position past the first prompt, not at the end of the conversation.
     """
-    # Mutation: dropping the `_boundary` insert breaks it — the only entry left is the one
-    # holding the generated ids, no rewind can reach the branch point, and `fed` becomes 6.
-    trie = PromptCache[DeltaCache](budget=1 << 30)
-    first = [1, 2, 3]
-    list(stream_ids(RecurrentLM(), first, max_tokens=4, prefix=trie))
-    # What a client that keeps the answer and drops the reasoning sends next: the same
-    # prompt, then ids the model never wrote.
+    prefix = prefixes()
+    first = list(range(1, 12))
+    list(stream_ids(RecurrentLM(), first, max_tokens=4, prefix=prefix))
     second = [*first, 91, 92, 40, 50]
-    warm, cold = RecurrentLM(), RecurrentLM()
+    warm, cold = Recording(RecurrentLM()), Recording(RecurrentLM())
 
-    reused = list(stream_ids(warm, second, max_tokens=3, prefix=trie))
-
-    assert reused == list(stream_ids(cold, second, max_tokens=3))
-    assert warm.fed[0] == len(second) - len(first), "the prompt boundary came back"
-    assert cold.fed[0] == len(second)
-
-
-def test_a_recurrent_trunk_is_refused_a_reuse_that_would_need_a_rewind() -> None:
-    """The other side of the same decision, and the reason it moved instead of being
-    dropped: a prompt that diverges inside the stored entry would need the state rewound to
-    the branch point, and a recurrent state cannot be reconstructed backwards. The run
-    prefills whole rather than resuming from a state that never existed."""
-    trie = PromptCache[DeltaCache](budget=1 << 30)
-    first = [1, 2, 3, 4, 5, 6]
-    list(stream_ids(RecurrentLM(), first, max_tokens=4, prefix=trie))
-    edited = [1, 2, 3, 40, 50, 60]
-    warm, cold = RecurrentLM(), RecurrentLM()
-
-    resumed = list(stream_ids(warm, edited, max_tokens=3, prefix=trie))
-
-    assert resumed == list(stream_ids(cold, edited, max_tokens=3))
-    assert warm.fed[0] == len(edited), "a state was rewound to a branch point"
-
-
-def test_a_mixed_trunk_reuses_an_exact_extension() -> None:
-    """The `bailing_hybrid` shape: one layer that cannot rewind is enough to have refused
-    the whole trunk, and an exact extension never asks any of them to."""
-    trie = PromptCache[LayerCache](budget=1 << 30)
-    first = [1, 2, 3]
-    grown = list(stream_ids(MixedLM(), first, max_tokens=4, prefix=trie))
-    second = [*first, *grown, 40, 50]
-    warm, cold = MixedLM(), MixedLM()
-
-    reused = list(stream_ids(warm, second, max_tokens=3, prefix=trie))
+    reused = list(stream_ids(warm, second, max_tokens=3, prefix=prefix))
 
     assert reused == list(stream_ids(cold, second, max_tokens=3))
-    assert warm.fed[0] == 2
-    assert cold.fed[0] == len(second)
+    assert sum(warm.fed[:-3]) == len(second) - 8, "two spans of four came out of the store"
+    assert sum(cold.fed[:-3]) == len(second)
 
 
-def test_a_mixed_trunk_is_refused_a_reuse_that_would_need_a_rewind() -> None:
-    """The KV layers of the list would rewind cleanly; the recurrent one would not, and the
-    candidate is judged over the whole list."""
-    trie = PromptCache[LayerCache](budget=1 << 30)
-    list(stream_ids(MixedLM(), [1, 2, 3, 4, 5, 6], max_tokens=4, prefix=trie))
-    edited = [1, 2, 3, 40, 50, 60]
-    warm, cold = MixedLM(), MixedLM()
+def test_a_recurrent_trunk_resumes_no_further_than_its_anchor() -> None:
+    """An edit past the anchor keeps it: the spans before the anchor still match, and the
+    state the trunk starts from is the one that stood on that boundary."""
+    prefix = prefixes()
+    first = list(range(1, 12))
+    list(stream_ids(RecurrentLM(), first, max_tokens=4, prefix=prefix))
+    edited = [*first[:9], 40, 50]
+    warm, cold = Recording(RecurrentLM()), Recording(RecurrentLM())
 
-    resumed = list(stream_ids(warm, edited, max_tokens=3, prefix=trie))
+    resumed = list(stream_ids(warm, edited, max_tokens=3, prefix=prefix))
 
     assert resumed == list(stream_ids(cold, edited, max_tokens=3))
-    assert warm.fed[0] == len(edited)
+    assert sum(warm.fed[:-3]) == len(edited) - 8, "two spans and the anchor on their far side"
 
 
-def test_the_trie_charges_what_the_run_reserved(model: GPT2, tokenizer: GPT2Tokenizer) -> None:
-    """The bytes are the caller's to report — the module never touches an `mx.array` — and a
-    KV cache costs its reserved buffers: keys and values, 601 + 2 rows rounded up to the
-    256-row block, `n_embd` wide, in fp32."""
-    trie = PromptCache[KVCache](budget=1 << 30)
+def test_a_recurrent_trunk_anchors_on_the_boundaries_its_decode_crosses() -> None:
+    """The second anchor, and the client it is for: one that echoes the ids it was sent back
+    verbatim continues the conversation past the prompt, so the boundary the prompt ended on
+    is not the deepest one that still matches. A decode stands still between steps, which is
+    the only place a recurrent state exists to be captured at all."""
+    prefix = prefixes()
+    first = list(range(1, 12))
+    grown = list(stream_ids(RecurrentLM(), first, max_tokens=8, prefix=prefix))
+    echoed = [*first, *grown, 40, 50]
+    warm, cold = Recording(RecurrentLM()), Recording(RecurrentLM())
 
-    list(stream_ids(model, list(tokenizer.encode(CONVERSATION)), max_tokens=2, prefix=trie))
+    reused = list(stream_ids(warm, echoed, max_tokens=3, prefix=prefix))
 
-    width = model.wte.weight.shape[1]
-    assert trie.nbytes == len(model.h) * 2 * 768 * width * 4
+    assert reused == list(stream_ids(cold, echoed, max_tokens=3))
+    assert sum(warm.fed[:-3]) == len(echoed) - 16, "the decode's own boundary, not the prompt's"
 
 
-def test_a_cache_that_does_not_fit_the_budget_is_not_kept(
+def test_a_recurrent_trunk_edited_before_its_anchor_prefills_whole() -> None:
+    """The cost this design accepts and states. A recurrent state cannot be recomputed from a
+    later position and cannot be rewound to an earlier one, so an edit that lands before the
+    only anchor leaves nothing to start from — the rows of the spans before it are still
+    there and are no use without a state to go with them."""
+    prefix = prefixes()
+    first = list(range(1, 12))
+    list(stream_ids(RecurrentLM(), first, max_tokens=4, prefix=prefix))
+    edited = [*first[:5], 40, 50, 60, 70, 80, 90]
+    warm, cold = Recording(RecurrentLM()), Recording(RecurrentLM())
+
+    resumed = list(stream_ids(warm, edited, max_tokens=3, prefix=prefix))
+
+    assert resumed == list(stream_ids(cold, edited, max_tokens=3))
+    assert sum(warm.fed[:-3]) == len(edited)
+
+
+def test_a_mixed_trunk_reuses_what_its_recurrent_layer_allows() -> None:
+    """The `bailing_hybrid` shape: layers that keep a rewindable KV next to one that keeps a
+    recurrent state. The list is resumed to one offset, which is the recurrent layer's — the
+    KV rows reach further and are not used past it."""
+    prefix = prefixes()
+    first = list(range(1, 12))
+    list(stream_ids(MixedLM(), first, max_tokens=4, prefix=prefix))
+    second = [*first, 40, 50]
+    warm, cold = Recording(MixedLM()), Recording(MixedLM())
+
+    reused = list(stream_ids(warm, second, max_tokens=3, prefix=prefix))
+
+    assert reused == list(stream_ids(cold, second, max_tokens=3))
+    assert sum(warm.fed[:-3]) == len(second) - 8, "two spans, and the anchor on their edge"
+    assert sum(cold.fed[:-3]) == len(second)
+
+
+def test_the_store_charges_what_the_spans_weigh(
     model: GPT2, tokenizer: GPT2Tokenizer
 ) -> None:
-    """The ceiling is enforced against the figure the run hands over, so a reported zero
-    would be a trie that grows for ever with a budget that only counts."""
-    trie = PromptCache[KVCache](budget=1)
+    """A span costs its rows and not the buffer they were cut out of: `reserve` rounds up to
+    256 rows, and charging the reservation would be a ceiling counting padding."""
+    prefix = prefixes(span=64)
+    prompt = list(tokenizer.encode(CONVERSATION))
 
-    list(stream_ids(model, list(tokenizer.encode(CONVERSATION)), max_tokens=2, prefix=trie))
+    list(stream_ids(model, prompt, max_tokens=2, prefix=prefix))
 
-    assert (len(trie), trie.nbytes) == (0, 0)
+    width = model.wte.weight.shape[1]
+    spans = (len(prompt) + 2) // 64
+    rows = spans * len(model.h) * 2 * 64 * width * 4
+    ids = spans * 64 * 4
+    assert prefix.store.nbytes == rows + ids
 
 
-def test_speculation_and_prefix_reuse_are_refused_together() -> None:
-    """Named rather than silently dropped: a round rewinds the target's cache and the draft's
-    in step, and the trie holds one of the two."""
-    scripted = ScriptedLM([1, 2, 3], 8)
-    trie = PromptCache[KVCache](budget=1 << 30)
+def test_a_span_that_does_not_fit_the_ceiling_is_not_kept(
+    model: GPT2, tokenizer: GPT2Tokenizer
+) -> None:
+    """The ceiling is enforced against what the store holds, so a reported zero would be a
+    store that grows for ever with a number that only counts. With no vault under it, what it
+    pushes out is gone."""
+    prefix = prefixes(span=64, ceiling=1)
 
-    with pytest.raises(SpeculationRefused):
-        list(stream_ids(scripted, [0], max_tokens=2, draft=scripted, prefix=trie))
+    list(stream_ids(model, list(tokenizer.encode(CONVERSATION)), max_tokens=2, prefix=prefix))
+
+    assert prefix.store.nbytes == 0
+
+
+def test_speculation_and_prefix_reuse_compose() -> None:
+    """They used to be refused together. What made them compose is the invariant the rounds
+    already keep: between them the target's rows are the settled ids and nothing the draft
+    guessed, so a boundary crossed there closes a span of this conversation."""
+    prefix = prefixes()
+    first = list(range(1, 12))
+
+    list(stream_ids(ScriptedLM([1, 2, 3], 8), first, max_tokens=3, prefix=prefix))
+    warm = Recording(ScriptedLM([1, 2, 3], 8))
+    second = [*first, 1, 2, 3, 40]
+
+    assert list(
+        stream_ids(warm, second, max_tokens=2, draft=ScriptedLM([1, 2, 3], 8), prefix=prefix)
+    ) == [1, 2]
+    assert sum(warm.fed[:1]) < len(second), "the target resumed instead of prefilling whole"
 
 
 class Recorded(Constraint):
@@ -787,47 +823,36 @@ def test_the_meter_tells_the_three_zeros_apart() -> None:
     off, kept, unkeepable = Meter(), Meter(), Meter()
 
     list(stream_ids(RecurrentLM(), [1, 2, 3], max_tokens=2, meter=off))
-    list(stream_ids(RecurrentLM(), [1, 2, 3], max_tokens=2, meter=kept,
-                    prefix=PromptCache[DeltaCache](budget=1 << 30)))
-    list(stream_ids(UnkeepableLM(), [1, 2, 3], max_tokens=2, meter=unkeepable,
-                    prefix=PromptCache[LayerCache](budget=1 << 30)))
+    list(stream_ids(RecurrentLM(), [1, 2, 3], max_tokens=2, meter=kept, prefix=prefixes()))
+    list(
+        stream_ids(
+            UnkeepableLM(),
+            [1, 2, 3],
+            max_tokens=2,
+            meter=unkeepable,
+            prefix=Prefixes(PrefixStore(0), "a-model", "a-stamp"),
+        )
+    )
 
-    assert (off.reused_tokens, off.kept_prefix) == (0, False), "no trie was asked for"
+    assert (off.reused_tokens, off.kept_prefix) == (0, False), "no store was asked for"
     assert (kept.reused_tokens, kept.kept_prefix) == (0, True), "first turn, so nothing to reuse"
     assert (unkeepable.reused_tokens, unkeepable.kept_prefix) == (0, False)
 
 
-class PromotedLM(CausalLM[LayerCache]):
-    """A trunk whose live cache is a promoted ring while `make_cache` still builds a growing
-    one — what a compiled decode leaves behind. Both halves are storable and neither rewinds,
-    so nothing but the signature stands between them."""
-
-    def make_cache(self) -> list[LayerCache]:
-        return [KVCache()]
-
-    def __call__(self, ids: mx.array, cache: list[LayerCache] | None = None) -> mx.array:
-        assert cache is not None
-        layer = cache[0]
-        rows = mx.zeros((1, 1, ids.shape[1], 4))
-        assert isinstance(layer, RingKVCache | KVCache)
-        layer.update_and_fetch(rows, rows)
-        return _from_offset(layer.offset, ids.shape[1])
-
-
-def test_a_boundary_is_refused_when_the_live_cache_is_not_the_shape_a_fresh_one_is() -> None:
-    """A ring's slot `j` holds absolute position `j % window`. Restoring it into the growing
-    cache `make_cache` builds gives the same names and the same shapes, and a rotation read
-    as a history — the disaster the disk key catches, in a place that has no key. Mutation:
-    dropping the `policy` comparison in `_boundary` keeps the entry and the trie hands back
-    scrambled rows.
-    """
-    model = PromotedLM()
-    growing = model.make_cache()
-    assert _boundary(model, growing) is None, "a trunk that rewinds needs no boundary"
-
+def test_a_ring_hands_over_absolute_rows_and_a_growing_cache_reads_them_back() -> None:
+    """A ring's slot `j` holds absolute position `j % window`, and a compiled decode is what
+    puts a trunk's layers into one. Handing the buffer over as it stands would give the next
+    turn a rotation read as a history — same names, same shapes, silently wrong. So `stored`
+    undoes the rotation and `restore` puts it back, and the two shapes of one sliding layer
+    trade the same spans."""
     ring = RingKVCache(8)
-    block = mx.zeros((1, 1, 20, 4))
-    ring.update_and_fetch(block, block)
-    assert ring.is_storable and not ring.is_trimmable, "otherwise the guard is never reached"
+    for at in range(20):
+        row = mx.full((1, 1, 1, 4), at, dtype=mx.float32)
+        ring.update_and_fetch(row, row)
 
-    assert _boundary(model, [ring]) is None
+    handed = ring.stored(16, 20)
+
+    assert [int(value) for value in handed["keys"][0, 0, :, 0].tolist()] == [16, 17, 18, 19]
+    back = RingKVCache(8)
+    back.restore(20, ring.stored(12, 20))
+    assert mx.array_equal(back.fetch()[0], ring.fetch()[0]).item()

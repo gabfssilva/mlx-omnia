@@ -248,24 +248,23 @@ class Dataset:
 
 @dataclass(frozen=True)
 class PrefixCacheFile:
-    """One conversation's cache, spilled to disk when the trie ran out of budget for it.
+    """One span of one conversation, on disk.
 
-    `key` is the digest of everything that changes what the bytes mean — model, checkpoint
-    stamp, KV policy, and the exact ids — because a stale file read as a good one is the
-    wrong cache surviving a restart. `tokens` is what it covers, and it is here rather than
-    only in the file so a candidate can be ranked before anything is opened.
+    `key` is the chained digest of everything that changes what the bytes mean — the spans
+    before it, its own ids, the checkpoint, its stamp, the KV policy and the layout's version
+    — because a stale file read as a good one is the wrong cache surviving a restart. Nothing
+    about the conversation is in the row: a lookup is by key, and the ids the read verifies
+    against ride in the payload.
     """
 
     key: str
+    kind: str
+    """Which of one key's two payloads this is: `rows` for the span itself, `anchor` for the
+    state that stood on its far boundary. Both are addressed by the same chained digest — they
+    describe the same prefix — and they are kept under different rules, so they are two
+    rows."""
     model: str
     path: str
-    ids: bytes
-    """The exact prompt, packed as int32. In the row and not only in the digest because a
-    lookup has to find the *longest* stored prefix of a new prompt, and a digest answers only
-    "is this the same". At four bytes a token a 62k conversation is 250 KB beside a file of
-    573 MB, and without it a conversation whose last turn re-renders one token differently
-    goes from a hit to a full prefill."""
-    tokens: int
     bytes: int
     created_at: float
     used_at: float
@@ -574,6 +573,36 @@ _SCHEMA_V9 = """
 ALTER TABLE model_settings ADD COLUMN sampling TEXT NOT NULL DEFAULT '{}';
 """
 
+# The prefix index, rebuilt around spans. What changed is the unit: it used to be one file
+# per conversation, found by walking every row of the model and computing a common prefix id
+# by id, and it is now one file per immutable span whose key is a chained digest — so a
+# lookup is a lookup. `ids` and `tokens` go with the walk that needed them; the span's own ids
+# ride inside the payload, where the check that a digest collision is a miss and not a
+# disaster is made after the read. `kind` separates the two payloads one key can have: the
+# span's rows, and the state that stood on its far boundary.
+#
+# The rows written before this describe files in the old format, which no chained key will
+# ever name. They are dropped rather than migrated: what they hold is regenerable by
+# definition, and a compatibility layer for a cache is a second format to keep correct for
+# ever.
+_SCHEMA_V10 = """
+DROP TABLE prefix_cache;
+
+CREATE TABLE prefix_cache (
+    key        TEXT NOT NULL,
+    kind       TEXT NOT NULL,
+    model      TEXT NOT NULL,
+    path       TEXT NOT NULL,
+    bytes      INTEGER NOT NULL,
+    created_at REAL NOT NULL,
+    used_at    REAL NOT NULL,
+    PRIMARY KEY (key, kind)
+) STRICT;
+
+CREATE INDEX prefix_cache_lru ON prefix_cache(used_at);
+CREATE INDEX prefix_cache_model ON prefix_cache(model);
+"""
+
 _MIGRATIONS: tuple[str, ...] = (
     _SCHEMA_V1,
     _SCHEMA_V2,
@@ -584,6 +613,7 @@ _MIGRATIONS: tuple[str, ...] = (
     _SCHEMA_V7,
     _SCHEMA_V8,
     _SCHEMA_V9,
+    _SCHEMA_V10,
 )
 
 SCHEMA_VERSION = len(_MIGRATIONS)
@@ -885,18 +915,16 @@ _FIDELITY_COLUMNS = (
 _DATASET_COLUMNS = "id, use, repo, config, split, columns, template, size, builtin, created_at"
 _REFERENCE_COLUMNS = "id, reference, corpus, tokens, seed, topk, path, bytes, created_at"
 
-_PREFIX_COLUMNS = "key, model, path, ids, tokens, bytes, created_at, used_at"
+_PREFIX_COLUMNS = "key, kind, model, path, bytes, created_at, used_at"
 
 
 def _prefix(row: tuple[object, ...]) -> PrefixCacheFile:
-    key, model, path, ids, tokens, size, created_at, used_at = row
-    assert isinstance(ids, bytes)
+    key, kind, model, path, size, created_at, used_at = row
     return PrefixCacheFile(
         key=_text(key),
+        kind=_text(kind),
         model=_text(model),
         path=_text(path),
-        ids=ids,
-        tokens=_integer(tokens),
         bytes=_integer(size),
         created_at=_real(created_at),
         used_at=_real(used_at),
@@ -1357,50 +1385,46 @@ class Store:
             return cursor.rowcount == 1
 
     def prefix_files(self, model: str | None = None) -> list[PrefixCacheFile]:
-        """What is on disk, longest first within a model. The order is what a lookup wants —
-        the longest cache that is a prefix of the prompt is the one worth reading — and what
-        a screen wants is the same list."""
+        """What is on disk, for one model or for all of them. Read once per residency to
+        build the vault's own index, so the order is only for a screen."""
         where, arguments = ("WHERE model = ?", (model,)) if model is not None else ("", ())
         with self._connect() as connection:
             rows: list[tuple[object, ...]] = connection.execute(
-                f"SELECT {_PREFIX_COLUMNS} FROM prefix_cache {where} ORDER BY tokens DESC, key",
+                f"SELECT {_PREFIX_COLUMNS} FROM prefix_cache {where} ORDER BY used_at DESC, key",
                 arguments,
             ).fetchall()
         return [_prefix(row) for row in rows]
-
-    def prefix_file(self, key: str) -> PrefixCacheFile | None:
-        with self._connect() as connection:
-            row: tuple[object, ...] | None = connection.execute(
-                f"SELECT {_PREFIX_COLUMNS} FROM prefix_cache WHERE key = ?", (key,)
-            ).fetchone()
-        return None if row is None else _prefix(row)
 
     def save_prefix_file(self, entry: PrefixCacheFile) -> None:
         with self._connect() as connection:
             connection.execute(
                 f"INSERT OR REPLACE INTO prefix_cache ({_PREFIX_COLUMNS})"
-                " VALUES (?, ?, ?, ?, ?, ?, ?, ?)",
+                " VALUES (?, ?, ?, ?, ?, ?, ?)",
                 (
                     entry.key,
+                    entry.kind,
                     entry.model,
                     entry.path,
-                    entry.ids,
-                    entry.tokens,
                     entry.bytes,
                     entry.created_at,
                     entry.used_at,
                 ),
             )
 
-    def touch_prefix_file(self, key: str, used_at: float) -> None:
+    def touch_prefix_file(self, key: str, kind: str, used_at: float) -> None:
         """A hit is a use. Without this the LRU would evict by age and drop the conversation
         somebody is in the middle of."""
         with self._connect() as connection:
-            connection.execute("UPDATE prefix_cache SET used_at = ? WHERE key = ?", (used_at, key))
+            connection.execute(
+                "UPDATE prefix_cache SET used_at = ? WHERE key = ? AND kind = ?",
+                (used_at, key, kind),
+            )
 
-    def delete_prefix_file(self, key: str) -> bool:
+    def delete_prefix_file(self, key: str, kind: str) -> bool:
         with self._connect() as connection:
-            cursor = connection.execute("DELETE FROM prefix_cache WHERE key = ?", (key,))
+            cursor = connection.execute(
+                "DELETE FROM prefix_cache WHERE key = ? AND kind = ?", (key, kind)
+            )
             return cursor.rowcount == 1
 
     def prefix_bytes(self) -> int:

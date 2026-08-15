@@ -100,15 +100,15 @@ class State:
     accumulator being the sum of `models[*].weights_bytes`."""
     kv_bytes: int
     prefix_memory_bytes: int
-    """What the resident tries hold of the conversations they have already read, over every
-    model — the memory tier of the same cache `prefix_disk_bytes` reports the other floor of.
-    Inside `resident_bytes` rather than beside it: the trie's arrays are live allocations both
-    meters already see."""
+    """What the prefix store holds of the conversations it has already read, over every model
+    — the memory tier of the same cache `prefix_disk_bytes` reports the other floor of. Inside
+    `resident_bytes` rather than beside it: a span's arrays are live allocations both meters
+    already see."""
     prefix_disk_bytes: int
-    """What the conversations spilled to disk weigh, over every model. Beside the memory
-    figures because it is the same question asked of the other resource, and reported at all
-    because a cache nobody can see is rubbish accumulating in silence — the argument
-    `fidelity` already makes for keeping its own listing."""
+    """What the spans on disk weigh, over every model. Beside the memory figures because it is
+    the same question asked of the other resource, and reported at all because a cache nobody
+    can see is rubbish accumulating in silence — the argument `fidelity` already makes for
+    keeping its own listing."""
 
 
 router = APIRouter()

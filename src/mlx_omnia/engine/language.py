@@ -2,7 +2,7 @@ import codecs
 from collections.abc import Collection, Iterable, Iterator, Sequence
 from dataclasses import dataclass, field
 from itertools import chain
-from typing import Any, Protocol, TypeIs, runtime_checkable
+from typing import Protocol, TypeIs, runtime_checkable
 
 import mlx.core as mx
 import mlx.nn as nn
@@ -16,8 +16,8 @@ from mlx_omnia.engine.batching import (
 from mlx_omnia.engine.batching import (
     step as batch_step,
 )
-from mlx_omnia.engine.core.cache import FixedKVCache, KVCache, LayerCache, RingKVCache
-from mlx_omnia.engine.core.prompt_cache import Budget, PromptCache, Spill
+from mlx_omnia.engine.core.cache import LayerCache
+from mlx_omnia.engine.core.prefix import Prefixes
 from mlx_omnia.engine.generate import (
     BlockOutputs,
     CausalLM,
@@ -107,31 +107,18 @@ class GenerationOptions:
     everything the count is made of — the rendered prompt, the ids — exists on the other
     side of `stream`. Out of the comparison: two requests asking for the same generation
     are the same options, whoever is measuring them."""
-    prefix_budget: Budget | int = field(default=0, compare=False)
-    """How many bytes of prefix cache this run may keep between requests, 0 for none — a
-    `Budget` when that ceiling is shared with the other resident models, a bare number when
-    this trie is the only one under it.
+    prefix: Prefixes | None = field(default=None, compare=False)
+    """Where this run's spans come from and go, `None` for a caller that keeps none.
 
-    It travels here for the reason the meter does — out where a caller stands there is a
-    conversation and not yet a prompt — and it is a ceiling rather than the cache itself
-    because `PromptCache[KVCache]` and `PromptCache[DeltaCache]` are two types, and nothing
-    above `stream` can name which one the model builds. `Budget` is what survives that: it
-    holds no cache, only the arithmetic over tries that do. Out of the comparison for the same
-    reason as the meter: it says what the run may keep, not what it generates."""
-    prefix_spill: Spill[Any] | None = field(default=None, compare=False)
-    """Where an evicted prefix goes and where a miss looks, `None` for a trie that only
-    forgets. Beside `prefix_budget` and for the same reasons — it is about what the run may
-    keep and not about what it generates — with one of its own: what implements it is the
-    caller's, because a directory, a key and a ceiling are a daemon's business and a trie of
-    caches has none.
-
-    `Any` in the parameter is the same wall `prefix_budget` meets: the element type is the
-    trunk's own cache class, which nothing holding a `LanguageModel[ModelInput]` can name.
-    What narrows it is `TextLanguageModel`, on the other side of `stream`."""
+    One handle and not a ceiling plus a spill: the store is the daemon's, one for every
+    resident model, and what travels per model is which checkpoint wrote the bytes. It is
+    here for the reason the meter is — out where a caller stands there is a conversation and
+    not yet a prompt — and out of the comparison for the same reason: it says what the run
+    may keep, not what it generates."""
     reasoning_budget: int | None = None
     """How many ids the reasoning block of this generation may spend, `None` for no cap.
 
-    A number and not a `ReasoningBudget`, for the reason `prefix_budget` is a number: out
+    A number and not a `ReasoningBudget`, for the reason `prefix` is a handle: out
     where a caller stands there is a conversation and not yet a prompt, and what the closer
     is in ids only exists past the tokenizer. `TextLanguageModel.stream` is where both are,
     so that is where it is turned into the block the loop watches for.
@@ -269,57 +256,11 @@ class LanguageModel[I: ModelInput](Model[I, Segment, GenerationOptions], Protoco
     away."""
 
 
-def prefix_cache[C: LayerCache](
-    prefix: PromptCache[C] | None, budget: Budget | int, spill: Spill[C] | None = None
-) -> PromptCache[C] | None:
-    """The trie this request generates against: none while the budget is 0, the one already
-    there when it has not moved, a new one when it has.
-
-    A changed budget drops what was cached instead of trimming to fit, and that is what makes
-    the setting `applied` rather than `restart`: the trie's ceiling is fixed at construction,
-    so honouring a PATCH means building again. A cache lost costs one prefill; a ceiling that
-    only counted for models loaded afterwards would be a number the screen shows and the
-    daemon ignores.
-
-    A shared `Budget` is compared by identity and a bare number by value, and both say the
-    same thing: the ceiling moved. The daemon hands the same object to every resident model
-    for as long as the config holds and builds another when it is PATCHed, so identity is what
-    "moved" means there; a caller with a plain int has no object to have kept.
-
-    The spill is not part of that comparison. It is the same object for the life of a
-    residency — one model, one directory, one key — so rebuilding on it would be rebuilding
-    on identity, and a caller that constructs it per request would drop the trie every time.
-    """
-    total = budget.total if isinstance(budget, Budget) else budget
-    if total <= 0:
-        return None
-    if prefix is not None:
-        kept = (
-            prefix.budget is budget if isinstance(budget, Budget) else prefix.budget.total == budget
-        )
-        if kept:
-            return prefix
-    return PromptCache(budget, spill)
-
-
-type StandingLayer = KVCache | FixedKVCache | RingKVCache
-"""What the batched trie stores: `batching.SequenceCache`'s element. A sliding layer keeps
-its rotation — only the fixed form is converted back, by `_grown` below."""
-
-
 def _batch_cache(model: BatchModel) -> SequenceCache:
     """The batch contract's cache and not the trunk's: `self.model` narrowed to `BatchModel`
     is an intersection whose `make_cache` still answers with the trunk's own element type,
     and what the batched path threads is the batch's."""
     return list(model.make_cache())
-
-
-def _grown(layer: FixedKVCache) -> KVCache:
-    """The fixed buffer's rows back in the growing form — views of immutable arrays, so
-    holding them costs nothing the entry was not already paying."""
-    fresh = KVCache()
-    fresh.restore(layer.rows, layer.stored())
-    return fresh
 
 
 @dataclass
@@ -330,7 +271,6 @@ class TextBatch:
     tokenizer: Tokenizer
     decoder: codecs.IncrementalDecoder
     segmenter: Segmenter
-    prefix: PromptCache[StandingLayer] | None = None
     closed: bool = False
 
     def push(self, token: int) -> tuple[Segment, ...]:
@@ -338,31 +278,14 @@ class TextBatch:
         return () if not piece else self.segmenter.push(piece)
 
     def finish(self) -> tuple[Segment, ...]:
+        """The text side alone. The spans are the decode's own: `batching` closes the last of
+        them on the step that retires the sequence, which is where the trunk stands still and
+        where the promoted layers still exist."""
         if self.closed:
             return ()
         self.closed = True
         tail = self.decoder.decode(b"", final=True)
-        pieces = (*(() if not tail else self.segmenter.push(tail)), *self.segmenter.flush())
-        if self.prefix is not None:
-            # The rewindable form, never the promoted one: a compiled bucket may have
-            # promoted this sequence's layers to fixed slots, which cannot be trimmed to a
-            # shorter match and which the bucket goes on overwriting for its next member.
-            # `stored()` hands over the rows in use, and a growing cache reads them back
-            # unchanged — the same conversion `FixedKVCache.is_storable` promises.
-            standing: SequenceCache = [
-                layer if not isinstance(layer, FixedKVCache) else _grown(layer)
-                for layer in self.state.cache
-            ]
-            mx.eval([tensor for layer in standing for tensor in layer.tensors])
-            self.prefix.insert(
-                self.state.tokens,
-                standing,
-                role="assistant",
-                nbytes=sum(layer.nbytes for layer in standing),
-            )
-        if self.state.meter is not None:
-            self.state.meter.kept_prefix = self.prefix is not None
-        return pieces
+        return (*(() if not tail else self.segmenter.push(tail)), *self.segmenter.flush())
 
 
 @dataclass
@@ -377,13 +300,12 @@ class TextPrefill:
     tokenizer: Tokenizer
     decoder: codecs.IncrementalDecoder
     segmenter: Segmenter
-    prefix: PromptCache[StandingLayer] | None = None
 
     def advance(self) -> TextBatch | None:
         state = self.prefill.advance()
         if state is None:
             return None
-        return TextBatch(state, self.tokenizer, self.decoder, self.segmenter, self.prefix)
+        return TextBatch(state, self.tokenizer, self.decoder, self.segmenter)
 
 
 @runtime_checkable
@@ -408,17 +330,11 @@ class TextLanguageModel[C: LayerCache, I: ModelInput = Text]:
         self.model = model
         self.tokenizer = tokenizer
         self.stop = stop
-        self.prefix: PromptCache[C] | None = None
-        """What this model kept from the requests before. It lives on the model and not on
-        the engine because its element type is this trunk's own cache, which nothing holding
-        a `LanguageModel[ModelInput]` can name — and because dying with the model is exactly
-        the invariant "one prompt in two resident models does not cross caches"."""
         self.drafter: nn.Module | None = None
         """`speculative.Drafting`. Out of the trunk's tree so whoever accounts for memory can
         weigh it: with an MTP head the two are one checkpoint on disk and still two trees
         here, and only one of them is under `self.model`."""
         self._block: int | None = None
-        self.batch_prefix: PromptCache[StandingLayer] | None = None
 
     @property
     def native_signature(self) -> ModelSignature:
@@ -499,28 +415,24 @@ class TextLanguageModel[C: LayerCache, I: ModelInput = Text]:
         budget = options.max_tokens
         if options.context_limit is not None:
             budget = min(budget, max(0, options.context_limit - len(encoded)))
-        # The two do not compose — a round rewinds the cache the trie hands out — and a round
-        # is worth more: the trie saves the prefill of a turn, the head saves a read of the
-        # weights per token of every turn.
         proposer = self._proposer(options)
-        prefix = (
-            None
-            if proposer is not None
-            else prefix_cache(self.batch_prefix, options.prefix_budget, options.prefix_spill)
-        )
-        if proposer is None:
-            self.batch_prefix = prefix
         cache = _batch_cache(model)
-        reuse = None if prefix is None else prefix.take(encoded, into=cache)
-        if reuse is not None:
-            cache = reuse.caches
+        # A proposer that keeps a row per position of the prompt cannot start from one that
+        # was resumed — it says so itself — and then the round wins: a prefix saves one
+        # turn's prefill, a round saves a read of the weights on every token of every turn.
+        walk = (
+            options.prefix.begin(cache, model)
+            if options.prefix is not None and (proposer is None or proposer.resumes)
+            else None
+        )
+        reused = 0 if walk is None else walk.resume(encoded, cache)
         return TextPrefill(
             BatchPrefill(
                 model,
                 encoded,
                 cache,
                 0,
-                0 if reuse is None else reuse.length,
+                reused,
                 budget,
                 options.sampler,
                 self.stop if options.stop is None else options.stop,
@@ -529,11 +441,11 @@ class TextLanguageModel[C: LayerCache, I: ModelInput = Text]:
                 options.meter,
                 reasoning_budget(options.reasoning_budget, prompt, self.tokenizer),
                 proposer,
+                walk,
             ),
             self.tokenizer,
             codecs.getincrementaldecoder("utf-8")("replace"),
             Segmenter(FALLBACK if input.parser is None else input.parser, prompt=prompt),
-            prefix,
         )
 
     def prepare_batch(self, input: ModelInput, options: GenerationOptions) -> TextBatch | None:
@@ -586,7 +498,6 @@ class TextLanguageModel[C: LayerCache, I: ModelInput = Text]:
         if isinstance(input.value, str) and self.can_batch(options):
             yield from self._stream_batched(input, options)
             return
-        self.prefix = prefix_cache(self.prefix, options.prefix_budget, options.prefix_spill)
         draft = self._proposer(options)
         # Three options are answers about the whole prompt and are read before its first
         # forward: how much window is left, which reasoning block the template left open, and
@@ -596,7 +507,7 @@ class TextLanguageModel[C: LayerCache, I: ModelInput = Text]:
             input.read()
             if options.context_limit is not None
             or options.reasoning_budget is not None
-            or self.prefix is not None
+            or options.prefix is not None
             or draft is not None
             else None
         )
@@ -625,10 +536,7 @@ class TextLanguageModel[C: LayerCache, I: ModelInput = Text]:
             stop=self.stop if options.stop is None else options.stop,
             penalty=options.penalty,
             meter=options.meter,
-            # The two do not compose (`stream_ids` says why), and a round is worth more than
-            # a prefix: the trie saves the prefill of a turn, the head saves a read of the
-            # weights per token of every turn.
-            prefix=None if draft is not None else self.prefix,
+            prefix=options.prefix,
             constraint=options.constraint,
             reasoning_budget=reasoning_budget(
                 options.reasoning_budget, whole if whole is not None else "", self.tokenizer

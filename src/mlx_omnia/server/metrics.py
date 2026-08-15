@@ -27,7 +27,7 @@ import asyncio
 import json
 import time
 from collections import deque
-from collections.abc import AsyncIterator, Callable, Generator
+from collections.abc import AsyncIterator, Callable, Generator, Iterable
 from contextlib import contextmanager
 from dataclasses import asdict, dataclass
 from typing import Annotated, Literal
@@ -81,12 +81,20 @@ class Sample:
     """Whether this run left the next turn anything to start from. It separates the third
     zero from the other two: a trunk whose layers neither rewind nor serialize keeps nothing
     at all, and every turn on it is a cold prefill no setting will fix."""
+    prefilled_tokens: int
+    """Fresh prompt rows the trunk has taken so far. It is the whole of `prompt_tokens -
+    reused_tokens` once the prefill is over, and before that it is where the prefill is —
+    the only thing that moves during a 40k prompt, which is a minute in which the request is
+    otherwise indistinguishable from a stalled one."""
     completion_tokens: int
     started_at: float
     load_seconds: float | None
     ttft: float | None
     tokens_per_second: float | None
     prefill_tokens_per_second: float | None
+    """The prompt's own rate. Once there is a first token it is the fresh prompt over `ttft`;
+    while the trunk is still reading it, the blocks fed so far over the clock they were fed
+    in — the same ratio, measured at where it has got to."""
     bytes_per_token: int | None
     ceiling_fraction: float | None
     speculation: Speculation | None
@@ -110,8 +118,35 @@ class Aggregate:
     prompt_tokens: int
     completion_tokens: int
     ttft: float | None
+    prefill_tokens_per_second: float | None
+    """The fresh prompt rows this model read over the time it took to read them — the same
+    ratio one request reports, summed. What a prefix cache handed over is out of the
+    numerator for the reason `prefill_rate` gives."""
     tokens_per_second: float | None
     bytes_per_token: int | None
+    ceiling_fraction: float | None
+
+
+@dataclass(frozen=True)
+class Totals:
+    """Every request this daemon has served, whatever model answered it.
+
+    `tokens_per_second` is the same ratio-of-totals an `Aggregate` reports, over every model:
+    a per-request decode rate weighted by what each request generated, and not the daemon's
+    throughput — two requests batched together each decode at their own rate while the wall
+    clock runs once. `ceiling_fraction` is those rates against each model's own ceiling,
+    weighted the same way, because bytes per token is a property of the checkpoint and there
+    is no single denominator to divide the sum by.
+    """
+
+    requests: int
+    running: int
+    """In flight right now — queued requests are the engine's `state`, not the register's."""
+    prompt_tokens: int
+    completion_tokens: int
+    ttft: float | None
+    prefill_tokens_per_second: float | None
+    tokens_per_second: float | None
     ceiling_fraction: float | None
 
 
@@ -119,10 +154,14 @@ class Aggregate:
 class Snapshot:
     """The one shape both windows answer with: the `GET` and every frame of the stream."""
 
-    live: Sample | None
+    live: list[Sample]
+    """Every request being served, newest first. A list because the engine batches: two
+    conversations on one model, or two models answering at once, are two live measurements
+    and a register that published one of them would be describing the other's screen."""
     requests: list[Sample]
     """Newest first."""
     models: list[Aggregate]
+    totals: Totals
 
 
 @dataclass
@@ -135,6 +174,10 @@ class _Totals:
     requests: int = 0
     ttft_seconds: float = 0.0
     ttft_requests: int = 0
+    prefill_tokens: int = 0
+    """Fresh rows, over the requests that got as far as a first token — the numerator
+    `ttft_seconds` is the denominator of. A request that was cancelled mid-prefill is in
+    neither: it has rows and no time to divide them by."""
     decode_seconds: float = 0.0
     decode_tokens: int = 0
     bytes_per_token: int | None = None
@@ -176,6 +219,18 @@ def prefill_rate(prompt_tokens: int, ttft: float | None, reused: int = 0) -> flo
     return fresh / ttft
 
 
+def _prefill_rate(meter: Meter) -> float | None:
+    """The finished request's rate, or — while the prompt is still being read — the rows the
+    trunk has taken over the clock it has been taking them in."""
+    settled = prefill_rate(meter.prompt_tokens, meter.ttft, meter.reused_tokens)
+    if settled is not None:
+        return settled
+    elapsed = meter.prefill_seconds
+    if elapsed is None or elapsed <= 0 or meter.prefilled_tokens <= 0:
+        return None
+    return meter.prefilled_tokens / elapsed
+
+
 def _measure(live: _Live, state: RequestState) -> Sample:
     meter = live.meter
     rate = meter.tokens_per_second
@@ -185,14 +240,13 @@ def _measure(live: _Live, state: RequestState) -> Sample:
         prompt_tokens=meter.prompt_tokens,
         reused_tokens=meter.reused_tokens,
         kept_prefix=meter.kept_prefix,
+        prefilled_tokens=meter.prefilled_tokens,
         completion_tokens=meter.completion_tokens,
         started_at=live.started_at,
         load_seconds=live.load_seconds,
         ttft=meter.ttft,
         tokens_per_second=rate,
-        prefill_tokens_per_second=prefill_rate(
-            meter.prompt_tokens, meter.ttft, meter.reused_tokens
-        ),
+        prefill_tokens_per_second=_prefill_rate(meter),
         bytes_per_token=live.bytes_per_token,
         ceiling_fraction=_fraction(rate, live.bytes_per_token),
         speculation=(
@@ -207,6 +261,12 @@ def _measure(live: _Live, state: RequestState) -> Sample:
     )
 
 
+def _mean_prefill(prefill_tokens: int, ttft_seconds: float) -> float | None:
+    if ttft_seconds <= 0 or prefill_tokens <= 0:
+        return None
+    return prefill_tokens / ttft_seconds
+
+
 def _aggregate(model: str, totals: _Totals) -> Aggregate:
     ttft = totals.ttft_seconds / totals.ttft_requests if totals.ttft_requests else None
     rate = totals.decode_tokens / totals.decode_seconds if totals.decode_seconds > 0 else None
@@ -216,9 +276,39 @@ def _aggregate(model: str, totals: _Totals) -> Aggregate:
         prompt_tokens=totals.prompt_tokens,
         completion_tokens=totals.completion_tokens,
         ttft=ttft,
+        prefill_tokens_per_second=_mean_prefill(totals.prefill_tokens, totals.ttft_seconds),
         tokens_per_second=rate,
         bytes_per_token=totals.bytes_per_token,
         ceiling_fraction=_fraction(rate, totals.bytes_per_token),
+    )
+
+
+def _overall(totals: Iterable[_Totals], running: int) -> Totals:
+    held = list(totals)
+    ttft_seconds = sum(one.ttft_seconds for one in held)
+    ttft_requests = sum(one.ttft_requests for one in held)
+    decode_seconds = sum(one.decode_seconds for one in held)
+    decode_tokens = sum(one.decode_tokens for one in held)
+    rate = decode_tokens / decode_seconds if decode_seconds > 0 else None
+    shares = [
+        (one.decode_tokens, one.decode_tokens / one.decode_seconds / ceiling(one.bytes_per_token))
+        for one in held
+        if one.bytes_per_token is not None and one.decode_seconds > 0
+    ]
+    weight = sum(tokens for tokens, _ in shares)
+    return Totals(
+        requests=sum(one.requests for one in held),
+        running=running,
+        prompt_tokens=sum(one.prompt_tokens for one in held),
+        completion_tokens=sum(one.completion_tokens for one in held),
+        ttft=ttft_seconds / ttft_requests if ttft_requests else None,
+        prefill_tokens_per_second=_mean_prefill(
+            sum(one.prefill_tokens for one in held), ttft_seconds
+        ),
+        tokens_per_second=rate,
+        ceiling_fraction=(
+            sum(tokens * share for tokens, share in shares) / weight if weight else None
+        ),
     )
 
 
@@ -272,6 +362,7 @@ class Metrics:
         if (ttft := meter.ttft) is not None:
             totals.ttft_seconds += ttft
             totals.ttft_requests += 1
+            totals.prefill_tokens += max(0, meter.prompt_tokens - meter.reused_tokens)
         if (decode := meter.decode_seconds) is not None and meter.completion_tokens > 1:
             # The same split the meter reports: the first token is ttft's, so the rate
             # covers the ones after it and a one-token request contributes to neither.
@@ -292,13 +383,10 @@ class Metrics:
 
     def snapshot(self) -> Snapshot:
         return Snapshot(
-            live=(
-                None
-                if not self._live
-                else _measure(self._live[max(self._live)], "running")
-            ),
+            live=[_measure(self._live[key], "running") for key in sorted(self._live, reverse=True)],
             requests=list(reversed(self._requests)),
             models=[_aggregate(model, totals) for model, totals in self._totals.items()],
+            totals=_overall(self._totals.values(), len(self._live)),
         )
 
     def _publish(self) -> None:

@@ -18,7 +18,7 @@ import pytest
 from mlx_omnia.engine.core import cache_file
 from mlx_omnia.engine.core.attend import attend
 from mlx_omnia.engine.core.cache import KVCache
-from mlx_omnia.engine.core.prompt_cache import PromptCache
+from mlx_omnia.engine.core.prefix import PrefixStore
 from mlx_omnia.engine.core.quantized_cache import FormatRefused, QuantizedKVCache, ShapeRefused
 from mlx_omnia.engine.quant.quantization import MXFP, NVFP, Affine
 
@@ -211,26 +211,35 @@ def test_trim_rewinds_to_any_row_and_not_to_a_multiple_of_the_group() -> None:
     assert (mx.abs(resumed - whole[..., 37:, :]).max() / mx.abs(whole).max()).item() < 2e-3
 
 
-def test_the_prefix_trie_reuses_a_compressed_cache_and_rewinds_it() -> None:
+def test_the_prefix_store_reuses_a_compressed_cache_span_by_span() -> None:
     """The two features meeting, which is what the packing decision was made for. A trunk of
-    compressed caches goes into the trie like any other, an exact extension is handed over
-    whole, and a prompt that diverges in the middle is rewound to the branch point — because
-    `is_trimmable` is still `True`, because every row stands on its own."""
+    compressed caches is cut into spans like any other — the dense head and the packed codes
+    are two row spaces of one conversation, and a span contributes to whichever of the two its
+    own tokens fall in."""
     format = Affine(group_size=64, bits=4)
-    trie = PromptCache[QuantizedKVCache](budget=1 << 30)
-    caches = [QuantizedKVCache(format, format)]
+    store = PrefixStore(1 << 30, span=8)
+    caches = [QuantizedKVCache(format, format, start_tokens=12)]
     queries, keys, values = rows(32, heads=HEADS), rows(32), rows(32, seed=1)
     attend(caches[0], queries, keys=keys, values=values, scale=SCALE, mask="causal")
     tokens = list(range(32))
-    trie.insert(tokens, caches, role="assistant", nbytes=caches[0].nbytes)
+    walk = store.begin("m", "sha", caches, None)
+    assert walk is not None
+    walk.commit(tokens, caches, 32)
 
-    extension = trie.take([*tokens, 900, 901])
-    assert extension is not None and extension.length == 32
+    fresh = [QuantizedKVCache(format, format, start_tokens=12)]
+    second = store.begin("m", "sha", fresh, None)
+    assert second is not None
 
-    trie.insert(tokens, caches, role="assistant", nbytes=caches[0].nbytes)
-    diverged = trie.take([*tokens[:20], 7777, 7778])
-    assert diverged is not None and diverged.length == 20
-    assert diverged.caches[0].offset == 20, "a compressed cache rewound to an arbitrary row"
+    assert second.resume([*tokens, 900, 901], fresh) == 32
+    assert (fresh[0].offset, fresh[0]._dense) == (32, 12)
+    # The next step on both, which is what a resumed cache is for. Comparing the buffers
+    # would pass on a cache that came back whole and unusable — the answer is what the
+    # conversation reads.
+    step, query = rows(1, seed=2), rows(1, heads=HEADS, seed=3)
+    expected = attend(caches[0], query, keys=step, values=step, scale=SCALE, mask=None)
+    assert mx.array_equal(
+        attend(fresh[0], query, keys=step, values=step, scale=SCALE, mask=None), expected
+    ).item()
 
 
 def test_the_bytes_fall_in_the_proportion_the_width_predicts() -> None:
@@ -281,9 +290,14 @@ def test_a_compressed_cache_survives_a_file_bit_for_bit(format: object, tmp_path
     attend(cache, queries, keys=keys, values=values, scale=SCALE, mask="causal")
 
     path = tmp_path / "compressed.safetensors"
-    cache_file.dump([cache], path)
+    cache_file.dump(
+        {f"0.{name}": tensor for name, tensor in cache.stored(0, 48).items()}
+        | {cache_file.IDS: mx.arange(48, dtype=mx.int32)},
+        path,
+    )
+    payload = cache_file.load(path)
     read = QuantizedKVCache(format, format, start_tokens=16)
-    cache_file.restore([read], path)
+    read.restore(48, {name.removeprefix("0."): tensor for name, tensor in payload.items()})
     assert (read.offset, read.rows) == (48, 48)
 
     # The next step on both, which is what a restored cache is for. Comparing the two
@@ -306,7 +320,7 @@ def test_the_format_is_in_the_key_so_a_file_of_another_policy_is_never_a_candida
     headed = QuantizedKVCache(narrow, narrow, start_tokens=16)
 
     digests = {
-        cache_file.key("m", "sha", cache_file.policy([cache]), [1, 2, 3])
+        cache_file.digest(["m", "sha", sorted(cache_file.policy([cache]).items())])
         for cache in (four, eight, mixed, headed, KVCache())
     }
     assert len(digests) == 5
