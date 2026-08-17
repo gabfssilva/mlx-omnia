@@ -40,8 +40,14 @@ class AddRmsNorm(AddRmsNormStrategy):
     """Resolves the strategy at construction and delegates; itself an
     `AddRmsNormStrategy`."""
 
-    def __init__(self, leaf: nn.RMSNorm, *, tokens: int | None = None) -> None:
-        self.strategy: AddRmsNormStrategy = resolve(_STRATEGIES, leaf, tokens=tokens)
+    def __init__(
+        self, leaf: nn.RMSNorm, *, tokens: int | None = None, reference: bool = False
+    ) -> None:
+        # `reference` requests the two-op chain of the same declaration — the parity
+        # reference a bench A/B swaps in — instead of a fusion.
+        self.strategy: AddRmsNormStrategy = resolve(
+            (DefaultAddRmsNorm,) if reference else _STRATEGIES, leaf, tokens=tokens
+        )
 
     def __call__(self, x: mx.array, projected: mx.array) -> tuple[mx.array, mx.array]:
         return self.strategy(x, projected)

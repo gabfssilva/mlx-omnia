@@ -9,7 +9,7 @@ import mlx.nn as nn
 import pytest
 
 from mlx_omnia.engine.core import layers
-from mlx_omnia.engine.core.kernels.qkv_rope.segmented import qkv_step
+from mlx_omnia.engine.core.kernels.qkv_rope.segmented import QkvStep, qkv_plan
 from mlx_omnia.engine.core.layers import SegmentedQKV
 from tests.conftest import relative_diff
 
@@ -17,6 +17,17 @@ _HIDDEN = 256
 _QUERIES = 16
 _KEY_VALUES = 8
 _FORMATS = ("dense", "affine4", "affine8", "mxfp4")
+
+
+def qkv_step(
+    x: mx.array,
+    queries: nn.Linear | nn.QuantizedLinear,
+    keys: nn.Linear | nn.QuantizedLinear,
+    values: nn.Linear | nn.QuantizedLinear,
+) -> mx.array | None:
+    """Plan-then-step in one call: None whether the trio or the token is off the gate."""
+    plan = qkv_plan(queries, keys, values)
+    return plan(x) if plan is not None else None
 
 
 def _project(
@@ -149,33 +160,45 @@ def test_an_off_gate_combination_runs_the_mlx_path_with_the_same_result() -> Non
     assert relative_diff(module(x), reference) < 1e-5
 
 
-def test_the_module_takes_the_kernel_on_a_single_token(
+def test_the_module_plans_once_and_takes_the_kernel_on_single_tokens(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    # mutação: tirar o ramo `x.shape[1] == 1` do __call__ quebra — o passo de um token
-    # deixa de passar pelo kernel e o contador fica em zero.
+    # mutação: tirar o ramo `x.shape[1] == 1` do _project quebra — o passo de um token
+    # deixa de passar pelo kernel e o contador de despachos fica em zero. Tirar o cache
+    # `_planned` quebra a contagem de planos: dois steps voltariam a planejar duas vezes.
     mx.random.seed(0)
     module = SegmentedQKV(_HIDDEN, queries=_QUERIES, keys=_KEY_VALUES,
                           values=_KEY_VALUES, bias=False)
-    calls: list[mx.array] = []
+    plans: list[QkvStep | None] = []
+    dispatches: list[mx.array] = []
 
     def recorded(
-        x: mx.array,
         queries: nn.Linear | nn.QuantizedLinear,
         keys: nn.Linear | nn.QuantizedLinear,
         values: nn.Linear | nn.QuantizedLinear,
-    ) -> mx.array | None:
-        result = qkv_step(x, queries, keys, values)
-        calls.append(x)
-        return result
+    ) -> QkvStep | None:
+        plan = qkv_plan(queries, keys, values)
+        plans.append(plan)
+        return plan
 
-    monkeypatch.setattr(layers, "qkv_step", recorded)
+    stepping = QkvStep.__call__
+
+    def stepped(self: QkvStep, x: mx.array) -> mx.array | None:
+        out = stepping(self, x)
+        if out is not None:
+            dispatches.append(out)
+        return out
+
+    monkeypatch.setattr(layers, "qkv_plan", recorded)
+    monkeypatch.setattr(QkvStep, "__call__", stepped)
 
     step = module(mx.random.normal((1, 1, _HIDDEN)))
+    again = module(mx.random.normal((1, 1, _HIDDEN)))
     prefill = module(mx.random.normal((1, 4, _HIDDEN)))
 
-    assert len(calls) == 1
-    assert step.shape == (1, 1, _QUERIES + 2 * _KEY_VALUES)
+    assert len(plans) == 1 and plans[0] is not None
+    assert len(dispatches) == 2
+    assert step.shape == again.shape == (1, 1, _QUERIES + 2 * _KEY_VALUES)
     assert prefill.shape == (1, 4, _QUERIES + 2 * _KEY_VALUES)
 
 

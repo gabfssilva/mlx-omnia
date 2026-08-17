@@ -8,9 +8,8 @@ from mlx_omnia.engine.core.cache import KVCache, LayerCache
 from mlx_omnia.engine.core.kernels.attention import (
     AttentionStep,
     AttentionStepStrategy,
-    DefaultAttentionStep,
+    rotate,
 )
-from mlx_omnia.engine.core.kernels.attention.default import rotate
 from mlx_omnia.engine.models.gpt_oss.config import GPTOSSConfig
 from mlx_omnia.engine.models.gpt_oss.layers import flags
 
@@ -97,35 +96,18 @@ class GPTOSSAttention(nn.Module):
         step = self._step
         fused = flags.USE_SINK_ATTENTION
         if step is None or self._step_cache is not cache or self._step_sink != fused:
-            step = (
-                AttentionStep(
-                    cache,
-                    heads=self.heads,
-                    kv_heads=self.kv_heads,
-                    head_dim=self.head_dim,
-                    scale=self.scale,
-                    dtype=dtype,
-                    rotary_pairs=self.head_dim // 2,
-                    mscale=self._mscale,
-                    freqs=self._freqs,
-                    sinks=self.sinks,
-                )
-                if fused
-                else DefaultAttentionStep(
-                    cache=cache,
-                    heads=self.heads,
-                    kv_heads=self.kv_heads,
-                    head_dim=self.head_dim,
-                    scale=self.scale,
-                    query_weight=None,
-                    key_weight=None,
-                    eps=1e-6,
-                    rotary_pairs=self.head_dim // 2,
-                    mscale=self._mscale,
-                    freqs=self._freqs,
-                    base=0.0,
-                    sinks=self.sinks,
-                )
+            step = AttentionStep(
+                cache,
+                heads=self.heads,
+                kv_heads=self.kv_heads,
+                head_dim=self.head_dim,
+                scale=self.scale,
+                dtype=dtype,
+                rotary_pairs=self.head_dim // 2,
+                mscale=self._mscale,
+                freqs=self._freqs,
+                sinks=self.sinks,
+                reference=not fused,
             )
             self._step, self._step_cache, self._step_sink = step, cache, fused
         return step

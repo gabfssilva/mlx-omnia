@@ -45,3 +45,6 @@ class MoeStep(MoeStepStrategy):
 
     def __call__(self, x: mx.array, chosen: mx.array, weights: mx.array) -> mx.array:
         return self.strategy(x, chosen, weights)
+
+    def rows(self, x: mx.array, chosen: mx.array, weights: mx.array) -> mx.array | None:
+        return self.strategy.rows(x, chosen, weights)

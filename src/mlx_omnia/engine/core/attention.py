@@ -6,11 +6,7 @@ from dataclasses import dataclass
 from typing import (
     Literal,
     NamedTuple,
-    NotRequired,
-    Protocol,
-    TypedDict,
     assert_never,
-    runtime_checkable,
 )
 
 import mlx.core as mx
@@ -22,27 +18,19 @@ from mlx_omnia.engine.core.cache import KVCache, LayerCache
 from mlx_omnia.engine.core.kernels.qkv_rope import QkvRope
 from mlx_omnia.engine.core.layers import SwiGLU, split_qkv
 from mlx_omnia.engine.core.masks import causal_mask
-from mlx_omnia.engine.core.rope import LlamaRoPEScaling, ScalingJson, llama3_freqs
+from mlx_omnia.engine.core.rope import LlamaRoPEScaling, llama3_freqs
 
 __all__ = [
-    "Attention",
-    "AttentionContext",
     "AttentionMask",
     "DenseActivations",
-    "DenseAttention",
     "DenseBlock",
     "DenseConfig",
-    "DenseJson",
     "DenseModel",
     "DenseTrunk",
     "FusedQKVAttention",
     "GatedNormalizedFusedQKVAttention",
     "HeadLayerNorm",
     "NormalizedFusedQKVAttention",
-    "OutputTransform",
-    "Projected",
-    "QKTransform",
-    "QKVProjection",
     "SeparateQKVAttention",
     "ragged_mask",
     "smooth_rotary_freqs",
@@ -76,110 +64,6 @@ def ragged_mask(
         return mx.arange(total) > offset - window
     columns = mx.arange(span if span is not None else int(mx.max(offset).item()) + length)
     return columns[None, None, None, :] > offset[:, None, None, None] - window
-
-
-@runtime_checkable
-class Attention[C: LayerCache](Protocol):
-    """Transform a sequence using an architecture-specific attention cache."""
-
-    def __call__(
-        self,
-        x: mx.array,
-        cache: C,
-        mask: AttentionMask = "causal",
-    ) -> mx.array: ...
-
-
-@dataclass(frozen=True, slots=True)
-class Projected[A]:
-    """Carry projected QKV tensors and output-specific state."""
-
-    queries: mx.array
-    keys: mx.array
-    values: mx.array
-    auxiliary: A
-
-
-@runtime_checkable
-class QKVProjection[A](Protocol):
-    """Project hidden states into query, key, value and auxiliary tensors."""
-
-    def __call__(self, x: mx.array) -> Projected[A]: ...
-
-
-@runtime_checkable
-class QKTransform(Protocol):
-    """Apply positional and normalization transforms to queries and keys."""
-
-    def __call__(
-        self, queries: mx.array, keys: mx.array, position: Position
-    ) -> tuple[mx.array, mx.array]: ...
-
-
-@runtime_checkable
-class AttentionContext[C: LayerCache](Protocol):
-    """Own context selection, cache mutation and the attention kernel."""
-
-    def position(self, cache: C) -> Position: ...
-
-    def attend(
-        self,
-        queries: mx.array,
-        keys: mx.array,
-        values: mx.array,
-        cache: C,
-        mask: AttentionMask,
-        scale: float,
-    ) -> mx.array: ...
-
-
-@runtime_checkable
-class OutputTransform[A](Protocol):
-    """Transform attended heads into the attention module output."""
-
-    def __call__(
-        self,
-        attended: mx.array,
-        residual: mx.array,
-        auxiliary: A,
-    ) -> mx.array: ...
-
-
-class DenseAttention[A, C: LayerCache](nn.Module):
-    """Compose projection, QK transformation, context and output policies."""
-
-    def __init__(
-        self,
-        projection: QKVProjection[A],
-        transform: QKTransform,
-        context: AttentionContext[C],
-        output: OutputTransform[A],
-        *,
-        scale: float,
-    ) -> None:
-        super().__init__()
-        self.projection = projection
-        self.transform = transform
-        self.context = context
-        self.output = output
-        self.scale = scale
-
-    def __call__(self, x: mx.array, mask: AttentionMask, cache: C) -> mx.array:
-        projected = self.projection(x)
-        queries, keys = self.transform(
-            projected.queries,
-            projected.keys,
-            self.context.position(cache),
-        )
-        attended = self.context.attend(
-            queries,
-            keys,
-            projected.values,
-            cache,
-            mask,
-            self.scale,
-        )
-        return self.output(attended, x, projected.auxiliary)
 
 
 class FusedQKVAttention(nn.Module):
@@ -840,26 +724,6 @@ class DenseConfig:
     tie_word_embeddings: bool
     intermediate_size: int
     eos_token_id: tuple[int, ...]
-
-
-class DenseJson(TypedDict):
-    """Describe the checkpoint fields consumed by the shared dense decoder."""
-
-    model_type: str
-    hidden_size: int
-    num_hidden_layers: int
-    num_attention_heads: int
-    vocab_size: int
-    rms_norm_eps: float
-    intermediate_size: int
-    eos_token_id: int | list[int]
-    num_key_value_heads: NotRequired[int]
-    head_dim: NotRequired[int]
-    rope_theta: NotRequired[float]
-    rope_scaling: NotRequired[ScalingJson | None]
-    attention_bias: NotRequired[bool]
-    mlp_bias: NotRequired[bool]
-    tie_word_embeddings: NotRequired[bool]
 
 
 class DenseBlock(nn.Module):

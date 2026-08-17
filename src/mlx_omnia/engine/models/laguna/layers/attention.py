@@ -7,8 +7,7 @@ import mlx.nn as nn
 
 from mlx_omnia.engine.core.attend import Attending, attend
 from mlx_omnia.engine.core.cache import FixedKVCache, KVCache, LayerCache, RingKVCache
-from mlx_omnia.engine.core.kernels.attention import AttentionCache, AttentionStep
-from mlx_omnia.engine.core.kernels.attention.default import rotate
+from mlx_omnia.engine.core.kernels.attention import AttentionCache, AttentionStep, rotate
 from mlx_omnia.engine.core.kernels.qmv import Qmv
 from mlx_omnia.engine.core.layers import split_qkv
 from mlx_omnia.engine.models.laguna.config import SLIDING, LagunaConfig, LagunaYaRNScaling

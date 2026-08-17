@@ -8,7 +8,7 @@ from mlx_omnia.engine.core.kernels.conv_step import ConvStep
 from mlx_omnia.engine.core.kernels.mamba_step import MambaStep
 
 if TYPE_CHECKING:
-    from mlx_omnia.engine.core.kernels.mamba_step.verify import VerifyMambaStep
+    from mlx_omnia.engine.core.kernels.mamba_step import VerifyMambaStep
 from mlx_omnia.engine.core.kernels.ssm import Ssm
 from mlx_omnia.engine.models.nemotron_h.config import NemotronHConfig
 
@@ -161,15 +161,12 @@ class NemotronHMamba(nn.Module):
         slots. Only a `FixedDeltaCache` carrying them (`LayerCache.checkpoints`) reaches here.
         """
         from mlx_omnia.engine.core.cache import FixedDeltaCache
-        from mlx_omnia.engine.core.kernels.mamba_step.fused import FusedMambaStep
-        from mlx_omnia.engine.core.kernels.mamba_step.verify import VerifyMambaStep
 
         assert isinstance(cache, FixedDeltaCache) and len(cache.graph) == 5
-        middle = self.mamba_step().strategy
-        assert isinstance(middle, FusedMambaStep)
         verify = self._verify
         if verify is None:
-            verify = VerifyMambaStep.of(middle)
+            verify = self.mamba_step().verify()
+            assert verify is not None
             self._verify = verify
         config = self.config
         proj = self.in_proj(x)[0]

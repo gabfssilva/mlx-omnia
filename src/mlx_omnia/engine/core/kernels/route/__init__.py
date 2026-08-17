@@ -15,9 +15,8 @@ The tie rule is the higher expert index everywhere except `OrdinalRoute`, whose 
 network resolves an exact tie to the lower one; the two never build for the same
 declaration because the tournament takes no scale.
 
-`sort.py` (the sorted-prefill permutation) and `residual.py` (the residual join with the
-router gemv fused in) are machinery around routing rather than strategies, and stay
-module-path imports.
+`residual.py` (the residual join with the router gemv fused in) is machinery around
+routing rather than a strategy, and stays a module-path import.
 """
 
 import mlx.core as mx
@@ -96,3 +95,6 @@ class Route(RouteStrategy):
         ids: mx.array | None = None,
     ) -> tuple[mx.array, mx.array]:
         return self.strategy(row, logits=logits, ids=ids)
+
+    def rows(self, logits: mx.array) -> tuple[mx.array, mx.array] | None:
+        return self.strategy.rows(logits)

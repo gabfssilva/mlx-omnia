@@ -12,7 +12,7 @@ from mlx_omnia.engine.core.cache import (
     KVCache,
     LayerCache,
 )
-from mlx_omnia.engine.core.kernels.add_norm import AddRmsNorm, AddRmsNormStrategy, DefaultAddRmsNorm
+from mlx_omnia.engine.core.kernels.add_norm import AddRmsNorm
 from mlx_omnia.engine.core.layers import SwiGLU
 from mlx_omnia.engine.models.qwen3_5.config import Qwen35TextConfig
 from mlx_omnia.engine.models.qwen3_5.layers import deltanet, flags, moe
@@ -37,7 +37,6 @@ def _trace_key(block: "Qwen35Block") -> tuple[object, ...]:
     return (
         deltanet.GatedDelta,
         AddRmsNorm,
-        DefaultAddRmsNorm,
         moe.Route,
         moe.GateUp,
         moe.DownCombine,
@@ -65,7 +64,7 @@ class Qwen35Block(nn.Module):
         )
         self.input_layernorm = nn.RMSNorm(config.hidden_size, eps=config.rms_norm_eps)
         self.post_attention_layernorm = nn.RMSNorm(config.hidden_size, eps=config.rms_norm_eps)
-        self._join_strategy: AddRmsNormStrategy | None = None
+        self._join_strategy: AddRmsNorm | None = None
         self._join_key: tuple[object, ...] | None = None
         self._tail = self._build_tail()
         # The uncompiled DeltaNet body, kept beside its trace: a trunk-level compile calls
@@ -88,21 +87,15 @@ class Qwen35Block(nn.Module):
             self._step_body = self._build_step()
             self._step = mx.compile(self._step_body, inputs=self._traced_state())
 
-    def _join(self) -> AddRmsNormStrategy:
+    def _join(self) -> AddRmsNorm:
         """Resolved once, at the first T=1 step — after load, when the norm leaf's
-        format is final. The A/B switch has no place in the declaration (the delegator
-        is total and would always find a kernel), so it picks the default strategy
-        directly; the cache key carries it, and the two bindings, for the same reason
-        `rule()` does."""
-        key = (AddRmsNorm, DefaultAddRmsNorm, flags.ADD_RMS_NORM_KERNEL)
+        format is final. The A/B switch requests the delegator's reference path; the
+        cache key carries it, and the binding, for the same reason `rule()` does."""
+        key = (AddRmsNorm, flags.ADD_RMS_NORM_KERNEL)
         join = self._join_strategy
         if join is None or self._join_key != key:
             post = self.post_attention_layernorm
-            join = (
-                AddRmsNorm(post, tokens=1)
-                if flags.ADD_RMS_NORM_KERNEL
-                else DefaultAddRmsNorm.build(post, tokens=1)
-            )
+            join = AddRmsNorm(post, tokens=1, reference=not flags.ADD_RMS_NORM_KERNEL)
             self._join_strategy, self._join_key = join, key
         return join
 

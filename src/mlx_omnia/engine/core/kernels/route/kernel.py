@@ -65,6 +65,12 @@ class RouteStrategy(Protocol):
         ids: mx.array | None = None,
     ) -> tuple[mx.array, mx.array]: ...
 
+    def rows(self, logits: mx.array) -> tuple[mx.array, mx.array] | None:
+        """The same pick over `[rows, experts]` logit rows in one dispatch, matching
+        the single-row calls row for row — or None when this strategy has no batched
+        form and the caller picks row by row."""
+        return None
+
 
 def gate_logits(gate: mx.array | None, row: mx.array, logits: mx.array | None) -> mx.array:
     """The router row `[rows]`, from the gate matrix `[rows, hidden]` or from the

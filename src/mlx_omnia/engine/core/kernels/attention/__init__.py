@@ -11,7 +11,8 @@ a fixed capacity cache to the full kernel, a layer with sink logits to the split
 flash-decode, everything else to `default.py` — the stock chain of `rms_norm`, `rope`,
 `update_and_fetch` and `mx.fast.scaled_dot_product_attention`. `sdpa.py` is not a
 strategy: it is the lifted decode kernel that stands in for that op, shared by whoever
-installs its patch.
+installs its patch. `rotate` — the ops rotation the default runs — is exported here for
+the paths that rotate outside a step (a prefill, a batched forward).
 
 One branch survives resolution, in every specialized strategy: prefill. `T != 1` is not
 the shape any of these kernels is written for, and the same layer object serves both
@@ -20,7 +21,7 @@ phases, so a step whose call is not a decode step defers to its `fallback`.
 
 import mlx.core as mx
 
-from mlx_omnia.engine.core.kernels.attention.default import DefaultAttentionStep
+from mlx_omnia.engine.core.kernels.attention.default import DefaultAttentionStep, rotate
 from mlx_omnia.engine.core.kernels.attention.full import FullAttentionStep
 from mlx_omnia.engine.core.kernels.attention.kernel import (
     Angles,
@@ -40,6 +41,7 @@ __all__ = [
     "FullAttentionStep",
     "SinkAttentionStep",
     "SlidingAttentionStep",
+    "rotate",
 ]
 
 # Order is preference: the first strategy that builds wins; the default accepts
@@ -80,9 +82,12 @@ class AttentionStep(AttentionStepStrategy):
         freqs: mx.array | None = None,
         base: float = 0.0,
         sinks: mx.array | None = None,
+        reference: bool = False,
     ) -> None:
+        # `reference` requests the ops chain of the same declaration — the parity
+        # reference a bench A/B swaps in — instead of the deepest fusion.
         self.strategy: AttentionStepStrategy = resolve(
-            _STRATEGIES,
+            (DefaultAttentionStep,) if reference else _STRATEGIES,
             cache,
             heads=heads,
             kv_heads=kv_heads,

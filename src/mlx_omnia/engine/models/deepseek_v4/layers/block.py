@@ -31,7 +31,7 @@ class DeepseekV4Block(nn.Module):
         x, post, comb = self.attn_hc(h, self.attn_norm, partials)
         h, partials = hc_expand(
             self.attn(x, mask, cache), residual, post, comb,
-            self.ffn_hc.fn if self.ffn_hc.fused else None,
+            self.ffn_hc.fn if self.ffn_hc.wants_partials else None,
         )
         residual = h
         x, post, comb = self.ffn_hc(h, self.ffn_norm, partials)

@@ -1,11 +1,13 @@
-"""The greedy output head: one strategy per head shape, one delegator.
+"""The screened output head: one strategy per head shape, one delegator.
 
-The primitive is the greedy STEP — `(x [..., hidden]) -> token id [...]` — not a logits
-row. `ArgmaxGreedyHead` serves it with the screened int5 chain, which reads the full bf16
+The primitive is the SCREENED ROW — `(x [..., hidden]) -> [..., vocab]`, a row whose
+argmax along the last axis is the stock head projection's, and whose other slots a
+caller must not read. It is the altitude `core.api.Screened` consumes.
+`ArgmaxScreenedHead` serves it with the screened int5 chain, which reads the full bf16
 weight only for the rows a certificate cannot rule out; `default.py` serves it with the
-stock projection followed by `argmax`, accepts everything, and so makes the delegator
-total. Both compute the same function of `x`, which is what lets the model call
-`GreedyHead` without knowing which one it got.
+stock projection, accepts everything, and so makes the delegator total. Both agree on
+the argmax, which is what lets a model call `ScreenedHead` without knowing which one it
+got.
 
 Sampling is not this primitive. Logprobs, temperature, top-p, top-k, speculative
 acceptance and row penalties all read logits the pruned chain never computes, and belong
@@ -14,27 +16,27 @@ on the head layer itself.
 
 import mlx.core as mx
 
-from mlx_omnia.engine.core.kernels.lm_head.argmax import ArgmaxGreedyHead
-from mlx_omnia.engine.core.kernels.lm_head.default import DefaultGreedyHead
-from mlx_omnia.engine.core.kernels.lm_head.kernel import GreedyHeadStrategy, HeadProjection
+from mlx_omnia.engine.core.kernels.lm_head.argmax import ArgmaxScreenedHead
+from mlx_omnia.engine.core.kernels.lm_head.default import DefaultScreenedHead
+from mlx_omnia.engine.core.kernels.lm_head.kernel import HeadProjection, ScreenedHeadStrategy
 from mlx_omnia.engine.core.kernels.resolve import resolve
 
 __all__ = [
-    "ArgmaxGreedyHead",
-    "DefaultGreedyHead",
-    "GreedyHead",
-    "GreedyHeadStrategy",
+    "ArgmaxScreenedHead",
+    "DefaultScreenedHead",
     "HeadProjection",
+    "ScreenedHead",
+    "ScreenedHeadStrategy",
 ]
 
 # Order is preference: the first strategy that builds wins; the default accepts
 # everything, so resolution never fails.
-_STRATEGIES = (ArgmaxGreedyHead, DefaultGreedyHead)
+_STRATEGIES = (ArgmaxScreenedHead, DefaultScreenedHead)
 
 
-class GreedyHead(GreedyHeadStrategy):
+class ScreenedHead(ScreenedHeadStrategy):
     """Resolves the strategy at construction and delegates; itself a
-    `GreedyHeadStrategy`."""
+    `ScreenedHeadStrategy`."""
 
     def __init__(
         self,
@@ -43,7 +45,7 @@ class GreedyHead(GreedyHeadStrategy):
         weight: mx.array | None = None,
         refine: bool = True,
     ) -> None:
-        self.strategy: GreedyHeadStrategy = resolve(
+        self.strategy: ScreenedHeadStrategy = resolve(
             _STRATEGIES,
             projection,
             weight=weight,

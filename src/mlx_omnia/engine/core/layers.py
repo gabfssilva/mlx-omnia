@@ -13,7 +13,7 @@ from typing import Literal
 import mlx.core as mx
 import mlx.nn as nn
 
-from mlx_omnia.engine.core.kernels.qkv_rope.segmented import qkv_step
+from mlx_omnia.engine.core.kernels.qkv_rope.segmented import QkvStep, qkv_plan
 from mlx_omnia.engine.core.mxcompat import gather_mm
 
 # What `mx.quantize` accepts. Kept as primitives here so `core` stays below
@@ -47,18 +47,30 @@ def split_qkv(
     return q, k, v
 
 
-def segmented(x: mx.array, parts: Sequence[nn.Linear | nn.QuantizedLinear]) -> mx.array:
+class _Segmented(nn.Module):
     """Projections sharing the input, concatenated on the output axis. Three of them on a
-    single-token step go through `qkv_step` in one dispatch; the concatenation stays as
-    fallback and parity reference."""
-    if len(parts) == 3 and x.shape[1] == 1:
-        fused = qkv_step(x, parts[0], parts[1], parts[2])
-        if fused is not None:
-            return fused
-    return mx.concatenate([part(x) for part in parts], axis=-1)
+    single-token step go through the planned kernel in one dispatch; the plan resolves
+    once, on the first step — after load, when each leaf's format is final — and the
+    concatenation stays as fallback and parity reference."""
+
+    def __init__(self) -> None:
+        super().__init__()
+        self._step: QkvStep | None = None
+        self._planned = False
+
+    def _project(
+        self, x: mx.array, parts: Sequence[nn.Linear | nn.QuantizedLinear]
+    ) -> mx.array:
+        if len(parts) == 3 and x.shape[1] == 1:
+            if not self._planned:
+                self._step = qkv_plan(parts[0], parts[1], parts[2])
+                self._planned = True
+            if self._step is not None and (fused := self._step(x)) is not None:
+                return fused
+        return mx.concatenate([part(x) for part in parts], axis=-1)
 
 
-class SegmentedQKV(nn.Module):
+class SegmentedQKV(_Segmented):
     """q/k/v sharing the input and concatenated on the output axis, kept as three
     physical leaves instead of one matrix.
 
@@ -78,10 +90,10 @@ class SegmentedQKV(nn.Module):
         self.v_proj: nn.Linear | nn.QuantizedLinear = nn.Linear(input_dims, values, bias=bias)
 
     def __call__(self, x: mx.array) -> mx.array:
-        return segmented(x, (self.q_proj, self.k_proj, self.v_proj))
+        return self._project(x, (self.q_proj, self.k_proj, self.v_proj))
 
 
-class SegmentedLinear(nn.Module):
+class SegmentedLinear(_Segmented):
     """The same split for a projection whose parts the checkpoint does not name q/k/v —
     a mixer that fuses four (qkv‖z‖b‖a), a gate‖up pair — kept as separate leaves when a
     mixed plan gives them no common matrix.
@@ -97,7 +109,7 @@ class SegmentedLinear(nn.Module):
         ]
 
     def __call__(self, x: mx.array) -> mx.array:
-        return segmented(x, self.parts)
+        return self._project(x, self.parts)
 
 
 def sorted_gather(

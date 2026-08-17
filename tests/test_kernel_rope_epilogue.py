@@ -13,7 +13,13 @@ from typing import TYPE_CHECKING
 import mlx.core as mx
 import numpy as np
 
-from mlx_omnia.engine.core.kernels.qkv_rope.epilogue import _KERNEL, _SOURCE, rope_epilogue
+from mlx_omnia.engine.core.kernels.qkv_rope.epilogue import (
+    _KERNEL,
+    _SOURCE,
+    RopeEpilogue,
+    rope_epilogue,
+)
+from mlx_omnia.engine.core.kernels.qkv_rope.kernel import Angles
 from mlx_omnia.engine.core.mxcompat import metal_kernel
 from mlx_omnia.engine.models.qwen3.config import Qwen3MoEConfig
 from mlx_omnia.engine.models.qwen3.layers.attention import Qwen3Attention
@@ -148,6 +154,42 @@ def test_bit_exact_bf16() -> None:
         ref_q, ref_k = _ops_path(attention, fused, offset)
         assert bool(mx.array_equal(q, ref_q))
         assert bool(mx.array_equal(k, ref_k))
+
+
+def test_build_refuses_rotations_the_kernel_does_not_derive() -> None:
+    # O kernel deriva rotação cheia e sem escala a partir de `base`; uma declaração com
+    # tabela de ângulos, rotary parcial ou mscale resolveria aqui e rodaria outra
+    # rotação em silêncio. mutação: remover qualquer um dos gates de `build` deixa o
+    # caso correspondente construir e este teste fica vermelho.
+    weight = mx.ones(CONFIG.head_dim)
+
+    def build(
+        *,
+        angles: Angles | None = None,
+        rotary_pairs: int | None = None,
+        mscale: float = 1.0,
+    ) -> RopeEpilogue | None:
+        return RopeEpilogue.build(
+            lambda x: x,
+            heads=CONFIG.num_attention_heads,
+            kv_heads=CONFIG.num_key_value_heads,
+            head_dim=CONFIG.head_dim,
+            rope=lambda x, offset: x,
+            eps=CONFIG.rms_norm_eps,
+            q_norm=weight,
+            k_norm=weight,
+            base=CONFIG.rope_theta,
+            angles=angles,
+            rotary_pairs=rotary_pairs,
+            mscale=mscale,
+            segments=None,
+        )
+
+    assert build() is not None
+    assert build(rotary_pairs=CONFIG.head_dim // 2) is not None
+    assert build(angles=lambda offset, length: mx.zeros((1, 1))) is None
+    assert build(rotary_pairs=CONFIG.head_dim // 4) is None
+    assert build(mscale=1.06) is None
 
 
 MUTATIONS = {

@@ -317,14 +317,6 @@ class FixedMLACache(FixedKVCache):
         self.offset = offset
 
 
-def _grown(buffer: mx.array, rows: int, capacity: int) -> mx.array:
-    shape = list(buffer.shape)
-    shape[2] = capacity
-    grown = mx.zeros(shape, dtype=buffer.dtype)
-    grown[..., :rows, :] = buffer[..., :rows, :]
-    return grown
-
-
 type LatentRow = MLACache | FixedMLACache
 """One sublayer's latent history, growing or promoted. A batch may hold either."""
 

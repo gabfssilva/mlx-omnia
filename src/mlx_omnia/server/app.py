@@ -30,7 +30,6 @@ from mlx_omnia.engine.schema import MalformedJSON, SchemaViolation
 from mlx_omnia.server import (
     anthropic,
     auth,
-    bench,
     benchmarks,
     catalog,
     config,
@@ -1110,7 +1109,6 @@ def create_app(engine: Engine, store: Store, *, host: str = "127.0.0.1") -> Fast
     app.include_router(metrics.router)
     app.include_router(download.router)
     app.include_router(quantize.router)
-    app.include_router(bench.router)
     app.include_router(benchmarks.router)
     app.include_router(datasets.router)
     app.include_router(fidelity.router)

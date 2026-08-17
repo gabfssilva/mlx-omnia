@@ -1,7 +1,4 @@
 import mlx.core as mx
-import mlx.nn as nn
-
-from mlx_omnia.engine.core.cache import LayerCache
 
 
 def test_dense_model_runs_rotary_and_nope_layers() -> None:
@@ -28,50 +25,3 @@ def test_dense_model_runs_rotary_and_nope_layers() -> None:
 
     assert logits.shape == (1, 3, config.vocab_size)
     assert [layer.offset for layer in cache] == [3, 3]
-
-
-def test_dense_attention_composes_its_collaborators() -> None:
-    from mlx_omnia.engine.core.attention import DenseAttention, Projected
-
-    class Projection(nn.Module):
-        def __call__(self, x: mx.array) -> Projected[mx.array]:
-            return Projected(x, 2 * x, 3 * x, 4 * x)
-
-    class Transform(nn.Module):
-        def __call__(
-            self, queries: mx.array, keys: mx.array, position: int | mx.array
-        ) -> tuple[mx.array, mx.array]:
-            return queries + position, keys + position
-
-    class Context(nn.Module):
-        def position(self, cache: LayerCache) -> int | mx.array:
-            return cache.offset
-
-        def attend(
-            self,
-            queries: mx.array,
-            keys: mx.array,
-            values: mx.array,
-            cache: LayerCache,
-            mask: mx.array | str | None,
-            scale: float,
-        ) -> mx.array:
-            return (queries + keys + values) * scale
-
-    class Output(nn.Module):
-        def __call__(self, attended: mx.array, residual: mx.array, auxiliary: mx.array) -> mx.array:
-            return attended + residual + auxiliary
-
-    cache = LayerCache()
-    cache.offset = 2
-    attention = DenseAttention(
-        projection=Projection(),
-        transform=Transform(),
-        context=Context(),
-        output=Output(),
-        scale=0.5,
-    )
-
-    result = attention(mx.array([[[1.0]]]), "causal", cache)
-
-    assert result.item() == 10.0

@@ -60,3 +60,7 @@ class HyperConnection(HyperConnectionStrategy):
         fn: mx.array | None = None,
     ) -> tuple[mx.array, mx.array | None]:
         return self.strategy.expand(x, residual, post, comb, fn)
+
+    @property
+    def wants_partials(self) -> bool:
+        return self.strategy.wants_partials

@@ -3,7 +3,7 @@ from typing import Protocol, runtime_checkable
 import mlx.core as mx
 import mlx.nn as nn
 
-from mlx_omnia.engine.core.kernels.ssm import DefaultSsm, Ssm
+from mlx_omnia.engine.core.kernels.ssm import Ssm
 from mlx_omnia.engine.core.kernels.ssm.step import ssm_step
 from mlx_omnia.engine.models.mamba2.config import Mamba2Config
 from mlx_omnia.engine.models.mamba2.layers import flags
@@ -56,12 +56,12 @@ class Mamba2Mixer(nn.Module):
             config.intermediate_size, config.hidden_size, bias=config.use_bias
         )
         self._scan: Ssm | None = None
-        self._reference: DefaultSsm | None = None
+        self._reference: Ssm | None = None
 
-    def _kernels(self) -> tuple[Ssm, DefaultSsm]:
+    def _kernels(self) -> tuple[Ssm, Ssm]:
         """Resolved once, at the first step — after load, when the weights are
-        final. The ops scan is kept beside the delegator because `flags.SSM_KERNEL`
-        selects between them at run time."""
+        final. The reference resolution is kept beside the fused one because
+        `flags.SSM_KERNEL` selects between them at run time."""
         scan, reference = self._scan, self._reference
         if scan is None or reference is None:
             config = self.config
@@ -75,7 +75,7 @@ class Mamba2Mixer(nn.Module):
                 time_step_limit=config.time_step_limit,
                 step=config.chunk_size,
             )
-            reference = DefaultSsm.build(
+            reference = Ssm(
                 A_log=self.A_log,
                 D=self.D,
                 dt_bias=self.dt_bias,
@@ -84,6 +84,7 @@ class Mamba2Mixer(nn.Module):
                 groups=config.n_groups,
                 time_step_limit=config.time_step_limit,
                 step=config.chunk_size,
+                reference=True,
             )
             self._scan, self._reference = scan, reference
         return scan, reference

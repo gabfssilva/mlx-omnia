@@ -1,7 +1,6 @@
 import mlx.core as mx
 import mlx.nn as nn
 
-from mlx_omnia.engine.core.kernels.hyper_connection import FusedHyperConnection
 from mlx_omnia.engine.core.kernels.hyper_connection import HyperConnection as HyperJunction
 from mlx_omnia.engine.models.deepseek_v4.config import DeepseekV4Config
 
@@ -49,7 +48,7 @@ class HyperConnection(nn.Module):
         )
         _JUNCTIONS.setdefault((self.hc_mult, config.hidden_size), junction)
         self._junction = junction
-        self.fused = isinstance(junction.strategy, FusedHyperConnection)
+        self.wants_partials = junction.wants_partials
 
     def __call__(
         self, x: mx.array, norm: nn.RMSNorm, partials: mx.array | None = None

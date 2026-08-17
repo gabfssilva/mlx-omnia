@@ -24,3 +24,9 @@ class MoeStepStrategy(Protocol):
     fp32 and cast once, the shared add in the input dtype."""
 
     def __call__(self, x: mx.array, chosen: mx.array, weights: mx.array) -> mx.array: ...
+
+    def rows(self, x: mx.array, chosen: mx.array, weights: mx.array) -> mx.array | None:
+        """The routed stack over T token rows, combined per row *without* the shared
+        expert — the caller adds it, the way the T-row op chain does — or None when
+        this strategy has no batched form and the caller runs its own forward."""
+        return None

@@ -7,9 +7,11 @@ template constant — and writes the concatenated output directly. The code is l
 in the number of formats; a combination is template instantiation, JIT-compiled for
 the one the checkpoint actually uses.
 
-`qkv_step` gates applicability and returns None otherwise; the module's concat path
-stays as fallback and parity reference. Outside the gate today: linear bias,
-affine bits other than 4/8, mxfp8/nvfp4, and geometry that doesn't tile.
+`qkv_plan` gates applicability once, over everything static — the formats, the tiling,
+the compiled kernel — and returns None otherwise; the plan it returns checks only what
+varies per token. The module's concat path stays as fallback and parity reference.
+Outside the gate today: linear bias, affine bits other than 4/8, mxfp8/nvfp4, and
+geometry that doesn't tile.
 """
 
 from dataclasses import dataclass
@@ -36,29 +38,6 @@ _ROWS_PER_TILE = 4
 # simdgroups per threadgroup (each with its own tile, no cross-simd reduction) reaches
 # 49.8% — parity with the fallback per byte, minus three dispatches per step.
 _SIMDS_PER_GROUP = 8
-
-
-def qkv_step(
-    x: mx.array,
-    queries: nn.Linear | nn.QuantizedLinear,
-    keys: nn.Linear | nn.QuantizedLinear,
-    values: nn.Linear | nn.QuantizedLinear,
-) -> mx.array | None:
-    """The concatenated projection of a single token, or None off the gate."""
-    if x.ndim != 3 or x.shape[0] != 1 or x.shape[1] != 1:
-        return None
-    kdim = x.shape[-1]
-    if kdim % _BLOCK:
-        return None
-    q, k, v = (_segment(module) for module in (queries, keys, values))
-    if q is None or k is None or v is None:
-        return None
-    if not all(_applies(segment, x.dtype) for segment in (q, k, v)):
-        return None
-    out = _kernel(q, k, v, kdim)(
-        _Inputs(x.reshape(-1), *_tensors(q), *_tensors(k), *_tensors(v))
-    )
-    return out.reshape(1, 1, -1)
 
 
 @dataclass(frozen=True)
@@ -120,23 +99,43 @@ def _segment(module: nn.Linear | nn.QuantizedLinear) -> _Segment | None:
             assert_never(module)
 
 
-def _applies(segment: _Segment, dtype: mx.Dtype) -> bool:
+def _applies(segment: _Segment) -> bool:
     if segment.weight.shape[0] % _ROWS_PER_TILE:
         return False
     match segment:
-        case _Dense(weight=weight):
-            return weight.dtype == dtype
-        case _AffinePacked(bits=bits, group=group, scales=scales):
+        case _Dense():
+            return True
+        case _AffinePacked(bits=bits, group=group):
             # 2/3/5/6-bit affine would take the generic unpack path unexercised by the
             # parity grid; they stay on the fallback until the grid covers them.
-            return (
-                bits in (4, 8)
-                and not group % _VALUES_PER_LANE
-                and not _BLOCK % group
-                and scales.dtype == dtype
-            )
+            return bits in (4, 8) and not group % _VALUES_PER_LANE and not _BLOCK % group
         case _Mxfp4():
             return True
+        case _:
+            assert_never(segment)
+
+
+def _pinned(segment: _Segment) -> mx.Dtype | None:
+    """The activation dtype a segment's decoder reads its tensors as, when it has one."""
+    match segment:
+        case _Dense(weight=weight):
+            return weight.dtype
+        case _AffinePacked(scales=scales):
+            return scales.dtype
+        case _Mxfp4():
+            return None
+        case _:
+            assert_never(segment)
+
+
+def _kdim(segment: _Segment) -> int:
+    match segment:
+        case _Dense(weight=weight):
+            return weight.shape[1]
+        case _AffinePacked(group=group, scales=scales):
+            return scales.shape[1] * group
+        case _Mxfp4(scales=scales):
+            return scales.shape[1] * 32
         case _:
             assert_never(segment)
 
@@ -166,6 +165,51 @@ def _tensors(segment: _Segment) -> tuple[mx.array, mx.array, mx.array]:
             return weight, scales, weight
         case _:
             assert_never(segment)
+
+
+@dataclass(frozen=True)
+class QkvStep:
+    """The single-token dispatch of a planned segment trio.
+
+    Everything static is settled by `qkv_plan`; a call checks only what varies per
+    token — the batch geometry, and the activation dtype when a dense or affine
+    segment pins one — and returns None off that gate.
+    """
+
+    kernel: MetalKernel[_Inputs, mx.array]
+    tensors: tuple[mx.array, ...]
+    dtype: mx.Dtype | None
+
+    def __call__(self, x: mx.array) -> mx.array | None:
+        if x.ndim != 3 or x.shape[0] != 1 or x.shape[1] != 1:
+            return None
+        if self.dtype is not None and x.dtype != self.dtype:
+            return None
+        return self.kernel(_Inputs(x.reshape(-1), *self.tensors)).reshape(1, 1, -1)
+
+
+def qkv_plan(
+    queries: nn.Linear | nn.QuantizedLinear,
+    keys: nn.Linear | nn.QuantizedLinear,
+    values: nn.Linear | nn.QuantizedLinear,
+) -> QkvStep | None:
+    """The resolved step of three leaves, or None off the static gate."""
+    q, k, v = (_segment(module) for module in (queries, keys, values))
+    if q is None or k is None or v is None:
+        return None
+    if not all(_applies(segment) for segment in (q, k, v)):
+        return None
+    pinned = {dtype for s in (q, k, v) if (dtype := _pinned(s)) is not None}
+    if len(pinned) > 1:
+        return None
+    kdim = _kdim(q)
+    if kdim % _BLOCK:
+        return None
+    return QkvStep(
+        _kernel(q, k, v, kdim),
+        (*_tensors(q), *_tensors(k), *_tensors(v)),
+        next(iter(pinned), None),
+    )
 
 
 _HEADER = """
@@ -360,15 +404,16 @@ def _kernel(
 class SegmentedQkv(QkvRopeStrategy):
     """The prologue of a projection kept as three physical leaves.
 
-    Only the projection fuses here — `qkv_step` reads the three leaves in whatever
+    Only the projection fuses here — the planned step reads the three leaves in whatever
     formats the checkpoint mixed and writes the concatenated output in one dispatch —
-    and the norm and the rotation run in ops, exactly as the fallback runs them. Off the
-    gate (a segment, a format the kernel does not decode) the projection itself falls
-    back to the declared one, which is the concatenation of the three leaf calls.
+    and the norm and the rotation run in ops, exactly as the fallback runs them. A
+    format the kernel does not decode refuses at `build`, so resolution lands on the
+    default; a shape the plan does not serve (a batch, a prefill) falls back to the
+    declared projection, which is the concatenation of the three leaf calls.
     """
 
     projection: Projection
-    segments: tuple[Leaf, Leaf, Leaf]
+    step: QkvStep
     fallback: DefaultQkvRope
 
     @classmethod
@@ -391,9 +436,12 @@ class SegmentedQkv(QkvRopeStrategy):
     ) -> Self | None:
         if segments is None:
             return None
+        step = qkv_plan(*segments)
+        if step is None:
+            return None
         return cls(
             projection,
-            segments,
+            step,
             DefaultQkvRope.build(
                 projection,
                 heads=heads,
@@ -414,7 +462,7 @@ class SegmentedQkv(QkvRopeStrategy):
     def __call__(
         self, x: mx.array, offset: int | mx.array
     ) -> tuple[mx.array, mx.array, mx.array]:
-        fused = qkv_step(x, *self.segments) if x.shape[1] == 1 else None
+        fused = self.step(x)
         if fused is None:
             fused = self.projection(x)
         return self.fallback.epilogue(fused, offset)

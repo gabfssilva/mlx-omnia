@@ -1,4 +1,4 @@
-from collections.abc import Iterable, Sequence
+from collections.abc import Sequence
 from typing import NamedTuple
 
 import mlx.core as mx
@@ -13,12 +13,7 @@ from mlx_omnia.engine.core.cache import (
     RingKVCache,
 )
 from mlx_omnia.engine.core.kernels.attention.sdpa import SCALED_DOT_PRODUCT_ATTENTION
-from mlx_omnia.engine.core.kernels.lm_head.argmax import (
-    Int5Planes,
-    int5_planes,
-    lm_head_argmax_applies,
-    lm_head_argmax_row,
-)
+from mlx_omnia.engine.core.kernels.lm_head import ScreenedHead
 from mlx_omnia.engine.core.patch import uses
 from mlx_omnia.engine.models.laguna.config import FULL, SLIDING, LagunaConfig
 from mlx_omnia.engine.models.laguna.layers.attention import ATLASES
@@ -33,23 +28,13 @@ class LagunaActivations(NamedTuple):
 
 type LagunaCache = KVCache | FixedKVCache | RingKVCache
 
-def _stores(slots: Iterable[LayerCache]) -> list[FixedKVCache | RingKVCache]:
-    """The promoted slots, narrowed back to the two shapes a Laguna decode graph reads."""
-    narrowed: list[FixedKVCache | RingKVCache] = []
-    for layer in slots:
-        assert isinstance(layer, FixedKVCache | RingKVCache)
-        narrowed.append(layer)
-    return narrowed
-
 
 @uses(SCALED_DOT_PRODUCT_ATTENTION)
 class Laguna(nn.Module, Tracing[LayerCache], Screened[LayerCache]):
 
-    _head_planes_cache: Int5Planes | None
-
     def __init__(self, config: LagunaConfig) -> None:
         super().__init__()
-        object.__setattr__(self, "_head_planes_cache", None)
+        self._screen_head: ScreenedHead | None = None
         self.config = config
         self.model = LagunaTrunk(config)
         if not config.tie_word_embeddings:
@@ -109,23 +94,14 @@ class Laguna(nn.Module, Tracing[LayerCache], Screened[LayerCache]):
         """`core.api.Screened`. The greedy id off a screened head instead of a projection.
 
         `lm_head` is bf16 `[vocab, hidden]` — 411 MB on Laguna-XS, against blocks that are
-        4-bit — and a greedy step reads one number out of it. The chain in
-        `core.kernels.lm_head` reads the coarse int5 planes for the whole vocabulary and the
-        full bf16 rows only for the candidates a certificate cannot rule out.
-
-        Row by row, because the chain is a single-token head: `lm_head_argmax_applies`
-        answers for `rows=1` and nothing else. Worth 1.108x on one row and 1.066x on two;
-        by four it is a wash, and the loop is what stops paying.
+        4-bit — and a greedy step reads one number out of it. `core.kernels.lm_head`
+        screens instead: the coarse int5 planes for the whole vocabulary and the full
+        bf16 rows only for the candidates a certificate cannot rule out. Worth 1.108x on
+        one row and 1.066x on two; by four it is a wash, and the loop is what stops
+        paying.
         """
-        planes = self._head_planes()
-        if planes is None:
-            return self(ids, cache)
         hidden = self._activations(ids, cache, project_head=False).logits[:, -1, :]
-        rows = [
-            lm_head_argmax_row(hidden[index], self.lm_head.weight, planes)
-            for index in range(hidden.shape[0])
-        ]
-        return mx.stack(rows)[:, None, :]
+        return self._screen()(hidden)[:, None, :]
 
     def activations(
         self,
@@ -173,31 +149,21 @@ class Laguna(nn.Module, Tracing[LayerCache], Screened[LayerCache]):
             logits = self.lm_head(normed)
         return LagunaActivations(blocks, logits)
 
-    def _head_planes(self) -> Int5Planes | None:
-        if self.config.tie_word_embeddings:
-            return None
-        cached = self._head_planes_cache
-        if cached is not None:
-            return cached
-        weight = self.lm_head.weight
-        vocab, hidden = weight.shape
-        if not lm_head_argmax_applies(vocab, hidden, rows=1, dtype=weight.dtype):
-            return None
-        planes = int5_planes(weight)
-        if planes is not None:
-            mx.eval(*planes)
-            object.__setattr__(self, "_head_planes_cache", planes)
-        return planes
+    def _screen(self) -> ScreenedHead:
+        """Resolved once, at the first greedy step — after load, when the head weight's
+        format is final."""
+        head = self._screen_head
+        if head is None:
+            head = (
+                ScreenedHead(self.model.embed_tokens.as_linear)
+                if self.config.tie_word_embeddings
+                else ScreenedHead(self.lm_head, weight=self.lm_head.weight)
+            )
+            self._screen_head = head
+        return head
 
-    def _greedy_logits(self, x: mx.array, planes: Int5Planes | None = None) -> mx.array:
-        if self.config.tie_word_embeddings:
-            return self.model.embed_tokens.as_linear(x)
-        planes = planes if planes is not None else self._head_planes()
-        if planes is None:
-            return self.lm_head(x)
-        return lm_head_argmax_row(x, self.lm_head.weight, planes).reshape(
-            *x.shape[:-1], self.config.vocab_size
-        )
+    def _greedy_logits(self, x: mx.array) -> mx.array:
+        return self._screen()(x)
 
     def __call__(
         self, ids: mx.array, cache: Sequence[LayerCache] | None = None

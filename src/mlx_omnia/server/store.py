@@ -67,17 +67,6 @@ class ModelSettings:
     sampling: str = "{}"
 
 
-@dataclass(frozen=True)
-class Bench:
-    """`ceiling_fraction` is absent when the checkpoint's bytes per token — and so the
-    bandwidth ceiling the number is a percentage of — is not known."""
-
-    model: str
-    tokens_per_second: float
-    ttft_ms: float
-    engine_version: str
-    created_at: float
-    ceiling_fraction: float | None = None
 
 
 @dataclass(frozen=True)
@@ -357,10 +346,6 @@ ALTER TABLE jobs ADD COLUMN subject TEXT NOT NULL DEFAULT '{}';
 # `state = 'not_run'` writes the body too, with the REAL columns empty: "128k by 16 did not
 # fit" only means something next to the context, the generate and the concurrency it did not
 # fit at.
-#
-# The `benches` table of 34.4 stays as it is. It is a published route, and backfilling these
-# tables from it would mean inventing the context, generate and concurrency those
-# measurements never had.
 _SCHEMA_V4 = """
 CREATE TABLE benchmark_runs (
     id             TEXT PRIMARY KEY,
@@ -603,6 +588,13 @@ CREATE INDEX prefix_cache_lru ON prefix_cache(used_at);
 CREATE INDEX prefix_cache_model ON prefix_cache(model);
 """
 
+# The `benches` table of 34.4 and its `/admin/benches` route were superseded by the
+# benchmark tables above; no client ever read the route, and its rows carry no context,
+# generate or concurrency to migrate.
+_SCHEMA_V11 = """
+DROP TABLE benches;
+"""
+
 _MIGRATIONS: tuple[str, ...] = (
     _SCHEMA_V1,
     _SCHEMA_V2,
@@ -614,6 +606,7 @@ _MIGRATIONS: tuple[str, ...] = (
     _SCHEMA_V8,
     _SCHEMA_V9,
     _SCHEMA_V10,
+    _SCHEMA_V11,
 )
 
 SCHEMA_VERSION = len(_MIGRATIONS)
@@ -684,16 +677,6 @@ def _profile(row: tuple[object, ...]) -> Profile:
     )
 
 
-def _bench(row: tuple[object, ...]) -> Bench:
-    model, tokens_per_second, ttft_ms, engine_version, created_at, ceiling_fraction = row
-    return Bench(
-        model=_text(model),
-        tokens_per_second=_real(tokens_per_second),
-        ttft_ms=_real(ttft_ms),
-        engine_version=_text(engine_version),
-        created_at=_real(created_at),
-        ceiling_fraction=_optional_real(ceiling_fraction),
-    )
 
 
 def _job(row: tuple[object, ...]) -> JobRecord:
@@ -896,7 +879,6 @@ def _reference(row: tuple[object, ...]) -> ReferenceCache:
 
 
 _PROFILE_COLUMNS = "model, name, sampling, system_prompt, template, features"
-_BENCH_COLUMNS = "model, tokens_per_second, ttft_ms, engine_version, created_at, ceiling_fraction"
 _JOB_COLUMNS = "id, kind, subject, state, progress, created_at, updated_at, error"
 _SESSION_COLUMNS = "id, title, model, created_at, updated_at, messages"
 _RUN_COLUMNS = (
@@ -1077,31 +1059,6 @@ class Store:
                 "DELETE FROM profiles WHERE model = ? AND name = ?", (model, name)
             )
             return cursor.rowcount == 1
-
-    def add_bench(self, bench: Bench) -> None:
-        with self._connect() as connection:
-            connection.execute(
-                f"INSERT INTO benches ({_BENCH_COLUMNS}) VALUES (?, ?, ?, ?, ?, ?)",
-                (
-                    bench.model,
-                    bench.tokens_per_second,
-                    bench.ttft_ms,
-                    bench.engine_version,
-                    bench.created_at,
-                    bench.ceiling_fraction,
-                ),
-            )
-
-    def benches(self, model: str | None = None) -> list[Bench]:
-        """Newest first: the model card shows the last measurement, the history under it."""
-        where = "" if model is None else " WHERE model = ?"
-        parameters: tuple[str, ...] = () if model is None else (model,)
-        with self._connect() as connection:
-            rows: list[tuple[object, ...]] = connection.execute(
-                f"SELECT {_BENCH_COLUMNS} FROM benches{where} ORDER BY created_at DESC, id DESC",
-                parameters,
-            ).fetchall()
-        return [_bench(row) for row in rows]
 
     def save_job(self, job: JobRecord) -> None:
         """The record is the row: a state transition is the same call as the first write."""

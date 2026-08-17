@@ -54,9 +54,12 @@ class Ssm(SsmStrategy):
         groups: int,
         time_step_limit: tuple[float, float] = (0.0, float("inf")),
         step: int = 256,
+        reference: bool = False,
     ) -> None:
+        # `reference` requests the ops scan of the same declaration — the parity
+        # reference a bench A/B swaps in — instead of the fused path.
         self.strategy: SsmStrategy = resolve(
-            _STRATEGIES,
+            (DefaultSsm,) if reference else _STRATEGIES,
             A_log=A_log,
             D=D,
             dt_bias=dt_bias,

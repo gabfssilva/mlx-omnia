@@ -40,3 +40,10 @@ class HyperConnectionStrategy(Protocol):
         comb: mx.array,
         fn: mx.array | None = None,
     ) -> tuple[mx.array, mx.array | None]: ...
+
+    @property
+    def wants_partials(self) -> bool:
+        """True when this junction's mixes gemv should ride the preceding expansion —
+        the fused path's serial-dispatch saving. False when the plain gemv in the
+        caller serves it just as well, so the expansion skips the extra output."""
+        return False

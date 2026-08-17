@@ -1,4 +1,4 @@
-"""The pruned greedy-head strategy: a screened int5 chain that picks the stock token.
+"""The pruned screened-head strategy: an int5 chain whose row keeps the stock argmax.
 
 The chain guarantees exactly one thing about the `[vocab]` bf16 row it assembles:
 
@@ -6,12 +6,11 @@ The chain guarantees exactly one thing about the `[vocab]` bf16 row it assembles
 
 Only the slots that survived the screen hold the value a stock head projection would
 produce; every other slot holds an int5 *approximation* of its logit, certified only to
-sit strictly below the winner. That is why the row never leaves this module:
-`ArgmaxGreedyHead` implements the greedy-step contract of `kernel.py` and returns the
-token id, so the second-best token, a top-k set, a softmax, a logprob, a temperature
-sample, a speculative acceptance ratio and a penalty applied to the row are all outside
-what a caller can reach. `lm_head_argmax_row` is the internal composition, exposed for the
-tests that assert the argmax equality directly.
+sit strictly below the winner. That is the screened-row contract of `kernel.py`:
+`ArgmaxScreenedHead` hands the row over, and a caller may read its argmax and nothing
+else — the second-best token, a top-k set, a softmax, a logprob, a temperature sample,
+a speculative acceptance ratio and a penalty over the row all read numbers that were
+never computed. `lm_head_argmax_row` is the single-row composition underneath it.
 
 Transcribed from the mlxfast-challenge record tree (Layr Labs, MIT), where the ablation
 measured the family at 12.9% of decode. Six kernels, four dispatches, two arms:
@@ -60,7 +59,7 @@ from typing import NamedTuple, Self
 
 import mlx.core as mx
 
-from mlx_omnia.engine.core.kernels.lm_head.kernel import GreedyHeadStrategy, HeadProjection
+from mlx_omnia.engine.core.kernels.lm_head.kernel import HeadProjection, ScreenedHeadStrategy
 from mlx_omnia.engine.core.mxcompat import metal_kernel
 
 _HEADER = """
@@ -931,10 +930,9 @@ def lm_head_argmax_row(
     """The four dispatches, composed: a `[vocab]` bf16 row whose ARGMAX is the stock head's
     and whose non-winning slots are an int5 approximation, NOT logits.
 
-    Internal to the strategy: `ArgmaxGreedyHead` reduces the row to a token id and is the
-    only thing the delegator exposes. A caller holding the row itself must read nothing but
-    its argmax -- a softmax, a temperature sample, a top-k or a logprob over it returns
-    numbers that were never computed.
+    One hidden row; `ArgmaxScreenedHead` is the strategy that loops it over a batch. A
+    caller holding the row must read nothing but its argmax -- a softmax, a temperature
+    sample, a top-k or a logprob over it returns numbers that were never computed.
 
     `refine` selects the three-level decode arm (base plane for every row, residual plane
     for surviving blocks only); False runs the one-pass int5 arm, which is what prefill's
@@ -954,7 +952,7 @@ def lm_head_argmax_row(
 
 
 @dataclass(frozen=True)
-class ArgmaxGreedyHead(GreedyHeadStrategy):
+class ArgmaxScreenedHead(ScreenedHeadStrategy):
     weight: mx.array
     planes: Int5Planes
     refine: bool
@@ -980,5 +978,11 @@ class ArgmaxGreedyHead(GreedyHeadStrategy):
         return cls(weight, planes, refine)
 
     def __call__(self, x: mx.array) -> mx.array:
-        row = lm_head_argmax_row(x, self.weight, self.planes, refine=self.refine)
-        return mx.argmax(row).reshape(x.shape[:-1])
+        # Row by row: the chain is a single-token head (`lm_head_argmax_applies`
+        # answers for rows=1), and a decode batch hands over a handful of rows.
+        flat = x.reshape(-1, x.shape[-1])
+        rows = [
+            lm_head_argmax_row(flat[index], self.weight, self.planes, refine=self.refine)
+            for index in range(flat.shape[0])
+        ]
+        return mx.stack(rows).reshape(*x.shape[:-1], self.weight.shape[0])

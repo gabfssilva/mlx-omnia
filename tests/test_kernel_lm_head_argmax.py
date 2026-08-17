@@ -23,7 +23,11 @@ from collections.abc import Callable
 import mlx.core as mx
 import pytest
 
-from mlx_omnia.engine.core.kernels.lm_head import ArgmaxGreedyHead, DefaultGreedyHead, GreedyHead
+from mlx_omnia.engine.core.kernels.lm_head import (
+    ArgmaxScreenedHead,
+    DefaultScreenedHead,
+    ScreenedHead,
+)
 from mlx_omnia.engine.core.kernels.lm_head.argmax import (
     Int5Planes,
     int5_planes,
@@ -206,36 +210,38 @@ def projection_of(weight: mx.array) -> Callable[[mx.array], mx.array]:
 
 def test_delegator_picks_the_pruned_chain_and_falls_back_on_geometry() -> None:
     weight = head_weight()
-    assert isinstance(GreedyHead(projection_of(weight), weight=weight).strategy, ArgmaxGreedyHead)
-    assert isinstance(GreedyHead(projection_of(weight)).strategy, DefaultGreedyHead)
+    assert isinstance(
+        ScreenedHead(projection_of(weight), weight=weight).strategy, ArgmaxScreenedHead
+    )
+    assert isinstance(ScreenedHead(projection_of(weight)).strategy, DefaultScreenedHead)
     fp32 = weight.astype(mx.float32)
     assert isinstance(
-        GreedyHead(projection_of(fp32), weight=fp32).strategy, DefaultGreedyHead
+        ScreenedHead(projection_of(fp32), weight=fp32).strategy, DefaultScreenedHead
     )
 
 
 @pytest.mark.parametrize("refine", [False, True])
-def test_both_strategies_return_the_same_token_id(refine: bool) -> None:
-    """The greedy-step contract: the pruned head and the full projection are the same
-    function of `x`, so the delegator's choice is invisible to a model."""
+def test_both_strategies_agree_on_the_argmax(refine: bool) -> None:
+    """The screened-row contract: the pruned row and the full projection share the one
+    thing a caller may read, so the delegator's choice is invisible to a model."""
     weight = head_weight()
-    pruned = GreedyHead(projection_of(weight), weight=weight, refine=refine)
-    stock = GreedyHead(projection_of(weight))
-    assert isinstance(pruned.strategy, ArgmaxGreedyHead)
+    pruned = ScreenedHead(projection_of(weight), weight=weight, refine=refine)
+    stock = ScreenedHead(projection_of(weight))
+    assert isinstance(pruned.strategy, ArgmaxScreenedHead)
 
     judged = 0
     for x in hidden_states(SAMPLES, seed=11):
         if not decided(stock_logits(weight, x)):
             continue
         judged += 1
-        assert pruned(x).item() == stock(x).item()
+        assert mx.argmax(pruned(x)).item() == mx.argmax(stock(x)).item()
     assert judged >= SAMPLES // 2, f"only {judged}/{SAMPLES} samples were decidable"
 
 
-def test_the_token_id_keeps_the_row_shape() -> None:
+def test_the_screened_row_keeps_the_leading_shape() -> None:
     weight = head_weight()
-    head = GreedyHead(projection_of(weight), weight=weight)
+    head = ScreenedHead(projection_of(weight), weight=weight)
     (x,) = hidden_states(1, seed=13)
 
-    assert head(x).shape == ()
-    assert head(x.reshape(1, 1, HIDDEN)).shape == (1, 1)
+    assert head(x).shape == (VOCAB,)
+    assert head(x.reshape(1, 1, HIDDEN)).shape == (1, 1, VOCAB)

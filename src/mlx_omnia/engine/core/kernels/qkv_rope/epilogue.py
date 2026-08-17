@@ -157,6 +157,13 @@ class RopeEpilogue(QkvRopeStrategy):
     ) -> Self | None:
         if base is None or q_norm is None or k_norm is None:
             return None
+        # The kernel derives a full, unscaled rotation from `base` alone; a declaration
+        # whose rotation is table-driven, partial, or pre-scaled would silently get a
+        # different one.
+        if angles is not None or mscale != 1.0:
+            return None
+        if rotary_pairs is not None and 2 * rotary_pairs != head_dim:
+            return None
         if not rope_epilogue_applies(head_dim):
             return None
         return cls(

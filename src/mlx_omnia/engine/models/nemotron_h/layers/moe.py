@@ -44,18 +44,17 @@ class NemotronHGate(nn.Module):
             # row-for-row identical to the gemv (bf16 reduction order), and a verify
             # that rounds differently from the decode it stands in for flips
             # near-ties — and the pick itself rides one dispatch for all rows.
-            from mlx_omnia.engine.core.kernels.route import SigmoidWideRoute
-
             route = self._decode_route()
-            strategy = route.strategy
             # Measured dead end: fusing the gemv into the pick dispatch (a bit-exact
             # `gemv_al_bfloat16` replica into threadgroup memory) was timing-neutral in
             # both compiled decode and compiled verify — these dispatches already
             # overlap; the launches are not on the critical path.
-            if length > 1 and isinstance(strategy, SigmoidWideRoute):
+            if length > 1:
                 logits = mx.stack([row @ self.weight.T for row in x[0]])
-                chosen, weights = strategy.rows(logits)
-                return chosen[None], weights[None]
+                picked = route.rows(logits)
+                if picked is not None:
+                    chosen, weights = picked
+                    return chosen[None], weights[None]
             picks = [route(row, logits=(row @ self.weight.T)) for row in x[0]]
             chosen = mx.stack([pick[0] for pick in picks])[None]
             weights = mx.stack([pick[1] for pick in picks])[None]
@@ -127,11 +126,9 @@ class NemotronHMoE(nn.Module):
                 routed_row = routed_row + self.shared_experts(x)[0, 0]
             return routed_row[None, None]
         if 1 < length <= 4 and projected.shape[0] == 1 and "fc2_latent_proj" not in self:
-            from mlx_omnia.engine.core.kernels.moe_step import Nvfp4MoeStep
-
-            strategy = self._decode_step().strategy
-            if isinstance(strategy, Nvfp4MoeStep):
-                mixed = strategy.rows(projected[0], chosen[0], weights[0])[None]
+            routed_rows = self._decode_step().rows(projected[0], chosen[0], weights[0])
+            if routed_rows is not None:
+                mixed = routed_rows[None]
                 if "shared_experts" in self:
                     return mixed + self.shared_experts(x)
                 return mixed

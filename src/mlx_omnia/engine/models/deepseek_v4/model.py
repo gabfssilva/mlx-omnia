@@ -125,7 +125,9 @@ class DeepseekV4(nn.Module, Tracing[LayerCache]):
         for index, (block, layer_cache) in enumerate(zip(layers, cache, strict=True)):
             following = layers[index + 1] if index + 1 < len(layers) else None
             next_fn = (
-                following.attn_hc.fn if following is not None and following.attn_hc.fused else None
+                following.attn_hc.fn
+                if following is not None and following.attn_hc.wants_partials
+                else None
             )
             h, partials = block(h, mask, layer_cache, ids, partials, next_fn)
             blocks.append(h)

@@ -344,3 +344,7 @@ class FusedHyperConnection(HyperConnectionStrategy):
             output_dtypes=[x.dtype, mx.float32],
         )
         return out[0], out[1]
+
+    @property
+    def wants_partials(self) -> bool:
+        return True

@@ -1,10 +1,10 @@
-"""The greedy head primitive's contract: what a strategy is and what a model declares.
+"""The screened head primitive's contract: what a strategy is and what a model declares.
 
-The primitive is the GREEDY STEP, not a projection: (x [..., hidden]) -> token id
-[...]. The output is the id the stock head projection's argmax would select; no logit
-row leaves a strategy. That is what makes the delegator total — the pruned
-argmax-exact chain and a full matmul followed by `argmax` compute the same function,
-and a caller cannot accidentally read a slot the pruned chain never computed.
+The primitive is the SCREENED ROW: (x [..., hidden]) -> [..., vocab], a row whose
+argmax along the last axis is the stock head projection's argmax — and, outside that
+argmax, not the same numbers. That is the altitude `core.api.Screened` consumes, and
+it is what makes the delegator total: the pruned argmax-exact chain and the stock
+projection agree on the one thing a caller may read.
 
 Anything that is not a pure greedy pick — logprobs, softmax, temperature or top-p
 sampling, a top-k set, a speculative acceptance ratio, a penalty over the row — is
@@ -24,7 +24,8 @@ class HeadProjection(Protocol):
 
 
 @runtime_checkable
-class GreedyHeadStrategy(Protocol):
-    """The greedy step: (x [..., hidden]) -> token id [...]."""
+class ScreenedHeadStrategy(Protocol):
+    """(x [..., hidden]) -> [..., vocab]: the stock projection's argmax, and outside
+    it a row a caller must read nothing else from."""
 
     def __call__(self, x: mx.array) -> mx.array: ...

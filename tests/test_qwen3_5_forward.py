@@ -17,7 +17,11 @@ from huggingface_hub import snapshot_download
 
 from mlx_omnia import stream_ids
 from mlx_omnia.engine.core.cache import DeltaCache, KVCache
-from mlx_omnia.engine.core.kernels.add_norm import AddRmsNorm, FusedAddRmsNorm
+from mlx_omnia.engine.core.kernels.add_norm import (
+    AddRmsNorm,
+    DefaultAddRmsNorm,
+    FusedAddRmsNorm,
+)
 from mlx_omnia.engine.core.kernels.gated_delta import (
     DefaultGatedDelta,
     FusedGatedDelta,
@@ -338,17 +342,11 @@ def test_add_rms_norm_kernel_matches_ops(
     stepwise path is the compiled one, so the flag has to reach inside the trace."""
     ids = golden["greedy_ids"]
     with_kernel = stepwise(model, ids)
-    calls = {"join": 0}
-
-    class Counted(AddRmsNorm):
-        def __call__(self, x: mx.array, projected: mx.array) -> tuple[mx.array, mx.array]:
-            calls["join"] += 1
-            return super().__call__(x, projected)
-
     monkeypatch.setattr(flags, "ADD_RMS_NORM_KERNEL", False)
-    monkeypatch.setattr(block, "AddRmsNorm", Counted)
     without_kernel = stepwise(model, ids)
-    assert calls["join"] == 0
+    assert all(
+        isinstance(layer._join().strategy, DefaultAddRmsNorm) for layer in blocks(model)
+    )
     assert relative_diff(with_kernel, without_kernel) < 1e-5
 
 

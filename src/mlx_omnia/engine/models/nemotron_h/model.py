@@ -126,9 +126,10 @@ class NemotronH(nn.Module, Draftable[LayerCache], Tracing[LayerCache]):
         return activations.logits, mx.concatenate([activations.blocks[index] for index in at], -1)
 
     def checkpoints(self, cache: Sequence[LayerCache], rows: int) -> bool:
-        """`core.api.Draftable`. Yes, when every mamba mixer holds the fused step: that is
-        the kernel `NemotronHMamba.verify_rows` writes the per-row states out of, and the
-        one thing about a rejected round that is not the cache's own answer.
+        """`core.api.Draftable`. Yes, when every mamba mixer's step has a verification
+        form: that is the kernel `NemotronHMamba.verify_rows` writes the per-row states
+        out of, and the one thing about a rejected round that is not the cache's own
+        answer.
 
         Worth having on this trunk in particular. 23 of its 52 layers are recurrent and the
         23 sparse ones hold nothing but an offset — replaying them reads the MoE weights a
@@ -136,15 +137,13 @@ class NemotronH(nn.Module, Draftable[LayerCache], Tracing[LayerCache]):
         rejected round would cost more than the token it bought.
         """
         del cache, rows
-        from mlx_omnia.engine.core.kernels.mamba_step.fused import FusedMambaStep
-
         for block, kind in zip(self.backbone.layers, self.config.pattern, strict=True):
             if kind != MAMBA:
                 continue
             assert isinstance(block, NemotronHBlock)
             mixer = block.mixer
             assert isinstance(mixer, NemotronHMamba)
-            if not isinstance(mixer.mamba_step().strategy, FusedMambaStep):
+            if mixer.mamba_step().verify() is None:
                 return False
         return True
 

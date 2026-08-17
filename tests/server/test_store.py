@@ -12,7 +12,6 @@ import pytest
 from mlx_omnia.server import store
 from mlx_omnia.server.store import (
     SCHEMA_VERSION,
-    Bench,
     JobRecord,
     ModelSettings,
     Profile,
@@ -65,7 +64,7 @@ def test_the_migration_creates_the_whole_schema_over_an_empty_file(tmp_path: Pat
     Store(path)
 
     assert user_version(path) == SCHEMA_VERSION
-    assert {"config", "profiles", "benches", "jobs"} <= table_names(path)
+    assert {"config", "profiles", "jobs"} <= table_names(path)
 
 
 def test_the_first_boot_creates_the_directory(tmp_path: Path) -> None:
@@ -145,14 +144,6 @@ def test_what_was_written_is_read_back_after_reopening_the_file(tmp_path: Path) 
         sampling='{"temperature": 0.2, "top_p": 0.9}',
         system_prompt="Answer with code and nothing else.",
     )
-    bench = Bench(
-        model="qwen3.6-35b",
-        tokens_per_second=56.6,
-        ttft_ms=412.5,
-        engine_version="0.9.3",
-        created_at=1_753_000_000.0,
-        ceiling_fraction=0.566,
-    )
     job = JobRecord(
         id="job-1",
         kind="download",
@@ -166,14 +157,12 @@ def test_what_was_written_is_read_back_after_reopening_the_file(tmp_path: Path) 
     written = Store(path)
     written.set_config({"port": "8642", "memory_limit_bytes": "120000000000"})
     written.save_profile(profile)
-    written.add_bench(bench)
     written.save_job(job)
 
     reopened = Store(path)
 
     assert reopened.config() == {"port": "8642", "memory_limit_bytes": "120000000000"}
     assert reopened.profile("qwen3.6-35b", "code") == profile
-    assert reopened.benches() == [bench]
     assert reopened.job("job-1") == job
 
 
@@ -194,18 +183,6 @@ def test_a_profile_is_replaced_by_name_and_deleting_says_whether_it_existed(
     assert database.delete_profile("qwen3.6-35b", "code") is True
     assert database.delete_profile("qwen3.6-35b", "code") is False
     assert database.profiles("qwen3.6-35b") == [prose]
-
-
-def test_bench_history_comes_back_newest_first_and_filtered_by_model(tmp_path: Path) -> None:
-    database = Store(tmp_path / "server.db")
-    older = Bench("qwen3.6-35b", 50.1, 402.0, "0.9.2", 10.0, 0.501)
-    newer = Bench("qwen3.6-35b", 56.6, 388.0, "0.9.3", 20.0)
-    other = Bench("gemma3-4b", 121.0, 90.0, "0.9.3", 30.0, 0.612)
-    for bench in (older, newer, other):
-        database.add_bench(bench)
-
-    assert database.benches() == [other, newer, older]
-    assert database.benches("qwen3.6-35b") == [newer, older]
 
 
 def test_a_job_is_updated_in_place_by_its_id(tmp_path: Path) -> None:
@@ -273,7 +250,7 @@ def test_two_stores_writing_from_threads_keep_every_row(tmp_path: Path) -> None:
 def test_the_database_sits_where_macos_keeps_what_a_user_backs_up(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
-    """Bench history and job rows are the user's own measurements, so Application Support
+    """Benchmark history and job rows are the user's own measurements, so Application Support
     and not the log directory. `OMNIA_STATE_DIR` is the override, and what tests point at a
     temp path so a run never touches the real database."""
     assert default_path().parent == Path.home() / "Library" / "Application Support" / "mlx-omnia"
@@ -326,10 +303,11 @@ def test_the_benchmark_migration_takes_a_file_at_the_previous_head(tmp_path: Pat
     database = Store(path)
 
     assert user_version(path) == SCHEMA_VERSION
-    assert SCHEMA_VERSION == 10
+    assert SCHEMA_VERSION == 11
     assert database.config() == {"port": "8642"}
     assert {"benchmark_runs", "benchmark_speed", "benchmark_datasets"} <= table_names(path)
     assert "prefix_cache" in table_names(path)
+    assert "benches" not in table_names(path)
 
 
 def test_model_settings_keep_the_concurrency_override(tmp_path: Path) -> None:

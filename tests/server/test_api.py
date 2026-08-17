@@ -420,7 +420,7 @@ def test_the_admin_routes_are_mounted_on_the_real_app(base_url: str) -> None:
     """Each `/admin` group lives in its own module and is wired in `create_app`. Their own
     suites mount the routers on a throwaway FastAPI, so nothing there would notice a group
     that never reaches the server the daemon actually serves."""
-    for path in ("system", "models", "jobs", "state", "metrics", "config", "benches"):
+    for path in ("system", "models", "jobs", "state", "metrics", "config", "benchmarks/runs"):
         assert httpx.get(f"{base_url}/admin/{path}", timeout=60).status_code == 200, path
     # A body the route refuses, not a download: what is being asked is whether the route
     # is there at all, and 404 is the answer that says it is not.
