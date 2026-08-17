@@ -1,12 +1,13 @@
 import mlx.core as mx
 import mlx.nn as nn
 
-from mlx_omnia.engine.core.cache import KVCache
+from mlx_omnia.engine.core.attend import AttentionMask
+from mlx_omnia.engine.core.cache import FixedKVCache, KVCache
 from mlx_omnia.engine.core.layers import MultiLinear
 from mlx_omnia.engine.models.bailing_hybrid.config import BailingHybridConfig
 from mlx_omnia.engine.models.bailing_hybrid.layers.cache import BatchedLatentKVCache
 
-type LatentStore = KVCache | BatchedLatentKVCache
+type LatentStore = KVCache | FixedKVCache | BatchedLatentKVCache
 """The latent cache a layer reads: one sequence's, or one per row of a ragged batch."""
 
 
@@ -47,7 +48,11 @@ class BailingHybridLatentAttention(nn.Module):
 
     def __call__(self, x: mx.array, cache: LatentStore) -> mx.array:
         rows, length = x.shape[0], x.shape[1]
-        offset = cache.offset
+        # Read before `update_and_fetch` moves it, and off the graph where the graph owns
+        # it: `offset` on a promoted buffer is the value the trace was built with and stays
+        # frozen there, while `position` is the tensor every step advances. `mx.fast.rope`
+        # takes either and returns the same bits for the equivalent int.
+        offset = cache.position if isinstance(cache, FixedKVCache) else cache.offset
         q = (
             self.q_proj(x)
             .reshape(rows, length, self.heads, self.qk_head_dim)
@@ -69,9 +74,9 @@ class BailingHybridLatentAttention(nn.Module):
             queries = mx.concatenate([self.embed_q(q_nope), q_pe], axis=-1)
             attended = mx.concatenate(
                 [
-                    self._absorbed(queries[index : index + 1], row_latent, row_pe)
-                    for index, (row_latent, row_pe) in enumerate(
-                        cache.update_and_fetch(latent, k_pe)
+                    self._absorbed(queries[index : index + 1], row_latent, row_pe, row_mask)
+                    for index, (row_latent, row_pe, row_mask) in enumerate(
+                        cache.update_rows(latent, k_pe)
                     )
                 ]
             )
@@ -82,7 +87,11 @@ class BailingHybridLatentAttention(nn.Module):
                 # Absorbed: the query moves into the latent's space, so nothing expands and
                 # the whole prefix is read once, 576 columns wide.
                 queries = mx.concatenate([self.embed_q(q_nope), q_pe], axis=-1)
-                attended = self._absorbed(queries, history, history_pe)
+                # A growing buffer hands back exactly the rows it wrote and answers `None`;
+                # a promoted one hands back its whole capacity and cuts the rest itself.
+                attended = self._absorbed(
+                    queries, history, history_pe, cache.readable(None, length)
+                )
                 attended = self.unembed_out(attended)
             else:
                 k_nope = self.embed_q(history, transpose=False)
@@ -104,7 +113,13 @@ class BailingHybridLatentAttention(nn.Module):
             attended.transpose(0, 2, 1, 3).reshape(rows, length, self.heads * self.v_head_dim)
         )
 
-    def _absorbed(self, queries: mx.array, latent: mx.array, latent_pe: mx.array) -> mx.array:
+    def _absorbed(
+        self,
+        queries: mx.array,
+        latent: mx.array,
+        latent_pe: mx.array,
+        mask: AttentionMask = None,
+    ) -> mx.array:
         """One absorbed step against one history: keys are `concat(latent, k_pe)`, values are
         the latent itself, so the output comes back in latent space."""
         return mx.fast.scaled_dot_product_attention(
@@ -112,5 +127,5 @@ class BailingHybridLatentAttention(nn.Module):
             mx.concatenate([latent, latent_pe], axis=-1),
             latent,
             scale=self.scale,
-            mask=None,
+            mask=mask,
         )

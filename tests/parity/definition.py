@@ -14,8 +14,8 @@ import mlx.core as mx
 import numpy as np
 
 from mlx_omnia import stream_ids
+from mlx_omnia.engine.core.api import LanguageModel
 from mlx_omnia.engine.core.cache import LayerCache
-from mlx_omnia.engine.generate import CausalLM
 from tests.conftest import floor, relative_diff
 
 
@@ -34,7 +34,7 @@ class TrunkActivations(Protocol):
 
 
 def a_parity_trunk() -> None:
-    """Trunk activations against the fixture, each tensor under its own measured floor."""
+    """LanguageModel activations against the fixture, each tensor under its own measured floor."""
 
     def it_holds_each_block_within_floor(
         activations: TrunkActivations, golden: dict[str, mx.array], layer: int
@@ -75,7 +75,7 @@ def a_faithful_cache() -> None:
     """A wrong cache can survive a degenerate greedy; it does not survive full logits."""
 
     def it_agrees_with_prefill_stepwise(
-        model: CausalLM[LayerCache], golden: dict[str, mx.array]
+        model: LanguageModel[LayerCache], golden: dict[str, mx.array]
     ) -> None:
         ids = golden["greedy_ids"]
         prefill = model(ids[None])
@@ -84,7 +84,7 @@ def a_faithful_cache() -> None:
         assert relative_diff(mx.concatenate(steps, axis=1), prefill) < 1e-5
 
     def it_replays_the_fixture_greedy_run(
-        model: CausalLM[LayerCache], golden: dict[str, mx.array]
+        model: LanguageModel[LayerCache], golden: dict[str, mx.array]
     ) -> None:
         prompt = [int(i) for i in np.array(golden["input_ids"])]
         expected = [int(i) for i in np.array(golden["greedy_ids"])]

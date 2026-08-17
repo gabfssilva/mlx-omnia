@@ -28,6 +28,7 @@ from mlx_omnia import (
     top_k,
 )
 from mlx_omnia.engine.bpe import ByteLevelBPE
+from mlx_omnia.engine.core.api import Draftable, Proposer
 from mlx_omnia.engine.core.masks import FULL
 from mlx_omnia.engine.models.muse_glimmer import CHECKPOINT, MuseGlimmer, load_assistant
 from mlx_omnia.engine.models.muse_glimmer.config import (
@@ -41,7 +42,7 @@ from mlx_omnia.engine.models.muse_glimmer.dflash import (
     MuseGlimmerDFlash,
 )
 from mlx_omnia.engine.models.muse_glimmer.model import MuseGlimmerLanguageModel
-from mlx_omnia.engine.speculative import Acceptance, Proposer, Speculable, SpeculationRefused
+from mlx_omnia.engine.speculative import Acceptance, SpeculationRefused
 from tests.conftest import checkpoint_dir, requires_checkpoint
 
 REPO = "local/Muse-Glimmer-30B-4bit"
@@ -187,7 +188,7 @@ def test_a_shorter_block_is_a_shorter_proposal(
 
 
 def test_the_target_lends_the_raw_pair_and_not_the_cooked_one(lender: MuseGlimmer) -> None:
-    """What `Speculable` is named for. Neither end of this facade's vocabulary is the bare
+    """What `Draftable` is named for. Neither end of this facade's vocabulary is the bare
     tensor — `embed` puts a scaleless RMS over the lookup, `head` puts `output_multiplier`
     and a softcap over `lm_head` — and the drafter was trained against the bare ones.
 
@@ -197,7 +198,7 @@ def test_the_target_lends_the_raw_pair_and_not_the_cooked_one(lender: MuseGlimme
     """
     ids = mx.array([3, 1, 4, 1, 5])
 
-    assert isinstance(lender, Speculable)
+    assert isinstance(lender, Draftable)
     rows = lender.raw_embed(ids)
     assert not mx.allclose(rows, lender.embed(ids))
 
@@ -211,13 +212,13 @@ def test_a_target_that_lends_nothing_is_refused_by_name(drafter: MuseGlimmerAssi
     """The pair is no longer typed to one model, so what a wrong target costs has to be an
     exception and not a signature. Before the first token, by name, and not an
     `AttributeError` three rounds into a generation."""
-    with pytest.raises(SpeculationRefused, match="Speculable"):
+    with pytest.raises(SpeculationRefused, match="Draftable"):
         MuseGlimmerDFlash(object(), drafter)  # pyright: ignore[reportArgumentType]
 
 
 @requires_checkpoint(REPO)
 def test_block_outputs_is_the_same_forward(target: MuseGlimmer, tokenizer: ByteLevelBPE) -> None:
-    """`BlockOutputs` is a selection and not a second path: the logits it returns are the
+    """`Draftable.block_outputs` is a selection and not a second path: the logits it returns are the
     logits `__call__` returns, and the features are the trunk's own rows at those depths."""
     ids = mx.array(tokenizer.encode(PROMPT))[None]
     at = (1, 13)

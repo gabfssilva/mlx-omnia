@@ -11,7 +11,7 @@ simulating the meters that lie.
 import asyncio
 import gc
 import time
-from collections.abc import Iterator
+from collections.abc import Iterator, Sequence
 from pathlib import Path
 from tempfile import mkdtemp
 from typing import TypeIs
@@ -32,6 +32,8 @@ from mlx_omnia import (
     Text,
     TextLanguageModel,
 )
+from mlx_omnia.engine.core.attend import attend
+from mlx_omnia.engine.core.cache import LayerCache
 from mlx_omnia.engine.footprint import resident_bytes
 from mlx_omnia.engine.parsers import Segment
 from mlx_omnia.server import engine as engine_module
@@ -58,7 +60,7 @@ class TinyLM(nn.Module):
     def make_cache(self) -> list[KVCache]:
         return [KVCache()]
 
-    def __call__(self, ids: mx.array, cache: list[KVCache] | None = None) -> mx.array:
+    def __call__(self, ids: mx.array, cache: Sequence[LayerCache] | None = None) -> mx.array:
         return self.embed(ids)
 
 
@@ -84,16 +86,17 @@ class WideLM(nn.Module):
     def make_cache(self) -> list[KVCache]:
         return [KVCache()]
 
-    def __call__(self, ids: mx.array, cache: list[KVCache] | None = None) -> mx.array:
+    def __call__(self, ids: mx.array, cache: Sequence[LayerCache] | None = None) -> mx.array:
         out = self.embed(ids)
         if cache is None:
             return out
-        rows = mx.zeros((1, 1, ids.shape[1], _WIDE), dtype=mx.float32)
-        keys, values = cache[0].update_and_fetch(rows, rows)
-        # The head reads both buffers back, the way a real trunk does, and that is what makes
-        # them exist: mlx is lazy, so a fake whose output ignores its own cache leaves the
-        # write unevaluated — and memory nothing allocated is memory nothing measures.
-        return out + keys[0, 0, -1, 0] + values[0, 0, -1, 0]
+        rows = mx.zeros((ids.shape[0], 1, ids.shape[1], _WIDE), dtype=mx.float32)
+        # Through the door a trunk uses, so the same fake serves a lone cache and a ragged
+        # batch's adapter. The head reads the result back, and that is what makes the rows
+        # exist: mlx is lazy, so a fake whose output ignores its own cache leaves the write
+        # unevaluated — and memory nothing allocated is memory nothing measures.
+        read = attend(cache[0], rows, keys=rows, values=rows, scale=1.0, mask=None)
+        return out + read[0, 0, -1, 0]
 
 
 def wide() -> CompositeModel[Text, Segment, GenerationOptions]:

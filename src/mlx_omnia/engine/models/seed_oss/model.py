@@ -4,8 +4,8 @@ from typing import NamedTuple
 import mlx.core as mx
 import mlx.nn as nn
 
-from mlx_omnia.engine.core.attend import KVStore
-from mlx_omnia.engine.core.cache import KVCache
+from mlx_omnia.engine.core.api import LanguageModel
+from mlx_omnia.engine.core.cache import KVCache, LayerCache
 from mlx_omnia.engine.models.seed_oss.config import SeedOssConfig
 from mlx_omnia.engine.models.seed_oss.layers.block import SeedOssTrunk
 
@@ -17,8 +17,7 @@ class SeedOssActivations(NamedTuple):
     logits: mx.array
 
 
-class SeedOss(nn.Module):
-    continuous_batching = True
+class SeedOss(nn.Module, LanguageModel[LayerCache]):
 
     def __init__(self, config: SeedOssConfig) -> None:
         super().__init__()
@@ -36,7 +35,7 @@ class SeedOss(nn.Module):
         return self.lm_head(normed)
 
     def activations(
-        self, ids: mx.array, cache: Sequence[KVStore] | None = None
+        self, ids: mx.array, cache: Sequence[LayerCache] | None = None
     ) -> SeedOssActivations:
         cache = cache if cache is not None else self.make_cache()
         x = self.model.embed_tokens(ids)
@@ -48,5 +47,5 @@ class SeedOss(nn.Module):
         normed = self.model.norm(x)
         return SeedOssActivations(embeddings, blocks, normed, self.head(normed))
 
-    def __call__(self, ids: mx.array, cache: Sequence[KVStore] | None = None) -> mx.array:
+    def __call__(self, ids: mx.array, cache: Sequence[LayerCache] | None = None) -> mx.array:
         return self.activations(ids, cache).logits

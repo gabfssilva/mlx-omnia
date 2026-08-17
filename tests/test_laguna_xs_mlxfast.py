@@ -15,6 +15,7 @@ import mlx.nn as nn
 import pytest
 
 from mlx_omnia import stream_ids
+from mlx_omnia.engine.core.decode import compiled_decode, plan_of
 from mlx_omnia.engine.core.prefix import Prefixes, PrefixStore
 from mlx_omnia.engine.generate import Meter
 from mlx_omnia.engine.models.laguna import CHECKPOINT, Laguna
@@ -49,11 +50,11 @@ def test_greedy_matches_golden(model: Laguna, case: dict[str, list[int]]) -> Non
 
 
 @requires_checkpoint(REPO, REVISION)
-def test_compiled_decode_matches_golden(model: Laguna, case: dict[str, list[int]]) -> None:
+def test_the_lease_matches_golden(model: Laguna, case: dict[str, list[int]]) -> None:
     cache = model.make_cache()
     logits = model(mx.array(case["prompt_tokens"])[None], cache)[:, -1, :]
     mx.eval(logits)
-    decode = model.compile_decode(cache)
+    decode = compiled_decode(plan_of(model), cache)
 
     for expected in case["expected_tokens"][:16]:
         token = mx.argmax(logits, axis=-1)
@@ -63,11 +64,11 @@ def test_compiled_decode_matches_golden(model: Laguna, case: dict[str, list[int]
 
 
 @requires_checkpoint(REPO, REVISION)
-def test_compiled_greedy_decode_matches_golden(model: Laguna, case: dict[str, list[int]]) -> None:
+def test_the_screened_lease_matches_golden(model: Laguna, case: dict[str, list[int]]) -> None:
     cache = model.make_cache()
     logits = model(mx.array(case["prompt_tokens"])[None], cache)[:, -1, :]
     mx.eval(logits)
-    decode = model.compile_greedy_decode(cache)
+    decode = compiled_decode(plan_of(model, screened=True), cache)
 
     for expected in case["expected_tokens"][:16]:
         token = mx.argmax(logits, axis=-1)
@@ -78,7 +79,7 @@ def test_compiled_greedy_decode_matches_golden(model: Laguna, case: dict[str, li
 
 @requires_checkpoint(REPO, REVISION)
 @pytest.mark.parametrize("length", [32, 511, 513])
-def test_compiled_greedy_decode_matches_eager_across_sliding_window(
+def test_the_screened_lease_matches_eager_across_sliding_window(
     model: Laguna, case: dict[str, list[int]], length: int
 ) -> None:
     prompt_tokens = (case["prompt_tokens"] * 2)[:length]
@@ -95,7 +96,7 @@ def test_compiled_greedy_decode_matches_eager_across_sliding_window(
     compiled_cache = model.make_cache()
     compiled_logits = model(prompt, compiled_cache)[:, -1, :]
     mx.eval(compiled_logits)
-    decode = model.compile_greedy_decode(compiled_cache)
+    decode = compiled_decode(plan_of(model, screened=True), compiled_cache)
     actual: list[int] = []
     for _ in range(8):
         token = mx.argmax(compiled_logits, axis=-1)

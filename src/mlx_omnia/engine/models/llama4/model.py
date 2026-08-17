@@ -4,8 +4,8 @@ from typing import NamedTuple
 import mlx.core as mx
 import mlx.nn as nn
 
-from mlx_omnia.engine.core.attend import KVStore
-from mlx_omnia.engine.core.cache import KVCache
+from mlx_omnia.engine.core.api import LanguageModel
+from mlx_omnia.engine.core.cache import KVCache, LayerCache
 from mlx_omnia.engine.models.llama4.config import CHUNKED, FULL, Llama4Config, Llama4TextConfig
 from mlx_omnia.engine.models.llama4.layers.block import Llama4Block
 from mlx_omnia.engine.models.llama4.layers.rope import llama3_rope
@@ -24,8 +24,7 @@ class Llama4Activations(NamedTuple):
     logits: mx.array
 
 
-class Llama4(nn.Module):
-    continuous_batching = True
+class Llama4(nn.Module, LanguageModel[LayerCache]):
 
     def __init__(self, config: Llama4Config) -> None:
         super().__init__()
@@ -42,7 +41,7 @@ class Llama4(nn.Module):
         return [KVCache() for _ in self.model.layers]
 
     def activations(
-        self, ids: mx.array, cache: Sequence[KVStore] | None = None
+        self, ids: mx.array, cache: Sequence[LayerCache] | None = None
     ) -> Llama4Activations:
         cache = cache if cache is not None else self.make_cache()
         x = self.model.embed_tokens(ids)
@@ -52,7 +51,7 @@ class Llama4(nn.Module):
         full: mx.array | str | None = None if length == 1 else "causal"
         chunked: mx.array | str | None = None
         if CHUNKED in layer_types:
-            chunked = self._chunked_mask(length, offset)
+            chunked = self._chunked_mask(length, offset, span=cache[0].span)
 
         blocks: list[mx.array] = []
         for block, kind, layer_cache in zip(self.model.layers, layer_types, cache, strict=True):
@@ -65,22 +64,24 @@ class Llama4(nn.Module):
             logits = self.lm_head(normed)
         return Llama4Activations(blocks, logits)
 
-    def __call__(self, ids: mx.array, cache: Sequence[KVStore] | None = None) -> mx.array:
+    def __call__(self, ids: mx.array, cache: Sequence[LayerCache] | None = None) -> mx.array:
         return self.activations(ids, cache).logits
 
-    def _chunked_mask(self, length: int, offset: int | mx.array) -> mx.array | str | None:
+    def _chunked_mask(
+        self, length: int, offset: int | mx.array, *, span: int
+    ) -> mx.array | str | None:
         """Block-local mask over a full cache: `kv_idx // chunk == q_idx // chunk`
         ANDed with causal. Not a sliding window — the window starts at the chunk
         boundary, not at `p - chunk`."""
         chunk = self.text.attention_chunk_size
         if not isinstance(offset, int):
             # Ragged decode: one band per row. Causality needs no term — each row's mask is
-            # trimmed to its own key span before it is applied.
-            span = int(mx.max(offset).item()) + 1
+            # trimmed to its own key span before it is applied. `span` comes from the layer
+            # rather than from `max(offset)`: the positions are the graph's here, and
+            # evaluating one is what a compiled decode cannot do.
             if span <= chunk:
                 return None
-            band = mx.arange(span) >= (offset[:, None, None, None] // chunk) * chunk
-            return band
+            return mx.arange(span) >= (offset[:, None, None, None] // chunk) * chunk
         keys = offset + length
         if keys <= chunk:
             return None if length == 1 else "causal"

@@ -16,6 +16,7 @@ one position in eighty-five, always on two logits a ULP apart. Here the weights 
 and the width is fp32, so a tie has measure zero and `==` means what it says.
 """
 
+import dataclasses
 import json
 from pathlib import Path
 
@@ -26,7 +27,8 @@ from mlx.utils import tree_flatten, tree_unflatten
 
 import mlx_omnia.engine.task as task
 from mlx_omnia import CompositeModel, load
-from mlx_omnia.engine.core.cache import DeltaCache, KVCache, LayerCache
+from mlx_omnia.engine.core.cache import DeltaCache, FixedDeltaCache, KVCache
+from mlx_omnia.engine.core.decode import compiled_verify
 from mlx_omnia.engine.generate import stream_ids
 from mlx_omnia.engine.models.nemotron_h.config import NemotronHConfig
 from mlx_omnia.engine.models.nemotron_h.model import NemotronH
@@ -106,24 +108,6 @@ def spread(model: nn.Module) -> None:
     model.update(tree_unflatten(moved))
 
 
-class _Recording:
-    """A `speculative.Step` that hands out the real step's caches and keeps a list of them,
-    so a test can ask how many rounds' worth were built."""
-
-    def __init__(self, inner: NemotronHMTP) -> None:
-        self.inner = inner
-        self.caches: list[list[LayerCache]] = []
-
-    def make_cache(self) -> list[LayerCache]:
-        self.caches.append(self.inner.make_cache())
-        return self.caches[-1]
-
-    def __call__(
-        self, embeddings: mx.array, hidden: mx.array, cache: list[LayerCache] | None = None
-    ) -> mx.array:
-        return self.inner(embeddings, hidden, cache)
-
-
 @pytest.fixture
 def trunk() -> NemotronH:
     mx.random.seed(11)
@@ -151,46 +135,55 @@ def test_the_trunk_needs_both_rewinds(trunk: NemotronH) -> None:
     assert all(layer.is_replayable for layer in cache)
 
 
-@pytest.mark.parametrize("kept", [0, 1, 2])
-def test_verify_rewinds_the_recurrent_state_to_the_rows_that_were_kept(
-    trunk: NemotronH, kept: int
-) -> None:
-    """What the ids cannot see. A rewind that keeps a rejected row, or forgets to replay, or
-    moves the wrong offset, leaves a cache that still decodes fluently — the argmax survives a
-    wrong state for a long time, and on four ids it survives it almost always. So the state is
-    compared directly, against a run that only ever saw the rows that were kept.
+@pytest.mark.parametrize("kept", [1, 2])
+def test_the_round_rewinds_the_recurrent_state_to_the_rows_that_were_kept(kept: int) -> None:
+    """What the ids cannot see. A rewind that keeps a rejected row, or picks the wrong slot,
+    or moves the wrong offset, leaves a cache that still decodes fluently — the argmax
+    survives a wrong state for a long time, and on four ids it survives it almost always. So
+    the state is compared directly, against a run that only ever saw the rows that were kept.
 
     The floor is measured in the same test rather than chosen: the reference is built twice,
     once as two calls and once as one, and whatever the chunked scan does differently between
     those groupings is the noise a real difference has to clear.
+
+    `ssm_state_size=32` because the per-row checkpoints are the fused step's, and the fused
+    step is what `NemotronH.checkpoints` requires — at 16 the round replays instead, which
+    the greedy-stream tests below cover.
     """
-    prefix, rows = mx.array([PROMPT]), mx.array([[1, 2, 3]])
+    mx.random.seed(11)
+    trunk = NemotronH(dataclasses.replace(config_of("M*EM*E"), ssm_state_size=32))
+    spread(trunk)
+    mx.eval(trunk.parameters())
+
+    prefix, rows = mx.array([PROMPT]), mx.array([1, 2, 3])
     tap = len(trunk.config.pattern) - 1
 
     cache = trunk.make_cache()
     trunk(prefix, cache)
-    _, _, rewind = trunk.verify(rows, cache, at=(tap,))
-    rewind(kept)
+    compiled = compiled_verify(trunk, cache, rows=3, taps=(tap,))
+    assert compiled is not None, "the fused step is what this trunk was built to reach"
+    verify, rewind = compiled
+    verify(rows)
+    rewind(kept, len(PROMPT) + kept)
 
     stepwise = trunk.make_cache()
     trunk(prefix, stepwise)
-    if kept:
-        trunk(rows[:, :kept], stepwise)
+    trunk(rows[None, :kept], stepwise)
     whole = trunk.make_cache()
-    trunk(mx.concatenate([prefix, rows[:, :kept]], axis=1), whole)
+    trunk(mx.concatenate([prefix, rows[None, :kept]], axis=1), whole)
 
     assert [layer.offset for layer in cache] == [layer.offset for layer in stepwise]
     recurrent = [i for i, kind in enumerate(trunk.config.pattern) if kind == "M"]
     assert recurrent, "the point of this trunk is the layers that cannot trim"
     for index in recurrent:
         got, want, other = cache[index], stepwise[index], whole[index]
-        assert isinstance(got, DeltaCache)
+        assert isinstance(got, FixedDeltaCache)
         assert isinstance(want, DeltaCache) and isinstance(other, DeltaCache)
-        assert got.state is not None and want.state is not None and other.state is not None
+        assert want.state is not None and other.state is not None
         floor = relative_diff(want.state, other.state)
-        assert relative_diff(got.state, want.state) <= max(3 * floor, 1e-6)
-        assert got.window is not None and want.window is not None
-        assert relative_diff(got.window, want.window) <= 1e-6
+        assert relative_diff(got.graph[1], want.state) <= max(3 * floor, 1e-6)
+        assert want.window is not None
+        assert relative_diff(got.graph[0], want.window) <= 1e-6
 
 
 def test_the_step_fuses_before_it_concatenates(trunk: NemotronH, step: NemotronHMTP) -> None:
@@ -302,21 +295,23 @@ def test_the_chain_reads_the_last_row_and_starts_its_cache_fresh(
     assert drafted.size == 2
     assert mx.array_equal(drafted, mx.concatenate(expected))
 
-    # And the cache belonged to that round: a second proposal builds another one rather than
-    # attending to the rows of the first. Asserted on the caches and not on the ids, because
-    # a head that kept them would still answer the same ids most of the time — the extra
-    # rows move the logits, and four of them is not a vocabulary that notices.
-    recorder = _Recording(step)
-    watched = Chained(trunk, recorder, block=3, tap=0)
+    # And the cache belonged to that round: a second proposal starts it over rather than
+    # attending to the rows of the first. Asserted on the rows and not on the ids, because a
+    # head that kept them would still answer the same ids most of the time — the extra rows
+    # move the logits, and four of them is not a vocabulary that notices.
+    # The attention layer and not every layer: the stateless kinds count their offset in
+    # Python, which a traced link advances once for the whole graph, and nothing in a chain
+    # ever reads it. What decides which rows a link attends is this one.
+    watched = Chained(trunk, step, block=3, tap=0)
     watched.absorb(features)
     watched.propose(committed)
+    assert watched._cache[0].rows == 2
     watched.propose(committed)
-    assert len(recorder.caches) == 2
-    assert recorder.caches[0] is not recorder.caches[1]
+    assert watched._cache[0].rows == 2
 
 
 def test_the_chain_refuses_a_target_that_lends_nothing(step: NemotronHMTP) -> None:
-    with pytest.raises(SpeculationRefused, match="Speculable"):
+    with pytest.raises(SpeculationRefused, match="Draftable"):
         Chained(object(), step, block=2, tap=0)  # pyright: ignore[reportArgumentType]
 
 

@@ -1,7 +1,8 @@
 import mlx.core as mx
 import mlx.nn as nn
 
-from mlx_omnia.engine.core.attend import KVStore, attend
+from mlx_omnia.engine.core.attend import attend
+from mlx_omnia.engine.core.cache import LayerCache
 from mlx_omnia.engine.models.qwen3_next.config import Qwen3NextConfig
 
 
@@ -28,7 +29,7 @@ class Qwen3NextAttention(nn.Module):
             x, self.rope_dims, traditional=False, base=self.rope_theta, scale=1.0, offset=offset
         )
 
-    def __call__(self, x: mx.array, cache: KVStore) -> mx.array:
+    def __call__(self, x: mx.array, cache: LayerCache) -> mx.array:
         rows, length = x.shape[0], x.shape[1]
         offset = cache.offset
         width = self.heads * self.head_dim

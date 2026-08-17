@@ -4,6 +4,7 @@ from typing import NamedTuple
 import mlx.core as mx
 import mlx.nn as nn
 
+from mlx_omnia.engine.core.api import Tracing
 from mlx_omnia.engine.core.cache import LayerCache
 from mlx_omnia.engine.models.longcat_flash_ngram.config import LongcatFlashNgramConfig
 from mlx_omnia.engine.models.longcat_flash_ngram.layers.attention import yarn_rope
@@ -11,6 +12,8 @@ from mlx_omnia.engine.models.longcat_flash_ngram.layers.block import LongcatFlas
 from mlx_omnia.engine.models.longcat_flash_ngram.layers.cache import (
     BatchedMLACache,
     BatchedNgramCache,
+    FixedMLACache,
+    FixedNgramCache,
     LatentStore,
     LongcatLayer,
     MLACache,
@@ -39,8 +42,7 @@ class LongcatFlashNgramActivations(NamedTuple):
     logits: mx.array
 
 
-class LongcatFlashNgram(nn.Module):
-    continuous_batching = True
+class LongcatFlashNgram(nn.Module, Tracing[LayerCache]):
 
     def __init__(self, config: LongcatFlashNgramConfig) -> None:
         super().__init__()
@@ -50,20 +52,36 @@ class LongcatFlashNgram(nn.Module):
             self.lm_head = nn.Linear(config.hidden_size, config.vocab_size, bias=False)
 
     def make_cache(self) -> list[LayerCache]:
-        caches: list[LayerCache] = [NgramCache(self.config.emb_neighbor_num)]
+        caches: list[LayerCache] = [
+            NgramCache(self.config.emb_neighbor_num, self.config.eos[0])
+        ]
         for _ in range(self.config.num_sublayers):
             caches.append(MLACache())
         return caches
+
+    def before_trace(self, cache: Sequence[LayerCache]) -> Sequence[object]:
+        """`core.api.Tracing`. Nothing to settle and nothing to capture: this trunk resolves
+        no kernel against its weights, and the MoE's only host-side branch is on the row
+        count, which a one-token trace fixes.
+
+        Both halves of the claim hold. Every position it rotates by is
+        `FixedMLACache.position` — a graph tensor, read in `LongcatFlashMLA.__call__` before
+        the update moves it — and the columns a promoted buffer has not written are cut by
+        `FixedKVCache.readable` in the same call. The n-gram context is the third moving
+        piece and it lives in `FixedNgramCache.state`, written functionally like any other.
+        """
+        del cache
+        return ()
 
     def activations(
         self, ids: mx.array, cache: Sequence[LongcatLayer] | None = None
     ) -> LongcatFlashNgramActivations:
         layers: Sequence[LongcatLayer] = self.make_cache() if cache is None else cache
         ngram_cache = layers[0]
-        assert isinstance(ngram_cache, NgramCache | BatchedNgramCache)
+        assert isinstance(ngram_cache, NgramCache | FixedNgramCache | BatchedNgramCache)
         mla_caches: list[LatentStore] = []
         for c in layers[1:]:
-            assert isinstance(c, MLACache | BatchedMLACache)
+            assert isinstance(c, MLACache | FixedMLACache | BatchedMLACache)
             mla_caches.append(c)
 
         x = self.model.ngram_embeddings(ids, ngram_cache)

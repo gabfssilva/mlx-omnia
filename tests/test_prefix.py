@@ -6,7 +6,7 @@ of a conversation is still stored, and the two anchors. The parity of a resumed 
 against a cold one is `test_generate.py`'s, over real trunks.
 """
 
-from collections.abc import Mapping, Sequence
+from collections.abc import Sequence
 
 import mlx.core as mx
 import pytest
@@ -17,9 +17,7 @@ from mlx_omnia.engine.core.cache import (
     FixedKVCache,
     KVCache,
     LayerCache,
-    Layout,
     RingKVCache,
-    Rows,
     SharedKVReader,
 )
 from mlx_omnia.engine.core.cache_file import IDS
@@ -39,21 +37,6 @@ def block(start: int, stop: int, tag: float = 0.0) -> mx.array:
     """Rows `[start, stop)` with a value that names the row, so a misplaced one is legible."""
     values = mx.arange(start * WIDTH, stop * WIDTH, dtype=mx.float32) + tag
     return values.reshape(1, 1, stop - start, WIDTH)
-
-
-class Windows:
-    """A trunk that declares a sliding window its cache classes cannot see, the way `laguna`
-    does: every layer is a plain `KVCache` and the window lives in the config."""
-
-    def __init__(self, layers: int, window: int) -> None:
-        self._layers = layers
-        self._window = window
-
-    def cache_layouts(self) -> list[Mapping[str, Layout]]:
-        return [
-            {"keys": Rows(keep=self._window), "values": Rows(keep=self._window)}
-            for _ in range(self._layers)
-        ]
 
 
 class Memory(Vault):
@@ -81,8 +64,8 @@ def store(ceiling: int = 1 << 30, vault: Vault | None = None, span: int = SPAN) 
     return PrefixStore(ceiling, vault, span=span)
 
 
-def walk(prefixes: PrefixStore, caches: Sequence[LayerCache], trunk: object = None) -> Prefix:
-    started = prefixes.begin("a-model", "a-stamp", caches, trunk)
+def walk(prefixes: PrefixStore, caches: Sequence[LayerCache]) -> Prefix:
+    started = prefixes.begin("a-model", "a-stamp", caches)
     assert started is not None, "the ceiling is open and the layouts are cuttable"
     return started
 
@@ -134,7 +117,6 @@ def cycled(
     fresh: Sequence[LayerCache],
     tokens: Sequence[int],
     *,
-    trunk: object = None,
     span: int = SPAN,
 ) -> int:
     """`caches` filled and committed, then `fresh` resumed off the same store.
@@ -143,13 +125,13 @@ def cycled(
     which is the only moment a recurrent state exists — then fed the tail and committed
     again."""
     prefixes = store(span=span)
-    writing = walk(prefixes, caches, trunk)
+    writing = walk(prefixes, caches)
     edge = (len(tokens) - 1) // writing.chain.span * writing.chain.span
     fill(caches, edge)
     writing.commit(tokens, caches, edge)
     fill(caches, len(tokens) - edge, edge)
     writing.commit(tokens, caches, len(tokens))
-    return walk(prefixes, fresh, trunk).resume(tokens, fresh)
+    return walk(prefixes, fresh).resume(tokens, fresh)
 
 
 def held(layer: LayerCache, start: int, stop: int) -> dict[str, mx.array]:
@@ -336,19 +318,18 @@ def describe_the_round_trip():
             assert relative_diff(latent[..., :12, :], block(0, 12)) == 0.0
 
         def it_round_trips_an_ngram_context():
-            source, target = [NgramCache(3)], [NgramCache(3)]
+            source, target = [NgramCache(3, eos=2)], [NgramCache(3, eos=2)]
 
             assert cycled(source, target, IDS_OF[:13]) == 12
             assert target[0].offset == 12
 
 
 def describe_a_sliding_window():
-    def describe_when_the_trunk_declares_one():
+    def describe_when_the_layer_carries_one():
         def it_reads_only_the_spans_the_mask_still_attends():
-            trunk = Windows(1, window=8)
-            source, target = [KVCache()], [KVCache()]
+            source, target = [KVCache(window=8)], [KVCache(window=8)]
 
-            covered = cycled(source, target, IDS_OF[:21], trunk=trunk)
+            covered = cycled(source, target, IDS_OF[:21])
 
             assert covered == 20
             keys, _ = target[0].fetch()
@@ -361,10 +342,9 @@ def describe_a_sliding_window():
         def it_never_zero_fills_inside_the_window():
             # Mutation: rounding `keep` down instead of up drops a live row and the decode
             # attends a zero.
-            trunk = Windows(1, window=6)
-            source, target = [KVCache()], [KVCache()]
+            source, target = [KVCache(window=6)], [KVCache(window=6)]
 
-            cycled(source, target, IDS_OF[:21], trunk=trunk)
+            cycled(source, target, IDS_OF[:21])
 
             keys, _ = target[0].fetch()
             assert relative_diff(keys[..., 14:20, :], block(14, 20)) == 0.0
@@ -423,7 +403,7 @@ def describe_the_chain():
             fill(first, 13)
             writing.commit(IDS_OF[:13], first, 13)
             second: list[LayerCache] = [KVCache()]
-            other = prefixes.begin("a-model", "another-stamp", second, None)
+            other = prefixes.begin("a-model", "another-stamp", second)
 
             assert other is not None
             assert other.resume(IDS_OF[:13], second) == 0
@@ -583,9 +563,9 @@ def describe_the_span_a_trunk_admits():
     def describe_when_a_window_is_narrower_than_the_span():
         def it_brings_the_span_down_to_the_window():
             prefixes = store(span=16)
-            caches: list[LayerCache] = [KVCache()]
+            caches: list[LayerCache] = [KVCache(window=6)]
 
-            assert walk(prefixes, caches, Windows(1, window=6)).chain.span == 6
+            assert walk(prefixes, caches).chain.span == 6
 
 
 def describe_residency():

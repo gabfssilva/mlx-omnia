@@ -20,7 +20,7 @@ import json
 import socket
 import threading
 import time
-from collections.abc import AsyncGenerator, Iterator
+from collections.abc import AsyncGenerator, Iterator, Sequence
 from concurrent.futures import ThreadPoolExecutor
 from contextlib import asynccontextmanager
 from dataclasses import dataclass
@@ -43,6 +43,7 @@ from mlx_omnia import (
     Text,
     TextLanguageModel,
 )
+from mlx_omnia.engine.core.cache import LayerCache
 from mlx_omnia.engine.footprint import SUSTAINED_GBS
 from mlx_omnia.engine.generate import Meter
 from mlx_omnia.engine.parsers import Segment
@@ -92,12 +93,12 @@ class TinyLM(nn.Module):
     def make_cache(self) -> list[KVCache]:
         return [KVCache()]
 
-    def __call__(self, ids: mx.array, cache: list[KVCache] | None = None) -> mx.array:
+    def __call__(self, ids: mx.array, cache: Sequence[LayerCache] | None = None) -> mx.array:
         return self.embed(ids)
 
 
 class PacedLM(TinyLM):
-    def __call__(self, ids: mx.array, cache: list[KVCache] | None = None) -> mx.array:
+    def __call__(self, ids: mx.array, cache: Sequence[LayerCache] | None = None) -> mx.array:
         time.sleep(_PACE)
         return super().__call__(ids, cache)
 

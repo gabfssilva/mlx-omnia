@@ -1,8 +1,7 @@
 import mlx.core as mx
 import mlx.nn as nn
 
-from mlx_omnia.engine.core.attend import KVStore
-from mlx_omnia.engine.core.cache import SharedKVReader
+from mlx_omnia.engine.core.cache import LayerCache
 from mlx_omnia.engine.models.gemma3n.config import Gemma3nTextConfig
 from mlx_omnia.engine.models.gemma3n.layers.altup import AltUp
 from mlx_omnia.engine.models.gemma3n.layers.attention import Gemma3nAttention
@@ -34,7 +33,7 @@ class Gemma3nBlock(nn.Module):
         self.correct_scale = config.altup_correct_scale
 
     def __call__(
-        self, x: mx.array, cache: KVStore | SharedKVReader, per_layer_input: mx.array
+        self, x: mx.array, cache: LayerCache, per_layer_input: mx.array
     ) -> mx.array:
         predictions = self.altup.predict(x)
         active = predictions[self.active]

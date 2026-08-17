@@ -6,8 +6,8 @@ import mlx.core as mx
 import mlx.nn as nn
 
 from mlx_omnia.engine.batching import BatchedKVCache, BatchedSharedKVReader
-from mlx_omnia.engine.core.attend import KVStore
-from mlx_omnia.engine.core.cache import KVCache, SharedKVReader
+from mlx_omnia.engine.core.api import Tracing
+from mlx_omnia.engine.core.cache import FixedKVCache, KVCache, LayerCache, SharedKVReader
 from mlx_omnia.engine.models.gemma4.config import Gemma4Config, Gemma4TextConfig
 from mlx_omnia.engine.models.gemma4.layers.block import Gemma4Block
 
@@ -39,8 +39,7 @@ class Gemma4Activations(NamedTuple):
     logits: mx.array
 
 
-class Gemma4(nn.Module):
-    continuous_batching = True
+class Gemma4(nn.Module, Tracing[LayerCache]):
 
     def __init__(self, config: Gemma4Config) -> None:
         super().__init__()
@@ -60,6 +59,19 @@ class Gemma4(nn.Module):
                 cache.append(KVCache())
         return cache
 
+    def before_trace(self, cache: Sequence[LayerCache]) -> Sequence[object]:
+        """`core.api.Tracing`. Nothing to settle: this trunk resolves no kernels lazily and
+        reads no resident table.
+
+        The two claims it does make. Every position it rotates by comes off the graph when
+        the graph owns it — `FixedKVCache.position` for a storing layer, and the writer's
+        position minus this step for a `SharedKVReader`, which is why that one holds its
+        writer rather than a copy of its rows. And the columns a promoted buffer has not
+        written are cut by `LayerCache.readable`, asked of the layer that holds them.
+        """
+        del cache
+        return ()
+
     def embed(self, ids: mx.array) -> mx.array:
         embedded = self.model.embed_tokens(ids)
         # sqrt(hidden_size) — 1536 is NOT a perfect square, so reproduce the bf16 cast.
@@ -76,7 +88,7 @@ class Gemma4(nn.Module):
     def activations(
         self,
         ids: mx.array,
-        cache: Sequence[KVStore | SharedKVReader] | None = None,
+        cache: Sequence[LayerCache] | None = None,
     ) -> Gemma4Activations:
         text = self.config.text_config
         types = text.attention_types
@@ -87,31 +99,29 @@ class Gemma4(nn.Module):
         per_layer_input = self._per_layer_inputs(ids, x)
         blocks: list[mx.array] = []
 
-        # For each layer_type, the storing layer's cache and its pre-update offset — the
-        # offset is captured BEFORE the store layer runs, so the shared layer's q is
-        # rotated by the correct starting position.
-        stores: dict[str, tuple[KVStore | SharedKVReader, int | None]] = {}
+        # For each layer_type, the layer that stores its full-length KV. What the shared
+        # layer needs past the rows is where its own queries sit, which is the writer's
+        # position minus this step — derived by the reader rather than captured here, so it
+        # is a graph value when the graph owns it.
+        stores: dict[str, LayerCache] = {}
 
         for i, (block, layer_cache) in enumerate(
             zip(self.model.layers, cache, strict=True)
         ):
             if text.store_full_length_kv(i):
-                pre = layer_cache.offset if isinstance(layer_cache, KVCache) else None
-                stores[types[i]] = (layer_cache, pre)
+                stores[types[i]] = layer_cache
 
             if text.is_kv_shared_layer(i):
-                store_cache, pre = stores[types[i]]
+                store_cache = stores[types[i]]
                 if isinstance(layer_cache, BatchedSharedKVReader):
-                    # Ragged rows have no one pair of tensors to publish; the adapter
-                    # takes the writer's rows, and derives the same pre-update offset.
+                    # Ragged rows have no one pair of tensors to link to; the adapter walks
+                    # the writer's rows and links each reader to its own.
                     assert isinstance(store_cache, BatchedKVCache)
                     layer_cache.adopt(store_cache, length)
                 else:
-                    assert isinstance(store_cache, KVCache)
+                    assert isinstance(store_cache, KVCache | FixedKVCache)
                     assert isinstance(layer_cache, SharedKVReader)
-                    assert pre is not None
-                    layer_cache.keys, layer_cache.values = store_cache.fetch()
-                    layer_cache.offset = pre
+                    layer_cache.adopt(store_cache, length)
 
             ple_slice = None
             if per_layer_input is not None:
@@ -125,7 +135,7 @@ class Gemma4(nn.Module):
         return Gemma4Activations(embeddings, blocks, normed, logits)
 
     def __call__(
-        self, ids: mx.array, cache: Sequence[KVStore | SharedKVReader] | None = None
+        self, ids: mx.array, cache: Sequence[LayerCache] | None = None
     ) -> mx.array:
         return self.activations(ids, cache).logits
 

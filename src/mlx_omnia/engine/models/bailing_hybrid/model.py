@@ -4,6 +4,7 @@ from typing import NamedTuple
 import mlx.core as mx
 import mlx.nn as nn
 
+from mlx_omnia.engine.core.api import Tracing
 from mlx_omnia.engine.core.cache import DeltaCache, LayerCache
 from mlx_omnia.engine.models.bailing_hybrid.config import BailingHybridConfig
 from mlx_omnia.engine.models.bailing_hybrid.layers.block import (
@@ -20,8 +21,7 @@ class BailingHybridActivations(NamedTuple):
     logits: mx.array
 
 
-class BailingHybrid(nn.Module):
-    continuous_batching = True
+class BailingHybrid(nn.Module, Tracing[LayerCache]):
 
     def __init__(self, config: BailingHybridConfig) -> None:
         super().__init__()
@@ -32,6 +32,19 @@ class BailingHybrid(nn.Module):
 
     def make_cache(self) -> list[LayerCache]:
         return [LatentKVCache() if attends else DeltaCache() for attends in self.config.attends]
+
+    def before_trace(self, cache: Sequence[LayerCache]) -> Sequence[object]:
+        """`core.api.Tracing`. Nothing to settle: this trunk resolves no kernels lazily and
+        reads no resident table, so a trace of its ordinary forward is the forward.
+
+        The two claims it does make. The latent layers read `FixedKVCache.position` rather
+        than `offset` and cut their own columns through `LayerCache.readable`
+        (`BailingHybridLatentAttention.__call__`); the KDA layers reach their window and
+        state through `FixedDeltaCache`'s properties over the graph container, which is
+        where a trace can see them written.
+        """
+        del cache
+        return ()
 
     def head(self, normed: mx.array) -> mx.array:
         if self.config.tie_word_embeddings:

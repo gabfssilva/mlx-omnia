@@ -29,16 +29,16 @@ The chain follows vllm here, and it was measured both ways (2026-08-14, nvfp4 27
 positions, and this head rewards the history — acceptance 0.73 to 0.85 at depth one, 0.45
 to 0.63 at depth two, against `speculative.Chained`'s fresh cache per round. Either way an
 emitted token never moves: what the drafter attends to only moves acceptance, and the
-verification is the target's own argmax. `compile_chain` below serves the fresh-cache
+verification is the target's own argmax. `speculative.Chained` compiles the fresh-cache
 variant and stays for whoever measures the other trade.
 """
 
-from collections.abc import Callable
+from collections.abc import Sequence
 
 import mlx.core as mx
 import mlx.nn as nn
 
-from mlx_omnia.engine.core.cache import FixedKVCache, KVCache
+from mlx_omnia.engine.core.cache import FixedKVCache, KVCache, LayerCache
 from mlx_omnia.engine.core.layers import SwiGLU
 from mlx_omnia.engine.models.qwen3_5.config import Qwen35TextConfig
 from mlx_omnia.engine.models.qwen3_5.layers.attention import Qwen35Attention
@@ -70,10 +70,8 @@ class Qwen35MTPBlock(nn.Module):
         self.input_layernorm = nn.RMSNorm(config.hidden_size, eps=config.rms_norm_eps)
         self.post_attention_layernorm = nn.RMSNorm(config.hidden_size, eps=config.rms_norm_eps)
 
-    def __call__(
-        self, x: mx.array, cache: KVCache | FixedKVCache, mask: mx.array | None = None
-    ) -> mx.array:
-        attended = x + self.self_attn(self.input_layernorm(x), cache, None, mask)
+    def __call__(self, x: mx.array, cache: KVCache | FixedKVCache) -> mx.array:
+        attended = x + self.self_attn(self.input_layernorm(x), cache)
         return attended + self.mlp(self.post_attention_layernorm(attended))
 
 
@@ -103,52 +101,6 @@ class Qwen35MTP(nn.Module):
     def make_cache(self) -> list[KVCache]:
         return [KVCache()]
 
-    def compile_chain(
-        self,
-        embed: Callable[[mx.array], mx.array],
-        head: Callable[[mx.array], mx.array],
-        width: int,
-    ) -> tuple[
-        Callable[[mx.array, mx.array], tuple[mx.array, mx.array]],
-        Callable[[], None],
-    ]:
-        """One chained draft step, compiled: (token id [1], hidden [1,1,H]) -> (next id
-        [1], next hidden). The step's own KV lives in a fixed buffer of `width` rows
-        whose position the caller resets to zero each round — the same graph serves
-        every link of the chain, because the only thing that moves between links is
-        that position.
-
-        `embed` is the target's raw embedding table and `head` its raw logits
-        projection (`speculative.Speculable`); both bake into the trace as constants.
-        Each link is one row, so `Qwen35Attention`'s single-row path — the same one the
-        trunk's compiled decode traces — serves unchanged, mask and array offset
-        included."""
-        config = self.config
-        (block,) = self.layers
-        assert isinstance(block, Qwen35MTPBlock)
-        dtype = block.self_attn.q_norm.weight.dtype
-        zeros = mx.zeros((1, config.num_key_value_heads, width, config.head_dim), dtype=dtype)
-        fixed = FixedKVCache(zeros, zeros, 0)
-        columns = mx.arange(width)
-
-        def forward(token: mx.array, hidden: mx.array) -> tuple[mx.array, mx.array]:
-            mask = (columns <= fixed.position).reshape(1, 1, 1, width)
-            x = block(self.fuse(embed(token[None]), hidden), fixed, mask)
-            out = self.norm(x)
-            assert isinstance(out, mx.array)
-            logits = head(out)
-            return mx.argmax(logits[:, -1, :], axis=-1), out
-
-        compiled = mx.compile(forward, inputs=fixed.state, outputs=fixed.state)
-
-        def chain(token: mx.array, hidden: mx.array) -> tuple[mx.array, mx.array]:
-            return compiled(token, hidden)
-
-        def reset() -> None:
-            fixed.state[2] = mx.array([0], dtype=mx.int32)
-
-        return chain, reset
-
     def fuse(self, embeddings: mx.array, hidden: mx.array) -> mx.array:
         """The two normed halves side by side, projected back down to one width. Separately
         normed and *then* concatenated, the embedding first — `qwen3_5_mtp.py:152-155`."""
@@ -160,12 +112,13 @@ class Qwen35MTP(nn.Module):
         return fused
 
     def __call__(
-        self, embeddings: mx.array, hidden: mx.array, cache: list[KVCache] | None = None
+        self, embeddings: mx.array, hidden: mx.array, cache: Sequence[LayerCache] | None = None
     ) -> mx.array:
         cache = self.make_cache() if cache is None else cache
         x = self.fuse(embeddings, hidden)
         for layer, layer_cache in zip(self.layers, cache, strict=True):
             assert isinstance(layer, Qwen35MTPBlock)
+            assert isinstance(layer_cache, KVCache | FixedKVCache)
             x = layer(x, layer_cache)
         out = self.norm(x)
         assert isinstance(out, mx.array)

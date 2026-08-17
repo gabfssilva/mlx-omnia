@@ -13,7 +13,7 @@ where it actually lands.
 
 import json
 import threading
-from collections.abc import Iterator, Mapping
+from collections.abc import Iterator, Mapping, Sequence
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import TypeIs
@@ -38,6 +38,7 @@ from mlx_omnia import (
     Text,
     TextLanguageModel,
 )
+from mlx_omnia.engine.core.cache import LayerCache
 from mlx_omnia.engine.parsers import Segment
 from mlx_omnia.server import Engine, catalog, create_app
 from mlx_omnia.server.store import Store
@@ -83,7 +84,7 @@ class TinyLM(nn.Module):
     def make_cache(self) -> list[KVCache]:
         return [KVCache()]
 
-    def __call__(self, ids: mx.array, cache: list[KVCache] | None = None) -> mx.array:
+    def __call__(self, ids: mx.array, cache: Sequence[LayerCache] | None = None) -> mx.array:
         return self.table[ids]
 
 

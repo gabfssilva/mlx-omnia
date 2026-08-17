@@ -5,8 +5,8 @@ import mlx.core as mx
 import mlx.nn as nn
 import numpy as np
 
-from mlx_omnia.engine.core.attend import KVStore
-from mlx_omnia.engine.core.cache import KVCache
+from mlx_omnia.engine.core.api import Draftable
+from mlx_omnia.engine.core.cache import KVCache, LayerCache
 from mlx_omnia.engine.core.prefill import prefill
 from mlx_omnia.engine.generate import Meter, Penalty, Sampler, greedy, stream_text
 from mlx_omnia.engine.language import (
@@ -39,8 +39,7 @@ class MuseGlimmerActivations(NamedTuple):
     logits: mx.array
 
 
-class MuseGlimmer(nn.Module):
-    continuous_batching = True
+class MuseGlimmer(nn.Module, Draftable[LayerCache]):
 
     def __init__(self, config: MuseGlimmerConfig) -> None:
         super().__init__()
@@ -64,7 +63,7 @@ class MuseGlimmer(nn.Module):
         return mx.fast.rms_norm(self.model.embed_tokens(ids), None, self.config.rms_norm_eps)
 
     def raw_embed(self, ids: mx.array) -> mx.array:
-        """The lookup without the scaleless RMS above — `speculative.Speculable`. The two
+        """The lookup without the scaleless RMS above — `core.api.Draftable`. The two
         differ here, and the drafter was trained against this one."""
         return self.model.embed_tokens(ids)
 
@@ -83,14 +82,14 @@ class MuseGlimmer(nn.Module):
         return mx.tanh(logits / cap) * cap
 
     def raw_logits(self, hidden: mx.array) -> mx.array:
-        """`lm_head` without the multiplier and the softcap above — `speculative.Speculable`.
+        """`lm_head` without the multiplier and the softcap above — `core.api.Draftable`.
         Both are monotone, so under greedy the substitution would never show."""
         return self.lm_head(hidden)
 
     def activations(
         self,
         ids: mx.array,
-        cache: Sequence[KVStore] | None = None,
+        cache: Sequence[LayerCache] | None = None,
         *,
         embeddings: mx.array | None = None,
     ) -> MuseGlimmerActivations:
@@ -107,10 +106,10 @@ class MuseGlimmer(nn.Module):
         return MuseGlimmerActivations(embedded, blocks, normed, self.head(normed))
 
     def block_outputs(
-        self, ids: mx.array, cache: Sequence[KVStore], *, at: Sequence[int]
+        self, ids: mx.array, cache: Sequence[LayerCache], *, at: Sequence[int]
     ) -> tuple[mx.array, mx.array]:
         """The forward, plus the output of blocks `at` concatenated on the last dim —
-        `generate.BlockOutputs`. What reads it is the DFlash drafter, whose whole input is
+        `core.api.Draftable`. What reads it is the DFlash drafter, whose whole input is
         the trunk's own reading of the context; the five it asks for out of 52 are the
         selection this signature exists for."""
         x = self.embed(ids)
@@ -126,7 +125,7 @@ class MuseGlimmer(nn.Module):
     def __call__(
         self,
         ids: mx.array,
-        cache: Sequence[KVStore] | None = None,
+        cache: Sequence[LayerCache] | None = None,
         *,
         embeddings: mx.array | None = None,
     ) -> mx.array:
@@ -242,7 +241,7 @@ def sees(config: MuseGlimmerConfig, processor: ProcessorConfig | None) -> bool:
     )
 
 
-class MuseGlimmerLanguageModel(TextLanguageModel[KVCache, MuseGlimmerInput]):
+class MuseGlimmerLanguageModel(TextLanguageModel[MuseGlimmerInput]):
     """The chassis with the vision path over it and its own speculation door: a text request
     is `TextLanguageModel`'s — the trie, the batched decode — and what is the family's is the
     picture and the DFlash drafter."""

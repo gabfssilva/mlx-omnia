@@ -19,8 +19,10 @@ import mlx.nn as nn
 import pytest
 from mlx.utils import tree_map
 
-from mlx_omnia.engine.batching import BatchModel, batch
+from mlx_omnia.engine.batching import _generic_bucket, _pad_rows, batch
+from mlx_omnia.engine.core.api import LanguageModel, Tracing
 from mlx_omnia.engine.core.cache import ConvCache, DeltaCache, KVCache, LayerCache
+from mlx_omnia.engine.core.decode import compiled_decode, plan_of
 from mlx_omnia.engine.core.masks import FULL, SLIDING
 from mlx_omnia.engine.models.afmoe.config import AfmoeConfig
 from mlx_omnia.engine.models.afmoe.model import Afmoe
@@ -77,6 +79,12 @@ from mlx_omnia.engine.models.hy3.config import Hy3Config
 from mlx_omnia.engine.models.hy3.model import Hy3
 from mlx_omnia.engine.models.jamba.config import JambaConfig
 from mlx_omnia.engine.models.jamba.model import Jamba
+from mlx_omnia.engine.models.laguna.config import (
+    LagunaConfig,
+    LagunaRoPEConfigs,
+    LagunaRoPEParameters,
+)
+from mlx_omnia.engine.models.laguna.model import Laguna
 from mlx_omnia.engine.models.lfm2.config import LFM2Config, LFM2MoEConfig, LFM2RoPEParameters
 from mlx_omnia.engine.models.lfm2.dense.model import LFM2
 from mlx_omnia.engine.models.lfm2.moe.model import LFM2MoE
@@ -137,9 +145,11 @@ from mlx_omnia.engine.models.step3p7.model import Step3p7
 
 PROMPTS: tuple[tuple[int, ...], ...] = ((3, 14, 15, 9, 2), (27, 1, 8))
 STEPS = 4
+CAPACITY = 256
+"""Rows a promoted buffer holds. Well past the prompts, so nothing here regrows."""
 
 
-def _redraw(model: BatchModel, drawable: Callable[[mx.array], bool]) -> None:
+def _redraw(model: LanguageModel, drawable: Callable[[mx.array], bool]) -> None:
     """A small normal draw over the parameters `drawable` accepts, evaluated once."""
     # The batch path's protocol says nothing about parameters; every trunk here is a Module.
     assert isinstance(model, nn.Module)
@@ -151,18 +161,18 @@ def _redraw(model: BatchModel, drawable: Callable[[mx.array], bool]) -> None:
     mx.eval(model.parameters())
 
 
-def _randomize(model: BatchModel) -> None:
+def _randomize(model: LanguageModel) -> None:
     """The template's weights: every parameter redrawn."""
     _redraw(model, lambda p: True)
 
 
-def _randomize_unpacked(model: BatchModel) -> None:
+def _randomize_unpacked(model: LanguageModel) -> None:
     """BitNet packs ternary weights as uint8 fields, and a normal draw in their place is not
     a weight at all."""
     _redraw(model, lambda p: p.dtype in (mx.float32, mx.float16, mx.bfloat16))
 
 
-def _randomize_floating(model: BatchModel) -> None:
+def _randomize_floating(model: LanguageModel) -> None:
     """Only the floating parameters: the family carries integer fields a draw would ruin."""
     _redraw(model, lambda p: mx.issubdtype(p.dtype, mx.floating))
 
@@ -173,10 +183,10 @@ class Case:
     state."""
 
     name: str
-    build: Callable[[], BatchModel]
+    build: Callable[[], LanguageModel]
     poison: Callable[[Sequence[LayerCache]], None]
     seed: int = 11
-    weights: Callable[[BatchModel], None] = _randomize
+    weights: Callable[[LanguageModel], None] = _randomize
     tolerance: float = 1e-4
 
 
@@ -916,6 +926,32 @@ def _build_jamba() -> Jamba:
     )
 
 
+
+def _build_laguna() -> Laguna:
+    rope = LagunaRoPEParameters(rope_theta=10_000.0, partial_rotary_factor=1.0)
+    return Laguna(
+        LagunaConfig(
+            hidden_size=8,
+            num_hidden_layers=2,
+            head_dim=4,
+            num_key_value_heads=1,
+            vocab_size=32,
+            rms_norm_eps=1e-6,
+            sliding_window=3,
+            tie_word_embeddings=False,
+            intermediate_size=16,
+            moe_intermediate_size=8,
+            shared_expert_intermediate_size=8,
+            num_experts=4,
+            num_experts_per_tok=2,
+            moe_routed_scaling_factor=1.0,
+            layer_types=(FULL, SLIDING),
+            mlp_layer_types=("dense", "sparse"),
+            num_attention_heads_per_layer=(2, 2),
+            rope_parameters=LagunaRoPEConfigs(rope, rope),
+        )
+    )
+
 def _build_lfm2_dense() -> LFM2:
     return LFM2(
         LFM2Config(
@@ -1048,7 +1084,9 @@ def _build_longcat_flash_ngram() -> LongcatFlashNgram:
             ngram_vocab_size_ratio=2,
             emb_neighbor_num=3,
             emb_split_num=1,
-            eos_token_id=0,
+            # Any real id: the fixed n-gram ring left-pads with zeros, so an eos of 0 is the
+            # one checkpoint shape that declines the lease — and no shipped checkpoint has it.
+            eos_token_id=1,
         )
     )
 
@@ -1429,6 +1467,9 @@ CASES: tuple[Case, ...] = (
     Case("granite", _build_granite, _poison_first_kv),
     Case("hunyuan_dense", _build_hunyuan_dense, _poison_first_kv),
     Case("hy3", _build_hy3, _poison_first_kv),
+    # The one trunk that ships its own compiled batch: what it proves here is that its
+    # ordinary forward serves a ragged batch too, which is what the shared bucket traces.
+    Case("laguna", _build_laguna, _poison_all_kv),
     Case("jamba", _build_jamba, _poison_jamba),
     Case("lfm2_dense", _build_lfm2_dense, _poison_lfm2),
     # 1e-3 and not the template's 1e-4: measured order-dependent kernel resolution noise —
@@ -1511,6 +1552,98 @@ def test_rows_are_isolated(case: Case) -> None:
     held = float(mx.max(mx.abs(dirty[1] - clean[1])).item())
     assert moved > 0.0
     assert held == 0.0
+
+
+# The families whose layers cannot yet present themselves in a fixed shape. Named rather
+# than discovered, so that one leaving the list is a deliberate change and one joining it is
+# a regression the run reports. Each is a cache class that stores something a plain fixed
+# buffer cannot stand in for: a pooled history whose window is completed by a host-side
+# counter, a shared reader whose rows are republished into a plain attribute every forward,
+# a quantized buffer whose rows are packed on the way in.
+#
+# `bailing_hybrid` was here and is not: its latent buffers *are* two dense tensors in
+# absolute order, which is exactly what `FixedKVCache` holds — what differed was the read,
+# and a read lives in the layer.
+UNFIXABLE = frozenset({"deepseek_v4", "glm_moe_dsa", "longcat_flash_ngram"})
+
+
+# A lease that changes which kernel runs cannot be held to a rounding floor meant for one
+# that does not. `laguna` resolves its fused single-row attention and projections against the
+# promoted buffers — which is the whole reason the lease exists — so the two paths round
+# differently by construction, at 2.9e-3 on tiny random weights. What holds it is
+# `test_laguna_xs_mlxfast.py`, against the checkpoint's own golden ids.
+RESOLVES_ON_LEASE = frozenset({"laguna"})
+
+
+@pytest.mark.parametrize("case", CASES, ids=lambda case: case.name)
+def test_the_one_row_lease_matches_the_eager_decode(case: Case) -> None:
+    """Every family that declares `core.api.Tracing`, decoded through the lease, against its
+    own eager stepwise forward.
+
+    The lease is the other half of what the cache contract bought and it is not the bucket:
+    the trunk is handed its promoted caches *directly*, with no ragged adapter in front, so
+    a forward that reads a position host-side or leaves its unwritten columns to its caller
+    is wrong here and right there. Four steps rather than one, because the first is the only
+    one a frozen position still gets right.
+    """
+    mx.random.seed(case.seed)
+    model = case.build()
+    case.weights(model)
+    if not isinstance(model, Tracing):
+        pytest.skip("this family does not claim its forward survives a trace")
+    if case.name in RESOLVES_ON_LEASE:
+        pytest.skip("the lease resolves other kernels here; its floor is a golden, not this")
+    prompt = mx.array([list(PROMPTS[0])])
+
+    eager = list(model.make_cache())
+    model(prompt, eager)
+    want = [model(mx.array([[step]]), eager)[:, -1, :] for step in range(STEPS)]
+
+    leased = list(model.make_cache())
+    model(prompt, leased)
+    assert all(layer.is_fixable for layer in leased), (
+        "this family declares Tracing but its layers decline a fixed shape"
+    )
+    decode = compiled_decode(plan_of(model), leased, CAPACITY)
+    got = [decode(mx.array([step])) for step in range(STEPS)]
+
+    mx.eval(want, got)
+    for row, wanted in zip(got, want, strict=True):
+        difference = float(mx.max(mx.abs(row - wanted)).item())
+        assert difference / float(mx.max(mx.abs(wanted)).item()) < case.tolerance
+
+
+@pytest.mark.parametrize("case", CASES, ids=lambda case: case.name)
+def test_the_compiled_bucket_matches_the_eager_batch(case: Case) -> None:
+    """Every family, through the compiled decode, against its own eager ragged forward.
+
+    This is what the cache contract bought. The bucket used to promote plain KV buffers and
+    refuse everything else, so a hybrid or a windowed trunk decoded eagerly under the server
+    no matter what its family had written; now each layer answers for its own fixed shape
+    and the ones that cannot say so are named above.
+    """
+    mx.random.seed(case.seed)
+    model = case.build()
+    case.weights(model)
+    eager = [model.make_cache() for _ in PROMPTS]
+    fixed = [model.make_cache() for _ in PROMPTS]
+    for prompt, one, two in zip(PROMPTS, eager, fixed, strict=True):
+        model(mx.array([list(prompt)]), one)
+        model(mx.array([list(prompt)]), two)
+
+    tokens = mx.stack([mx.array([prompt[-1]]) for prompt in PROMPTS])
+    want = model(tokens, batch(eager))[:, -1, :]
+    bucket = _generic_bucket(model, fixed, CAPACITY)
+
+    if case.name in UNFIXABLE:
+        assert bucket is None, "this family now takes a fixed shape — drop it from UNFIXABLE"
+        return
+    assert bucket is not None, "this family stopped reaching the compiled bucket"
+    got = bucket.decode(_pad_rows(tokens, len(bucket.slots)))[: len(PROMPTS)]
+    mx.eval(want, got)
+    difference = float(mx.max(mx.abs(got - want)).item())
+    ceiling = float(mx.max(mx.abs(want)).item())
+    assert difference / ceiling < case.tolerance
 
 
 # Gemma 2's own: the shared helper the family's softcapped attention routes through.

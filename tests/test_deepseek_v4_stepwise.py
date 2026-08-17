@@ -110,7 +110,7 @@ def test_a_resumed_prefill_reproduces_a_cold_one(
 
     store = PrefixStore(1 << 30, span=SPAN)
     warm = model.make_cache()
-    writing = store.begin("deepseek", "a-stamp", warm, model)
+    writing = store.begin("deepseek", "a-stamp", warm)
     assert writing is not None
     edge = 2 * SPAN
     model(ids[:, :edge], warm)
@@ -118,7 +118,7 @@ def test_a_resumed_prefill_reproduces_a_cold_one(
     writing.commit(tokens, warm, edge)
 
     resumed = model.make_cache()
-    walk = store.begin("deepseek", "a-stamp", resumed, model)
+    walk = store.begin("deepseek", "a-stamp", resumed)
     assert walk is not None
     assert walk.resume(tokens, resumed) == edge
     # Counted before the tail runs: `pooled_rows` is what came back, and one forward later it

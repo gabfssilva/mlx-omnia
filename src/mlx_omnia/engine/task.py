@@ -14,9 +14,9 @@ import mlx.core as mx
 import mlx.nn as nn
 
 from mlx_omnia.engine.checkpoint import MTP_PREFIX, Pending, Sight, save_quantized
+from mlx_omnia.engine.core import api
 from mlx_omnia.engine.core.cache import LayerCache
 from mlx_omnia.engine.footprint import checkpoint_bytes
-from mlx_omnia.engine.generate import CausalLM
 from mlx_omnia.engine.language import LanguageModel
 from mlx_omnia.engine.model import ModelInput
 from mlx_omnia.engine.models import (
@@ -663,7 +663,7 @@ def tree(
     dtype: mx.Dtype | None = None,
     revision: str | None = None,
     local_files_only: bool = False,
-) -> CausalLM[LayerCache]:
+) -> api.LanguageModel[LayerCache]:
     """Load the bare model tree — the layer `stream_ids` and the bench consume,
     without the task-level facade `load` wraps around it.
 
@@ -680,7 +680,7 @@ def tree(
 
     Returns
     -------
-    CausalLM[LayerCache]
+    api.LanguageModel[LayerCache]
         The architecture's module tree, loaded and materialized.
 
     Raises
@@ -689,10 +689,10 @@ def tree(
         If the checkpoint architecture is unsupported.
     """
     directory, spec, _, _ = _resolve(model, revision, local_files_only, _MODEL_SPECS)
-    # The one erasure point. `CausalLM[C]` is invariant in C (the cache leaves through
+    # The one erasure point. `api.LanguageModel[C]` is invariant in C (the cache leaves through
     # `make_cache` and returns through `__call__`), so nine trees with nine concrete
     # caches share no honest supertype, and nothing in a `str | Path` argument can bind
     # a type var. The claim the cast makes is wider than the tree (it does not accept
     # arbitrary `LayerCache` rows) — safe because every consumer round-trips the cache
     # the model itself handed out, and none constructs a foreign one.
-    return cast(CausalLM[LayerCache], spec.load(directory, dtype))
+    return cast(api.LanguageModel[LayerCache], spec.load(directory, dtype))

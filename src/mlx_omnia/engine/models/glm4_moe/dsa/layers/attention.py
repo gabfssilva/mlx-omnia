@@ -6,8 +6,9 @@ from mlx_omnia.engine.core.rope import Yarn
 from mlx_omnia.engine.models.glm4_moe.dsa.config import GlmMoEDSAConfig
 from mlx_omnia.engine.models.glm4_moe.dsa.layers.cache import (
     BatchedDSACache,
-    DSACache,
+    DSASolo,
     DSAStore,
+    FixedDSACache,
 )
 from mlx_omnia.engine.models.glm4_moe.dsa.layers.indexer import Indexer
 
@@ -42,7 +43,7 @@ class GlmMoEDSAAttention(nn.Module):
         )
         self.indexer = Indexer(config, rope)
 
-    def rotate(self, x: mx.array, offset: int) -> mx.array:
+    def rotate(self, x: mx.array, offset: int | mx.array) -> mx.array:
         if self.rope.freqs is None:
             return mx.fast.rope(
                 x, self.qk_rope_head_dim, traditional=True, base=self.rope_theta,
@@ -62,15 +63,17 @@ class GlmMoEDSAAttention(nn.Module):
             return mx.concatenate(
                 [
                     self.forward(x[index : index + 1], row)
-                    for index, row in enumerate(cache.rows)
+                    for index, row in enumerate(cache.sequences)
                 ]
             )
         return self.forward(x, cache)
 
-    def forward(self, x: mx.array, cache: DSACache) -> mx.array:
+    def forward(self, x: mx.array, cache: DSASolo) -> mx.array:
         rows = x.shape[0]
         length = x.shape[1]
-        offset = cache.offset
+        # Read before either half is updated: a promoted cache answers with a graph tensor,
+        # and both the attention's rotation and the indexer's take it.
+        offset = cache.position if isinstance(cache, FixedDSACache) else cache.offset
         qr = self.q_a_layernorm(self.q_a_proj(x))
         lifted = self.q_b_proj(qr).reshape(rows, length, self.heads, self.q_head_dim)
         q = lifted.transpose(0, 2, 1, 3)
@@ -91,7 +94,15 @@ class GlmMoEDSAAttention(nn.Module):
         )
 
         total = keys.shape[2]
-        dense = None if length == 1 else causal_mask(length, total, None)
+        # `total` is the rows written for a growing cache and the whole capacity for a
+        # promoted one, so the band has to come from the cache rather than from the shape.
+        # `readable` hands a growing cache's mask back untouched — `None` at T=1, the causal
+        # band over a prefill — and cuts a fixed buffer's to the columns it has written.
+        band = None if length == 1 else causal_mask(length, total, None)
+        dense = cache.attention.readable(band, length)
+        assert not isinstance(dense, str)
+        # The indexer selects over the same columns, out of a buffer that advanced with
+        # this one, so the band that says which of them exist is the same band.
         selected = self.indexer(x, qr, dense, cache.index)
         mask: mx.array | str | None
         if selected is None:
@@ -103,6 +114,10 @@ class GlmMoEDSAAttention(nn.Module):
                 mx.array(True),
                 axis=-1,
             )
+            # The AND is what closes the regime where fewer columns are written than
+            # `topk`: the selection then fills its remaining slots with columns the mask
+            # scored at `-inf`, and those are exactly the ones `dense` drops. A fixed
+            # buffer is in that regime for the first `topk` rows of every conversation.
             mask = sparse if dense is None else sparse & dense
 
         attended = mx.fast.scaled_dot_product_attention(

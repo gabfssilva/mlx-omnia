@@ -4,6 +4,7 @@ from typing import NamedTuple
 import mlx.core as mx
 import mlx.nn as nn
 
+from mlx_omnia.engine.core.api import LanguageModel
 from mlx_omnia.engine.core.cache import DeltaCache, KVCache, LayerCache
 from mlx_omnia.engine.models.jamba.config import JambaConfig
 from mlx_omnia.engine.models.jamba.layers.block import JambaBlock, JambaLayer
@@ -27,8 +28,7 @@ class JambaTrunk(nn.Module):
         self.final_layernorm = nn.RMSNorm(config.hidden_size, eps=config.rms_norm_eps)
 
 
-class Jamba(nn.Module):
-    continuous_batching = True
+class Jamba(nn.Module, LanguageModel[LayerCache]):
 
     def __init__(self, config: JambaConfig) -> None:
         super().__init__()

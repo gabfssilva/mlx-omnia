@@ -28,11 +28,12 @@ from collections.abc import Sequence
 import mlx.core as mx
 import mlx.nn as nn
 
+from mlx_omnia.engine.core.api import Draftable
 from mlx_omnia.engine.core.cache import KVCache
 from mlx_omnia.engine.core.layers import SwiGLU
 from mlx_omnia.engine.core.masks import SLIDING
 from mlx_omnia.engine.models.muse_glimmer.config import MuseGlimmerAssistantConfig
-from mlx_omnia.engine.speculative import Speculable, SpeculationRefused
+from mlx_omnia.engine.speculative import SpeculationRefused
 
 
 def sliding_mask(queries: int, keys: int, window: int) -> mx.array | None:
@@ -199,7 +200,7 @@ one forward. The knob overrides it, and `block_size` above the trained length st
 
 
 class MuseGlimmerDFlash:
-    """The drafter bound to its target: a `speculative.Proposer`.
+    """The drafter bound to its target: a `core.api.Proposer`.
 
     It is the pair and not the drafter that can propose anything — the ids the drafter
     writes are the target's embedding rows going in and the target's head coming out — so
@@ -216,10 +217,10 @@ class MuseGlimmerDFlash:
         *,
         block_size: int | None = None,
     ) -> None:
-        if not isinstance(target, Speculable):
+        if not isinstance(target, Draftable):
             raise SpeculationRefused(
                 f"{type(target).__name__} does not lend its embedding table and its head "
-                "(`speculative.Speculable`), and a DFlash block is nothing but rows through "
+                "(`core.api.Draftable`), and a DFlash block is nothing but rows through "
                 "the two"
             )
         config = drafter.config
@@ -264,7 +265,7 @@ class MuseGlimmerDFlash:
         has not seen — and the rest of the block is the mask token; what comes back is the
         argmax of the target's own head over every row but the anchor's.
 
-        Both borrowed pieces are the raw ones — `Speculable` is where the difference is
+        Both borrowed pieces are the raw ones — `Draftable` is where the difference is
         named, and it is what the drafter was trained against.
         """
         anchor = mx.array([committed[-1]])

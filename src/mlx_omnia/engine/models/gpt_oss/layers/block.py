@@ -1,7 +1,8 @@
 import mlx.core as mx
 import mlx.nn as nn
 
-from mlx_omnia.engine.core.attend import AttentionMask, KVStore
+from mlx_omnia.engine.core.attend import AttentionMask
+from mlx_omnia.engine.core.cache import LayerCache
 from mlx_omnia.engine.models.gpt_oss.config import GPTOSSConfig
 from mlx_omnia.engine.models.gpt_oss.layers.attention import GPTOSSAttention
 from mlx_omnia.engine.models.gpt_oss.layers.moe import GPTOSSMLP
@@ -15,7 +16,7 @@ class GPTOSSBlock(nn.Module):
         self.input_layernorm = nn.RMSNorm(config.hidden_size, eps=config.rms_norm_eps)
         self.post_attention_layernorm = nn.RMSNorm(config.hidden_size, eps=config.rms_norm_eps)
 
-    def __call__(self, x: mx.array, mask: AttentionMask, cache: KVStore) -> mx.array:
+    def __call__(self, x: mx.array, mask: AttentionMask, cache: LayerCache) -> mx.array:
         attended = x + self.self_attn(self.input_layernorm(x), mask, cache)
         normed = self.post_attention_layernorm(attended)
         fused = self.mlp.fused_step(normed, attended)

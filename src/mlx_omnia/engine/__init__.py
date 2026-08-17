@@ -18,7 +18,6 @@ from mlx_omnia.engine.chat import (
 )
 from mlx_omnia.engine.core.cache import KVCache
 from mlx_omnia.engine.generate import (
-    CausalLM,
     LogitFilter,
     Penalty,
     Sampler,
@@ -143,7 +142,6 @@ __all__ = [
     "BitNetConfig",
     "ByteLevelBPE",
     "Capability",
-    "CausalLM",
     "Chat",
     "ChatCapability",
     "ChatMessage",

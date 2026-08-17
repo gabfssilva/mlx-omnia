@@ -3,7 +3,7 @@ import mlx.nn as nn
 
 from mlx_omnia.engine.models.deepseek_v4.config import DeepseekV4Config
 from mlx_omnia.engine.models.deepseek_v4.layers.attention import DeepseekV4Attention
-from mlx_omnia.engine.models.deepseek_v4.layers.cache import DeepseekV4Cache
+from mlx_omnia.engine.models.deepseek_v4.layers.cache import DeepseekV4Solo
 from mlx_omnia.engine.models.deepseek_v4.layers.hyper import HyperConnection, HyperHead, hc_expand
 from mlx_omnia.engine.models.deepseek_v4.layers.moe import DeepseekV4MoE
 
@@ -22,7 +22,7 @@ class DeepseekV4Block(nn.Module):
         self,
         h: mx.array,
         mask: mx.array | str | None,
-        cache: DeepseekV4Cache,
+        cache: DeepseekV4Solo,
         ids: mx.array,
         partials: mx.array | None = None,
         next_fn: mx.array | None = None,

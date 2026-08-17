@@ -16,6 +16,7 @@ import argparse
 import json
 import os
 import sys
+from collections.abc import Sequence
 from pathlib import Path
 
 from mlx_omnia.bench.arms import omnia
@@ -26,7 +27,7 @@ from mlx_omnia.bench.gate import Cool
 from mlx_omnia.bench.paired import Side, git, git_root, paired, worktree
 from mlx_omnia.bench.prompt import BENCH_PROMPT, tile
 from mlx_omnia.bench.report import Calibration, stderr
-from mlx_omnia.engine.batching import BatchModel
+from mlx_omnia.bench.results import report, store
 
 CALIBRATION = Path.home() / ".cache/mlx_omnia/selfpair.json"
 """Still the file the script this replaced wrote: renaming it would throw away every stored
@@ -40,6 +41,32 @@ refusal and not a wrong number."""
 
 def _gated(args: argparse.Namespace) -> bool:
     return not args.no_gate and os.environ.get("OMNIA_COOL_GATE") != "0"
+
+
+def _record(
+    args: argparse.Namespace,
+    command: str,
+    arguments: dict[str, object],
+    payload: dict[str, object],
+    active: int | None = None,
+    executed: Sequence[str] = (),
+) -> None:
+    """Every gated run lands in the store; an ungated one is a debugging direction, not a
+    number the series can carry. `executed` is the run's own account of what it depended
+    on; the prompt the ids were tiled from counts with it."""
+    if not _gated(args):
+        stderr("ungated run: not stored")
+        return
+    path = store(
+        command,
+        args.model,
+        arguments,
+        payload,
+        sustained_gbs=omnia.SUSTAINED_GBS,
+        active_bytes_per_token=active,
+        executed=[*executed, str(BENCH_PROMPT)],
+    )
+    stderr(f"stored: {path}")
 
 
 def _prompt(known: omnia.Known, wanted: int, tokens: int) -> list[int]:
@@ -165,6 +192,21 @@ def run_interleaved(args: argparse.Namespace) -> None:
     print("\n".join(lines))
     if args.json is not None:
         Path(args.json).write_text(json.dumps(comparison.as_dict(), indent=2))
+    _record(
+        args,
+        "interleaved",
+        {
+            "prompt_tokens": len(ids),
+            "tokens": args.tokens,
+            "runs": args.runs,
+            "against": args.against,
+            "draft": args.draft,
+            "lookahead": args.lookahead if args.draft is not None else None,
+        },
+        comparison.as_dict(),
+        active=omnia.active_bytes_per_token(built.model) if known.ceiling else None,
+        executed=omnia.executed(),
+    )
 
 
 def run_paired(args: argparse.Namespace) -> None:
@@ -205,6 +247,19 @@ def run_paired(args: argparse.Namespace) -> None:
     print(result.render())
     if args.json is not None:
         Path(args.json).write_text(json.dumps(result.as_dict(), indent=2))
+    _record(
+        args,
+        "paired",
+        {
+            "prompt_tokens": len(ids),
+            "tokens": args.tokens,
+            "runs": args.runs,
+            "ref": args.ref,
+            "baseline_commit": commit,
+        },
+        result.as_dict(),
+        executed=result.executed,
+    )
 
 
 def run_concurrency(args: argparse.Namespace) -> None:
@@ -216,8 +271,6 @@ def run_concurrency(args: argparse.Namespace) -> None:
         dtype=known.dtype,
         tokens=args.tokens,
     ).model
-    if not isinstance(model, BatchModel):
-        raise ValueError(f"{args.model} does not support continuous batching")
     gate = default_gate() if _gated(args) else Cool(None)
     result = omnia.measure_concurrency(
         model,
@@ -230,6 +283,22 @@ def run_concurrency(args: argparse.Namespace) -> None:
     print(result.render())
     if args.json is not None:
         Path(args.json).write_text(json.dumps(result.as_dict(), indent=2))
+    _record(
+        args,
+        "concurrency",
+        {
+            "prompt_tokens": len(ids),
+            "tokens": args.tokens,
+            "runs": args.runs,
+            "concurrencies": list(args.concurrencies),
+        },
+        result.as_dict(),
+        executed=omnia.executed(),
+    )
+
+
+def run_report(args: argparse.Namespace) -> None:
+    print(report(args.sha, model=args.model))
 
 
 def parser() -> argparse.ArgumentParser:
@@ -281,6 +350,11 @@ def parser() -> argparse.ArgumentParser:
     three = commands.add_parser("constrained", help="the same decode, free and under a schema")
     shared(three, json_out=False)
     three.set_defaults(run=run_constrained)
+
+    four = commands.add_parser("report", help="stored results for a commit")
+    four.add_argument("sha", help="a commit, ref, or hex prefix")
+    four.add_argument("--model", help="restrict to one model")
+    four.set_defaults(run=run_report)
     return root
 
 

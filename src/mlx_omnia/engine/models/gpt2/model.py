@@ -4,8 +4,8 @@ from typing import NamedTuple
 import mlx.core as mx
 import mlx.nn as nn
 
-from mlx_omnia.engine.core.attend import KVStore
-from mlx_omnia.engine.core.cache import KVCache
+from mlx_omnia.engine.core.api import LanguageModel
+from mlx_omnia.engine.core.cache import KVCache, LayerCache
 from mlx_omnia.engine.models.gpt2.config import GPT2Config
 from mlx_omnia.engine.models.gpt2.layers.block import GPT2Block
 
@@ -17,8 +17,7 @@ class GPT2Activations(NamedTuple):
     logits: mx.array
 
 
-class GPT2(nn.Module):
-    continuous_batching = True
+class GPT2(nn.Module, LanguageModel[LayerCache]):
 
     def __init__(self, config: GPT2Config) -> None:
         super().__init__()
@@ -31,7 +30,7 @@ class GPT2(nn.Module):
         return [KVCache() for _ in self.h]
 
     def activations(
-        self, ids: mx.array, cache: Sequence[KVStore] | None = None
+        self, ids: mx.array, cache: Sequence[LayerCache] | None = None
     ) -> GPT2Activations:
         positions = mx.arange(ids.shape[-1])
         if cache is not None:
@@ -42,12 +41,12 @@ class GPT2(nn.Module):
         x = self.wte(ids) + self.wpe(positions)
         embeddings = x
         blocks: list[mx.array] = []
-        caches: Sequence[KVStore | None] = cache if cache is not None else [None] * len(self.h)
+        caches: Sequence[LayerCache | None] = cache if cache is not None else [None] * len(self.h)
         for block, layer_cache in zip(self.h, caches, strict=True):
             x = block(x, layer_cache)
             blocks.append(x)
         normed = self.ln_f(x)
         return GPT2Activations(embeddings, blocks, normed, self.wte.as_linear(normed))
 
-    def __call__(self, ids: mx.array, cache: Sequence[KVStore] | None = None) -> mx.array:
+    def __call__(self, ids: mx.array, cache: Sequence[LayerCache] | None = None) -> mx.array:
         return self.activations(ids, cache).logits

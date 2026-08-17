@@ -16,13 +16,13 @@ from typing import Protocol, runtime_checkable
 
 import mlx.core as mx
 
-from mlx_omnia.engine.core.cache import FixedKVCache, KVCache, RingKVCache
 from mlx_omnia.engine.core.mxcompat import softmax
 
 __all__ = [
     "Attending",
     "AttentionMask",
     "KVStore",
+    "Storing",
     "attend",
     "dense_attention",
     "softcapped_attention",
@@ -30,9 +30,23 @@ __all__ = [
 
 type AttentionMask = mx.array | str | None
 
-type Storing = KVCache | FixedKVCache | RingKVCache
-"""The caches that answer `update_and_fetch`. Named here rather than imported from
-`core.attention` because that module reads this one."""
+
+@runtime_checkable
+class Storing(Protocol):
+    """A cache that takes this step's rows and hands back the dense history.
+
+    Structural rather than a union of the classes in `core.cache`: that module reads this
+    one, so naming them here would close a cycle — and the three facts a dense attention
+    needs of a cache are the ones below, not its class.
+    """
+
+    offset: int | mx.array
+
+    def update_and_fetch(
+        self, keys: mx.array, values: mx.array, /
+    ) -> tuple[mx.array, mx.array]: ...
+
+    def readable(self, mask: AttentionMask, queries: int, /) -> AttentionMask: ...
 
 
 @runtime_checkable
@@ -123,6 +137,10 @@ def attend(
         )
     if cache is not None:
         keys, values = cache.update_and_fetch(keys, values)
+        # The rows are back, and a fixed-shape buffer hands back more of them than it has
+        # written. A store whose fetch is exactly what it wrote answers with the caller's
+        # mask unchanged, which is every growing cache in `core.cache`.
+        mask = cache.readable(mask, queries.shape[2])
     return dense_attention(
         queries, keys, values, scale=scale, mask=mask, sinks=sinks, softcap=softcap
     )

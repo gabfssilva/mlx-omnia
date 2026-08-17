@@ -43,6 +43,7 @@ import mlx.core as mx
 import mlx.nn as nn
 
 from mlx_omnia import GenerationOptions, LanguageModel, ModelInput, UnsupportedInput
+from mlx_omnia.engine.core import api
 from mlx_omnia.engine.core.cache import LayerCache
 from mlx_omnia.engine.core.prefix import Prefixes, PrefixStore
 from mlx_omnia.engine.footprint import active_bytes_per_token, checkpoint_bytes, resident_bytes
@@ -300,22 +301,7 @@ def drafter(model: object) -> nn.Module | None:
     return None if facade is None else facade.drafter
 
 
-@runtime_checkable
-class _CausalLM(Protocol):
-    """`generate.CausalLM` with a runtime check on it.
-
-    Declared here rather than made `runtime_checkable` upstream: what needs the check is this
-    file, which has to *find* the trunk under the facades before it can substitute one, and the
-    protocol every model is written against should not grow a decorator for a walk that lives
-    in a daemon.
-    """
-
-    def make_cache(self) -> list[LayerCache]: ...
-
-    def __call__(self, ids: mx.array, cache: list[LayerCache] | None = None) -> mx.array: ...
-
-
-def _trunk(model: object) -> tuple[Wrapping, _CausalLM] | None:
+def _trunk(model: object) -> tuple[Wrapping, api.LanguageModel[LayerCache]] | None:
     """The facade holding the checkpoint's own trunk, and that trunk with any policy already on
     it peeled off — the pair a KV policy is substituted through.
 
@@ -332,13 +318,13 @@ def _trunk(model: object) -> tuple[Wrapping, _CausalLM] | None:
         held = model.model
         if isinstance(held, Quantizing):
             return model, held.model
-        if isinstance(held, _CausalLM):
+        if isinstance(held, api.LanguageModel):
             return model, held
         model = held
     return None
 
 
-def _probe(trunk: _CausalLM, policy: Compression) -> str | None:
+def _probe(trunk: api.LanguageModel[LayerCache], policy: Compression) -> str | None:
     """One short prefill and one decode step through the wrapped trunk, `None` when it ran.
 
     The half of the gate arithmetic cannot answer. A family that reaches its cache with
@@ -361,7 +347,9 @@ def _probe(trunk: _CausalLM, policy: Compression) -> str | None:
     return None
 
 
-def _verdict(model_id: str, trunk: _CausalLM, policy: Compression) -> str | None:
+def _verdict(
+    model_id: str, trunk: api.LanguageModel[LayerCache], policy: Compression
+) -> str | None:
     """Why this policy cannot hold on this trunk, `None` when it can.
 
     Run off the loop, for the reason the loader is: the probe is a forward, and the catalog

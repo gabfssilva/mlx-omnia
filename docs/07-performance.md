@@ -99,7 +99,9 @@ Two things the formula does not carry:
 - **A sparse target does not read `A_t` once per round.** Every verified row gathers the experts it routes to, up to `(k+1)·A_t` when no two rows share an expert: a loose bound, since attention, the router and the head are read once regardless. The routing union cannot be measured by the harness, so a sparse target is reported as two edges rather than a number.
 - **It is a bandwidth bound, and the draft is not bandwidth-bound.** `k` serial forwards over a small model are latency-bound long before they are bandwidth-bound, so a speculative arm sits further below its ceiling than a plain one does.
 
-For sampling, preserving the target distribution requires the ratio between draft and target probabilities for the drawn token. Rejection redraws from the residual `max(0, p − q)`. A `Sampler` here is an opaque `logits -> id` callable, so neither distribution is available. The implementation explicitly refuses non-greedy speculation because token equality under temperature would bias the output.
+Under sampling, exactness is about which token is *emitted*, not about how acceptance is decided. Draw the target's own token on each verification row and accept a proposal when it matches: the emitted token is that draw on both branches, so the output is the target's distribution for any draft at any temperature. Accepting instead with probability `min(1, p/q)`, redrawing a rejection from the residual `max(0, p − q)`, is exact too. They differ only in how often the two draws agree — `Σ p·q` for the first, `Σ min(p, q) = 1 − TV(p, q)` for the second, which is the most any coupling of two distributions can agree. Greedy is where both collapse to argmax equality.
+
+Neither is implemented. The first needs nothing the code lacks and is unwritten; the second needs distributions an opaque `logits -> id` `Sampler` does not expose. `stream_ids` refuses the non-greedy path by name.
 
 ## How a number is produced
 

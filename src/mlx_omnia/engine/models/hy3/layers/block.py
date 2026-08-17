@@ -1,7 +1,7 @@
 import mlx.core as mx
 import mlx.nn as nn
 
-from mlx_omnia.engine.core.attend import KVStore
+from mlx_omnia.engine.core.cache import LayerCache
 from mlx_omnia.engine.core.kernels.add_norm import AddRmsNorm
 from mlx_omnia.engine.core.layers import SwiGLU
 from mlx_omnia.engine.models.hy3.config import SPARSE, Hy3Config
@@ -24,7 +24,7 @@ class Hy3Block(nn.Module):
         self._join_norm: AddRmsNorm | None = None
 
     def __call__(
-        self, x: mx.array, mask: mx.array | str | None, cache: KVStore
+        self, x: mx.array, mask: mx.array | str | None, cache: LayerCache
     ) -> mx.array:
         attended, h = self._join(x, mask, cache)
         mlp = self.mlp
@@ -41,7 +41,7 @@ class Hy3Block(nn.Module):
         return join
 
     def _join(
-        self, x: mx.array, mask: mx.array | str | None, cache: KVStore
+        self, x: mx.array, mask: mx.array | str | None, cache: LayerCache
     ) -> tuple[mx.array, mx.array]:
         """(x + attention, its post-norm)."""
         attended = self.self_attn(self.input_layernorm(x), cache, mask)

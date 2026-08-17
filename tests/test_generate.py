@@ -1,4 +1,4 @@
-from collections.abc import Callable
+from collections.abc import Callable, Sequence
 from itertools import islice
 from pathlib import Path
 
@@ -7,9 +7,10 @@ import pytest
 from huggingface_hub import hf_hub_download, snapshot_download
 
 from mlx_omnia import GPT2, GPT2Tokenizer, KVCache, sampler, stream_generate, stream_ids, top_k
-from mlx_omnia.engine.core.cache import DeltaCache, LayerCache, RingKVCache
+from mlx_omnia.engine.core.api import LanguageModel, Screened, Tracing
+from mlx_omnia.engine.core.cache import DeltaCache, FixedKVCache, LayerCache, RingKVCache
 from mlx_omnia.engine.core.prefix import Prefixes, PrefixStore
-from mlx_omnia.engine.generate import CausalLM, Constraint, Meter
+from mlx_omnia.engine.generate import Constraint, Meter
 from mlx_omnia.engine.models.gpt2 import CHECKPOINT
 from mlx_omnia.engine.speculative import SpeculationRefused
 from tests.conftest import load_golden, relative_diff
@@ -121,7 +122,7 @@ def test_streaming_detokenizer_holds_partial_utf8(tokenizer: GPT2Tokenizer) -> N
     assert "�" not in "".join(pieces)
 
 
-class ScriptedLM(CausalLM[KVCache]):
+class ScriptedLM(LanguageModel[KVCache]):
     """Emits a fixed id sequence, one per step, so no checkpoint is needed."""
 
     def __init__(self, ids: list[int], vocab: int) -> None:
@@ -132,7 +133,7 @@ class ScriptedLM(CausalLM[KVCache]):
     def make_cache(self) -> list[KVCache]:
         return [KVCache()]
 
-    def __call__(self, ids: mx.array, cache: list[KVCache] | None = None) -> mx.array:
+    def __call__(self, ids: mx.array, cache: Sequence[LayerCache] | None = None) -> mx.array:
         token = self.ids[min(self.step, len(self.ids) - 1)]
         self.step += 1
         if cache is not None:
@@ -146,50 +147,80 @@ class ScriptedLM(CausalLM[KVCache]):
         return mx.broadcast_to(row, (1, ids.shape[1], self.vocab))
 
 
-class CompiledScriptedLM(ScriptedLM):
+def _position(layer: LayerCache) -> mx.array:
+    """The rows already written, as the graph sees them. `offset` is the host's view and a
+    trace freezes it; `FixedKVCache.position` is the tensor the graph reads."""
+    if isinstance(layer, FixedKVCache):
+        return layer.position
+    assert isinstance(layer.offset, int)
+    return mx.array([layer.offset])
+
+
+class CompiledScriptedLM(ScriptedLM, Tracing[LayerCache]):
+    """The same script, read off the graph instead of off a counter — which is the whole of
+    what `core.api.Tracing` claims, and the reason `ScriptedLM` above must never declare it:
+    `self.step` increments once inside a trace and then answers the same id forever.
+
+    Absolute positions, so the row at position p predicts `ids[p]`: with a prompt of length
+    L the i-th id generated is `ids[L - 1 + i]`.
+    """
+
     def __init__(self, ids: list[int], vocab: int) -> None:
         super().__init__(ids, vocab)
-        self.compiled_calls = 0
+        self.traced = 0
 
-    def compile_decode(self, cache: list[KVCache]) -> Callable[[mx.array], mx.array]:
-        def decode(ids: mx.array) -> mx.array:
-            self.compiled_calls += 1
-            return self(ids[None], cache)[:, -1, :]
+    def before_trace(self, cache: Sequence[LayerCache]) -> Sequence[object]:
+        self.traced += 1
+        return ()
 
-        return decode
+    def __call__(self, ids: mx.array, cache: Sequence[LayerCache] | None = None) -> mx.array:
+        assert cache is not None, "the compiled path always carries a cache"
+        rows = mx.ones((1, 1, ids.shape[1], 4), dtype=mx.float32)
+        at = _position(cache[0])
+        for layer in cache:
+            layer.update_and_fetch(rows, rows)
+        table = mx.array(self.ids)
+        # One id per row, at that row's own absolute position — the last of them is what the
+        # loop reads, and a block prefill has to land on the same script a step-by-step run
+        # would have.
+        positions = mx.minimum(at + mx.arange(ids.shape[1]), len(self.ids) - 1)
+        tokens = mx.take(table, positions)
+        rows = -mx.abs(mx.arange(self.vocab)[None] - tokens[:, None]).astype(mx.float32)
+        return rows.reshape(1, ids.shape[1], self.vocab)
 
 
-class GreedyCompiledScriptedLM(CompiledScriptedLM):
+class GreedyCompiledScriptedLM(CompiledScriptedLM, Screened[LayerCache]):
     def __init__(self, ids: list[int], vocab: int) -> None:
         super().__init__(ids, vocab)
-        self.greedy_compiled_calls = 0
+        self.screened_calls = 0
 
-    def compile_greedy_decode(self, cache: list[KVCache]) -> Callable[[mx.array], mx.array]:
-        def decode(ids: mx.array) -> mx.array:
-            self.greedy_compiled_calls += 1
-            return self(ids[None], cache)[:, -1, :]
-
-        return decode
+    def screened(self, ids: mx.array, cache: Sequence[LayerCache]) -> mx.array:
+        self.screened_calls += 1
+        return self(ids, cache)
 
 
-def test_stream_ids_uses_model_compiled_decode_after_prefill() -> None:
+def test_stream_ids_takes_the_lease_after_prefill() -> None:
+    """Once, and not once per token: the graph is built on the first step and every step
+    after runs it. `before_trace` firing is what says the lease was taken at all — an eager
+    loop never calls it."""
     model = CompiledScriptedLM([1, 2, 3, 4], vocab=5)
 
     assert list(stream_ids(model, [0], max_tokens=4)) == [1, 2, 3, 4]
-    assert model.compiled_calls == 4
+    assert model.traced == 1
 
 
-def test_stream_ids_uses_greedy_compiled_decode_only_for_plain_greedy() -> None:
+def test_the_screened_head_serves_plain_greedy_and_nothing_else() -> None:
+    """Outside its argmax the screened row is not logits, so a sampler over it would read
+    numbers that were never computed. The switch is the whole guard."""
     model = GreedyCompiledScriptedLM([1, 2, 3, 4], vocab=5)
 
     assert list(stream_ids(model, [0], max_tokens=4)) == [1, 2, 3, 4]
-    assert model.greedy_compiled_calls == 4
-    assert model.compiled_calls == 0
+    assert model.screened_calls == 1
 
     model = GreedyCompiledScriptedLM([1, 2, 3, 4], vocab=5)
     assert list(stream_ids(model, [0], max_tokens=4, sampler=sampler(top_k(1)))) == [1, 2, 3, 4]
-    assert model.greedy_compiled_calls == 0
-    assert model.compiled_calls == 4
+    assert model.screened_calls == 0
+    assert model.traced == 1, "still leased, just not screened"
 
 
 class _PromotedStand(KVCache):
@@ -200,19 +231,10 @@ class _PromotedStand(KVCache):
         return False
 
 
-class PromotingScriptedLM(GreedyCompiledScriptedLM):
-    """Compiles the way the real trunks do: the growing layers are replaced in place by
-    stand-ins the trie cannot rewind, and whoever kept the old list objects holds the
-    prompt's rows and nothing the decode writes after."""
-
-    def __init__(self, ids: list[int], vocab: int) -> None:
-        super().__init__(ids, vocab)
-        self.abandoned: list[KVCache] | None = None
-
-    def compile_greedy_decode(self, cache: list[KVCache]) -> Callable[[mx.array], mx.array]:
-        self.abandoned = list(cache)
-        cache[:] = [_PromotedStand() for _ in cache]
-        return super().compile_greedy_decode(cache)
+PromotingScriptedLM = GreedyCompiledScriptedLM
+"""What used to simulate a promotion. The engine promotes now — `LayerCache.fixed` replaces
+every growing layer in place with a fixed buffer the trie cannot rewind — so the double has
+nothing left to stand in for."""
 
 
 def prefixes(span: int = 4, ceiling: int = 1 << 30) -> Prefixes:
@@ -227,12 +249,14 @@ def test_a_compiling_model_still_compiles_under_a_prefix() -> None:
     single-stream decode lost its compiled path. The condition is gone — a promoted layer
     hands over its rows in absolute order like any other — so what is left to assert is that
     both happen at once."""
-    model = GreedyCompiledScriptedLM([1, 2, 3, 4], vocab=5)
+    # Padded to absolute positions: a three-id prompt is read at 0..2, so the script the
+    # generation reads starts at index 2.
+    model = GreedyCompiledScriptedLM([0, 0, 1, 2, 3, 4], vocab=5)
     prefix = prefixes()
 
     assert list(stream_ids(model, [0, 0, 0], max_tokens=4, prefix=prefix)) == [1, 2, 3, 4]
 
-    assert model.greedy_compiled_calls == 4
+    assert model.screened_calls == 1
     assert prefix.store.nbytes > 0
 
 
@@ -240,7 +264,7 @@ def test_a_promoted_decode_still_stores_its_spans() -> None:
     """The promoted shape used to be the one conversation that could keep nothing: it cannot
     rewind, and the trie's whole road back was rewinding. A span is cut out of it in absolute
     order instead, which the fixed buffer answers for exactly as the growing one does."""
-    model = PromotingScriptedLM([1, 2, 3, 4], vocab=5)
+    model = PromotingScriptedLM([0, 0, 0, 0, 1, 2, 3, 4], vocab=5)
     prefix = prefixes()
     meter = Meter()
     prompt = [0, 7, 7, 7, 7]
@@ -252,15 +276,15 @@ def test_a_promoted_decode_still_stores_its_spans() -> None:
         4,
     ]
 
-    assert model.greedy_compiled_calls == 4
+    assert model.screened_calls == 1
     assert meter.kept_prefix
-    warm = PromotingScriptedLM([1, 2, 3, 4], vocab=5)
+    warm = PromotingScriptedLM([0, 0, 0, 0, 1, 2, 3, 4], vocab=5)
     second = Recording(warm)
     list(stream_ids(second, [*prompt, 1, 2, 3, 4, 0], max_tokens=1, prefix=prefix))
     assert second.fed[0] == len(prompt) + 5 - 8, "two spans of four came out of the store"
 
 
-class PartiallyPromotingLM(CausalLM[KVCache]):
+class PartiallyPromotingLM(LanguageModel[KVCache]):
     """Two growing layers, rows written on every forward, and a compile that replaces only
     the first: the second stays live in `cache` and takes the decode's rows, which is the
     case the insert's trim exists for."""
@@ -273,7 +297,7 @@ class PartiallyPromotingLM(CausalLM[KVCache]):
     def make_cache(self) -> list[KVCache]:
         return [KVCache(), KVCache()]
 
-    def __call__(self, ids: mx.array, cache: list[KVCache] | None = None) -> mx.array:
+    def __call__(self, ids: mx.array, cache: Sequence[LayerCache] | None = None) -> mx.array:
         assert cache is not None
         rows = mx.ones((1, 1, ids.shape[1], 4), dtype=mx.float32)
         for layer in cache:
@@ -305,7 +329,7 @@ def test_a_partially_promoted_cache_stores_both_halves_at_the_same_rows() -> Non
 
     fresh = PartiallyPromotingLM([1, 2, 3, 4], vocab=5)
     cache = fresh.make_cache()
-    walk = prefix.begin(cache, fresh)
+    walk = prefix.begin(cache)
     assert walk is not None
     assert walk.resume([*prompt, 1, 2, 3, 4, 0], cache) == 8
     assert [layer.offset for layer in cache] == [8, 8]
@@ -384,7 +408,7 @@ CONVERSATION = "The quick brown fox jumps over the lazy dog. " * 60
 NEXT_TURN = " And then?"
 
 
-class Recording[C: LayerCache](CausalLM[C]):
+class Recording[C: LayerCache](LanguageModel[C]):
     """The model with a tape: how many rows each forward was fed, and the row of logits the
     sampler read from it.
 
@@ -393,7 +417,7 @@ class Recording[C: LayerCache](CausalLM[C]):
     identical — which is the whole reason CLAUDE.md puts the full comparison in the rule.
     """
 
-    def __init__(self, model: CausalLM[C]) -> None:
+    def __init__(self, model: LanguageModel[C]) -> None:
         self.model = model
         self.fed: list[int] = []
         self.logits: list[mx.array] = []
@@ -416,7 +440,7 @@ def _from_offset(offset: int, length: int) -> mx.array:
     return mx.broadcast_to(row, (1, length, 8))
 
 
-class RecurrentLM(CausalLM[DeltaCache]):
+class RecurrentLM(LanguageModel[DeltaCache]):
     """A trunk whose layer keeps a recurrent state. It answers like any other: what the
     refusal is about is the reuse, not the request."""
 
@@ -434,7 +458,7 @@ class RecurrentLM(CausalLM[DeltaCache]):
         return _from_offset(cache[0].offset, ids.shape[1])
 
 
-class MixedLM(CausalLM[LayerCache]):
+class MixedLM(LanguageModel[LayerCache]):
     """The shape of a hybrid trunk: layers that keep a rewindable KV next to one that keeps
     a recurrent state. What the trie is allowed to do is a property of the list, and the
     homogeneous fakes above never produce a mixed one."""
@@ -445,7 +469,7 @@ class MixedLM(CausalLM[LayerCache]):
     def make_cache(self) -> list[LayerCache]:
         return [KVCache(), DeltaCache(), KVCache()]
 
-    def __call__(self, ids: mx.array, cache: list[LayerCache] | None = None) -> mx.array:
+    def __call__(self, ids: mx.array, cache: Sequence[LayerCache] | None = None) -> mx.array:
         assert cache is not None
         self.fed.append(ids.shape[1])
         rows = mx.ones((1, 1, ids.shape[1], 4), dtype=mx.float32)
@@ -580,7 +604,7 @@ def test_a_cancelled_run_stores_exactly_the_ids_that_entered_the_cache(
 
     conversation = [*prompt, *taken, 0]
     cache = model.make_cache()
-    walk = prefix.begin(cache, model)
+    walk = prefix.begin(cache)
     assert walk is not None
     assert walk.resume(conversation, cache) == covered_by(conversation)
     assert [layer.offset for layer in cache] == [covered_by(conversation)] * len(model.h)
@@ -800,7 +824,7 @@ def test_speculation_and_a_grammar_are_refused_together() -> None:
         list(stream_ids(scripted, [0], max_tokens=2, draft=scripted, constraint=Recorded()))
 
 
-class UnkeepableLM(CausalLM[LayerCache]):
+class UnkeepableLM(LanguageModel[LayerCache]):
     """A trunk whose layer neither rewinds nor serializes — `RingKVCache` and the composite
     Falcon-H1 kept before it declared `is_storable`. Nothing about the request fails; the
     conversation is simply never kept."""
@@ -808,7 +832,7 @@ class UnkeepableLM(CausalLM[LayerCache]):
     def make_cache(self) -> list[LayerCache]:
         return [LayerCache()]
 
-    def __call__(self, ids: mx.array, cache: list[LayerCache] | None = None) -> mx.array:
+    def __call__(self, ids: mx.array, cache: Sequence[LayerCache] | None = None) -> mx.array:
         assert cache is not None
         cache[0].offset += ids.shape[1]
         return _from_offset(cache[0].offset, ids.shape[1])

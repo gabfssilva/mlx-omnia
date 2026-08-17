@@ -6,14 +6,16 @@ What is checked here is not the arithmetic of the compression — that is
 consistent with itself and an unwrapped layer of a hybrid is left exactly as it was.
 """
 
+from collections.abc import Sequence
+
 import mlx.core as mx
 import pytest
 
+from mlx_omnia.engine.core.api import Draftable, LanguageModel, Tracing
 from mlx_omnia.engine.core.attend import Attending, attend
 from mlx_omnia.engine.core.cache import DeltaCache, KVCache, LayerCache
 from mlx_omnia.engine.core.prefix import PrefixStore
 from mlx_omnia.engine.core.quantized_cache import QuantizedKVCache
-from mlx_omnia.engine.generate import BlockOutputs, CausalLM, CompiledDecode
 from mlx_omnia.engine.quant.quantization import Affine
 from mlx_omnia.engine.quantizing import Quantizing, admits
 
@@ -37,7 +39,7 @@ class HybridLM:
     def make_cache(self) -> list[LayerCache]:
         return [KVCache(), DeltaCache()]
 
-    def __call__(self, ids: mx.array, cache: list[LayerCache] | None = None) -> mx.array:
+    def __call__(self, ids: mx.array, cache: Sequence[LayerCache] | None = None) -> mx.array:
         assert cache is not None
         rows = ids.shape[1]
         block = mx.ones((1, self.HEADS, rows, self.HEAD_DIM), dtype=mx.float32)
@@ -80,17 +82,17 @@ def test_a_wrapped_trunk_keeps_its_prefix_under_one_policy() -> None:
     are compressed under the same policy — which is the entire reason the policy lives in
     `make_cache` instead of being substituted downstream of it — so the seeds agree and a
     hybrid conversation keeps its spans."""
-    model: CausalLM[LayerCache] = Quantizing(HybridLM(), K_FORMAT, V_FORMAT)
+    model: LanguageModel[LayerCache] = Quantizing(HybridLM(), K_FORMAT, V_FORMAT)
     store = PrefixStore(1 << 30, span=4)
     tokens = list(range(1, 12))
     cache = model.make_cache()
-    walk = store.begin("m", "sha", cache, model)
+    walk = store.begin("m", "sha", cache)
     assert walk is not None
     model(mx.array([tokens[:8]]), cache)
     walk.commit(tokens, cache, 8)
 
     warm = model.make_cache()
-    second = store.begin("m", "sha", warm, model)
+    second = store.begin("m", "sha", warm)
 
     assert second is not None
     assert second.resume(tokens, warm) == 8
@@ -107,30 +109,30 @@ def test_a_wrapper_that_does_not_override_make_cache_loses_every_prefix(
     is dense while the live one is compressed: same layer count, same shapes, two different
     meanings — and the policy inside the seed is what tells them apart. The failure is silent
     otherwise, since a chain that never matches is a prefix that is simply never reused."""
-    model: CausalLM[LayerCache] = Quantizing(HybridLM(), K_FORMAT, V_FORMAT)
+    model: LanguageModel[LayerCache] = Quantizing(HybridLM(), K_FORMAT, V_FORMAT)
     store = PrefixStore(1 << 30, span=4)
     tokens = list(range(1, 12))
     cache = model.make_cache()
-    walk = store.begin("m", "sha", cache, model)
+    walk = store.begin("m", "sha", cache)
     assert walk is not None
     model(mx.array([tokens[:8]]), cache)
     walk.commit(tokens, cache, 8)
 
     monkeypatch.setattr(Quantizing, "make_cache", _dense_make_cache)
     dense = model.make_cache()
-    second = store.begin("m", "sha", dense, model)
+    second = store.begin("m", "sha", dense)
 
     assert second is not None
     assert second.resume(tokens, dense) == 0
 
 
-def test_the_wrapper_declares_neither_compiled_decode_nor_block_outputs() -> None:
+def test_the_wrapper_declares_neither_compiled_decode_nor_draftable() -> None:
     """Both are `runtime_checkable`, so this is what `stream_ids` and a block-conditioned
     proposer actually ask. The refusal is deliberate and costs decode speed: a compiled trace
     over a compressed cache has no parity fixture behind it."""
     wrapped = Quantizing(HybridLM(), K_FORMAT, V_FORMAT)
-    assert not isinstance(wrapped, CompiledDecode)
-    assert not isinstance(wrapped, BlockOutputs)
+    assert not isinstance(wrapped, Tracing)
+    assert not isinstance(wrapped, Draftable)
 
 
 def test_admits_reads_the_head_width_against_the_formats_groups() -> None:

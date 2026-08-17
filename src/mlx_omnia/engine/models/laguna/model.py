@@ -1,22 +1,17 @@
-from collections.abc import Callable, Mapping, Sequence
+from collections.abc import Iterable, Sequence
 from typing import NamedTuple
 
 import mlx.core as mx
 import mlx.nn as nn
 
-from mlx_omnia.engine.batching import BatchedKVCache, batch
 from mlx_omnia.engine.checkpoint import wire_resident
-from mlx_omnia.engine.core.attend import KVStore
+from mlx_omnia.engine.core.api import Screened, Tracing
 from mlx_omnia.engine.core.cache import (
     FixedKVCache,
     KVCache,
     LayerCache,
-    Layout,
     RingKVCache,
-    Rows,
-    fit,
 )
-from mlx_omnia.engine.core.decode import Buckets, DecodePlan, SlotBucket, compiled_decode
 from mlx_omnia.engine.core.kernels.attention.sdpa import SCALED_DOT_PRODUCT_ATTENTION
 from mlx_omnia.engine.core.kernels.lm_head.argmax import (
     Int5Planes,
@@ -38,25 +33,7 @@ class LagunaActivations(NamedTuple):
 
 type LagunaCache = KVCache | FixedKVCache | RingKVCache
 
-_BUCKETS = (2, 4, 8)
-
-
-def _bucket_size(count: int) -> int:
-    """The smallest compiled batch a live count fits into."""
-    for size in _BUCKETS:
-        if count <= size:
-            return size
-    raise ValueError(f"batch decode takes at most {_BUCKETS[-1]} sequences, got {count}")
-
-
-def _pad_rows(ids: mx.array, size: int) -> mx.array:
-    missing = size - ids.shape[0]
-    if missing <= 0:
-        return ids
-    return mx.concatenate([ids, mx.repeat(ids[-1:], missing, axis=0)])
-
-
-def _stores(slots: Sequence[LayerCache]) -> list[FixedKVCache | RingKVCache]:
+def _stores(slots: Iterable[LayerCache]) -> list[FixedKVCache | RingKVCache]:
     """The promoted slots, narrowed back to the two shapes a Laguna decode graph reads."""
     narrowed: list[FixedKVCache | RingKVCache] = []
     for layer in slots:
@@ -65,401 +42,120 @@ def _stores(slots: Sequence[LayerCache]) -> list[FixedKVCache | RingKVCache]:
     return narrowed
 
 
-def _batched(slots: Sequence[Sequence[FixedKVCache | RingKVCache]]) -> list[BatchedKVCache]:
-    """Every Laguna layer is a KV layer, so every adapter `batch` builds is a KV one."""
-    adapters: list[BatchedKVCache] = []
-    for layer in batch(slots):
-        assert isinstance(layer, BatchedKVCache)
-        adapters.append(layer)
-    return adapters
-
-
 @uses(SCALED_DOT_PRODUCT_ATTENTION)
-class Laguna(nn.Module):
-    continuous_batching = True
+class Laguna(nn.Module, Tracing[LayerCache], Screened[LayerCache]):
 
-    _single_buckets: Buckets
-    _batch_buckets: Buckets
-    _single_live: dict[str, tuple[LayerCache, ...]]
-    _batch_dead: dict[tuple[str, int, int, int], list[LagunaCache]]
     _head_planes_cache: Int5Planes | None
 
     def __init__(self, config: LagunaConfig) -> None:
         super().__init__()
-        object.__setattr__(self, "_single_buckets", Buckets())
-        object.__setattr__(self, "_batch_buckets", Buckets())
-        object.__setattr__(self, "_single_live", {})
-        object.__setattr__(self, "_batch_dead", {})
         object.__setattr__(self, "_head_planes_cache", None)
         self.config = config
         self.model = LagunaTrunk(config)
         if not config.tie_word_embeddings:
             self.lm_head = nn.Linear(config.hidden_size, config.vocab_size, bias=False)
 
-    def make_cache(self) -> list[KVCache | RingKVCache]:
-        """Sliding layers get a fixed ring: constant shape per step is what lets the fused
-        sliding reader own the append, and what keeps the decode graph from being rebuilt
-        around a growing slice.
+    def make_cache(self) -> list[KVCache]:
+        """A growing buffer per layer, and the sliding ones carry their window.
 
-        Held back with the fused sliding reader: correct only once the reader owns the
-        append, and the per-step slice writes here cost more than the growing cache."""
-        return [KVCache() for _ in self.config.layer_types]
+        Which layer slides is the architecture's, so it is declared here. What the window
+        then buys is the cache's own: `layout` can say how deep a resume has to read, and
+        `fixed` promotes into a ring instead of a buffer. Both used to be this class's
+        answers, which made a model declare something about its state.
 
-    def cache_layouts(self) -> list[Mapping[str, Layout]] | None:
-        """Which layers slide, which the cache classes cannot say.
-
-        `make_cache` hands every layer a plain `KVCache` — the prefill keeps the whole history
-        and the mask is what makes a layer sliding — so the window lives in the config and
-        nowhere in the cache. Declaring it is what lets a resume skip the spans the mask
-        proves are never read again: a sliding layer attends `columns > position - window`,
-        so the rows before that carry zero weight for every query that will ever run.
-        """
+        The prefill still keeps the whole history — the mask is what makes a layer sliding
+        — and the ring arrives on promotion, where a constant shape per step is what lets
+        the fused sliding reader own the append."""
         return [
-            {"keys": Rows(keep=window), "values": Rows(keep=window)}
-            if kind == SLIDING
-            else {"keys": Rows(), "values": Rows()}
+            KVCache(window=self.config.sliding_window if kind == SLIDING else None)
             for kind in self.config.layer_types
-            for window in (self.config.sliding_window,)
         ]
 
-    def compile_decode(
-        self, cache: list[KVCache | FixedKVCache | RingKVCache], capacity: int | None = None
-    ) -> Callable[[mx.array], mx.array]:
-        """Promote a completed prefill cache and compile one-token forwards."""
-        return self._compile_decode(cache, self._room(cache, capacity), argmax_only=False)
+    def before_trace(self, cache: Sequence[LayerCache]) -> Sequence[object]:
+        """`core.api.Tracing`. Everything a traced step cannot do for itself, once per build.
 
-    def compile_greedy_decode(
-        self, cache: list[KVCache | FixedKVCache | RingKVCache], capacity: int | None = None
-    ) -> Callable[[mx.array], mx.array]:
-        return self._compile_decode(cache, self._room(cache, capacity), argmax_only=True)
+        The atlas is grown and evaluated, each layer's attention resolves against the shape
+        it will actually read, and the fused kernels and the MoE's step applies are chosen.
+        All of it is host-side work — a dict write, an `mx.eval`, a branch on a Python value
+        — and a trace runs its Python exactly once, so what is not settled here is settled
+        wrong.
 
-    @staticmethod
-    def _room(cache: list[KVCache | FixedKVCache | RingKVCache], capacity: int | None) -> int:
-        """4096 unless the prompt outgrew it — a multi-turn conversation walks in past it —
-        and then the smallest fitting bucket, since the fixed buffer is read whole by every
-        step's attention."""
-        return capacity if capacity is not None else max(4096, fit(cache[0].rows))
-
-    def single_decode(
-        self,
-        ids: mx.array,
-        cache: list[LagunaCache],
-        *,
-        capacity: int,
-    ) -> mx.array:
-        bucket = self._single_bucket(cache, capacity, greedy=False)
-        return bucket.decode(ids)
-
-    def single_greedy(
-        self,
-        ids: mx.array,
-        cache: list[LagunaCache],
-        *,
-        capacity: int,
-    ) -> mx.array:
-        bucket = self._single_bucket(cache, capacity, greedy=True)
-        return mx.argmax(bucket.decode(ids), axis=-1)
-
-    def prepare_single_greedy(
-        self,
-        cache: list[LagunaCache],
-        *,
-        capacity: int,
-    ) -> Callable[[mx.array], mx.array]:
-        decode = self._compile_decode(cache, capacity, argmax_only=True)
-
-        def greedy_decode(ids: mx.array) -> mx.array:
-            return mx.argmax(decode(ids), axis=-1)[0]
-
-        return greedy_decode
-
-    def _single_bucket(
-        self,
-        cache: list[LagunaCache],
-        capacity: int,
-        *,
-        greedy: bool,
-    ) -> SlotBucket:
-        """A resident single-sequence graph, dropped the moment the live cache is another
-        request's. Reloading the slots would keep the graph but not the wrapper's `base`,
-        and a decode that resumes another request's step counter writes the wrong rows."""
-        mode = "greedy" if greedy else "logits"
-        live = self._single_live.get(mode)
-        if live is not None and not all(
-            source is target for source, target in zip(cache, live, strict=True)
-        ):
-            self._single_buckets.clear()
-            self._single_live.clear()
-
-        def build(_pending: Sequence[list[LayerCache]], room: int) -> SlotBucket:
-            decode = self._compile_decode(cache, room, argmax_only=greedy)
-            return SlotBucket((tuple(cache),), decode)
-
-        view: list[list[LayerCache]] = [[*cache]]
-        bucket = self._single_buckets.lease(mode, view, capacity, build)
-        self._single_live[mode] = tuple(cache)
-        return bucket
-
-    def compile_batch_decode(
-        self,
-        caches: Sequence[list[KVCache | FixedKVCache | RingKVCache]],
-        capacity: int = 4096,
-    ) -> Callable[[mx.array], mx.array]:
-        return self._build_batch(caches, capacity, project_head=True).decode
-
-    def _lease_batch(
-        self,
-        caches: Sequence[list[LagunaCache]],
-        capacity: int,
-        *,
-        project_head: bool,
-    ) -> SlotBucket:
-        mode = "logits" if project_head else "hidden"
-        count = len(caches)
-        size = _bucket_size(count)
-        padded: list[list[LagunaCache]] = [
-            *caches,
-            *(self._dead_slot(mode, size, capacity, row) for row in range(count, size)),
-        ]
-        views: list[list[LayerCache]] = [[*sequence] for sequence in padded]
-
-        def build(_pending: Sequence[list[LayerCache]], room: int) -> SlotBucket:
-            return self._build_batch(padded, room, project_head=project_head)
-
-        bucket = self._batch_buckets.lease(mode, views, capacity, build)
-        for sequence, slot in zip(padded, bucket.slots, strict=True):
-            sequence[:] = _stores(slot)
-        return bucket
-
-    def _dead_slot(
-        self, mode: str, size: int, capacity: int, row: int
-    ) -> list[LagunaCache]:
-        """A bucket row no sequence occupies. It is never loaded from a live sequence: one
-        token of its own is enough to give the row a position, and every layer's validity
-        mask reads that position, so the row attends its own stale state and the decode
-        drops the result."""
-        key = (mode, size, capacity, row)
-        dead: list[LagunaCache] | None = self._batch_dead.get(key)
-        if dead is None:
-            dead = [*self.make_cache()]
-            self._activations(mx.array([[0]]), dead, project_head=False)
-            mx.eval(*(tensor for layer in dead for tensor in layer.tensors))
-            self._batch_dead[key] = dead
-        return dead
-
-    def _build_batch(
-        self,
-        caches: Sequence[list[LagunaCache]],
-        capacity: int,
-        *,
-        project_head: bool,
-    ) -> SlotBucket:
-        if len(caches) not in _BUCKETS:
-            raise ValueError(f"compiled batch size must be one of {_BUCKETS}, got {len(caches)}")
-        if any(len(sequence) != len(self.config.layer_types) for sequence in caches):
-            raise ValueError("batch decode cache count does not match the model")
-        offsets = [sequence[0].rows for sequence in caches]
-        if max(offsets) >= capacity:
-            raise ValueError(
-                f"prompt length {max(offsets)} does not fit compiled capacity {capacity}"
-            )
-        slots = self._make_batch_slots(caches, capacity)
-        stores = _batched(slots)
-        state = [layer.state for sequence in slots for layer in sequence]
-
-        for block in self.model.layers:
-            block.self_attn.angles(max(offsets))
-            block.self_attn.kernels()
-            block.kernels()
-            if isinstance(block.mlp, LagunaSparseMoe):
-                block.mlp.step_applies()
-        wire_resident()
-        for sequence, slot in zip(caches, slots, strict=True):
-            sequence[:] = slot
-
-        def forward(ids: mx.array) -> mx.array:
-            x = self.model.embed_tokens(ids)
-            for block, layer_cache in zip(self.model.layers, stores, strict=True):
-                x = block(x, None, layer_cache)
-            normed = self.model.norm(x)
-            if not project_head:
-                return normed
-            if self.config.tie_word_embeddings:
-                return self.model.embed_tokens.as_linear(normed)
-            return self.lm_head(normed)
-
-        return SlotBucket(
-            tuple(tuple(slot) for slot in slots),
-            mx.compile(forward, inputs=[ATLASES, state], outputs=state),
-        )
-
-    def _make_batch_slots(
-        self,
-        caches: Sequence[Sequence[LayerCache]],
-        capacity: int,
-    ) -> list[list[FixedKVCache | RingKVCache]]:
-        slots = [self._promote_slot(sequence, capacity) for sequence in caches]
-        mx.eval(*(tensor for slot in slots for layer in slot for tensor in layer.tensors))
-        return slots
-
-    def _promote_slot(
-        self,
-        sequence: Sequence[LayerCache],
-        capacity: int,
-    ) -> list[FixedKVCache | RingKVCache]:
-        """SLIDING layers get a ring, FULL layers a fixed buffer at `capacity`. The family's
-        policy, not the core's: which layer slides is a property of the architecture."""
-        slot: list[FixedKVCache | RingKVCache] = []
-        for source, kind in zip(sequence, self.config.layer_types, strict=True):
-            assert isinstance(source, KVCache | FixedKVCache | RingKVCache)
-            if kind == SLIDING:
-                if isinstance(source, KVCache):
-                    target = RingKVCache.promote(source, self.config.sliding_window)
-                elif isinstance(source, RingKVCache):
-                    keys, values = source.fetch()
-                    target = RingKVCache(self.config.sliding_window)
-                    # `reload` and not `restore`: the rotation *is* the state here, and the
-                    # two rings share it. `restore` takes rows in absolute order and would
-                    # unrotate and rotate the same buffer for nothing.
-                    target.reload(
-                        source.rows,
-                        keys + mx.zeros_like(keys),
-                        values + mx.zeros_like(values),
-                    )
-                else:
-                    raise TypeError("sliding layer requires a growing or ring KV cache")
+        The atlas goes back as a capture because it is the one thing here that the graph
+        *reads* and something outside it rewrites: a conversation walking past `_ATLAS_ROWS`
+        grows the table, and a trace holding the old array would rotate every later token by
+        an angle off the end of it.
+        """
+        # Sized to the capacity and not to the rows written: inside the graph the position is
+        # a tensor and the rotation reads the table by `mx.take`, so every column this buffer
+        # could reach has to be in it before the trace, not by the time it gets there.
+        span = cache[0].span
+        for layer, layer_cache in zip(self.model.layers, cache, strict=True):
+            layer.self_attn.angles(span - 1)
+            if isinstance(layer_cache, FixedKVCache | RingKVCache):
+                # One row, read raw: the attention resolves against the buffer it will
+                # actually index, which is what keeps the fused single-row kernel on.
+                layer.self_attn.prepare_decode(layer_cache)
             else:
-                if isinstance(source, RingKVCache):
-                    raise TypeError("full layer cannot be restored from a ring KV cache")
-                keys, values = source.fetch()
-                rows = source.rows
-                shape = list(keys.shape)
-                shape[2] = capacity
-                fixed_keys = mx.zeros(shape, dtype=keys.dtype)
-                fixed_values = mx.zeros(shape, dtype=values.dtype)
-                fixed_keys[..., :rows, :] = keys[..., :rows, :]
-                fixed_values[..., :rows, :] = values[..., :rows, :]
-                target = FixedKVCache(fixed_keys, fixed_values, rows)
-            slot.append(target)
-        return slot
+                # A ragged batch. The adapter owns the read and the per-row mask, so what is
+                # left to settle is the kernels the block chooses.
+                layer.self_attn.kernels()
+            layer.kernels()
+            if isinstance(layer.mlp, LagunaSparseMoe):
+                layer.mlp.step_applies()
+        wire_resident()
+        return [ATLASES]
 
-    def batch_decode(
-        self,
-        ids: mx.array,
-        caches: Sequence[list[KVCache | FixedKVCache | RingKVCache]],
-        *,
-        capacity: int,
-    ) -> mx.array:
-        bucket = self._lease_batch(caches, capacity, project_head=True)
-        return bucket.decode(_pad_rows(ids, len(bucket.slots)))[: len(caches)]
+    def screened(self, ids: mx.array, cache: Sequence[LayerCache]) -> mx.array:
+        """`core.api.Screened`. The greedy id off a screened head instead of a projection.
 
-    def batch_greedy(
-        self,
-        ids: mx.array,
-        caches: Sequence[list[KVCache | FixedKVCache | RingKVCache]],
-        *,
-        capacity: int,
-    ) -> tuple[mx.array, ...]:
-        bucket = self._lease_batch(caches, capacity, project_head=False)
-        count = len(caches)
-        hidden = bucket.decode(_pad_rows(ids, len(bucket.slots)))[:count, -1, :]
+        `lm_head` is bf16 `[vocab, hidden]` — 411 MB on Laguna-XS, against blocks that are
+        4-bit — and a greedy step reads one number out of it. The chain in
+        `core.kernels.lm_head` reads the coarse int5 planes for the whole vocabulary and the
+        full bf16 rows only for the candidates a certificate cannot rule out.
+
+        Row by row, because the chain is a single-token head: `lm_head_argmax_applies`
+        answers for `rows=1` and nothing else. Worth 1.108x on one row and 1.066x on two;
+        by four it is a wash, and the loop is what stops paying.
+        """
         planes = self._head_planes()
         if planes is None:
-            logits = (
-                self.model.embed_tokens.as_linear(hidden)
-                if self.config.tie_word_embeddings
-                else self.lm_head(hidden)
-            )
-            tokens = mx.argmax(logits, axis=-1)
-            return tuple(tokens[index] for index in range(count))
-        return tuple(
-            mx.argmax(lm_head_argmax_row(hidden[index], self.lm_head.weight, planes))
-            for index in range(count)
-        )
-
-    def _compile_decode(
-        self,
-        cache: list[KVCache | FixedKVCache | RingKVCache],
-        capacity: int,
-        *,
-        argmax_only: bool,
-    ) -> Callable[[mx.array], mx.array]:
-        if len(cache) != len(self.config.layer_types):
-            raise ValueError("decode cache count does not match the model")
-        offset = cache[0].rows
-        if offset >= capacity:
-            raise ValueError(f"prompt length {offset} does not fit compiled capacity {capacity}")
-        head_planes = self._head_planes() if argmax_only else None
-
-        def promote(current: list[LayerCache], fitting: int) -> list[LayerCache]:
-            slot = self._make_batch_slots([current], fitting)[0]
-            cache[:] = slot
-            return [*slot]
-
-        def prepare(slots: Sequence[LayerCache]) -> None:
-            for layer, layer_cache in zip(self.model.layers, _stores(slots), strict=True):
-                layer.self_attn.angles(slots[0].rows)
-                layer.self_attn.prepare_decode(layer_cache)
-                layer.kernels()
-                if isinstance(layer.mlp, LagunaSparseMoe):
-                    layer.mlp.step_applies()
-            wire_resident()
-
-        def step(ids: mx.array, slots: Sequence[LayerCache], mask: mx.array | None) -> mx.array:
-            # The core's validity mask is unused: Laguna builds its own inside `_activations`,
-            # where the ring's mask is the ring's own graph-visible position.
-            del mask
-            return self._activations(
-                ids[None], _stores(slots), project_head=head_planes is None
-            ).logits[:, -1, :]
-
-        plan = DecodePlan(
-            step=step,
-            promote=promote,
-            prepare=prepare,
-            captures=lambda: [ATLASES],
-        )
-        layers: list[LayerCache] = [*cache]
-        compiled = compiled_decode(plan, layers, capacity)
-        if head_planes is None:
-            return compiled
-
-        def greedy_forward(ids: mx.array) -> mx.array:
-            return self._greedy_logits(compiled(ids), head_planes)
-
-        return greedy_forward
+            return self(ids, cache)
+        hidden = self._activations(ids, cache, project_head=False).logits[:, -1, :]
+        rows = [
+            lm_head_argmax_row(hidden[index], self.lm_head.weight, planes)
+            for index in range(hidden.shape[0])
+        ]
+        return mx.stack(rows)[:, None, :]
 
     def activations(
         self,
         ids: mx.array,
-        cache: Sequence[KVStore] | None = None,
+        cache: Sequence[LayerCache] | None = None,
     ) -> LagunaActivations:
         return self._activations(ids, cache, project_head=True)
 
     def _activations(
         self,
         ids: mx.array,
-        cache: Sequence[KVStore] | None,
+        cache: Sequence[LayerCache] | None,
         *,
         project_head: bool,
     ) -> LagunaActivations:
         cache = cache if cache is not None else self.make_cache()
         x = self.model.embed_tokens(ids)
         length = x.shape[1]
-        offset = cache[0].offset
         full: mx.array | str | None = None if length == 1 else "causal"
         sliding: mx.array | str | None = None
         if SLIDING in self.config.layer_types:
-            ring = next(
-                (
-                    layer
-                    for layer, kind in zip(cache, self.config.layer_types, strict=True)
-                    if kind == SLIDING and isinstance(layer, RingKVCache)
-                ),
-                None,
+            slider = next(
+                layer
+                for layer, kind in zip(cache, self.config.layer_types, strict=True)
+                if kind == SLIDING
             )
             sliding = (
-                self._ring_mask(ring) if ring is not None else self._sliding_mask(length, offset)
+                self._ring_mask(slider)
+                if isinstance(slider, RingKVCache)
+                else self._sliding_mask(length, slider.offset, span=slider.span)
             )
 
         blocks: list[mx.array] = []
@@ -504,7 +200,7 @@ class Laguna(nn.Module):
         )
 
     def __call__(
-        self, ids: mx.array, cache: Sequence[KVStore] | None = None
+        self, ids: mx.array, cache: Sequence[LayerCache] | None = None
     ) -> mx.array:
         return self.activations(ids, cache).logits
 
@@ -518,7 +214,9 @@ class Laguna(nn.Module):
             return None
         return (mx.arange(ring.window) <= ring.position).reshape(1, 1, 1, ring.window)
 
-    def _sliding_mask(self, length: int, offset: int | mx.array) -> mx.array | str | None:
+    def _sliding_mask(
+        self, length: int, offset: int | mx.array, *, span: int
+    ) -> mx.array | str | None:
         """The band `rows >= columns and rows < columns + window`, built only where
         it is not already something cheaper. No key is old enough for the window to
         cut while `offset + length <= window`, so the band *is* the causal mask there
@@ -526,7 +224,10 @@ class Laguna(nn.Module):
         offset - window`."""
         window = self.config.sliding_window
         if not isinstance(offset, int):
-            keys = int(mx.max(offset).item()) + length
+            # `span` and not `max(offset)`: the positions here are the graph's, and
+            # evaluating one is what a compiled decode cannot do. The layer answers with a
+            # static column count because buffer shapes do not move inside a step.
+            keys = span
             columns = mx.arange(keys)[None, None, None, :]
             rows = offset[:, None] + mx.arange(length)[None, :]
             positions = rows[:, None, :, None]

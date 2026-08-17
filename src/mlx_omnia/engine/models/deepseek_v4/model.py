@@ -4,14 +4,18 @@ from typing import NamedTuple
 import mlx.core as mx
 import mlx.nn as nn
 
+from mlx_omnia.engine.core.api import Tracing
+from mlx_omnia.engine.core.cache import LayerCache
 from mlx_omnia.engine.models.deepseek_v4.config import OVERLAP, DeepseekV4Config
 from mlx_omnia.engine.models.deepseek_v4.layers.block import DeepseekV4Trunk
 from mlx_omnia.engine.models.deepseek_v4.layers.cache import (
     BatchedDeepseekV4Cache,
     DeepseekV4Cache,
+    DeepseekV4Solo,
+    FixedDeepseekV4Cache,
 )
 
-type DeepseekV4Layer = DeepseekV4Cache | BatchedDeepseekV4Cache
+type DeepseekV4Layer = DeepseekV4Solo | BatchedDeepseekV4Cache
 """What one layer of this family's cache can be: its own cache, or the ragged adapter."""
 
 
@@ -20,9 +24,7 @@ class DeepseekV4Activations(NamedTuple):
     logits: mx.array
 
 
-class DeepseekV4(nn.Module):
-    continuous_batching = True
-
+class DeepseekV4(nn.Module, Tracing[LayerCache]):
     def __init__(self, config: DeepseekV4Config) -> None:
         super().__init__()
         self.config = config
@@ -32,26 +34,48 @@ class DeepseekV4(nn.Module):
     def make_cache(self) -> list[DeepseekV4Cache]:
         """One cache per layer, shaped by that layer's compress ratio: the pooled halves
         only exist where the layer has a compressor."""
-        return [
-            DeepseekV4Cache(ratio, indexed=ratio == OVERLAP) for ratio in self.config.ratios
-        ]
+        return [DeepseekV4Cache(ratio, indexed=ratio == OVERLAP) for ratio in self.config.ratios]
+
+    def before_trace(self, cache: Sequence[LayerCache]) -> Sequence[object]:
+        """`core.api.Tracing`. Every delegator the trunk's graph will bake, resolved outside
+        it: the router and the expert kernels decide applicability by reading the leaves they
+        were handed, and an array read inside `mx.compile` raises.
+
+        Nothing is captured. The kernels hold the leaves they resolved against, so an array
+        that is both a declared input and a strategy's field is what the compile rejects;
+        left out they bake in as constants.
+
+        Both halves of the claim hold. Every position this trunk rotates by is
+        `FixedDeepseekV4Cache.position` — a graph tensor, read before the local window's
+        update moves it — and the columns neither the fixed buffer nor the pool has written
+        are cut by `DeepseekV4Attention._band` and `FixedPoolCache.mask` before the attend.
+        """
+        del cache
+        for block in self.model.layers:
+            block.ffn.resolve()
+        return []
 
     def activations(
-        self, ids: mx.array, cache: Sequence[DeepseekV4Layer] | None = None
+        self, ids: mx.array, cache: Sequence[LayerCache] | None = None
     ) -> DeepseekV4Activations:
         cache = cache if cache is not None else self.make_cache()
         if isinstance(cache[0], BatchedDeepseekV4Cache):
-            return self._ragged(ids, cache)
-        single: list[DeepseekV4Cache] = []
+            rows: list[DeepseekV4Layer] = []
+            for layer in cache:
+                if not isinstance(layer, BatchedDeepseekV4Cache):
+                    raise TypeError(
+                        f"a batched deepseek_v4 forward mixes in {type(layer).__name__}"
+                    )
+                rows.append(layer)
+            return self._ragged(ids, rows)
+        single: list[DeepseekV4Solo] = []
         for layer in cache:
-            if not isinstance(layer, DeepseekV4Cache):
+            if not isinstance(layer, DeepseekV4Cache | FixedDeepseekV4Cache):
                 raise TypeError(f"a deepseek_v4 forward mixes in {type(layer).__name__}")
             single.append(layer)
         return self._forward(ids, single)
 
-    def __call__(
-        self, ids: mx.array, cache: Sequence[DeepseekV4Layer] | None = None
-    ) -> mx.array:
+    def __call__(self, ids: mx.array, cache: Sequence[LayerCache] | None = None) -> mx.array:
         return self.activations(ids, cache).logits
 
     def _ragged(self, ids: mx.array, cache: Sequence[DeepseekV4Layer]) -> DeepseekV4Activations:
@@ -69,9 +93,9 @@ class DeepseekV4(nn.Module):
             if not isinstance(layer, BatchedDeepseekV4Cache):
                 raise TypeError("a batched deepseek_v4 forward mixes in a solo layer")
             layers.append(layer)
-        count = len(layers[0].rows)
+        count = len(layers[0].sequences)
         parts = [
-            self._forward(ids[row : row + 1], [layer.rows[row] for layer in layers])
+            self._forward(ids[row : row + 1], [layer.sequences[row] for layer in layers])
             for row in range(count)
         ]
         blocks = [
@@ -80,11 +104,16 @@ class DeepseekV4(nn.Module):
         ]
         return DeepseekV4Activations(blocks, mx.concatenate([part.logits for part in parts]))
 
-    def _forward(
-        self, ids: mx.array, cache: Sequence[DeepseekV4Cache]
-    ) -> DeepseekV4Activations:
+    def _forward(self, ids: mx.array, cache: Sequence[DeepseekV4Solo]) -> DeepseekV4Activations:
         x = self.model.embed_tokens(ids)
-        mask = self._window(x.shape[1], cache[0].offset)
+        # A fixed layer builds its own band: `offset` there is the host's stale view of a
+        # position that moved inside the graph, and a window cut from it would freeze at
+        # whatever token the trace was taken on.
+        mask = (
+            None
+            if isinstance(cache[0], FixedDeepseekV4Cache)
+            else self._window(x.shape[1], cache[0].offset)
+        )
         h = mx.contiguous(
             mx.broadcast_to(
                 x[:, :, None, :], (x.shape[0], x.shape[1], self.config.hc_mult, x.shape[2])
@@ -96,9 +125,7 @@ class DeepseekV4(nn.Module):
         for index, (block, layer_cache) in enumerate(zip(layers, cache, strict=True)):
             following = layers[index + 1] if index + 1 < len(layers) else None
             next_fn = (
-                following.attn_hc.fn
-                if following is not None and following.attn_hc.fused
-                else None
+                following.attn_hc.fn if following is not None and following.attn_hc.fused else None
             )
             h, partials = block(h, mask, layer_cache, ids, partials, next_fn)
             blocks.append(h)

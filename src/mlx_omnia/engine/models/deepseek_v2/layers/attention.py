@@ -1,7 +1,8 @@
 import mlx.core as mx
 import mlx.nn as nn
 
-from mlx_omnia.engine.core.attend import KVStore, attend
+from mlx_omnia.engine.core.attend import attend
+from mlx_omnia.engine.core.cache import LayerCache
 from mlx_omnia.engine.core.rope import Yarn
 from mlx_omnia.engine.models.deepseek_v2.config import DeepseekV2Config
 
@@ -67,7 +68,7 @@ class DeepseekV2Attention(nn.Module):
             return self.q_proj(x)
         return self.q_b_proj(self.q_a_layernorm(self.q_a_proj(x)))
 
-    def __call__(self, x: mx.array, cache: KVStore) -> mx.array:
+    def __call__(self, x: mx.array, cache: LayerCache) -> mx.array:
         rows, length = x.shape[0], x.shape[1]
         offset = cache.offset
         q = self.queries(x).reshape(rows, length, self.heads, self.q_head_dim).transpose(0, 2, 1, 3)

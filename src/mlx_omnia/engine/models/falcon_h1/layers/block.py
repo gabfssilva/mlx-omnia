@@ -25,7 +25,7 @@ class FalconH1DecoderLayer(nn.Module):
         self.input_layernorm = nn.RMSNorm(config.hidden_size, eps=config.rms_norm_eps)
         self.pre_ff_layernorm = nn.RMSNorm(config.hidden_size, eps=config.rms_norm_eps)
 
-    def __call__(self, x: mx.array, mamba_cache: Recurring, kv_cache: KVStore) -> mx.array:
+    def __call__(self, x: mx.array, mamba_cache: Recurring, kv_cache: LayerCache) -> mx.array:
         h = self.input_layernorm(x)
         mamba_h = self.mamba(h, mamba_cache)
         attn_h = self.self_attn(h, kv_cache)

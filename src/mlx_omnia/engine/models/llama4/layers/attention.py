@@ -3,7 +3,8 @@ import math
 import mlx.core as mx
 import mlx.nn as nn
 
-from mlx_omnia.engine.core.attend import KVStore, attend
+from mlx_omnia.engine.core.attend import attend
+from mlx_omnia.engine.core.cache import LayerCache
 from mlx_omnia.engine.core.layers import split_qkv
 from mlx_omnia.engine.models.llama4.config import Llama4TextConfig
 
@@ -49,7 +50,7 @@ class Llama4Attention(nn.Module):
             freqs=self._freqs,
         )
 
-    def __call__(self, x: mx.array, mask: mx.array | str | None, cache: KVStore) -> mx.array:
+    def __call__(self, x: mx.array, mask: mx.array | str | None, cache: LayerCache) -> mx.array:
         length = x.shape[1]
         offset = cache.offset
         query_width = self.heads * self.head_dim

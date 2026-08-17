@@ -1,8 +1,9 @@
 import mlx.core as mx
 import mlx.nn as nn
 
-from mlx_omnia.engine.core.attend import Attending, AttentionMask, KVStore, attend
-from mlx_omnia.engine.core.attention import Spanned, ragged_mask
+from mlx_omnia.engine.core.attend import Attending, AttentionMask, attend
+from mlx_omnia.engine.core.attention import ragged_mask
+from mlx_omnia.engine.core.cache import LayerCache
 from mlx_omnia.engine.core.layers import split_qkv
 from mlx_omnia.engine.core.masks import SLIDING, causal_mask
 from mlx_omnia.engine.models.gemma2.config import Gemma2Config
@@ -39,7 +40,7 @@ class Gemma2Attention(nn.Module):
             return None
         return causal_mask(queries, keys, self.window)
 
-    def __call__(self, x: mx.array, cache: KVStore) -> mx.array:
+    def __call__(self, x: mx.array, cache: LayerCache) -> mx.array:
         length = x.shape[1]
         offset = cache.offset
         q, k, v = split_qkv(
@@ -51,7 +52,7 @@ class Gemma2Attention(nn.Module):
                 length,
                 offset,
                 self.window,
-                span=cache.span if isinstance(cache, Spanned) else None,
+                span=cache.span,
             )
         else:
             # A growing KV cache fetches exactly what it holds, so its own offset measures

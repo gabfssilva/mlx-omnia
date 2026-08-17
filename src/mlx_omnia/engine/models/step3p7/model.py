@@ -5,9 +5,9 @@ import mlx.core as mx
 import mlx.nn as nn
 import numpy as np
 
-from mlx_omnia.engine.core.attend import KVStore
-from mlx_omnia.engine.core.attention import Spanned, ragged_mask
-from mlx_omnia.engine.core.cache import KVCache
+from mlx_omnia.engine.core.api import LanguageModel
+from mlx_omnia.engine.core.attention import ragged_mask
+from mlx_omnia.engine.core.cache import KVCache, LayerCache
 from mlx_omnia.engine.core.prefill import prefill
 from mlx_omnia.engine.generate import Meter, Penalty, Sampler, greedy, stream_text
 from mlx_omnia.engine.language import (
@@ -32,11 +32,10 @@ class Step3p7Activations(NamedTuple):
     logits: mx.array
 
 
-class Step3p7(nn.Module):
+class Step3p7(nn.Module, LanguageModel[LayerCache]):
     """The VLM: step3p5 trunk + perception_encoder vision tower + linear projector.
     Image features are scattered into ``input_ids == image_token_id`` via masked_scatter."""
 
-    continuous_batching = True
 
     def __init__(self, config: Step3p7Config) -> None:
         super().__init__()
@@ -58,7 +57,7 @@ class Step3p7(nn.Module):
     def activations(
         self,
         ids: mx.array,
-        cache: Sequence[KVStore] | None = None,
+        cache: Sequence[LayerCache] | None = None,
         *,
         embeddings: mx.array | None = None,
     ) -> Step3p7Activations:
@@ -72,7 +71,7 @@ class Step3p7(nn.Module):
         sliding: mx.array | str | None = None
         if SLIDING in types:
             if isinstance(offset, mx.array):
-                span = cache[0].span if isinstance(cache[0], Spanned) else None
+                span = cache[0].span
                 sliding = ragged_mask(length, offset, text.sliding_window, span=span)
             else:
                 sliding = self._sliding_mask(length, offset)
@@ -92,7 +91,7 @@ class Step3p7(nn.Module):
     def __call__(
         self,
         ids: mx.array,
-        cache: Sequence[KVStore] | None = None,
+        cache: Sequence[LayerCache] | None = None,
         *,
         embeddings: mx.array | None = None,
     ) -> mx.array:
@@ -180,7 +179,7 @@ def sees(config: Step3p7Config, processor: Step3p7Processor | None) -> bool:
     )
 
 
-class Step3p7LanguageModel(TextLanguageModel[KVCache, Step3p7Input]):
+class Step3p7LanguageModel(TextLanguageModel[Step3p7Input]):
     """The chassis with the vision path over it: a text request is `TextLanguageModel`'s —
     the trie, the batched decode — and what is the family's is the picture."""
 

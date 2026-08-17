@@ -4,7 +4,7 @@ from collections.abc import Callable
 import mlx.core as mx
 import mlx.nn as nn
 
-from mlx_omnia.engine.core.attend import Attending, KVStore
+from mlx_omnia.engine.core.attend import KVStore
 from mlx_omnia.engine.core.cache import (
     DeltaCache,
     FixedDeltaCache,
@@ -106,16 +106,10 @@ class Qwen35Block(nn.Module):
             self._join_strategy, self._join_key = join, key
         return join
 
-    def mix(
-        self,
-        x: mx.array,
-        cache: Qwen35Layer,
-        positions: mx.array | None,
-        mask: mx.array | None = None,
-    ) -> mx.array:
+    def mix(self, x: mx.array, cache: Qwen35Layer, positions: mx.array | None) -> mx.array:
         if self.attends:
-            assert isinstance(cache, KVCache | FixedKVCache | Attending)
-            return self.self_attn(self.input_layernorm(x), cache, positions, mask)
+            assert isinstance(cache, LayerCache)
+            return self.self_attn(self.input_layernorm(x), cache, positions)
         assert isinstance(cache, Recurring)
         return self.linear_attn(self.input_layernorm(x), cache)
 
@@ -138,12 +132,8 @@ class Qwen35Block(nn.Module):
             mlp.kernels()
         self._resolved_outside = True
 
-    def graph_step(
-        self,
-        x: mx.array,
-        cache: FixedKVCache | FixedDeltaCache,
-        positions: mx.array | None,
-        mask: mx.array | None,
+    def _graph_step(
+        self, x: mx.array, cache: FixedKVCache | FixedDeltaCache, positions: mx.array | None
     ) -> mx.array:
         """One token through this block reading every array off a graph-visible cache —
         the body a trunk-level `mx.compile` traces.
@@ -151,10 +141,11 @@ class Qwen35Block(nn.Module):
         Deliberately not `self._step`/`self._tail_step`: those are traces of their own,
         and a trace inside a trace is either inlined twice or a barrier the outer graph
         cannot fuse across. The arithmetic is the same closure either way, so the two
-        paths round identically."""
+        paths round identically. `_rebuild` is deliberately absent for the same reason —
+        it is host-side work, and `Qwen35.before_trace` is where it happens instead."""
         if self.attends:
             assert isinstance(cache, FixedKVCache)
-            return self._tail(x, self.self_attn(self.input_layernorm(x), cache, positions, mask))
+            return self._tail(x, self.self_attn(self.input_layernorm(x), cache, positions))
         assert isinstance(cache, FixedDeltaCache)
         window, state = cache.window, cache.state
         step = self._step_body
@@ -325,6 +316,12 @@ class Qwen35Block(nn.Module):
         # Both the fused steps and the sparse tail are one row wide; a ragged batch takes
         # the eager path below instead.
         single = x.shape[0] == 1 and x.shape[1] == 1
+        if single and isinstance(cache, FixedKVCache | FixedDeltaCache):
+            # Promoted caches, so this call is inside a trunk-level trace whether or not it
+            # knows it. First, and before the `COMPILED_STEP` pair: a `FixedDeltaCache` is
+            # a `DeltaCache`, and taking that branch would nest a compile inside the outer
+            # graph and re-resolve delegators the outer graph had already baked.
+            return self._graph_step(x, cache, positions)
         if single and flags.COMPILED_STEP:
             if self.attends and isinstance(cache, KVCache):
                 # Projections stay eager: mx.fast.rope takes the offset as an op

@@ -222,12 +222,12 @@ def test_the_prefix_store_reuses_a_compressed_cache_span_by_span() -> None:
     queries, keys, values = rows(32, heads=HEADS), rows(32), rows(32, seed=1)
     attend(caches[0], queries, keys=keys, values=values, scale=SCALE, mask="causal")
     tokens = list(range(32))
-    walk = store.begin("m", "sha", caches, None)
+    walk = store.begin("m", "sha", caches)
     assert walk is not None
     walk.commit(tokens, caches, 32)
 
     fresh = [QuantizedKVCache(format, format, start_tokens=12)]
-    second = store.begin("m", "sha", fresh, None)
+    second = store.begin("m", "sha", fresh)
     assert second is not None
 
     assert second.resume([*tokens, 900, 901], fresh) == 32

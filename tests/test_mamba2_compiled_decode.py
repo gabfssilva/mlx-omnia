@@ -15,6 +15,7 @@ import mlx.core as mx
 from mlx.utils import tree_map
 
 from mlx_omnia.engine.core.cache import FixedDeltaCache
+from mlx_omnia.engine.core.decode import compiled_decode, plan_of
 from mlx_omnia.engine.models.mamba2.config import Mamba2Config
 from mlx_omnia.engine.models.mamba2.model import Mamba2
 
@@ -51,7 +52,7 @@ def test_compiled_decode_matches_eager_stepwise() -> None:
     model(prompt, eager_cache)
     model(prompt, compiled_cache)
 
-    decode = model.compile_decode(compiled_cache)
+    decode = compiled_decode(plan_of(model), compiled_cache)
     assert all(isinstance(layer, FixedDeltaCache) for layer in compiled_cache)
     first = compiled_cache[0]
     assert isinstance(first, FixedDeltaCache)
@@ -81,7 +82,7 @@ def test_mutated_state_breaks_parity() -> None:
     model(prompt, eager_cache)
     model(prompt, compiled_cache)
 
-    decode = model.compile_decode(compiled_cache)
+    decode = compiled_decode(plan_of(model), compiled_cache)
     first = compiled_cache[0]
     assert isinstance(first, FixedDeltaCache)
     state = first.state

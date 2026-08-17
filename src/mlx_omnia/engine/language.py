@@ -8,7 +8,6 @@ import mlx.core as mx
 import mlx.nn as nn
 
 from mlx_omnia.engine.batching import (
-    BatchModel,
     BatchPrefill,
     BatchSequence,
     SequenceCache,
@@ -16,11 +15,10 @@ from mlx_omnia.engine.batching import (
 from mlx_omnia.engine.batching import (
     step as batch_step,
 )
+from mlx_omnia.engine.core import api
 from mlx_omnia.engine.core.cache import LayerCache
 from mlx_omnia.engine.core.prefix import Prefixes
 from mlx_omnia.engine.generate import (
-    BlockOutputs,
-    CausalLM,
     Constraint,
     Meter,
     Penalty,
@@ -41,7 +39,7 @@ from mlx_omnia.engine.model import (
     Wrapping,
 )
 from mlx_omnia.engine.parsers import FALLBACK, REASONING, Parser, Segment, Segmenter, opened
-from mlx_omnia.engine.speculative import Chained, Proposer, Speculable, Step
+from mlx_omnia.engine.speculative import Chained
 
 TEXT = ContentType(Modality.TEXT, "text/plain")
 
@@ -256,10 +254,9 @@ class LanguageModel[I: ModelInput](Model[I, Segment, GenerationOptions], Protoco
     away."""
 
 
-def _batch_cache(model: BatchModel) -> SequenceCache:
-    """The batch contract's cache and not the trunk's: `self.model` narrowed to `BatchModel`
-    is an intersection whose `make_cache` still answers with the trunk's own element type,
-    and what the batched path threads is the batch's."""
+def _batch_cache(model: api.LanguageModel[LayerCache]) -> SequenceCache:
+    """The batch's cache and not the trunk's: a trunk's `make_cache` answers with its own
+    element type, and what the batched path threads is one list of plain layers."""
     return list(model.make_cache())
 
 
@@ -319,10 +316,10 @@ class ContinuousLanguageModel(Protocol):
     def step_batch(self, sequences: Sequence[TextBatch]) -> list[tuple[Segment, ...]]: ...
 
 
-class TextLanguageModel[C: LayerCache, I: ModelInput = Text]:
+class TextLanguageModel[I: ModelInput = Text]:
     def __init__(
         self,
-        model: CausalLM[C],
+        model: api.LanguageModel[LayerCache],
         tokenizer: Tokenizer,
         *,
         stop: Collection[int] = (),
@@ -344,29 +341,25 @@ class TextLanguageModel[C: LayerCache, I: ModelInput = Text]:
         return isinstance(input, Text)
 
     def speculate_with(self, drafter: nn.Module, *, block_size: int | None = None) -> None:
-        """Take an MTP step for this trunk — `speculative.Drafting`.
+        """Take an MTP step for this trunk — `core.api.Drafting`.
 
         Here and not on a family's facade because nothing in it is a family's: the step is a
-        `Step`, the trunk lends the two ends of its vocabulary through `Speculable`, and the
-        rows the step conditions on come out of `BlockOutputs`. A family that implements the
-        three speculates through this; one that does not is refused by the name of what it is
-        missing, which is the only way a checkpoint id can be wrong here.
+        `core.api.Step`, and the trunk lends it the two ends of its vocabulary and the rows it
+        conditions on through `core.api.Draftable`. A family that implements both speculates
+        through this; one that does not is refused by the name of what it is missing, which is
+        the only way a checkpoint id can be wrong here.
 
         A DFlash drafter does not come through this door. Its proposal is one forward over a
         block of mask tokens against layers the *drafter's* own config names, so the pair
         needs that config to build — `models/muse_glimmer` owns it and its own facade.
         """
-        if not isinstance(drafter, Step):
+        if not isinstance(drafter, api.Step):
             raise TypeError(f"{type(drafter).__name__} is not an MTP step for this engine")
-        if not isinstance(self.model, Speculable):
+        if not isinstance(self.model, api.Draftable):
             raise TypeError(
-                f"{type(self.model).__name__} does not lend its embedding table and its head "
-                "(`speculative.Speculable`), which is the whole of an MTP step's vocabulary"
-            )
-        if not isinstance(self.model, BlockOutputs):
-            raise TypeError(
-                f"{type(self.model).__name__} has no `block_outputs`, so there is nothing for "
-                "the step to condition on"
+                f"{type(self.model).__name__} does not lend its embedding table, its head and "
+                "the blocks the step conditions on (`core.api.Draftable`), which is the whole "
+                "of what an MTP step borrows"
             )
         block = drafter.block if block_size is None else block_size
         if block < 2:
@@ -374,7 +367,7 @@ class TextLanguageModel[C: LayerCache, I: ModelInput = Text]:
         self.drafter = drafter
         self._block = block
 
-    def _proposer(self, options: GenerationOptions) -> Proposer | None:
+    def _proposer(self, options: GenerationOptions) -> api.Proposer | None:
         """The proposer for this request, or `None` for every request that cannot be verified
         against the target's own argmax.
 
@@ -391,24 +384,23 @@ class TextLanguageModel[C: LayerCache, I: ModelInput = Text]:
             return None
         if options.constraint is not None or options.reasoning_budget is not None:
             return None
-        assert isinstance(drafter, Step)
-        assert isinstance(self.model, Speculable)
+        assert isinstance(drafter, api.Step)
+        assert isinstance(self.model, api.Draftable)
         # `-1`: the step conditions on the trunk's last block, and `block_outputs` indexes the
         # list Python's way. A trunk that grows a layer still taps the right one.
         return Chained(self.model, drafter, block=self._block, tap=-1)
 
     def can_batch(self, options: GenerationOptions) -> bool:
-        return isinstance(self.model, BatchModel)
+        """Always. Continuous batching used to be an attestation every family made and none
+        declined; what it needs of a trunk is `make_cache` and the forward, which is the
+        whole of what a trunk is."""
+        return True
 
     def begin_batch(self, input: ModelInput, options: GenerationOptions) -> TextPrefill | None:
         """Everything `prepare_batch` decides before the first forward, with the prefill left
         for the caller to spend a block at a time."""
         model = self.model
-        if (
-            not isinstance(input, Text)
-            or not isinstance(model, BatchModel)
-            or not self.can_batch(options)
-        ):
+        if not isinstance(input, Text):
             return None
         prompt = input.read()
         encoded = list(self.tokenizer.encode(prompt))
@@ -421,7 +413,7 @@ class TextLanguageModel[C: LayerCache, I: ModelInput = Text]:
         # was resumed — it says so itself — and then the round wins: a prefix saves one
         # turn's prefill, a round saves a read of the weights on every token of every turn.
         walk = (
-            options.prefix.begin(cache, model)
+            options.prefix.begin(cache)
             if options.prefix is not None and (proposer is None or proposer.resumes)
             else None
         )
@@ -460,8 +452,6 @@ class TextLanguageModel[C: LayerCache, I: ModelInput = Text]:
     def step_batch(self, sequences: Sequence[TextBatch]) -> list[tuple[Segment, ...]]:
         """Advance text requests through one shared decode forward."""
         model = self.model
-        if not isinstance(model, BatchModel):
-            raise TypeError(f"{type(model).__name__} does not support continuous batching")
         active = [index for index, sequence in enumerate(sequences) if not sequence.state.finished]
         emitted: list[list[int]] = [[] for _ in sequences]
         advanced = batch_step(model, [sequences[index].state for index in active]) if active else []

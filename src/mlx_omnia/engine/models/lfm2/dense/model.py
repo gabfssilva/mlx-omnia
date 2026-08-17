@@ -4,8 +4,9 @@ from typing import NamedTuple
 import mlx.core as mx
 import mlx.nn as nn
 
-from mlx_omnia.engine.core.attend import Attending, KVStore
-from mlx_omnia.engine.core.cache import ConvCache, FixedKVCache, KVCache, RingKVCache
+from mlx_omnia.engine.core.api import LanguageModel
+from mlx_omnia.engine.core.attend import Attending
+from mlx_omnia.engine.core.cache import ConvCache, FixedKVCache, KVCache, LayerCache, RingKVCache
 from mlx_omnia.engine.models.lfm2.config import LFM2Config
 from mlx_omnia.engine.models.lfm2.layers.attention import LFM2Attention
 from mlx_omnia.engine.models.lfm2.layers.conv import ConvStore, LFM2Conv
@@ -30,7 +31,7 @@ class LFM2Block(nn.Module):
         self.operator_norm = nn.RMSNorm(config.hidden_size, eps=config.norm_eps)
         self.ffn_norm = nn.RMSNorm(config.hidden_size, eps=config.norm_eps)
 
-    def __call__(self, x: mx.array, cache: KVStore | ConvStore) -> mx.array:
+    def __call__(self, x: mx.array, cache: LayerCache) -> mx.array:
         normed = self.operator_norm(x)
         # A block has one mixer or the other; mlx.nn.Module's __getattr__ is untyped, so
         # the branch is narrowed here.
@@ -61,8 +62,7 @@ class LFM2Activations(NamedTuple):
     logits: mx.array
 
 
-class LFM2(nn.Module):
-    continuous_batching = True
+class LFM2(nn.Module, LanguageModel[LayerCache]):
 
     def __init__(self, config: LFM2Config) -> None:
         super().__init__()
@@ -80,7 +80,7 @@ class LFM2(nn.Module):
         return self.lm_head(normed)
 
     def activations(
-        self, ids: mx.array, cache: Sequence[KVStore | ConvStore] | None = None
+        self, ids: mx.array, cache: Sequence[LayerCache] | None = None
     ) -> LFM2Activations:
         cache = cache if cache is not None else self.make_cache()
         embeddings = self.model.embed_tokens(ids)
@@ -93,6 +93,6 @@ class LFM2(nn.Module):
         return LFM2Activations(embeddings, blocks, normed, self.head(normed))
 
     def __call__(
-        self, ids: mx.array, cache: Sequence[KVStore | ConvStore] | None = None
+        self, ids: mx.array, cache: Sequence[LayerCache] | None = None
     ) -> mx.array:
         return self.activations(ids, cache).logits

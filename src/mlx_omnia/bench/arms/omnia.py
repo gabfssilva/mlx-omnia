@@ -8,6 +8,7 @@ for.
 """
 
 import statistics
+import sys
 import time
 from collections.abc import Callable, Iterator, Sequence
 from dataclasses import dataclass
@@ -21,12 +22,13 @@ from mlx_omnia.bench.arm import Arm, TokenId, arm
 from mlx_omnia.bench.arms.hub import cached, snapshot
 from mlx_omnia.bench.forcing import forced
 from mlx_omnia.bench.gate import Gate
-from mlx_omnia.engine.batching import BatchModel, prepare_batch_sequence, step
+from mlx_omnia.engine.batching import prepare_batch_sequence, step
 from mlx_omnia.engine.bpe import ByteLevelBPE
+from mlx_omnia.engine.core.api import LanguageModel
 from mlx_omnia.engine.core.cache import LayerCache
+from mlx_omnia.engine.core.kernels.resolve import RESOLVED
 from mlx_omnia.engine.footprint import SUSTAINED_GBS, Routed
 from mlx_omnia.engine.footprint import active_bytes_per_token as _module_bytes_per_token
-from mlx_omnia.engine.generate import CausalLM
 from mlx_omnia.engine.speculative import Acceptance
 
 __all__ = [
@@ -42,6 +44,7 @@ __all__ = [
     "active_bytes_per_token",
     "build",
     "drafter",
+    "executed",
     "loaded",
     "measure_concurrency",
     "over",
@@ -50,7 +53,7 @@ __all__ = [
     "tokenizer",
 ]
 
-type Tree = CausalLM[LayerCache]
+type Tree = LanguageModel[LayerCache]
 """What `mlx_omnia.tree` hands back: the forward and the cache, which is all `stream_ids`
 asks of a model."""
 
@@ -104,7 +107,7 @@ class ConcurrencySweep:
 
 
 def measure_concurrency(
-    model: BatchModel,
+    model: LanguageModel[LayerCache],
     prompt: Sequence[int],
     *,
     concurrencies: Sequence[int],
@@ -343,3 +346,35 @@ def tokenizer(repo: str) -> Callable[[str], list[int]]:
     directory = snapshot(repo, "tokenizer.json")
     bpe = ByteLevelBPE.from_file(directory / "tokenizer.json")
     return lambda text: list(bpe.encode(text))
+
+
+def executed() -> list[str]:
+    """The files this process's runs actually depended on: every imported `mlx_omnia`
+    module, minus the kernel strategies that were imported to stand in a `_STRATEGIES`
+    tuple but never built. The results store keys a stored measurement's validity on
+    exactly these files, so a change to a module a run never touched does not invalidate
+    its number."""
+    skip = _strategies() - RESOLVED
+    files: list[str] = []
+    for name, module in list(sys.modules.items()):
+        if name != "mlx_omnia" and not name.startswith("mlx_omnia."):
+            continue
+        if name in skip:
+            continue
+        file = getattr(module, "__file__", None)
+        if isinstance(file, str):
+            files.append(file)
+    return sorted(files)
+
+
+def _strategies() -> set[str]:
+    """Every module standing in some primitive's `_STRATEGIES` tuple — read from the loaded
+    packages rather than guessed from paths, so a helper module inside a primitive is never
+    mistaken for a strategy and wrongly discounted."""
+    listed: set[str] = set()
+    for name, module in list(sys.modules.items()):
+        if name.startswith("mlx_omnia.engine.core.kernels."):
+            classes = getattr(module, "_STRATEGIES", None)
+            if isinstance(classes, tuple):
+                listed.update(one.__module__ for one in classes if isinstance(one, type))
+    return listed

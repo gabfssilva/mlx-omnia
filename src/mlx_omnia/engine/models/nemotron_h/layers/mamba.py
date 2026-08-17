@@ -158,7 +158,7 @@ class NemotronHMamba(nn.Module):
         Beyond the output, four things land in the cache's graph container for the
         round's rewind to pick from: the per-token states, the raw conv-input rows, the
         window as it stood before this call, and the advanced window/state in the usual
-        slots. Only a `FixedDeltaCache` promoted by `compile_verify` reaches here.
+        slots. Only a `FixedDeltaCache` carrying them (`LayerCache.checkpoints`) reaches here.
         """
         from mlx_omnia.engine.core.cache import FixedDeltaCache
         from mlx_omnia.engine.core.kernels.mamba_step.fused import FusedMambaStep
@@ -188,6 +188,12 @@ class NemotronHMamba(nn.Module):
         return self.out_proj(normed)[None]
 
     def __call__(self, x: mx.array, cache: Recurring) -> mx.array:
+        from mlx_omnia.engine.core.cache import FixedDeltaCache
+
+        if isinstance(cache, FixedDeltaCache) and cache.checkpointing:
+            # A round asked for the state after every row, and the slots are here. Same
+            # arithmetic either way — the walk below keeps only the last one.
+            return self.verify_rows(x, cache)
         config = self.config
         batch, length = x.shape[0], x.shape[1]
         window, state = cache.window, cache.state

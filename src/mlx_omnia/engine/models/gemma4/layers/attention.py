@@ -1,9 +1,9 @@
 import mlx.core as mx
 import mlx.nn as nn
 
-from mlx_omnia.engine.core.attend import Attending, KVStore, attend
+from mlx_omnia.engine.core.attend import Attending, attend
 from mlx_omnia.engine.core.attention import ragged_mask
-from mlx_omnia.engine.core.cache import KVCache, SharedKVReader
+from mlx_omnia.engine.core.cache import FixedKVCache, KVCache, LayerCache, SharedKVReader
 from mlx_omnia.engine.core.masks import SLIDING, causal_mask
 from mlx_omnia.engine.models.gemma4.config import Gemma4TextConfig
 from mlx_omnia.engine.models.gemma4.layers.norm import RMSNormNoScale
@@ -65,14 +65,34 @@ class Gemma4Attention(nn.Module):
             return None
         return causal_mask(queries, keys, self.window)
 
+    def _band(
+        self, cache: LayerCache, length: int, columns: int, offset: int | mx.array
+    ) -> mx.array | None:
+        """The columns this step may attend, then the cache's own cut over them.
+
+        Two shapes of band, and the difference is where the rows sit. A buffer that hands
+        back exactly what it wrote puts the query at its end, and `causal_mask` is right
+        there. One that hands back more — a promoted buffer, or a reader borrowing from one
+        — has the query somewhere in the middle, so the window is measured from the position
+        instead. Which of the two is the cache's own answer, and asking it is cheaper than
+        enumerating the classes that borrow.
+        """
+        if cache.readable(None, length) is None:
+            return self.mask(length, columns)
+        return cache.readable(ragged_mask(length, offset, self.window, span=columns), length)
+
     def __call__(
         self,
         x: mx.array,
-        cache: KVStore | SharedKVReader,
+        cache: LayerCache,
     ) -> mx.array:
         rows = x.shape[0]
         length = x.shape[1]
-        offset = cache.offset
+        # A shared reader's queries sit where its writer stood before this step, which it
+        # derives off the graph when the graph owns the writer's position; every other cache
+        # answers with its own offset, read before an update moves it.
+        borrows = isinstance(cache, SharedKVReader | FixedKVCache)
+        offset = cache.position if borrows else cache.offset
 
         q = self.q_proj(x).reshape(
             rows, length, self.heads, self.head_dim
@@ -104,23 +124,23 @@ class Gemma4Attention(nn.Module):
                 keys=k,
                 values=v,
                 scale=self.scale,
-                mask=ragged_mask(length, offset, self.window),
+                # `span` and not `max(offset)`: the positions here are the store's
+                # own and evaluating one is what a compiled bucket cannot do.
+                mask=ragged_mask(length, offset, self.window, span=cache.span),
             )
         elif self.kv_shared:
             assert isinstance(cache, SharedKVReader)
-            keys = cache.keys
-            values = cache.values
-            assert keys is not None and values is not None
+            keys, values = cache.fetch()
             attended = attend(
                 None,
                 q,
                 keys=keys,
                 values=values,
                 scale=self.scale,
-                mask=self.mask(length, keys.shape[2]),
+                mask=self._band(cache, length, keys.shape[2], offset),
             )
         else:
-            assert isinstance(cache, KVCache)
+            assert isinstance(cache, KVCache | FixedKVCache)
             keys, values = cache.update_and_fetch(k, v)
             attended = attend(
                 None,
@@ -128,7 +148,7 @@ class Gemma4Attention(nn.Module):
                 keys=keys,
                 values=values,
                 scale=self.scale,
-                mask=self.mask(length, keys.shape[2]),
+                mask=self._band(cache, length, keys.shape[2], offset),
             )
         return self.o_proj(
             attended.transpose(0, 2, 1, 3).reshape(rows, length, self.heads * self.head_dim)

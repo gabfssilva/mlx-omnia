@@ -11,7 +11,7 @@ nothing else can.
 
 import asyncio
 import threading
-from collections.abc import Iterator
+from collections.abc import Iterator, Sequence
 from typing import TypeIs
 
 import httpx
@@ -31,6 +31,7 @@ from mlx_omnia import (
     TextLanguageModel,
     Tokenizer,
 )
+from mlx_omnia.engine.core.cache import LayerCache
 from mlx_omnia.engine.parsers import Segment
 from mlx_omnia.server import catalog
 from mlx_omnia.server.engine import Engine
@@ -45,7 +46,7 @@ class ConstantLM:
     def make_cache(self) -> list[KVCache]:
         return [KVCache()]
 
-    def __call__(self, ids: mx.array, cache: list[KVCache] | None = None) -> mx.array:
+    def __call__(self, ids: mx.array, cache: Sequence[LayerCache] | None = None) -> mx.array:
         return mx.zeros((1, ids.shape[1], 8), dtype=mx.float32)
 
 

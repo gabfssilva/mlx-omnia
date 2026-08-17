@@ -10,11 +10,13 @@ import time
 from collections.abc import Callable, Collection, Generator, Iterable, Iterator, Sequence
 from dataclasses import dataclass, field
 from itertools import islice
-from typing import Protocol, runtime_checkable
+from typing import Protocol
 
 import mlx.core as mx
 
+from mlx_omnia.engine.core.api import LanguageModel, Tracing
 from mlx_omnia.engine.core.cache import LayerCache
+from mlx_omnia.engine.core.decode import compiled_decode, plan_of
 from mlx_omnia.engine.core.mxcompat import softmax
 from mlx_omnia.engine.core.prefill import ARRIVING, BLOCK, landing, pulled
 from mlx_omnia.engine.core.prefix import Prefixes, Reuse
@@ -29,43 +31,6 @@ from mlx_omnia.engine.speculative import (
 type Sampler = Callable[[mx.array], mx.array]
 type LogitFilter = Callable[[mx.array], mx.array]
 type Penalty = Callable[[mx.array, mx.array], mx.array]
-
-
-class CausalLM[C: LayerCache](Protocol):
-    def make_cache(self) -> list[C]: ...
-
-    def __call__(self, ids: mx.array, cache: list[C] | None = None) -> mx.array: ...
-
-
-@runtime_checkable
-class BlockOutputs[C: LayerCache](Protocol):
-    """A forward that also hands back what the trunk held at depths the caller names.
-
-    The same computation as `__call__` — the ids go in once — with a second thing coming
-    out of it: `at` selects blocks by index, and the features are their outputs
-    concatenated on the last dim, `[batch, length, len(at) * hidden]`. Selection is the
-    caller's because the whole trunk is 52 tensors where the reader wants five: returning
-    all of them costs 1.4 GB per prefill block against 136 MB for the ones asked for.
-
-    What reads it is a proposer that conditions on the target's own reading of the context
-    instead of on its ids (`speculative.Proposer`). Nothing else in the package calls it,
-    and a model that does not implement it can still be spoken to and still be drafted for
-    — by a proposer that reads no blocks.
-    """
-
-    def block_outputs(
-        self, ids: mx.array, cache: list[C], *, at: Sequence[int]
-    ) -> tuple[mx.array, mx.array]: ...
-
-
-@runtime_checkable
-class CompiledDecode[C: LayerCache](Protocol):
-    def compile_decode(self, cache: list[C]) -> Callable[[mx.array], mx.array]: ...
-
-
-@runtime_checkable
-class CompiledGreedyDecode[C: LayerCache](Protocol):
-    def compile_greedy_decode(self, cache: list[C]) -> Callable[[mx.array], mx.array]: ...
 
 
 class Constraint(Protocol):
@@ -392,8 +357,8 @@ class Meter:
         return (self.completion_tokens - 1) / elapsed
 
 
-def stream_ids[C: LayerCache, D: LayerCache](
-    model: CausalLM[C],
+def stream_ids[D: LayerCache](
+    model: LanguageModel[LayerCache],
     prompt: Iterable[int],
     *,
     max_tokens: int,
@@ -401,7 +366,7 @@ def stream_ids[C: LayerCache, D: LayerCache](
     stop: Collection[int] = (),
     penalty: Penalty | None = None,
     meter: Meter | None = None,
-    draft: CausalLM[D] | Proposer | None = None,
+    draft: LanguageModel[D] | Proposer | None = None,
     lookahead: int = 4,
     acceptance: Acceptance | None = None,
     prefix: Prefixes | None = None,
@@ -454,9 +419,11 @@ def stream_ids[C: LayerCache, D: LayerCache](
     if draft is not None:
         if sampler is not greedy:
             raise SpeculationRefused(
-                "speculation is greedy-only: the acceptance rule that keeps a sampled "
-                "distribution needs the draft's and the target's probabilities, and a "
-                "`Sampler` hands back an id and no distribution at all"
+                "speculation is greedy-only: no sampled acceptance rule is wired here yet. "
+                "The one that accepts most needs both distributions and a `Sampler` hands "
+                "back an id and neither; the exact-but-weaker one — draw the target's own "
+                "token per verification row, accept on equality — needs nothing new and is "
+                "unwritten. `high-temp-draft.md`"
             )
         if penalty is not None:
             raise SpeculationRefused(
@@ -492,7 +459,9 @@ def stream_ids[C: LayerCache, D: LayerCache](
         )
         return
 
-    cache = model.make_cache()
+    # `list[LayerCache]` and not `list[C]`: the compiled decode promotes in place, and what
+    # it writes back is a fixed buffer or a ring — never the element type the trunk built.
+    cache: list[LayerCache] = list(model.make_cache())
     walk = None
     if prefix is not None:
         # The chain is over ids it has to have, so a prompt still being produced is waited
@@ -500,7 +469,7 @@ def stream_ids[C: LayerCache, D: LayerCache](
         # block boundary would be reuse silently lost on exactly the long conversations this
         # exists for.
         prompt = prompt if isinstance(prompt, Sequence) else list(prompt)
-        walk = prefix.begin(cache, model)
+        walk = prefix.begin(cache)
     # What the cache holds, row for row: the prompt, whether its head was resumed or
     # prefilled, plus every id the loop feeds back in. It is filled as the prompt arrives,
     # which for a sequence is all at once.
@@ -615,21 +584,21 @@ def stream_ids[C: LayerCache, D: LayerCache](
         # and a ring has already dropped every row outside its window: a span left
         # uncommitted here is a span the next boundary the decode crosses cannot be cut from.
         stopped(fed)
-        compile_step: Callable[[list[C]], Callable[[mx.array], mx.array]] | None = None
-        if (
-            sampler is greedy
-            and penalty is None
-            and constraint is None
-            and isinstance(model, CompiledGreedyDecode)
-        ):
-            compile_step = model.compile_greedy_decode
-        elif isinstance(model, CompiledDecode):
-            compile_step = model.compile_decode
-        if compile_step is not None:
-            # Unconditional now. A promotion hands the decode a fixed buffer or a ring, and
-            # both answer for their rows in absolute order — the shape the spans are cut in —
-            # so there is nothing left for a compile to be conditional on.
-            decode = compile_step(cache)
+        # The lease: the trunk is handed the promoted caches themselves, which is what keeps
+        # a fused single-row kernel on. `Tracing` is the claim that its forward survives
+        # that — graph-visible positions, and the unwritten columns of a fixed buffer masked
+        # by the trunk itself. `is_fixable` is the layers' half of the same question.
+        #
+        # Screened only when nothing else will read the row: outside its argmax it is not
+        # logits, so a sampler, a penalty or a grammar over it would read invented numbers.
+        if isinstance(model, Tracing) and cache and all(layer.is_fixable for layer in cache):
+            decode = compiled_decode(
+                plan_of(
+                    model,
+                    screened=sampler is greedy and penalty is None and constraint is None,
+                ),
+                cache,
+            )
         for emitted in range(max_tokens):
             # Free, step n+1 is queued before n is read back and the GPU never idles;
             # constrained, n+1's mask needs the value of n, so the queue waits behind the
@@ -729,8 +698,8 @@ def stream_text(
     yield from segmenter.flush()
 
 
-def stream_generate[C: LayerCache](
-    model: CausalLM[C],
+def stream_generate(
+    model: LanguageModel[LayerCache],
     tokenizer: TextTokenizer,
     prompt: str,
     *,

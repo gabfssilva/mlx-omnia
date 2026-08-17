@@ -8,7 +8,6 @@ from mlx_omnia.engine.language import GenerationOptions, Text, TextLanguageModel
 
 
 class CountingModel:
-    continuous_batching = True
 
     def __init__(self, vocab: int) -> None:
         self.vocab = vocab

@@ -152,7 +152,6 @@ def test_a_job_that_runs_to_the_end_is_completed() -> None:
 
 
 class BatchCountingTrunk:
-    continuous_batching = True
 
     def __init__(self) -> None:
         self.batch_sizes: list[int] = []
@@ -178,7 +177,6 @@ class AsciiTokenizer:
 
 
 class BlockingBatchTrunk:
-    continuous_batching = True
 
     def __init__(self) -> None:
         self.inner: Qwen3 | None = None

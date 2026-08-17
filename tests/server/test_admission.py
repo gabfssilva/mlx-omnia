@@ -18,7 +18,7 @@ import json
 import threading
 import time
 import weakref
-from collections.abc import AsyncGenerator, Iterator
+from collections.abc import AsyncGenerator, Iterator, Sequence
 from contextlib import asynccontextmanager
 from pathlib import Path
 from typing import TypeIs
@@ -38,6 +38,7 @@ from mlx_omnia import (
     Text,
     TextLanguageModel,
 )
+from mlx_omnia.engine.core.cache import LayerCache
 from mlx_omnia.engine.parsers import Segment
 from mlx_omnia.server import Engine, catalog, create_app
 from mlx_omnia.server.engine import Job, ModelTooLarge
@@ -91,7 +92,7 @@ class Weights(nn.Module):
     def make_cache(self) -> list[KVCache]:
         return [KVCache()]
 
-    def __call__(self, ids: mx.array, cache: list[KVCache] | None = None) -> mx.array:
+    def __call__(self, ids: mx.array, cache: Sequence[LayerCache] | None = None) -> mx.array:
         return self.embed(ids)
 
 

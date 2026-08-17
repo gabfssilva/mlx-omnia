@@ -9,6 +9,7 @@ from mlx_omnia.engine.models.longcat_flash_ngram.config import (
 )
 from mlx_omnia.engine.models.longcat_flash_ngram.layers.cache import (
     BatchedMLACache,
+    FixedMLACache,
     LatentStore,
 )
 
@@ -126,7 +127,11 @@ class LongcatFlashMLA(nn.Module):
             latent = latent * self.mla_scale_kv_lora
         k_pe = k_pe.reshape(b, length, 1, self.qk_rope).transpose(0, 2, 1, 3)
 
-        offset = cache.offset
+        # Read before `update_and_fetch` moves it: the rotation belongs to the row this step
+        # is about to write. A promoted cache answers with an array, which keeps the offset
+        # an input of the trace instead of a constant baked at the first token —
+        # `mx.fast.rope` takes either, and the two are bit-identical.
+        offset = cache.position if isinstance(cache, FixedMLACache) else cache.offset
         q_pe = mx.fast.rope(
             q_pe, self.qk_rope, traditional=True, base=None, scale=1.0,
             offset=offset, freqs=self._freqs,
@@ -140,6 +145,12 @@ class LongcatFlashMLA(nn.Module):
         if isinstance(cache, BatchedMLACache):
             return self._ragged(cache, q_nope, q_pe, latent, k_pe, mask, b, length)
         latent, k_pe = cache.update_and_fetch(latent, k_pe)
+        if isinstance(cache, FixedMLACache):
+            # A promoted cache hands back its whole capacity; the columns past its position
+            # hold whatever was there before, and this is the band that cuts them.
+            band = cache.readable(mask, length)
+            assert isinstance(band, mx.array)
+            mask = band
 
         if length == 1:
             output = self._absorbed(q_nope, q_pe, latent, k_pe, mask)
@@ -193,10 +204,14 @@ class LongcatFlashMLA(nn.Module):
         lengths, so nothing past the projections is a single dense tensor."""
         if length != 1:
             raise ValueError("a ragged latent batch decodes one token per step")
-        pairs = cache.update_and_fetch(latent, k_pe)
+        pairs = cache.update_rows(latent, k_pe)
         attended: list[mx.array] = []
         for index, (row_latent, row_k_pe) in enumerate(pairs):
-            row_mask = None if mask is None else mask[index : index + 1][..., : row_k_pe.shape[2]]
+            sliced = None if mask is None else mask[index : index + 1][..., : row_k_pe.shape[2]]
+            # The row's own answer: `None` for a growing buffer that returned exactly what it
+            # wrote, the written columns for a promoted one that returned its capacity.
+            row_mask = cache.sequences[index].readable(sliced, 1)
+            assert not isinstance(row_mask, str)
             attended.append(
                 self._absorbed(
                     q_nope[index : index + 1],

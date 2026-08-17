@@ -4,6 +4,7 @@ from typing import NamedTuple
 import mlx.core as mx
 import mlx.nn as nn
 
+from mlx_omnia.engine.core.api import LanguageModel
 from mlx_omnia.engine.core.cache import DeltaCache, KVCache, LayerCache
 from mlx_omnia.engine.models.qwen3_next.config import Qwen3NextConfig
 from mlx_omnia.engine.models.qwen3_next.layers.block import Qwen3NextLayer, Qwen3NextTrunk
@@ -16,8 +17,7 @@ class Qwen3NextActivations(NamedTuple):
     logits: mx.array
 
 
-class Qwen3Next(nn.Module):
-    continuous_batching = True
+class Qwen3Next(nn.Module, LanguageModel[LayerCache]):
 
     def __init__(self, config: Qwen3NextConfig) -> None:
         super().__init__()

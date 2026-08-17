@@ -16,7 +16,8 @@ from typing import (
 import mlx.core as mx
 import mlx.nn as nn
 
-from mlx_omnia.engine.core.attend import Attending, AttentionMask, KVStore, attend
+from mlx_omnia.engine.core.api import LanguageModel
+from mlx_omnia.engine.core.attend import Attending, AttentionMask, attend
 from mlx_omnia.engine.core.cache import KVCache, LayerCache
 from mlx_omnia.engine.core.kernels.qkv_rope import QkvRope
 from mlx_omnia.engine.core.layers import SwiGLU, split_qkv
@@ -50,16 +51,6 @@ __all__ = [
 type Position = int | mx.array
 type FusedProjectionName = Literal["qkv_proj", "query_key_value", "c_attn", "fused_proj"]
 type OutputProjectionName = Literal["o_proj", "out_proj", "dense", "c_proj"]
-
-
-@runtime_checkable
-class Spanned(Protocol):
-    """A ragged store that can say, as a static int, how many columns a mask over its rows
-    must cover. Buffer shapes do not change inside a step, so the answer survives an
-    `mx.compile` trace — which per-row positions, being traced arrays, cannot."""
-
-    @property
-    def span(self) -> int: ...
 
 
 def ragged_mask(
@@ -292,7 +283,7 @@ class FusedQKVAttention(nn.Module):
     def __call__(
         self,
         x: mx.array,
-        cache: KVStore | None = None,
+        cache: LayerCache | None = None,
         mask: AttentionMask = "causal",
     ) -> mx.array:
         length = x.shape[1]
@@ -499,7 +490,7 @@ class NormalizedFusedQKVAttention(FusedQKVAttention, _QKNorm):
     def __call__(
         self,
         x: mx.array,
-        cache: KVStore | None = None,
+        cache: LayerCache | None = None,
         mask: AttentionMask = "causal",
     ) -> mx.array:
         length = x.shape[1]
@@ -523,7 +514,7 @@ class NormalizedFusedQKVAttention(FusedQKVAttention, _QKNorm):
                         length,
                         cache.offset,
                         self.window,
-                        span=cache.span if isinstance(cache, Spanned) else None,
+                        span=cache.span,
                     ),
                 )
             else:
@@ -531,14 +522,21 @@ class NormalizedFusedQKVAttention(FusedQKVAttention, _QKNorm):
                 # fetched*, and a ring reports its whole window rather than what it has
                 # seen — so deriving the span from the offset would be right for a growing
                 # cache and wrong for the others. Cacheless, the rows at hand are the span.
-                if cache is not None:
+                if cache is None:
+                    automatic = self.attention_mask(length, keys.shape[2])
+                else:
                     keys, values = cache.update_and_fetch(keys, values)
+                    # A fixed-shape buffer hands back its whole capacity; the columns it
+                    # has not written are its own to cut.
+                    automatic = cache.readable(
+                        self.attention_mask(length, keys.shape[2]), length
+                    )
                 attended = mx.fast.scaled_dot_product_attention(
                     queries,
                     keys,
                     values,
                     scale=self.scale,
-                    mask=self.attention_mask(length, keys.shape[2]),
+                    mask=automatic,
                 )
         else:
             attended = attend(
@@ -736,7 +734,7 @@ class SeparateQKVAttention(_QKNorm):
     def __call__(
         self,
         x: mx.array,
-        cache: KVStore,
+        cache: LayerCache,
         mask: AttentionMask = "causal",
     ) -> mx.array:
         batch, length = x.shape[:2]
@@ -754,7 +752,7 @@ class SeparateQKVAttention(_QKNorm):
                     length,
                     cache.offset,
                     self.window,
-                    span=cache.span if isinstance(cache, Spanned) else None,
+                    span=cache.span,
                 )
             else:
                 effective_mask = None if _causal_decode(length, mask) else mask
@@ -772,6 +770,9 @@ class SeparateQKVAttention(_QKNorm):
                 effective_mask = self.attention_mask(length, keys.shape[2])
             else:
                 effective_mask = None if _causal_decode(length, mask) else mask
+            # A fixed-shape buffer hands back its whole capacity; the columns it has not
+            # written are its own to cut, and every growing cache answers unchanged.
+            effective_mask = cache.readable(effective_mask, length)
             sinks = self.sinks if self._has_sinks else None
             attended = mx.fast.scaled_dot_product_attention(
                 queries,
@@ -884,7 +885,7 @@ class DenseBlock(nn.Module):
         self.input_layernorm = nn.RMSNorm(config.hidden_size, eps=config.rms_norm_eps)
         self.post_attention_layernorm = nn.RMSNorm(config.hidden_size, eps=config.rms_norm_eps)
 
-    def __call__(self, x: mx.array, cache: KVStore) -> mx.array:
+    def __call__(self, x: mx.array, cache: LayerCache) -> mx.array:
         attended = x + self.self_attn(self.input_layernorm(x), cache)
         return attended + self.mlp(self.post_attention_layernorm(attended))
 
@@ -910,7 +911,7 @@ class DenseActivations(NamedTuple):
     logits: mx.array
 
 
-class DenseModel(nn.Module):
+class DenseModel(nn.Module, LanguageModel[LayerCache]):
     """Run the shared dense decoder and language-model head."""
 
     def __init__(self, config: DenseConfig, rotary: tuple[bool, ...] | None = None) -> None:
@@ -931,7 +932,7 @@ class DenseModel(nn.Module):
         return self.lm_head(normed)
 
     def activations(
-        self, ids: mx.array, cache: Sequence[KVStore] | None = None
+        self, ids: mx.array, cache: Sequence[LayerCache] | None = None
     ) -> DenseActivations:
         """Run the model and expose its principal activation boundaries."""
         cache = cache if cache is not None else self.make_cache()
@@ -944,7 +945,7 @@ class DenseModel(nn.Module):
         normed = self.model.norm(x)
         return DenseActivations(embeddings, blocks, normed, self.head(normed))
 
-    def __call__(self, ids: mx.array, cache: Sequence[KVStore] | None = None) -> mx.array:
+    def __call__(self, ids: mx.array, cache: Sequence[LayerCache] | None = None) -> mx.array:
         return self.activations(ids, cache).logits
 
 

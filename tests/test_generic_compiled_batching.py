@@ -1,4 +1,4 @@
-"""The generic compiled bucket: any family whose every layer is a plain KV cache."""
+"""The generic compiled bucket: any family whose every layer can take a fixed shape."""
 
 from collections.abc import Callable, Sequence
 
@@ -6,18 +6,24 @@ import mlx.core as mx
 import pytest
 
 from mlx_omnia.engine.batching import (
-    BatchModel,
     BatchSequence,
+    _generic_bucket,
     _generic_state,
+    _pad_rows,
     prepare_batch_sequence,
     step,
 )
-from mlx_omnia.engine.core.cache import FixedKVCache
+from mlx_omnia.engine.core.api import LanguageModel
+from mlx_omnia.engine.core.cache import FixedDeltaCache, FixedKVCache, batch
 from mlx_omnia.engine.generate import greedy
 from mlx_omnia.engine.models.olmoe.config import OlmoEConfig
 from mlx_omnia.engine.models.olmoe.model import OlmoE
 from mlx_omnia.engine.models.qwen3.config import Qwen3Config
 from mlx_omnia.engine.models.qwen3.model import Qwen3
+from mlx_omnia.engine.models.qwen3_5.model import Qwen35
+from tests.conftest import relative_diff
+from tests.test_qwen3_5_compiled_decode import _model as _qwen35_model
+from tests.test_qwen3_5_compiled_decode import _spread as _qwen35_spread
 
 _PROMPTS: tuple[list[int], ...] = ([1, 2, 3], [4, 5, 6, 7, 8], [9, 10])
 _STEPS = 4
@@ -61,7 +67,7 @@ def _olmoe() -> OlmoE:
     return model
 
 
-def _eager(model: BatchModel, prompt: Sequence[int], steps: int) -> list[int]:
+def _eager(model: LanguageModel, prompt: Sequence[int], steps: int) -> list[int]:
     """The same greedy walk, one sequence at a time, through the growing cache."""
     cache = model.make_cache()
     logits = model(mx.array([list(prompt)]), cache)[:, -1, :]
@@ -74,7 +80,7 @@ def _eager(model: BatchModel, prompt: Sequence[int], steps: int) -> list[int]:
 
 
 def _sequences(
-    model: BatchModel, prompts: Sequence[Sequence[int]], *, capacity: int | None = None
+    model: LanguageModel, prompts: Sequence[Sequence[int]], *, capacity: int | None = None
 ) -> list[BatchSequence]:
     sequences = [
         prepare_batch_sequence(model, list(prompt), max_tokens=64, sampler=greedy)
@@ -86,7 +92,9 @@ def _sequences(
     return sequences
 
 
-def _batched(model: BatchModel, sequences: Sequence[BatchSequence], steps: int) -> list[list[int]]:
+def _batched(
+    model: LanguageModel, sequences: Sequence[BatchSequence], steps: int
+) -> list[list[int]]:
     emitted: list[list[int]] = [[] for _ in sequences]
     for _ in range(steps):
         for index, tokens in enumerate(step(model, sequences)):
@@ -97,7 +105,7 @@ def _batched(model: BatchModel, sequences: Sequence[BatchSequence], steps: int) 
 @pytest.mark.parametrize("build", [_qwen3, _olmoe], ids=["qwen3", "olmoe"])
 @pytest.mark.parametrize("count", [1, 2, 3])
 def test_generic_compiled_batch_matches_eager_decode(
-    build: Callable[[], BatchModel], count: int
+    build: Callable[[], LanguageModel], count: int
 ) -> None:
     model = build()
     prompts = _PROMPTS[:count]
@@ -166,3 +174,82 @@ def test_generic_bucket_regrows_past_its_capacity() -> None:
 
     assert actual == expected
     assert all(sequence.capacity > 8 for sequence in sequences)
+
+
+def _qwen3_5() -> Qwen35:
+    """A hybrid: gated-delta layers beside attention ones, so one batch holds a
+    `FixedDeltaCache` next to a `FixedKVCache` — the mix a bucket that only understood
+    attention caches would refuse."""
+    built = _qwen35_model(0)
+    _qwen35_spread(built)
+    return built
+
+
+def _ragged(model: LanguageModel, sequences: Sequence[BatchSequence], steps: int) -> list[mx.array]:
+    """The same slots through the eager ragged forward, returning logits per step."""
+    caches = [sequence.cache for sequence in sequences]
+    rows: list[list[mx.array]] = [[] for _ in sequences]
+    for _ in range(steps):
+        ids = mx.stack([sequence.pending for sequence in sequences])[:, None]
+        logits = model(ids, batch(caches))[:, -1, :]
+        for index, sequence in enumerate(sequences):
+            rows[index].append(logits[index : index + 1])
+            sequence.pending = mx.argmax(logits[index : index + 1], axis=-1)[0]
+    return [mx.concatenate(step_rows) for step_rows in rows]
+
+
+@pytest.mark.parametrize("count", [1, 2, 3])
+def test_a_hybrid_trunk_reaches_the_compiled_bucket(count: int) -> None:
+    """The bucket used to take plain KV layers and nothing else, so a hybrid decoded eagerly
+    under the server no matter what its family had implemented. What changed is that each
+    layer answers for its own fixed shape, and a recurrent one has an answer.
+
+    Against the eager *ragged* forward: what is under test is the compilation, and a
+    single-sequence decode would also be measuring the step kernels a batch of one takes
+    and a batch of several does not.
+    """
+    model = _qwen3_5()
+    prompts = _PROMPTS[:count]
+    expected = _ragged(model, _sequences(model, prompts), _STEPS)
+
+    sequences = _sequences(model, prompts)
+    produced = _compiled_logits(model, sequences, _STEPS)
+
+    for row, wanted in zip(produced, expected, strict=True):
+        assert relative_diff(row, wanted) < 1e-5
+    assert _generic_state(model).buckets._buckets, "the hybrid stayed on the eager path"
+    kinds = {type(layer) for sequence in sequences for layer in sequence.cache}
+    assert FixedDeltaCache in kinds and FixedKVCache in kinds
+
+
+def _compiled_logits(
+    model: LanguageModel, sequences: Sequence[BatchSequence], steps: int
+) -> list[mx.array]:
+    caches = [sequence.cache for sequence in sequences]
+    rows: list[list[mx.array]] = [[] for _ in sequences]
+    for _ in range(steps):
+        ids = mx.stack([sequence.pending for sequence in sequences])[:, None]
+        room = max(sequence.capacity for sequence in sequences)
+        bucket = _generic_bucket(model, caches, room)
+        assert bucket is not None, "the hybrid declined the compiled bucket"
+        logits = bucket.decode(_pad_rows(ids, len(bucket.slots)))[: len(sequences)]
+        for sequence in sequences:
+            for layer in sequence.cache:
+                layer.offset += 1
+        for index, sequence in enumerate(sequences):
+            rows[index].append(logits[index : index + 1])
+            sequence.pending = mx.argmax(logits[index : index + 1], axis=-1)[0]
+    return [mx.concatenate(step_rows) for step_rows in rows]
+
+
+def test_a_fixable_family_without_batch_adapters_declines_the_bucket() -> None:
+    """longcat's layers all answer `fixed`, but their fixed forms carry no ragged batch
+    adapter yet: the bucket must decline to `None` — the eager ragged fallback the family
+    had while it still declined `fixed` — rather than let `batch` raise out of the build."""
+    from tests.test_longcat_flash_ngram_compiled_decode import _model as _longcat_model
+
+    model = _longcat_model(3)
+    sequences = _sequences(model, _PROMPTS[:2])
+    caches = [sequence.cache for sequence in sequences]
+
+    assert _generic_bucket(model, caches, 256) is None

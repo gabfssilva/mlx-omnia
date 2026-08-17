@@ -7,7 +7,7 @@ second dispatch by architecture over `tokenizer.json`: Gemma 3 reads that file w
 tokenizer of its own, so the file alone does not say which one.
 """
 
-from collections.abc import Iterator
+from collections.abc import Iterator, Sequence
 from typing import TypeIs
 
 import mlx.core as mx
@@ -27,6 +27,7 @@ from mlx_omnia import (
     TextLanguageModel,
     load,
 )
+from mlx_omnia.engine.core.cache import LayerCache
 from mlx_omnia.engine.language import Prefill, tokenizer_of, trunk_of
 from mlx_omnia.engine.parsers import Segment
 from tests.conftest import checkpoint_dir, requires_checkpoint
@@ -40,7 +41,7 @@ class ConstantLM:
     def make_cache(self) -> list[KVCache]:
         return [KVCache()]
 
-    def __call__(self, ids: mx.array, cache: list[KVCache] | None = None) -> mx.array:
+    def __call__(self, ids: mx.array, cache: Sequence[LayerCache] | None = None) -> mx.array:
         return mx.zeros((1, ids.shape[1], 8), dtype=mx.float32)
 
 
@@ -95,7 +96,7 @@ class TreeLM(nn.Module):
     def make_cache(self) -> list[KVCache]:
         return [KVCache()]
 
-    def __call__(self, ids: mx.array, cache: list[KVCache] | None = None) -> mx.array:
+    def __call__(self, ids: mx.array, cache: Sequence[LayerCache] | None = None) -> mx.array:
         return self.embed(ids)
 
 
@@ -114,7 +115,7 @@ def test_the_tree_a_calibration_pass_runs_is_reached_through_the_same_facades() 
 
 
 def test_a_backend_that_is_no_tree_answers_nothing_instead_of_the_facade() -> None:
-    """`ConstantLM` is a `CausalLM` and no `nn.Module`, which is exactly the double the
+    """`ConstantLM` is a `LanguageModel` and no `nn.Module`, which is exactly the double the
     server suites load: the walk ends on it and says so."""
     assert trunk_of(CompositeModel(TextLanguageModel(ConstantLM(), WordTokenizer()), [])) is None
     assert trunk_of(Tokenizerless()) is None

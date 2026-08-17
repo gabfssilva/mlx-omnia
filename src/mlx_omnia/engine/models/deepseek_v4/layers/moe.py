@@ -37,7 +37,7 @@ class MoEGate(nn.Module):
         self.experts = config.n_routed_experts
         self._route: Route | None = None
 
-    def _router(self) -> Route:
+    def router(self) -> Route:
         """Resolved once, at the first T=1 step — after load, when the leaves'
         formats are final."""
         route = self._route
@@ -58,7 +58,7 @@ class MoEGate(nn.Module):
 
     def step(self, x: mx.array, ids: mx.array) -> tuple[mx.array, mx.array]:
         """One token: `(indices [k], weights [k])`, flat."""
-        return self._router()(x, ids=ids)
+        return self.router()(x, ids=ids)
 
     def __call__(self, x: mx.array, ids: mx.array) -> tuple[mx.array, mx.array]:
         logits = x @ self.weight.T
@@ -127,7 +127,7 @@ class DeepseekV4MoE(nn.Module):
         self._gate_up: GateUp | None = None
         self._down: DownCombine | None = None
 
-    def _kernels(self) -> tuple[GateUp, DownCombine]:
+    def kernels(self) -> tuple[GateUp, DownCombine]:
         """Resolved once, at the first T=1 step — after load, when the leaves'
         formats are final."""
         gate_up, down = self._gate_up, self._down
@@ -140,8 +140,18 @@ class DeepseekV4MoE(nn.Module):
             self._gate_up, self._down = gate_up, down
         return gate_up, down
 
+    def resolve(self) -> None:
+        """Bind the router and the expert kernels now, outside whatever runs next.
+
+        They resolve on their first T=1 step otherwise, and a first step that happens to be
+        inside `mx.compile` is a strategy reading its leaves under a trace — which raises,
+        because applicability here is a property of the data and not of the shapes.
+        """
+        self.gate.router()
+        self.kernels()
+
     def fused_step(self, x: mx.array, chosen: mx.array, weights: mx.array) -> mx.array:
-        gate_up, down = self._kernels()
+        gate_up, down = self.kernels()
         act = gate_up(x.reshape(-1), chosen.reshape(-1))
         combined = down(
             act,

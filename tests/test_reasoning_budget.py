@@ -1,9 +1,12 @@
 """The reasoning budget: the ids a block may spend, and the closer fed when it runs out."""
 
+from collections.abc import Sequence
+
 import mlx.core as mx
 import pytest
 
 from mlx_omnia import KVCache, stream_ids
+from mlx_omnia.engine.core.cache import LayerCache
 from mlx_omnia.engine.generate import ConstraintConflict, ReasoningBlock, ReasoningBudget
 from mlx_omnia.engine.language import GenerationOptions, Text, TextLanguageModel, reasoning_budget
 
@@ -48,7 +51,7 @@ class Scripted:
     def make_cache(self) -> list[KVCache]:
         return [KVCache()]
 
-    def __call__(self, ids: mx.array, cache: list[KVCache] | None = None) -> mx.array:
+    def __call__(self, ids: mx.array, cache: Sequence[LayerCache] | None = None) -> mx.array:
         token = self.ids[min(self.step, len(self.ids) - 1)]
         self.step += 1
         row = -mx.abs(mx.arange(self.vocab) - token).astype(mx.float32)

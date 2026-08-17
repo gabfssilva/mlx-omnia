@@ -1,7 +1,7 @@
 import mlx.core as mx
 import mlx.nn as nn
 
-from mlx_omnia.engine.core.attend import KVStore
+from mlx_omnia.engine.core.cache import LayerCache
 from mlx_omnia.engine.core.layers import SwiGLU
 from mlx_omnia.engine.models.cohere.config import CohereConfig
 from mlx_omnia.engine.models.cohere.layers.attention import CohereAttention
@@ -16,6 +16,6 @@ class CohereBlock(nn.Module):
             config.hidden_size, eps=config.layer_norm_eps, bias=config.layer_norm_bias
         )
 
-    def __call__(self, x: mx.array, cache: KVStore) -> mx.array:
+    def __call__(self, x: mx.array, cache: LayerCache) -> mx.array:
         normed = self.input_layernorm(x)
         return x + self.self_attn(normed, cache) + self.mlp(normed)

@@ -1,5 +1,5 @@
-"""One compiled decode for every family: promotion, regrow+recompile, epoch staleness,
-validity masks, and graph residency — written three times today, once here."""
+"""One compiled decode for every family: promotion, regrow+recompile, epoch staleness and
+graph residency — written three times today, once here."""
 
 from collections.abc import Callable, Sequence
 from dataclasses import dataclass
@@ -7,8 +7,9 @@ from typing import NamedTuple
 
 import mlx.core as mx
 
+from mlx_omnia.engine.core.api import Draftable, LanguageModel, Screened, Tracing
 from mlx_omnia.engine.core.cache import (
-    FixedDeltaCache,
+    Composite,
     FixedKVCache,
     KVCache,
     LayerCache,
@@ -16,15 +17,16 @@ from mlx_omnia.engine.core.cache import (
     fit,
 )
 
-type StepFn = Callable[[mx.array, Sequence[LayerCache], mx.array | None], mx.array]
-"""step(ids, slots, mask) -> logits.
+type StepFn = Callable[[mx.array, Sequence[LayerCache]], mx.array]
+"""step(ids, slots) -> logits.
 
 - ids: what the stream hands the decode; the family decides the reshape.
 - slots: the promoted caches (fixed shapes), one per layer.
-- mask: the validity mask `columns <= anchor.position`, shape [1, 1, 1, capacity], built
-  inside the traced forward so it reads the anchor's live position; None when the trunk
-  has no full-attention layer.
 - returns logits [1, vocab], last row already selected.
+
+No mask. A promoted buffer hands back its whole capacity and cuts the columns it has not
+written itself (`LayerCache.readable`), which is the only form that also survives a ragged
+batch — so there is nothing left for the caller to build or thread through.
 
 Must be traceable by `mx.compile`. Weights are deliberately NOT captured: `mx.compile`
 swaps arrays inside captured containers for tracers in place, and a frozen strategy field
@@ -60,22 +62,141 @@ class DecodePlan:
     """Extra live containers for the compile's inputs/outputs."""
 
 
+def plan_of(model: LanguageModel[LayerCache], *, screened: bool = False) -> DecodePlan:
+    """The plan the engine writes for any trunk, from what the trunk already declares.
+
+    `step` is the forward and `promote` is `LayerCache.fixed`; neither varies by
+    architecture, which is why neither is a family's to supply. What a family may still
+    answer is `core.api.Tracing` — the resolution a trace cannot do and the containers it
+    must be handed — and this reads it if it is there.
+
+    Parameters
+    ----------
+    model : LanguageModel[LayerCache]
+        The trunk. Measured at 1.025x laguna's own hand-written plan, which is what
+        retired it.
+    screened : bool, optional
+        Take `core.api.Screened.screened` instead of the forward. The caller is asserting
+        that nothing but `argmax` will read the result; `Screened` documents what that
+        costs to get wrong. Ignored by a trunk that does not implement it.
+    """
+    step_fn = (
+        model.screened if screened and isinstance(model, Screened) else model.__call__
+    )
+
+    def promote(current: list[LayerCache], fitting: int) -> list[LayerCache]:
+        promoted = [layer.fixed(fitting) for layer in current]
+        mx.eval(*(tensor for layer in promoted for tensor in layer.tensors))
+        return promoted
+
+    def step(ids: mx.array, slots: Sequence[LayerCache]) -> mx.array:
+        return step_fn(ids[None], slots)[:, -1, :]
+
+    if not isinstance(model, Tracing):
+        return DecodePlan(step=step, promote=promote)
+
+    captured: list[object] = []
+
+    def prepare(slots: Sequence[LayerCache]) -> None:
+        captured[:] = model.before_trace(slots)
+
+    return DecodePlan(
+        step=step,
+        promote=promote,
+        prepare=prepare,
+        epochs=lambda: model.trace_epoch,
+        captures=lambda: [*captured],
+    )
+
+
+def compiled_verify(
+    model: Draftable[LayerCache],
+    cache: list[LayerCache],
+    *,
+    rows: int,
+    taps: Sequence[int],
+) -> tuple[Callable[[mx.array], tuple[mx.array, mx.array]], Callable[[int, int], None]] | None:
+    """A speculative round's fixed-shape half: one graph over the `rows` a round always
+    feeds, and a rewind that costs no forward.
+
+    Every round verifies exactly `width + 1` positions — the one committed token the target's
+    cache has not seen, plus the proposals — so the shape never moves and the graph is built
+    once. That is the same trade `compiled_decode` makes one row at a time, and the same
+    pieces make it: `LayerCache.fixed` for the shapes, `LayerCache.checkpoints` for the room
+    a rejection needs, `core.api.Tracing` for what a trace cannot settle for itself, and
+    `Draftable.block_outputs` for the forward — which is the trunk's ordinary one, because a
+    promoted buffer masks its own columns and the band that cuts them is also the causal one
+    over these rows.
+
+    `None` is a target the round rewinds by restoring and replaying instead: one whose
+    layers cannot present a fixed shape, or one whose mixers do not record the state after
+    every row (`Draftable.checkpoints`).
+    """
+    if not cache or not all(layer.is_fixable for layer in cache):
+        return None
+    if not model.checkpoints(cache, rows):
+        return None
+
+    def build(
+        fitting: int,
+    ) -> tuple[Callable[[mx.array], tuple[mx.array, mx.array]], int, tuple[int, ...]]:
+        # A generation that outgrows the fixed attention buffers promotes again into larger
+        # ones and recompiles; the recurrent containers are size-free and stay.
+        slots = [layer.fixed(fitting) for layer in cache]
+        granted = [layer.checkpoints(rows) for layer in slots]
+        assert all(granted), "this target claimed a rewind its promoted layers cannot hold"
+        mx.eval(*(tensor for layer in slots for tensor in layer.tensors))
+        cache[:] = slots
+        if isinstance(model, Tracing):
+            model.before_trace(slots)
+        state = state_of(slots)
+
+        def forward(ids: mx.array) -> tuple[mx.array, mx.array]:
+            logits, features = model.block_outputs(ids[None], slots, at=taps)
+            return logits[0], features
+
+        compiled = mx.compile(forward, inputs=state, outputs=state)
+        return compiled, fitting, model.trace_epoch if isinstance(model, Tracing) else ()
+
+    offset = cache[0].offset
+    compiled, room, epochs = build(fit(offset))
+    current = offset
+    before = offset
+
+    def verify(ids: mx.array) -> tuple[mx.array, mx.array]:
+        nonlocal compiled, room, epochs, current, before
+        if current + rows > room:
+            compiled, room, epochs = build(fit(current))
+        elif isinstance(model, Tracing) and model.trace_epoch != epochs:
+            compiled, room, epochs = build(room)
+        before = current
+        logits, features = compiled(ids)
+        current = before + rows
+        for layer in cache:
+            layer.offset = current
+        return logits, features
+
+    def rewind(kept: int, position: int) -> None:
+        nonlocal current
+        current = position
+        for layer in cache:
+            layer.rewind(kept, position)
+
+    return verify, rewind
+
+
 def state_of(slots: Sequence[LayerCache]) -> list[list[mx.array]]:
-    """The containers the graph sees. Layers holding no container stay out."""
+    """The containers the graph sees. Layers holding no container stay out; a `Composite`
+    with no shared list of its own answers through its parts — each part keeps rebinding
+    its own list, so they enter separately rather than flattened into one."""
     state: list[list[mx.array]] = []
     for layer in slots:
-        if isinstance(layer, FixedKVCache):
-            state.append(layer.state)
-        elif isinstance(layer, FixedDeltaCache):
-            state.append(layer.graph)
-        elif isinstance(layer, RingKVCache) and layer.state is not None:
-            state.append(layer.state)
+        held = layer.containers
+        if held is not None:
+            state.append(held)
+        elif isinstance(layer, Composite):
+            state.extend(state_of(list(layer.parts.values())))
     return state
-
-
-def anchor_of(slots: Sequence[LayerCache]) -> FixedKVCache | None:
-    """The first `FixedKVCache`, owner of the position the mask reads."""
-    return next((layer for layer in slots if isinstance(layer, FixedKVCache)), None)
 
 
 def compiled_decode(
@@ -89,19 +210,10 @@ def compiled_decode(
         slots = plan.promote(cache, fitting)
         cache[:] = slots
         state = state_of(slots)
-        anchor = anchor_of(slots)
-        columns = None if anchor is None else mx.arange(fitting)
         plan.prepare(slots)
 
         def forward(ids: mx.array) -> mx.array:
-            # Read before any layer advances it: the row this step writes lands at the
-            # pre-update position, so `<=` keeps it attendable and `<` would drop it.
-            mask = (
-                None
-                if anchor is None or columns is None
-                else (columns <= anchor.position).reshape(1, 1, 1, fitting)
-            )
-            return plan.step(ids, slots, mask)
+            return plan.step(ids, slots)
 
         inputs: list[object] = [*plan.captures(), state]
         compiled = mx.compile(forward, inputs=inputs, outputs=state)

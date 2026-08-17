@@ -1,4 +1,4 @@
-from collections.abc import Callable, Sequence
+from collections.abc import Sequence
 from typing import cast
 
 import mlx.core as mx
@@ -6,18 +6,20 @@ import pytest
 
 from mlx_omnia.engine.batching import (
     BatchedKVCache,
-    BatchedLayer,
-    BatchGreedyDecoder,
-    BatchModel,
     BatchPrefill,
-    PreparedSingleGreedyDecoder,
-    SingleGreedyDecoder,
+    LanguageModel,
     batch,
     prepare_batch_sequence,
     step,
 )
-from mlx_omnia.engine.core.cache import DeltaCache, FixedKVCache, KVCache, RingKVCache
-from mlx_omnia.engine.core.prefill import BLOCK
+from mlx_omnia.engine.core.api import Screened, Tracing
+from mlx_omnia.engine.core.cache import (
+    DeltaCache,
+    FixedKVCache,
+    KVCache,
+    LayerCache,
+    RingKVCache,
+)
 from mlx_omnia.engine.core.prefix import Prefixes, PrefixStore
 from mlx_omnia.engine.generate import (
     Constraint,
@@ -118,8 +120,7 @@ def test_qwen3_moe_ragged_batch_matches_independent_decode_steps() -> None:
     assert mx.allclose(together, apart, rtol=1e-5, atol=1e-5).item()
 
 
-class CountingModel(BatchModel):
-    continuous_batching = True
+class CountingModel(LanguageModel):
 
     def __init__(self, vocab: int) -> None:
         self.vocab = vocab
@@ -129,7 +130,7 @@ class CountingModel(BatchModel):
     def make_cache(self) -> list[KVCache]:
         return [KVCache()]
 
-    def __call__(self, ids: mx.array, cache: Sequence[BatchedLayer]) -> mx.array:
+    def __call__(self, ids: mx.array, cache: Sequence[LayerCache]) -> mx.array:
         self.batch_sizes.append(ids.shape[0])
         self.widths.append(ids.shape[1])
         targets = (ids + 1) % self.vocab
@@ -142,48 +143,44 @@ class StoringModel(CountingModel):
     so a double that never writes one has nothing to store — which is the right answer and
     not the one a test about storing wants."""
 
-    def __call__(self, ids: mx.array, cache: Sequence[BatchedLayer]) -> mx.array:
+    def __call__(self, ids: mx.array, cache: Sequence[LayerCache]) -> mx.array:
         rows = mx.ones((ids.shape[0], 1, ids.shape[1], 4), dtype=mx.float32)
         for layer in cache:
             if isinstance(layer, KVCache | FixedKVCache | RingKVCache):
                 layer.update_and_fetch(rows, rows)
             elif isinstance(layer, BatchedKVCache):
-                for index, row in enumerate(layer.rows):
+                for index, row in enumerate(layer.sequences):
                     row.update_and_fetch(rows[index : index + 1], rows[index : index + 1])
         return super().__call__(ids, cache)
 
 
-class GreedyCountingModel(CountingModel, BatchGreedyDecoder):
+class GreedyCountingModel(StoringModel, Screened[LayerCache]):
+    """`core.api.Screened`: the same argmax off a cheaper row. The double returns the real
+    logits — what it is here to record is *when* the engine asks for the screen, which is
+    once per graph and only when nothing but greedy will read it."""
+
     def __init__(self, vocab: int) -> None:
         super().__init__(vocab)
-        self.greedy_batch_sizes: list[int] = []
+        self.screened_rows: list[int] = []
 
-    def batch_greedy(
-        self,
-        ids: mx.array,
-        caches: Sequence[list[KVCache | FixedKVCache | RingKVCache]],
-        *,
-        capacity: int,
-    ) -> tuple[mx.array, ...]:
-        self.greedy_batch_sizes.append(ids.shape[0])
-        tokens = (ids[:, 0] + 1) % self.vocab
-        return tuple(tokens[index] for index in range(ids.shape[0]))
+    def screened(self, ids: mx.array, cache: Sequence[LayerCache]) -> mx.array:
+        self.screened_rows.append(ids.shape[0])
+        return self(ids, cache)
 
 
-class HybridCountingModel(GreedyCountingModel, SingleGreedyDecoder):
+class HybridCountingModel(GreedyCountingModel, StoringModel, Tracing[LayerCache]):
+    """Takes the one-row lease. Its forward is `(ids + 1) % vocab` — it reads no position
+    and holds no buffer whose unwritten columns could need masking — so both halves of
+    `core.api.Tracing` hold, and the counter is what says the graph was built."""
+
     def __init__(self, vocab: int) -> None:
         super().__init__(vocab)
-        self.single_greedy_calls = 0
+        self.traced = 0
 
-    def single_greedy(
-        self,
-        ids: mx.array,
-        cache: list[KVCache | FixedKVCache | RingKVCache],
-        *,
-        capacity: int,
-    ) -> mx.array:
-        self.single_greedy_calls += 1
-        return (ids + 1) % self.vocab
+    def before_trace(self, cache: Sequence[LayerCache]) -> Sequence[object]:
+        del cache
+        self.traced += 1
+        return ()
 
 
 class RowsForbiddenFixedKVCache(FixedKVCache):
@@ -192,53 +189,28 @@ class RowsForbiddenFixedKVCache(FixedKVCache):
         raise AssertionError("decode step synchronized the cache position")
 
 
+class RowsForbiddenKVCache(KVCache):
+    """Promotes into a buffer that refuses to say how many rows it holds — reading that is
+    a device sync, and a compiled step that pays one per token is the bug this catches."""
+
+    @property
+    def is_fixable(self) -> bool:
+        """`KVCache` answers for its exact class — a subclass that stores the same rows and
+        reads them differently is not what its `fixed` hands back. This one supplies its
+        own, so it answers for itself."""
+        return True
+
+    def fixed(self, capacity: int) -> LayerCache:
+        promoted = super().fixed(capacity)
+        assert isinstance(promoted, FixedKVCache)
+        keys, values = promoted.fetch()
+        return RowsForbiddenFixedKVCache(keys, values, promoted.offset)
+
+
 class StableCapacityModel(HybridCountingModel):
-    def single_greedy(
-        self,
-        ids: mx.array,
-        cache: list[KVCache | FixedKVCache | RingKVCache],
-        *,
-        capacity: int,
-    ) -> mx.array:
-        if isinstance(cache[0], KVCache):
-            cache[0] = RowsForbiddenFixedKVCache(
-                mx.zeros((1, 1, capacity, 1)),
-                mx.zeros((1, 1, capacity, 1)),
-                cache[0].offset,
-            )
-        return super().single_greedy(ids, cache, capacity=capacity)
+    def make_cache(self) -> list[KVCache]:
+        return [RowsForbiddenKVCache()]
 
-
-class PreparedSingleCountingModel(HybridCountingModel, PreparedSingleGreedyDecoder):
-    def __init__(self, vocab: int) -> None:
-        super().__init__(vocab)
-        self.prepare_single_calls = 0
-
-    def prepare_single_greedy(
-        self,
-        cache: list[KVCache | FixedKVCache | RingKVCache],
-        *,
-        capacity: int,
-    ) -> Callable[[mx.array], mx.array]:
-        self.prepare_single_calls += 1
-
-        def decode(ids: mx.array) -> mx.array:
-            return ((ids + 1) % self.vocab)[0]
-
-        return decode
-
-
-def test_batch_prefill_is_split_into_bounded_blocks() -> None:
-    model = CountingModel(128)
-
-    prepare_batch_sequence(
-        model,
-        [65] * (BLOCK + 1),
-        max_tokens=1,
-        sampler=greedy,
-    )
-
-    assert model.widths == [BLOCK, 1]
 
 
 class AsciiTokenizer:
@@ -298,19 +270,24 @@ def test_batch_step_feeds_the_owed_closer_when_the_budget_runs_out() -> None:
 
 
 def test_batch_step_uses_greedy_head_only_for_unfiltered_requests() -> None:
+    """Once, not per step: the screen is inside the traced graph, so what the counter shows
+    is the build."""
     model = GreedyCountingModel(16)
     first = prepare_batch_sequence(model, [1], max_tokens=2, sampler=greedy)
     second = prepare_batch_sequence(model, [4], max_tokens=2, sampler=greedy)
 
     step(model, [first, second])
 
-    assert model.greedy_batch_sizes == [2]
+    assert model.screened_rows == [2]
     assert [first.pending.item(), second.pending.item()] == [3, 6]
 
 
-def test_batch_step_uses_the_single_decoder_with_one_active_request(
+def test_batch_step_leases_a_one_row_graph_for_a_single_request(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
+    """One sequence never becomes a batch of one. The lease hands the trunk its promoted
+    caches, which is what a fused single-row kernel needs to stay on — a stacked row would
+    be a ragged adapter and the slow path."""
     model = HybridCountingModel(16)
     sequence = prepare_batch_sequence(model, [1], max_tokens=2, sampler=greedy)
 
@@ -321,8 +298,8 @@ def test_batch_step_uses_the_single_decoder_with_one_active_request(
 
     step(model, [sequence])
 
-    assert model.single_greedy_calls == 1
-    assert model.greedy_batch_sizes == []
+    assert model.traced == 1
+    assert model.screened_rows == [1], "one row, and the screen is the lease's"
 
 
 def test_batch_step_does_not_read_graph_visible_rows_after_prefill() -> None:
@@ -332,18 +309,19 @@ def test_batch_step_does_not_read_graph_visible_rows_after_prefill() -> None:
     step(model, [sequence])
     step(model, [sequence])
 
-    assert model.single_greedy_calls == 2
+    assert model.traced == 1
 
 
-def test_batch_step_prepares_the_single_decoder_once() -> None:
-    model = PreparedSingleCountingModel(16)
+def test_the_lease_is_built_once_and_reused() -> None:
+    """Building it compiles a graph, so a lease rebuilt per tick would cost more than the
+    adapter it exists to avoid."""
+    model = HybridCountingModel(16)
     sequence = prepare_batch_sequence(model, [1], max_tokens=3, sampler=greedy)
 
     step(model, [sequence])
     step(model, [sequence])
 
-    assert model.prepare_single_calls == 1
-    assert model.single_greedy_calls == 0
+    assert model.traced == 1
 
 
 def test_batch_step_does_not_use_greedy_head_with_a_constraint() -> None:
@@ -355,7 +333,7 @@ def test_batch_step_does_not_use_greedy_head_with_a_constraint() -> None:
 
     step(model, [constrained, free])
 
-    assert model.greedy_batch_sizes == []
+    assert model.screened_rows == []
 
 
 def test_batch_step_keeps_constraints_per_sequence() -> None:
@@ -433,7 +411,7 @@ def test_a_batched_prefill_closes_a_span_as_soon_as_a_block_finishes_it() -> Non
     model = StoringModel(128)
     cache = list[KVCache | FixedKVCache | RingKVCache](model.make_cache())
     prompt = [65, 66, 67, 68, 69, 70, 71, 72, 73]
-    walk = prefix.begin(cache, model)
+    walk = prefix.begin(cache)
     assert walk is not None
     prefill = BatchPrefill(model, prompt, cache, 0, 0, 1, greedy, prefix=walk, block=2)
 
@@ -444,7 +422,7 @@ def test_a_batched_prefill_closes_a_span_as_soon_as_a_block_finishes_it() -> Non
         pass
     assert walk.covered == 8
     warm = list[KVCache | FixedKVCache | RingKVCache](model.make_cache())
-    second = prefix.begin(warm, model)
+    second = prefix.begin(warm)
     assert second is not None
     assert second.resume(prompt, warm) == 8
 
@@ -528,7 +506,7 @@ def test_a_prompt_that_generates_nothing_still_leaves_its_spans() -> None:
     model = StoringModel(128)
     cache = list[KVCache | FixedKVCache | RingKVCache](model.make_cache())
     prompt = [65, 66, 67, 68, 69]
-    walk = prefix.begin(cache, model)
+    walk = prefix.begin(cache)
     assert walk is not None
     prefill = BatchPrefill(model, prompt, cache, 0, 0, 0, greedy, prefix=walk)
 
@@ -538,13 +516,12 @@ def test_a_prompt_that_generates_nothing_still_leaves_its_spans() -> None:
     assert walk.covered == 4
 
 
-class RecurrentBatchModel(BatchModel):
+class RecurrentBatchModel(LanguageModel):
     """A batched trunk whose layer keeps a recurrent state — the `nemotron_h` shape in
     miniature. Its state exists only where the layer is stopped, which is what makes the
     prefill's cut on the last boundary the difference between a resumable turn and a turn
     that leaves nothing."""
 
-    continuous_batching = True
 
     def __init__(self, vocab: int) -> None:
         self.vocab = vocab
@@ -553,7 +530,7 @@ class RecurrentBatchModel(BatchModel):
     def make_cache(self) -> list[KVCache]:
         return cast(list[KVCache], [DeltaCache()])
 
-    def __call__(self, ids: mx.array, cache: Sequence[BatchedLayer]) -> mx.array:
+    def __call__(self, ids: mx.array, cache: Sequence[LayerCache]) -> mx.array:
         self.widths.append(ids.shape[1])
         layer = cache[0]
         assert isinstance(layer, DeltaCache)
@@ -574,14 +551,14 @@ def test_a_batched_prefill_stops_on_a_boundary_so_a_recurrent_turn_can_be_resume
     model = RecurrentBatchModel(128)
     prompt = list(range(65, 76))
     cache = list[KVCache | FixedKVCache | RingKVCache](model.make_cache())
-    walk = prefix.begin(cache, model)
+    walk = prefix.begin(cache)
     assert walk is not None
     prefill = BatchPrefill(model, prompt, cache, 0, 0, 1, greedy, prefix=walk)
     while prefill.advance() is None:
         pass
 
     warm = list[KVCache | FixedKVCache | RingKVCache](model.make_cache())
-    second = prefix.begin(warm, model)
+    second = prefix.begin(warm)
     assert second is not None
 
     assert second.resume([*prompt, 200, 201], warm) == 8

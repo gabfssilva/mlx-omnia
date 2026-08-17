@@ -9,6 +9,7 @@ number chosen to make a test pass.
 """
 
 import json
+from collections.abc import Sequence
 from pathlib import Path
 
 import mlx.core as mx
@@ -142,7 +143,7 @@ class Recording:
     def make_cache(self) -> list[LayerCache]:
         return self.model.make_cache()
 
-    def __call__(self, ids: mx.array, cache: list[LayerCache] | None = None) -> mx.array:
+    def __call__(self, ids: mx.array, cache: Sequence[LayerCache] | None = None) -> mx.array:
         out = self.model(ids, cache)
         self.fed.append(ids.shape[1])
         self.logits.append(out[:, -1, :])
@@ -218,7 +219,7 @@ def test_stepwise_matches_prefill_over_a_reused_hybrid_cache(
     ids above do not."""
     prefix, second = conversation(model, golden)
     cache = model.make_cache()
-    walk = prefix.begin(cache, model)
+    walk = prefix.begin(cache)
     assert walk is not None
     covered = walk.resume(second, cache)
     assert covered == (len(second) - 1) // SPAN * SPAN
@@ -246,14 +247,14 @@ def test_stepwise_matches_prefill_over_spans_read_back_from_disk(
     files = _Files(tmp_path)
     prefix = Prefixes(PrefixStore(1, files, span=SPAN), "bailing", "a-stamp")
     warm = model.make_cache()
-    walk = prefix.begin(warm, model)
+    walk = prefix.begin(warm)
     assert walk is not None
     model(mx.array([ids[:cut]]), warm)
     mx.eval([tensor for layer in warm for tensor in layer.tensors])
     walk.commit(ids, warm, cut)
 
     read = model.make_cache()
-    second = prefix.begin(read, model)
+    second = prefix.begin(read)
     assert second is not None
     assert second.resume(ids, read) == cut
     assert files.reads > 0, "nothing came off disk, so the parity below proves nothing"

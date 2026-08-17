@@ -94,7 +94,7 @@ def test_moe_internals_within_floor(
     from mlx_omnia.engine.core.mxcompat import softmax
     from mlx_omnia.engine.models.longcat_flash_ngram.layers.cache import MLACache, NgramCache
 
-    ngram_cache = NgramCache(model.config.emb_neighbor_num)
+    ngram_cache = NgramCache(model.config.emb_neighbor_num, model.config.eos[0])
     embeddings = model.model.ngram_embeddings(golden["input_ids"][None], ngram_cache)
     block = model.model.layers[0]
     mla_cache = MLACache()

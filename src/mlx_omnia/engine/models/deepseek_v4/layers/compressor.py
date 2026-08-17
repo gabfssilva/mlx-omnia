@@ -3,7 +3,7 @@ import mlx.nn as nn
 
 from mlx_omnia.engine.core.mxcompat import softmax
 from mlx_omnia.engine.models.deepseek_v4.config import OVERLAP, DeepseekV4Config
-from mlx_omnia.engine.models.deepseek_v4.layers.cache import PoolCache
+from mlx_omnia.engine.models.deepseek_v4.layers.cache import FixedPoolCache, PoolCache
 from mlx_omnia.engine.models.deepseek_v4.layers.rope import rotary
 
 
@@ -53,6 +53,42 @@ class Compressor(nn.Module):
             pooled = self.rope(self.norm(pooled)[:, None], base // self.ratio)
             cache.append(pooled)
         return cache.fetch(self.head_dim, x.dtype)
+
+    def step(self, x: mx.array, cache: FixedPoolCache, position: mx.array) -> mx.array:
+        """One token against a fixed pool: the row into the ring, the window pooled
+        unconditionally, the result into the slot its window owns.
+
+        The `if usable:` of `__call__` is not scheduled around, it is gone: a step in the
+        middle of a window pools what the ring holds so far and writes it into the slot the
+        completing step overwrites, and `FixedPoolCache.mask` hides that slot until then. On
+        the completing step the whole window is valid, so the mask below leaves the gates
+        untouched and the arithmetic is the one `_pool` runs over a full window.
+        """
+        kv, gate = mx.split(self.wkvg(x), 2, axis=-1)
+        cache.write(kv, gate, position)
+        rows, gates, valid = cache.window(position)
+        pooled = self._pool_fixed(rows, gates, valid)
+        cache.append(self.rope(self.norm(pooled)[:, None], position // self.ratio), position)
+        return cache.fetch(self.head_dim, x.dtype)
+
+    def _pool_fixed(self, kv: mx.array, gate: mx.array, valid: mx.array) -> mx.array:
+        """`_pool` over a window the position may not have filled yet.
+
+        The lanes are already selected and the windows already shifted — that is what
+        `FixedPoolCache.window` hands back — so what is left is the position embedding, cut
+        the same way, and the mask that keeps an unreached row out of the softmax. `where`
+        over an all-true mask returns its input, which is why the completing step's numbers
+        are the growing form's and not merely close to them.
+        """
+        if not self.overlap:
+            logits = mx.where(valid, gate.astype(mx.float32) + self.ape, -mx.inf)
+            weights = softmax(logits, axis=-2)
+            return (kv * weights.astype(kv.dtype)).sum(axis=-2)
+        # `_pool` adds the full-width `ape` before splitting the lanes; the two halves stacked
+        # along the window's rows is the same sum, in the order the shift puts them.
+        ape = mx.concatenate(mx.split(self.ape, 2, axis=-1), axis=0)
+        logits = mx.where(valid, gate + ape.astype(gate.dtype), -mx.inf)
+        return (kv * softmax(logits, axis=-2, precise=True)).sum(axis=-2)
 
     def _pool(self, kv: mx.array, gate: mx.array) -> mx.array:
         if not self.overlap:
@@ -114,4 +150,26 @@ class Indexer(nn.Module):
         pool_mask = cache.mask(length, offset)
         if pool_mask is not None:
             scores = mx.where(pool_mask, scores, mx.finfo(scores.dtype).min)
+        return mx.argpartition(-scores, kth=self.topk - 1, axis=-1)[..., : self.topk]
+
+    def step(
+        self, x: mx.array, residual: mx.array, cache: FixedPoolCache, position: mx.array
+    ) -> mx.array | None:
+        """`__call__` against a fixed pool, at T=1.
+
+        The short-pool shortcut stays a host branch and is still statically decidable: what
+        it reads is the buffer's capacity, which a trace cannot change. Where it does fire,
+        the selection covers every column and the caller's `sparse & pool_mask` is what cuts
+        the rows the position has not reached — the same intersection the growing path makes
+        when a query sits behind a row the pool already holds.
+        """
+        pooled = self.compressor.step(x, cache, position)
+        if pooled.shape[2] <= self.topk:
+            return None
+        q = self.wq_b(residual).reshape(1, 1, self.heads, self.head_dim).transpose(0, 2, 1, 3)
+        keys = pooled.astype(mx.float32).swapaxes(-1, -2)
+        scores = mx.maximum(self.rope(q, position).astype(mx.float32) @ keys, 0)
+        weights = self.weights_proj(x).astype(mx.float32) * (self.heads**-0.5)
+        scores = (scores * self.scale * weights.swapaxes(-1, -2)[..., None]).sum(axis=1)[0]
+        scores = mx.where(cache.mask(1, position), scores, mx.finfo(scores.dtype).min)
         return mx.argpartition(-scores, kth=self.topk - 1, axis=-1)[..., : self.topk]

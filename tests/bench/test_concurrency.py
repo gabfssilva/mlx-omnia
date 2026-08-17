@@ -9,7 +9,6 @@ from mlx_omnia.engine.core.cache import KVCache
 
 
 class CountingModel:
-    continuous_batching = True
 
     def __init__(self) -> None:
         self.batch_sizes: list[int] = []

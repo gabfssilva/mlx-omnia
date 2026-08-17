@@ -114,7 +114,7 @@ class Qwen35DeltaNet(nn.Module):
 
     def verify_rows(self, x: mx.array, cache: FixedDeltaCache) -> mx.array:
         """`__call__` over a compiled verify's rows, with the pieces a slot-pick rewind
-        needs written to the cache's checkpoint slots (`Qwen35.compile_verify` extends
+        needs written to the cache's checkpoint slots (`FixedDeltaCache.checkpoints` extends
         `graph` to five: window, state, per-row states, the round's conv rows, and the
         window before the round).
 
@@ -197,6 +197,10 @@ class Qwen35DeltaNet(nn.Module):
         return self.out_proj(gated.reshape(1, length, config.value_dim))
 
     def __call__(self, x: mx.array, cache: Recurring) -> mx.array:
+        if isinstance(cache, FixedDeltaCache) and cache.checkpointing:
+            # A round asked for the state after every row, and the slots are here. Same
+            # arithmetic either way — the walk below keeps only the last one.
+            return self.verify_rows(x, cache)
         config = self.config
         rows, length = x.shape[0], x.shape[1]
         heads = config.linear_num_value_heads

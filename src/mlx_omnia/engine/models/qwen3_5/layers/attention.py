@@ -5,8 +5,8 @@ import mlx.core as mx
 import mlx.nn as nn
 import numpy as np
 
-from mlx_omnia.engine.core.attend import KVStore, attend
-from mlx_omnia.engine.core.cache import FixedKVCache
+from mlx_omnia.engine.core.attend import attend
+from mlx_omnia.engine.core.cache import FixedKVCache, LayerCache
 from mlx_omnia.engine.models.qwen3_5.config import Qwen35TextConfig
 
 
@@ -92,14 +92,14 @@ class Qwen35Attention(nn.Module):
     def __call__(
         self,
         x: mx.array,
-        cache: KVStore,
+        cache: LayerCache,
         positions: mx.array | None = None,
-        mask: mx.array | None = None,
     ) -> mx.array:
-        """`mask` is the fixed buffer's own fill, and only a compiled decode passes one: a
-        growing cache holds exactly the rows written, so `None` attends all of them. A
-        fixed buffer holds its whole capacity, and the columns past the position are
-        zeros the softmax would otherwise weigh."""
+        """No mask parameter. A growing cache holds exactly the rows written, so `None`
+        attends all of them; a fixed buffer holds its whole capacity and cuts the columns
+        past its position itself (`FixedKVCache.readable`, applied inside `core.attend`).
+        The band that cut is also the causal one over those rows, which is why the same
+        call serves a one-token decode and a verification's `width + 1` rows."""
         config = self.config
         length = x.shape[1]
         queries = config.num_attention_heads * config.head_dim
@@ -122,10 +122,7 @@ class Qwen35Attention(nn.Module):
             keys=k,
             values=v.transpose(0, 2, 1, 3),
             scale=1 / math.sqrt(config.head_dim),
-            # An explicit mask wins at any length: the compiled verify feeds `rows` rows
-            # over a fixed buffer, where the fill mask is also the causal one. Without
-            # one the growing paths keep their answers — all rows at T=1, causal past it.
-            mask=mask if mask is not None else (None if length == 1 else "causal"),
+            mask=None if length == 1 else "causal",
         )
         attended = attended.transpose(0, 2, 1, 3).reshape(x.shape[0], length, queries)
         return self.o_proj(attended * mx.sigmoid(gate))

@@ -1,9 +1,9 @@
 import mlx.core as mx
 import mlx.nn as nn
 
-from mlx_omnia.engine.core.attend import Attending, KVStore
+from mlx_omnia.engine.core.attend import Attending
 from mlx_omnia.engine.core.attention import ragged_mask
-from mlx_omnia.engine.core.cache import KVCache, SharedKVReader
+from mlx_omnia.engine.core.cache import FixedKVCache, KVCache, LayerCache, SharedKVReader
 from mlx_omnia.engine.core.masks import SLIDING, causal_mask
 from mlx_omnia.engine.models.gemma3n.config import Gemma3nTextConfig
 
@@ -37,9 +37,13 @@ class Gemma3nAttention(nn.Module):
             return None
         return causal_mask(queries, keys, self.window)
 
-    def __call__(self, x: mx.array, cache: KVStore | SharedKVReader) -> mx.array:
+    def __call__(self, x: mx.array, cache: LayerCache) -> mx.array:
         rows, length = x.shape[0], x.shape[1]
-        offset = cache.offset
+        # A shared reader's queries sit where its writer stood before this step, which it
+        # derives off the graph when the graph owns the writer's position; every other cache
+        # answers with its own offset, read before an update moves it.
+        borrows = isinstance(cache, SharedKVReader | FixedKVCache)
+        offset = cache.position if borrows else cache.offset
         queries = self.rope(
             self.q_norm(
                 self.q_proj(x).reshape(rows, length, self.heads, self.head_dim)
@@ -56,18 +60,32 @@ class Gemma3nAttention(nn.Module):
                 keys=keys,
                 values=values,
                 scale=1.0,
-                mask=ragged_mask(length, offset, self.window),
+                # `span` and not `max(offset)`: the positions here are the store's
+                # own and evaluating one is what a compiled bucket cannot do.
+                mask=ragged_mask(length, offset, self.window, span=cache.span),
             )
         else:
             if self.shared:
                 assert isinstance(cache, SharedKVReader)
-                assert cache.keys is not None and cache.values is not None
-                keys, values = cache.keys, cache.values
+                keys, values = cache.fetch()
             else:
-                assert isinstance(cache, KVCache)
+                assert isinstance(cache, KVCache | FixedKVCache)
                 keys, values = cache.update_and_fetch(*self.project(x, offset))
+            columns = keys.shape[2]
+            # Two shapes of band, and the difference is where the rows sit. A buffer that
+            # hands back exactly what it wrote puts the query at its end, and `mask` is right
+            # there. One that hands back more — a promoted buffer, or a reader borrowing from
+            # one — has the query somewhere in the middle, so the window is measured from the
+            # position instead. Which of the two is the cache's own answer.
+            band = (
+                self.mask(length, columns)
+                if cache.readable(None, length) is None
+                else cache.readable(
+                    ragged_mask(length, offset, self.window, span=columns), length
+                )
+            )
             attended = mx.fast.scaled_dot_product_attention(
-                queries, keys, values, scale=1.0, mask=self.mask(length, keys.shape[2])
+                queries, keys, values, scale=1.0, mask=band
             )
         return self.o_proj(
             attended.transpose(0, 2, 1, 3).reshape(rows, length, self.heads * self.head_dim)

@@ -17,7 +17,7 @@ orchestrator's, and this suite has to be able to run before it lands.
 
 import threading
 import time
-from collections.abc import AsyncGenerator, Generator, Iterator
+from collections.abc import AsyncGenerator, Generator, Iterator, Sequence
 from contextlib import asynccontextmanager, contextmanager
 from dataclasses import dataclass, field
 from importlib.metadata import version
@@ -41,6 +41,7 @@ from mlx_omnia import (
     Text,
     TextLanguageModel,
 )
+from mlx_omnia.engine.core.cache import LayerCache
 from mlx_omnia.engine.parsers import Segment
 from mlx_omnia.server import bench, jobs
 from mlx_omnia.server.engine import Engine, Loader
@@ -81,7 +82,7 @@ class TinyLM(nn.Module):
     def make_cache(self) -> list[KVCache]:
         return [KVCache()]
 
-    def __call__(self, ids: mx.array, cache: list[KVCache] | None = None) -> mx.array:
+    def __call__(self, ids: mx.array, cache: Sequence[LayerCache] | None = None) -> mx.array:
         return self.embed(ids)
 
 

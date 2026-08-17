@@ -15,6 +15,7 @@ from mlx.utils import tree_flatten, tree_unflatten
 
 import mlx_omnia.engine.models.qwen3_5.layers.moe as moe_module
 from mlx_omnia.engine.core.cache import FixedDeltaCache, FixedKVCache
+from mlx_omnia.engine.core.decode import compiled_decode, plan_of
 from mlx_omnia.engine.generate import stream_ids
 from mlx_omnia.engine.models.qwen3_5 import CHECKPOINT
 from mlx_omnia.engine.models.qwen3_5.config import (
@@ -107,7 +108,7 @@ def test_compiled_decode_matches_stepwise(model: Qwen35) -> None:
 
     cache = model.make_cache()
     model(prompt, cache)
-    decode = model.compile_decode(cache, capacity=32)
+    decode = compiled_decode(plan_of(model), cache, capacity=32)
     produced = [decode(mx.array([token])) for token in TOKENS]
 
     for row, wanted in zip(produced, expected, strict=True):
@@ -117,7 +118,7 @@ def test_compiled_decode_matches_stepwise(model: Qwen35) -> None:
 def test_compiled_decode_promotes_and_counts(model: Qwen35) -> None:
     cache = model.make_cache()
     model(mx.array(PROMPT)[None], cache)
-    decode = model.compile_decode(cache, capacity=32)
+    decode = compiled_decode(plan_of(model), cache, capacity=32)
 
     kinds = model.config.text_config.layer_types
     for layer, kind in zip(cache, kinds, strict=True):
@@ -145,7 +146,7 @@ def test_compiled_decode_regrows_past_capacity(model: Qwen35) -> None:
 
     cache = model.make_cache()
     model(prompt, cache)
-    decode = model.compile_decode(cache, capacity=12)
+    decode = compiled_decode(plan_of(model), cache, capacity=12)
     produced = [decode(mx.array([token])) for token in tokens]
 
     for row, wanted in zip(produced, expected, strict=True):
@@ -160,7 +161,7 @@ def test_the_rope_offset_survives_the_trace(model: Qwen35) -> None:
     prompt = mx.array(PROMPT)[None]
     cache = model.make_cache()
     model(prompt, cache)
-    decode = model.compile_decode(cache, capacity=32)
+    decode = compiled_decode(plan_of(model), cache, capacity=32)
 
     first = decode(mx.array([1]))
     second = decode(mx.array([1]))
@@ -227,14 +228,14 @@ def test_the_two_paths_alternate_on_one_model(model: Qwen35) -> None:
 
     cache = model.make_cache()
     model(prompt, cache)
-    decode = model.compile_decode(cache, capacity=32)
+    decode = compiled_decode(plan_of(model), cache, capacity=32)
 
     eager_cache = model.make_cache()
     model(prompt, eager_cache)
 
     for index, token in enumerate(TOKENS):
         # The per-block step comes first on purpose. `mx.compile` traces on the first
-        # call, not at `compile_decode`, so a step taken in that window is what leaves the
+        # call, not at `compiled_decode`, so a step taken in that window is what leaves the
         # trunk graph tracing over delegators another trace has already claimed.
         eager = model(mx.array([[token]]), eager_cache)[:, -1, :]
         row = decode(mx.array([token]))
@@ -246,8 +247,9 @@ def test_the_two_paths_alternate_on_one_model(model: Qwen35) -> None:
 @requires_checkpoint(REPO)
 def test_compiled_decode_matches_the_eager_stream_on_the_checkpoint() -> None:
     """The same claim in bf16 on a real trunk: the ids a compiled decode writes are the
-    ids the eager loop writes. `stream_ids` reaches for `compile_decode` on its own when
-    the model declares it, so the eager run is the one that has to be asked for."""
+    ids the eager loop writes. `stream_ids` reaches for the compiled decode on its own
+    when the trunk declares `Tracing`, so the eager run is the one that has to be asked
+    for."""
     model = CHECKPOINT.load(checkpoint_dir(REPO), None)
     assert isinstance(model, Qwen35)
     prompt = [3838, 374, 279, 6722, 315, 9625, 30]

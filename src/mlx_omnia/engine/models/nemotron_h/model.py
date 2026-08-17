@@ -1,21 +1,17 @@
-from collections.abc import Callable, Sequence
+from collections.abc import Sequence
 from typing import NamedTuple, assert_never
 
 import mlx.core as mx
 import mlx.nn as nn
 
+from mlx_omnia.engine.core.api import Draftable, Tracing
 from mlx_omnia.engine.core.cache import (
     DeltaCache,
-    FixedDeltaCache,
-    FixedKVCache,
     KVCache,
     LayerCache,
-    fit,
-    regrow,
 )
-from mlx_omnia.engine.core.decode import DecodePlan, compiled_decode
 from mlx_omnia.engine.core.kernels.add_norm import RowsAddRmsNorm
-from mlx_omnia.engine.models.nemotron_h.config import ATTENTION, MAMBA, NemotronHConfig
+from mlx_omnia.engine.models.nemotron_h.config import MAMBA, NemotronHConfig
 from mlx_omnia.engine.models.nemotron_h.layers.block import NemotronHBlock, NemotronHLayer
 from mlx_omnia.engine.models.nemotron_h.layers.mamba import NemotronHMamba
 
@@ -58,14 +54,41 @@ class NemotronHTrunk(nn.Module):
         self.norm_f = nn.RMSNorm(config.hidden_size, eps=config.layer_norm_epsilon)
 
 
-class NemotronH(nn.Module):
-    continuous_batching = True
+class NemotronH(nn.Module, Draftable[LayerCache], Tracing[LayerCache]):
+
+    _joins_cache: list[RowsAddRmsNorm] | None
+    _joins_resolved: bool
 
     def __init__(self, config: NemotronHConfig) -> None:
         super().__init__()
+        # Off the module's own attributes: `nn.Module.__setattr__` files a list into the
+        # parameter tree, and these hold the norms' weights by reference rather than being
+        # weights. Resolved on first use and not here, because the leaves this reads are
+        # the checkpoint's and the checkpoint has not been loaded yet.
+        object.__setattr__(self, "_joins_cache", None)
+        object.__setattr__(self, "_joins_resolved", False)
         self.config = config
         self.backbone = NemotronHTrunk(config)
         self.lm_head = nn.Linear(config.hidden_size, config.vocab_size, bias=False)
+
+    def before_trace(self, cache: Sequence[LayerCache]) -> Sequence[object]:
+        """`core.api.Tracing`. The residual joins, resolved outside the graph that bakes
+        them: `RowsAddRmsNorm.build` reads a leaf's size to decide applicability, and a
+        trace runs its Python once — a join left unresolved here would be chosen against
+        whatever the first token happened to see.
+
+        Nothing is captured. The joins hold the norms' weights as frozen fields, and an
+        array that is both a declared input and a strategy's field is the uncaptured-input
+        error; left out they bake in as constants, which is what a decode wants.
+
+        Both halves of the claim hold without this trunk doing anything: every position it
+        reads is `LayerCache.offset` passed straight into `mx.fast.rope` with `rope_dims=0`
+        — never a Python int — and the columns a promoted buffer has not written are cut by
+        `FixedKVCache.readable` inside `core.attend`.
+        """
+        del cache
+        self.joins()
+        return ()
 
     def make_cache(self) -> list[LayerCache]:
         caches: list[LayerCache] = []
@@ -82,289 +105,94 @@ class NemotronH(nn.Module):
         return caches
 
     def raw_embed(self, ids: mx.array) -> mx.array:
-        """`speculative.Speculable`. The trunk puts nothing over the lookup here, so the raw
+        """`core.api.Draftable`. The trunk puts nothing over the lookup here, so the raw
         pair and the cooked one are the same tensors — which is why the protocol names them
         rather than trusting a family to have only one."""
         return self.backbone.embeddings(ids)
 
     def raw_logits(self, hidden: mx.array) -> mx.array:
-        """`speculative.Speculable`. `norm_f` is *not* applied: the rows an MTP step returns
+        """`core.api.Draftable`. `norm_f` is *not* applied: the rows an MTP step returns
         already went through the step's own `final_layernorm`, and normalizing twice is a
         different model. The trunk's own path applies `norm_f` before calling this."""
         return self.lm_head(hidden)
 
     def block_outputs(
-        self, ids: mx.array, cache: list[LayerCache], *, at: Sequence[int]
+        self, ids: mx.array, cache: Sequence[LayerCache], *, at: Sequence[int]
     ) -> tuple[mx.array, mx.array]:
-        """`generate.BlockOutputs`: the same forward, plus the output of blocks `at`
+        """`core.api.Draftable`: the same forward, plus the output of blocks `at`
         concatenated on the last dim. What reads it is an MTP step, which asks for one — the
         last block, whose rows are what the step's `hnorm` was trained on."""
         activations = self.activations(ids, cache)
         return activations.logits, mx.concatenate([activations.blocks[index] for index in at], -1)
 
-    def verify(
-        self, ids: mx.array, cache: list[LayerCache], *, at: Sequence[int]
-    ) -> tuple[mx.array, mx.array, Callable[[int], None]]:
-        """`speculative.Verifiable`: `block_outputs`, plus a cheap way back.
+    def checkpoints(self, cache: Sequence[LayerCache], rows: int) -> bool:
+        """`core.api.Draftable`. Yes, when every mamba mixer holds the fused step: that is
+        the kernel `NemotronHMamba.verify_rows` writes the per-row states out of, and the
+        one thing about a rejected round that is not the cache's own answer.
 
-        Only 23 of these 52 layers keep state a rewind cannot subtract. The 6 attention layers
-        hold keys, which are dropped by moving the offset; the 23 sparse ones hold nothing but
-        the offset itself. Replaying all of them — which is what the round does for a trunk
-        that cannot say otherwise — reads the MoE weights a second time, and on this trunk
-        that is 57% of the bytes and the reason a rejected round costs more than the token it
-        bought.
-
-        The inputs the replay needs are already here: block `i` was fed block `i-1`'s output,
-        and `activations` collected every one. Holding a reference to the 23 that matter costs
-        nothing the forward had not already allocated.
+        Worth having on this trunk in particular. 23 of its 52 layers are recurrent and the
+        23 sparse ones hold nothing but an offset — replaying them reads the MoE weights a
+        second time, and on this checkpoint that is 57% of the bytes and the reason a
+        rejected round would cost more than the token it bought.
         """
-        # Before the forward, which is the only moment a restore point means anything: by the
-        # time `rewind` is called the recurrent layers have already taken every row, including
-        # the ones about to be thrown away.
-        restores = [
-            layer.checkpoint()
-            for layer, kind in zip(cache, self.config.pattern, strict=True)
-            if kind == MAMBA
-        ]
-        activations = self.activations(ids, cache)
-        inputs = [activations.embeddings, *activations.blocks[:-1]]
-
-        def rewind(kept: int) -> None:
-            for restore in restores:
-                restore()
-            for index, kind in enumerate(self.config.pattern):
-                if kind == MAMBA:
-                    self.backbone.layers[index](inputs[index][:, :kept], cache[index])
-                else:
-                    # The keys of a rejected row stay in the buffer and are overwritten by the
-                    # next update, exactly as `KVCache.trim` leaves them; a layer holding only
-                    # a count needs only the count.
-                    cache[index].offset += kept - ids.shape[1]
-
-        features = mx.concatenate([activations.blocks[index] for index in at], -1)
-        return activations.logits, features, rewind
-
-    def compile_decode(
-        self, cache: list[LayerCache], capacity: int | None = None
-    ) -> Callable[[mx.array], mx.array]:
-        """Promote a completed prefill cache and compile one-token forwards.
-
-        The 6 attention layers get a fixed buffer with a graph-visible position; the 23
-        recurrent ones get their window and state moved into a graph-visible container
-        (`FixedDeltaCache`); the sparse and dense ones hold only an offset, which never
-        enters the graph. The attention mask is the fixed buffer's own fill: every column
-        up to and including the row this step writes.
-
-        The default capacity is sized to the prompt rather than a constant: the fixed
-        buffer is read whole by every step's attention, so an oversized one is bytes on
-        the decode's critical path. When a generation outgrows it, the wrapper promotes
-        again into a larger buffer and recompiles — a copy and a retrace, paid once per
-        doubling and never per token.
-        """
-        blocks = self.backbone.layers
-        joins = _joins(blocks, self.backbone.norm_f)
-
-        def promote(layers: list[LayerCache], fitting: int) -> list[LayerCache]:
-            promoted: list[LayerCache] = []
-            for layer, kind in zip(layers, self.config.pattern, strict=True):
-                if kind == ATTENTION:
-                    assert isinstance(layer, KVCache | FixedKVCache)
-                    grown = (
-                        regrow(layer, fitting)
-                        if isinstance(layer, FixedKVCache)
-                        else FixedKVCache.promote(layer, fitting)
-                    )
-                    promoted.append(grown)
-                elif kind == MAMBA:
-                    assert isinstance(layer, DeltaCache)
-                    promoted.append(
-                        layer
-                        if isinstance(layer, FixedDeltaCache)
-                        else FixedDeltaCache.promote(layer)
-                    )
-                else:
-                    promoted.append(layer)
-            return promoted
-
-        def step(
-            ids: mx.array, slots: Sequence[LayerCache], mask: mx.array | None
-        ) -> mx.array:
-            x = self.backbone.embeddings(ids[None])
-            if joins is None:
-                for block, layer_cache in zip(blocks, slots, strict=True):
-                    assert isinstance(block, NemotronHBlock)
-                    x = block(x, layer_cache, mask)
-                return self.lm_head(self.backbone.norm_f(x))[:, -1, :]
-            first = blocks[0]
-            assert isinstance(first, NemotronHBlock)
-            normed = first.norm(x)
-            for block, layer_cache, join in zip(blocks, slots, joins, strict=True):
-                assert isinstance(block, NemotronHBlock)
-                x, normed = join(x, block.mix(normed, layer_cache, mask))
-            return self.lm_head(normed)[:, -1, :]
-
-        return compiled_decode(DecodePlan(step=step, promote=promote), cache, capacity)
-
-    def compile_verify(
-        self, cache: list[LayerCache], *, width: int, at: Sequence[int]
-    ) -> (
-        tuple[
-            Callable[[mx.array], tuple[mx.array, mx.array]],
-            Callable[[int], None],
-        ]
-        | None
-    ):
-        """The speculative round's fixed-shape half, compiled: one forward over the
-        `width + 1` rows a round always verifies, and a rewind that costs no forward.
-
-        The rewind is vllm's shape: the recurrent layers' verify kernel wrote the state
-        after every row to its own slot, and the conv windows are raw projection rows,
-        so keeping `kept` rows is picking a slot and a slice. The attention layers'
-        fixed buffers rewind by moving the graph-visible position back — the rows past
-        it are stale and overwritten by the next round.
-        """
-        rows = width + 1
-        pattern = self.config.pattern
-        # The per-token-checkpoint kernel is what makes the compiled round worth
-        # taking; a configuration it declines falls back to replay by returning None.
+        del cache, rows
         from mlx_omnia.engine.core.kernels.mamba_step.fused import FusedMambaStep
 
-        for block, kind in zip(self.backbone.layers, pattern, strict=True):
+        for block, kind in zip(self.backbone.layers, self.config.pattern, strict=True):
             if kind != MAMBA:
                 continue
             assert isinstance(block, NemotronHBlock)
             mixer = block.mixer
             assert isinstance(mixer, NemotronHMamba)
             if not isinstance(mixer.mamba_step().strategy, FusedMambaStep):
-                return None
-        if ATTENTION not in pattern:
-            return None
-        offset = cache[0].offset
-        promoted: list[LayerCache] = []
-        for layer, kind in zip(cache, pattern, strict=True):
-            if kind == ATTENTION:
-                assert isinstance(layer, KVCache)
-                promoted.append(FixedKVCache.promote(layer, fit(offset)))
-            elif kind == MAMBA:
-                assert isinstance(layer, DeltaCache)
-                fixed = FixedDeltaCache.promote(layer)
-                window, state = fixed.graph
-                fixed.graph.extend(
-                    [
-                        mx.zeros((rows, *state.shape[1:]), dtype=state.dtype),
-                        mx.zeros((rows, window.shape[-1]), dtype=window.dtype),
-                        mx.zeros_like(window),
-                    ]
-                )
-                promoted.append(fixed)
-            else:
-                promoted.append(layer)
-        cache[:] = promoted
-        blocks = self.backbone.layers
-        steps = mx.arange(rows)
+                return False
+        return True
 
-        joins = _joins(blocks, self.backbone.norm_f)
-
-        def build(fitting: int) -> tuple[Callable[[mx.array], tuple[mx.array, mx.array]], int]:
-            # A generation that outgrows the fixed attention buffers promotes again into
-            # larger ones and recompiles — the mamba containers are size-free and stay.
-            for index, kind in enumerate(pattern):
-                if kind != ATTENTION:
-                    continue
-                layer = promoted[index]
-                assert isinstance(layer, FixedKVCache)
-                if layer.state[0].shape[2] < fitting:
-                    promoted[index] = regrow(layer, fitting)
-            cache[:] = promoted
-            state_containers = [
-                layer.state if isinstance(layer, FixedKVCache) else layer.graph
-                for layer in promoted
-                if isinstance(layer, FixedKVCache | FixedDeltaCache)
-            ]
-            anchor = next(layer for layer in promoted if isinstance(layer, FixedKVCache))
-            columns = mx.arange(fitting)
-
-            def forward(ids: mx.array) -> tuple[mx.array, mx.array]:
-                mask = (columns[None, :] <= anchor.position + steps[:, None]).reshape(
-                    1, 1, rows, fitting
-                )
-                x = self.backbone.embeddings(ids[None])
-                outputs: list[mx.array] = []
-                first = blocks[0]
-                assert isinstance(first, NemotronHBlock)
-                normed = first.norm(x) if joins is not None else x
-                for index, (block, layer_cache, kind) in enumerate(
-                    zip(blocks, promoted, pattern, strict=True)
-                ):
-                    assert isinstance(block, NemotronHBlock)
-                    if joins is None:
-                        normed = block.norm(x)
-                    if kind == MAMBA:
-                        mixer = block.mixer
-                        assert isinstance(mixer, NemotronHMamba)
-                        assert isinstance(layer_cache, DeltaCache)
-                        mixed = mixer.verify_rows(normed, layer_cache)
-                    else:
-                        mixed = block.mix(normed, layer_cache, mask)
-                    if joins is None:
-                        x = x + mixed
-                    else:
-                        x, normed = joins[index](x, mixed)
-                    outputs.append(x)
-                final = self.backbone.norm_f(x) if joins is None else normed
-                logits = self.lm_head(final)
-                features = mx.concatenate([outputs[index] for index in at], -1)
-                return logits[0], features
-
-            return (
-                mx.compile(forward, inputs=state_containers, outputs=state_containers),
-                fitting,
+    def joins(self) -> list[RowsAddRmsNorm] | None:
+        """The residual joins, resolved once — after load, when the norms' leaves are
+        final. `None` is a trunk whose hidden size the rows kernel declines, and the plain
+        add-then-norm chain is what it gets."""
+        if not self._joins_resolved:
+            object.__setattr__(
+                self, "_joins_cache", _joins(self.backbone.layers, self.backbone.norm_f)
             )
-
-        compiled, room = build(fit(offset))
-        current = offset
-        before = offset
-
-        def verify(ids: mx.array) -> tuple[mx.array, mx.array]:
-            nonlocal current, before, compiled, room
-            if current + rows > room:
-                compiled, room = build(fit(current))
-            before = current
-            logits, features = compiled(ids)
-            current = before + rows
-            for layer in promoted:
-                layer.offset = current
-            return logits, features
-
-        def rewind(kept: int) -> None:
-            nonlocal current
-            current = before + kept
-            for layer in promoted:
-                if isinstance(layer, FixedKVCache):
-                    layer.state[2] = mx.array([current], dtype=mx.int32)
-                elif isinstance(layer, FixedDeltaCache):
-                    window_before = layer.graph[4][0]
-                    conv_rows = layer.graph[3][:kept]
-                    tail = self.config.conv_kernel - 1
-                    layer.graph[0] = mx.concatenate([window_before, conv_rows], axis=0)[
-                        None, -tail:
-                    ]
-                    layer.graph[1] = layer.graph[2][kept - 1][None]
-                layer.offset = current
-
-        return verify, rewind
+            object.__setattr__(self, "_joins_resolved", True)
+        return self._joins_cache
 
     def activations(
         self, ids: mx.array, cache: Sequence[NemotronHLayer] | None = None
     ) -> NemotronHActivations:
+        """One forward for every shape this trunk runs in — prefill, one-token decode, and
+        the `width + 1` rows of a verification — over growing caches or promoted ones.
+
+        The joins are the reason it is worth saying so. Block `i`'s residual add and the
+        norm block `i + 1` reads it through are one kernel, which crosses a block boundary
+        and so cannot live inside a block; running it here instead of only under a compiled
+        decode is what keeps the two from being two arithmetics that have to agree.
+        `RowsAddRmsNorm` is bit-identical to `nn.RMSNorm` over the same sum, in fp32 and
+        bf16 alike, which is what makes the fused chain and the plain one the same numbers
+        and not merely close ones.
+        """
         layers: Sequence[NemotronHLayer] = self.make_cache() if cache is None else cache
         x = self.backbone.embeddings(ids)
         embeddings = x
         blocks: list[mx.array] = []
-        for block, layer_cache in zip(self.backbone.layers, layers, strict=True):
-            x = block(x, layer_cache)
-            blocks.append(x)
-        normed = self.backbone.norm_f(x)
+        joins = self.joins()
+        if joins is None:
+            for block, layer_cache in zip(self.backbone.layers, layers, strict=True):
+                x = block(x, layer_cache)
+                blocks.append(x)
+            normed = self.backbone.norm_f(x)
+        else:
+            first = self.backbone.layers[0]
+            assert isinstance(first, NemotronHBlock)
+            normed = first.norm(x)
+            for block, layer_cache, join in zip(
+                self.backbone.layers, layers, joins, strict=True
+            ):
+                assert isinstance(block, NemotronHBlock)
+                x, normed = join(x, block.mix(normed, layer_cache))
+                blocks.append(x)
         return NemotronHActivations(embeddings, blocks, normed, self.lm_head(normed))
 
     def __call__(

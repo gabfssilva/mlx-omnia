@@ -5,8 +5,8 @@ from typing import NamedTuple
 import mlx.core as mx
 import mlx.nn as nn
 
-from mlx_omnia.engine.core.attend import Attending, KVStore, attend
-from mlx_omnia.engine.core.cache import FixedKVCache, KVCache, RingKVCache
+from mlx_omnia.engine.core.attend import Attending, attend
+from mlx_omnia.engine.core.cache import FixedKVCache, KVCache, LayerCache, RingKVCache
 from mlx_omnia.engine.core.kernels.attention import AttentionCache, AttentionStep
 from mlx_omnia.engine.core.kernels.attention.default import rotate
 from mlx_omnia.engine.core.kernels.qmv import Qmv
@@ -61,7 +61,7 @@ class LagunaAttention(nn.Module):
         self,
         x: mx.array,
         mask: mx.array | str | None,
-        cache: KVStore,
+        cache: LayerCache,
     ) -> mx.array:
         batch = x.shape[0]
         length = x.shape[1]

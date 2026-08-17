@@ -15,7 +15,7 @@ this module counts is the probe's.
 
 import asyncio
 import json
-from collections.abc import Iterator, Mapping
+from collections.abc import Iterator, Mapping, Sequence
 from pathlib import Path
 from typing import Protocol, TypeIs, runtime_checkable
 
@@ -78,7 +78,7 @@ class Attending(nn.Module):
         self.caches.append(made)
         return made
 
-    def __call__(self, ids: mx.array, cache: list[LayerCache] | None = None) -> mx.array:
+    def __call__(self, ids: mx.array, cache: Sequence[LayerCache] | None = None) -> mx.array:
         self.forwards += 1
         assert cache is not None
         rows = mx.ones((1, 2, ids.shape[1], HEAD_DIM), dtype=mx.float32)
@@ -106,7 +106,7 @@ class Fetching(Attending):
     policy, and nothing about its config says so.
     """
 
-    def __call__(self, ids: mx.array, cache: list[LayerCache] | None = None) -> mx.array:
+    def __call__(self, ids: mx.array, cache: Sequence[LayerCache] | None = None) -> mx.array:
         self.forwards += 1
         assert cache is not None
         rows = mx.ones((1, 2, ids.shape[1], HEAD_DIM), dtype=mx.float32)

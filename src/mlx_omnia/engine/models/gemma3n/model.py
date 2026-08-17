@@ -5,8 +5,8 @@ import mlx.core as mx
 import mlx.nn as nn
 
 from mlx_omnia.engine.batching import BatchedKVCache, BatchedSharedKVReader
-from mlx_omnia.engine.core.attend import KVStore
-from mlx_omnia.engine.core.cache import KVCache, SharedKVReader
+from mlx_omnia.engine.core.api import Tracing
+from mlx_omnia.engine.core.cache import FixedKVCache, KVCache, LayerCache, SharedKVReader
 from mlx_omnia.engine.models.gemma3n.config import Gemma3nConfig, Gemma3nTextConfig
 from mlx_omnia.engine.models.gemma3n.layers.altup import rescale
 from mlx_omnia.engine.models.gemma3n.layers.block import Gemma3nBlock
@@ -44,8 +44,7 @@ class Gemma3nTrunk(nn.Module):
         self.norm = nn.RMSNorm(config.hidden_size, eps=config.rms_norm_eps)
 
 
-class Gemma3n(nn.Module):
-    continuous_batching = True
+class Gemma3n(nn.Module, Tracing[LayerCache]):
 
     def __init__(self, config: Gemma3nConfig) -> None:
         super().__init__()
@@ -58,6 +57,19 @@ class Gemma3n(nn.Module):
             SharedKVReader() if layer >= self.text.first_shared_layer else KVCache()
             for layer in range(self.text.num_hidden_layers)
         ]
+
+    def before_trace(self, cache: Sequence[LayerCache]) -> Sequence[object]:
+        """`core.api.Tracing`. Nothing to settle: this trunk resolves no kernels lazily and
+        reads no resident table.
+
+        The two claims it does make. Every position it rotates by comes off the graph when
+        the graph owns it — `FixedKVCache.position` for a storing layer, and the writer's
+        position minus this step for a `SharedKVReader`, which is why that one holds its
+        writer rather than a copy of its rows. And the columns a promoted buffer has not
+        written are cut by `LayerCache.readable`, asked of the layer that holds them.
+        """
+        del cache
+        return ()
 
     def per_layer_inputs(self, ids: mx.array, embedded: mx.array) -> mx.array:
         config = self.text
@@ -82,7 +94,7 @@ class Gemma3n(nn.Module):
         return mx.tanh(logits / cap) * cap
 
     def activations(
-        self, ids: mx.array, cache: Sequence[KVStore | SharedKVReader] | None = None
+        self, ids: mx.array, cache: Sequence[LayerCache] | None = None
     ) -> Gemma3nActivations:
         config = self.text
         cache = cache if cache is not None else self.make_cache()
@@ -103,9 +115,9 @@ class Gemma3n(nn.Module):
                     assert isinstance(store, BatchedKVCache)
                     layer_cache.adopt(store, ids.shape[1])
                 else:
-                    assert isinstance(store, KVCache) and isinstance(layer_cache, SharedKVReader)
-                    layer_cache.keys, layer_cache.values = store.fetch()
-                    layer_cache.offset = store.offset - ids.shape[1]
+                    assert isinstance(store, KVCache | FixedKVCache)
+                    assert isinstance(layer_cache, SharedKVReader)
+                    layer_cache.adopt(store, ids.shape[1])
             x = block(x, layer_cache, per_layer[:, :, layer, :])
             blocks.append(x[config.altup_active_idx])
 
@@ -121,6 +133,6 @@ class Gemma3n(nn.Module):
         return Gemma3nActivations(embedded, blocks, normed, self.head(normed))
 
     def __call__(
-        self, ids: mx.array, cache: Sequence[KVStore | SharedKVReader] | None = None
+        self, ids: mx.array, cache: Sequence[LayerCache] | None = None
     ) -> mx.array:
         return self.activations(ids, cache).logits

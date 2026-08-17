@@ -3,7 +3,7 @@ from collections.abc import Callable
 import mlx.core as mx
 import mlx.nn as nn
 
-from mlx_omnia.engine.core.cache import KVCache, LayerCache
+from mlx_omnia.engine.core.cache import FixedDeltaCache, FixedKVCache, KVCache, LayerCache
 from mlx_omnia.engine.core.layers import SwiGLU, l2norm, swish
 from mlx_omnia.engine.models.bailing_hybrid.config import BailingHybridConfig
 from mlx_omnia.engine.models.bailing_hybrid.layers import flags, kda
@@ -73,8 +73,12 @@ class BailingHybridBlock(nn.Module):
         # One mixer or the other; mlx.nn.Module's __getattr__ is untyped.
         mixer = self.attention
         # The compiled steps bake the batch axis into their trace, so a ragged batch of more
-        # than one row takes the eager path.
-        if x.shape[1] == 1 and x.shape[0] == 1 and flags.COMPILED_STEP:
+        # than one row takes the eager path — and so do promoted caches, which mean this call
+        # is already inside a trunk-level trace: a trace within a trace is either inlined
+        # twice or a barrier the outer graph cannot fuse across, and `_rebuild` is host-side
+        # work that would run once and then never again.
+        promoted = isinstance(cache, FixedKVCache | FixedDeltaCache)
+        if x.shape[1] == 1 and x.shape[0] == 1 and flags.COMPILED_STEP and not promoted:
             if self.attends:
                 # The MLA projections stay eager: mx.fast.rope takes the offset as an op
                 # attribute and a trace would freeze it at the first token.
@@ -89,7 +93,7 @@ class BailingHybridBlock(nn.Module):
         normed = self.input_layernorm(x)
         if self.attends:
             assert isinstance(mixer, BailingHybridLatentAttention)
-            assert isinstance(cache, KVCache | BatchedLatentKVCache)
+            assert isinstance(cache, KVCache | FixedKVCache | BatchedLatentKVCache)
             projected = mixer(normed, cache)
         else:
             assert isinstance(mixer, KimiDeltaAttention) and isinstance(cache, Recurring)

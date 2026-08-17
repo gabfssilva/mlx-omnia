@@ -1,7 +1,7 @@
 import mlx.core as mx
 import mlx.nn as nn
 
-from mlx_omnia.engine.core.attend import Attending, KVStore
+from mlx_omnia.engine.core.attend import Attending
 from mlx_omnia.engine.core.cache import KVCache, LayerCache
 from mlx_omnia.engine.core.layers import SwiGLU
 from mlx_omnia.engine.models.jamba.config import JambaConfig
@@ -9,7 +9,7 @@ from mlx_omnia.engine.models.jamba.layers.attention import JambaAttention
 from mlx_omnia.engine.models.jamba.layers.mamba import JambaMamba, Recurring
 from mlx_omnia.engine.models.jamba.layers.moe import JambaMoE
 
-type JambaLayer = LayerCache | KVStore | Recurring
+type JambaLayer = LayerCache | Recurring
 """A layer's cache, alone or standing for one row each: attention reads it through
 `core.attend`, and the mamba mixer through `window`/`state`."""
 

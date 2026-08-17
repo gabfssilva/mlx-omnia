@@ -16,7 +16,8 @@ import pytest
 from huggingface_hub import hf_hub_download, snapshot_download
 
 from mlx_omnia import GPT2, GPT2Tokenizer, KVCache, repetition_penalty, sampler, stream_ids, top_k
-from mlx_omnia.engine.core.cache import DeltaCache, RingKVCache
+from mlx_omnia.engine.core.api import Draftable
+from mlx_omnia.engine.core.cache import DeltaCache, LayerCache, RingKVCache
 from mlx_omnia.engine.generate import Meter
 from mlx_omnia.engine.models.gpt2 import CHECKPOINT
 from mlx_omnia.engine.speculative import Acceptance, SpeculationRefused, stream_speculative_ids
@@ -56,7 +57,7 @@ class ScriptedLM:
     def make_cache(self) -> list[KVCache]:
         return [KVCache()]
 
-    def __call__(self, ids: mx.array, cache: list[KVCache] | None = None) -> mx.array:
+    def __call__(self, ids: mx.array, cache: Sequence[LayerCache] | None = None) -> mx.array:
         assert cache is not None, "the speculative loop always carries a cache"
         offset = cache[0].offset
         length = ids.shape[-1]
@@ -389,11 +390,26 @@ def test_a_draft_that_is_the_target_is_almost_always_accepted(
     assert counts.rate > 0.5
 
 
-class ScriptedBlockLM(ScriptedLM):
-    """The same script, through `generate.BlockOutputs`. The features are the rows' own
+class ScriptedBlockLM(ScriptedLM, Draftable[LayerCache]):
+    """The same script, through `core.api.Draftable`. The features are the rows' own
     absolute positions repeated once per tap, which is what lets a test say exactly which
     positions the loop handed over — a loop that passed the rejected tail, or passed a
-    block twice, spells it here as a gap or a repeat."""
+    block twice, spells it here as a gap or a repeat.
+
+    The two raw ends are here because `Draftable` is one protocol and a real block proposer
+    needs all three: reading the target's blocks means working in hidden rows, and hidden
+    rows become ids only through the target's head (`muse_glimmer/dflash.py` calls both).
+    `BlockProposer` below reads its proposals off a script instead of computing them, so it
+    is the one block proposer that never calls them.
+    """
+
+    def raw_embed(self, ids: mx.array) -> mx.array:
+        """One-hot over the vocabulary — the smallest embedding that round-trips through
+        `raw_logits`."""
+        return mx.eye(self.vocab)[ids]
+
+    def raw_logits(self, hidden: mx.array) -> mx.array:
+        return hidden
 
     def block_outputs(
         self, ids: mx.array, cache: list[KVCache], *, at: Sequence[int]

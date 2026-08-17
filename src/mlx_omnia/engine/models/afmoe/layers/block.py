@@ -1,7 +1,7 @@
 import mlx.core as mx
 import mlx.nn as nn
 
-from mlx_omnia.engine.core.attend import KVStore
+from mlx_omnia.engine.core.cache import LayerCache
 from mlx_omnia.engine.core.layers import SwiGLU
 from mlx_omnia.engine.core.masks import SLIDING
 from mlx_omnia.engine.models.afmoe.config import AfmoeConfig
@@ -24,6 +24,6 @@ class AfmoeBlock(nn.Module):
         self.pre_mlp_layernorm = nn.RMSNorm(config.hidden_size, eps=eps)
         self.post_mlp_layernorm = nn.RMSNorm(config.hidden_size, eps=eps)
 
-    def __call__(self, x: mx.array, cache: KVStore) -> mx.array:
+    def __call__(self, x: mx.array, cache: LayerCache) -> mx.array:
         attended = x + self.post_attention_layernorm(self.self_attn(self.input_layernorm(x), cache))
         return attended + self.post_mlp_layernorm(self.mlp(self.pre_mlp_layernorm(attended)))

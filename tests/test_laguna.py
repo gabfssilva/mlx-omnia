@@ -13,7 +13,13 @@ import numpy as np
 import pytest
 
 from mlx_omnia import KVCache, stream_ids
-from mlx_omnia.engine.batching import batch, prepare_batch_sequence, step
+from mlx_omnia.engine.batching import (
+    _generic_bucket,
+    _generic_state,
+    batch,
+    prepare_batch_sequence,
+    step,
+)
 from mlx_omnia.engine.core.cache import FixedKVCache, RingKVCache
 from mlx_omnia.engine.core.layers import sorted_gather
 from mlx_omnia.engine.generate import greedy
@@ -82,7 +88,6 @@ def test_continuous_batching_matches_independent_ragged_decode() -> None:
     actual = model(ids, batch(batched_caches))
     mx.eval(expected, actual)
 
-    assert model.continuous_batching
     assert bool(mx.allclose(actual, expected, rtol=1e-4, atol=1e-5))
     assert [cache.offset for cache in batched_caches[0]] == [3, 3]
     assert [cache.offset for cache in batched_caches[1]] == [5, 5]
@@ -98,6 +103,35 @@ def test_rope_atlas_rebuilds_when_an_object_id_is_reused() -> None:
     angles = first.angles(0)
 
     assert angles.shape == (first._rotary_dim,)
+
+
+def _bucket(model: Laguna, caches: list[list], capacity: int, *, screened: bool = False):
+    """The engine's compiled bucket, where Laguna used to ship its own. `batch_decode` and
+    `batch_greedy` are gone: what they did — pad to a bucket size, promote, trace, keep the
+    graph resident — is `batching._generic_bucket` for every family."""
+    bucket = _generic_bucket(model, caches, capacity, screened=screened)
+    assert bucket is not None, "laguna's layers all promote"
+    return bucket
+
+
+def _pad(ids: mx.array, size: int) -> mx.array:
+    missing = size - ids.shape[0]
+    if missing <= 0:
+        return ids
+    return mx.concatenate([ids, mx.repeat(ids[-1:], missing, axis=0)])
+
+
+def batch_rows(model: Laguna, ids: mx.array, caches: list[list], *, capacity: int) -> mx.array:
+    """`[rows, vocab]` for the live rows: the bucket already selects the last token."""
+    bucket = _bucket(model, caches, capacity)
+    return bucket.decode(_pad(ids, len(bucket.slots)))[: len(caches)]
+
+
+def batch_tokens(model: Laguna, ids: mx.array, caches: list[list], *, capacity: int) -> tuple:
+    """The screened head over a batch — the argmax is the stock head's, the rest is not."""
+    bucket = _bucket(model, caches, capacity, screened=True)
+    rows = bucket.decode(_pad(ids, len(bucket.slots)))[: len(caches)]
+    return tuple(mx.argmax(rows[index]) for index in range(len(caches)))
 
 
 def test_continuous_batching_accepts_single_cache_adapter() -> None:
@@ -122,12 +156,10 @@ def test_compiled_batch_bucket_matches_eager_decode(batch_size: int) -> None:
         prompt = mx.arange(index + 2, dtype=mx.int32)[None]
         model(prompt, expected)
         model(prompt, compiled)
-    decode = model.compile_batch_decode(compiled_caches, capacity=16)
-
     for token in (7, 8):
         ids = mx.full((batch_size, 1), token, dtype=mx.int32)
-        expected = model(ids, batch(expected_caches))
-        actual = decode(ids)
+        expected = model(ids, batch(expected_caches))[:, -1, :]
+        actual = batch_rows(model, ids, compiled_caches, capacity=16)
         mx.eval(expected, actual)
         assert bool(mx.allclose(actual, expected, rtol=1e-4, atol=1e-5))
 
@@ -184,7 +216,7 @@ def test_batched_greedy_head_matches_full_logits(batch_size: int) -> None:
     ids = mx.arange(batch_size, dtype=mx.int32)[:, None] + 7
 
     expected = mx.argmax(model(ids, batch(expected_caches))[:, -1, :], axis=-1)
-    actual = model.batch_greedy(ids, greedy_caches, capacity=16)
+    actual = batch_tokens(model, ids, greedy_caches, capacity=16)
     assert isinstance(actual, tuple)
     mx.eval(expected, *actual)
 
@@ -196,15 +228,15 @@ def test_compiled_batch_decoders_do_not_retain_retired_cache_groups() -> None:
     caches = [model.make_cache() for _ in range(2)]
     for cache in caches:
         model(mx.array([[1, 2]]), cache)
-    model.batch_greedy(mx.full((2, 1), 7), caches, capacity=16)
-    decoder = next(iter(model._batch_buckets._buckets.values()))
+    batch_tokens(model, mx.full((2, 1), 7), caches, capacity=16)
+    decoder = next(iter(_generic_state(model).buckets._buckets.values()))
 
     joining = model.make_cache()
     model(mx.array([[3, 4]]), joining)
-    model.batch_greedy(mx.array([[8], [9]]), [caches[1], joining], capacity=16)
+    batch_tokens(model, mx.array([[8], [9]]), [caches[1], joining], capacity=16)
 
-    assert len(model._batch_buckets._buckets) == 1
-    assert next(iter(model._batch_buckets._buckets.values())) is decoder
+    assert len(_generic_state(model).buckets._buckets) == 1
+    assert next(iter(_generic_state(model).buckets._buckets.values())) is decoder
     assert all(isinstance(layer, (FixedKVCache, RingKVCache)) for layer in joining)
 
 
@@ -220,14 +252,14 @@ def test_compiled_batch_slot_reuse_preserves_the_remaining_sequence() -> None:
         model(prompt, expected_cache)
 
     first_ids = mx.array([[7], [8]])
-    first = model.batch_decode(first_ids, actual[:2], capacity=16)
-    first_expected = model(first_ids, batch(expected[:2]))
+    first = batch_rows(model, first_ids, actual[:2], capacity=16)
+    first_expected = model(first_ids, batch(expected[:2]))[:, -1, :]
     mx.eval(first, first_expected)
     assert bool(mx.allclose(first, first_expected, rtol=1e-4, atol=1e-5))
 
     second_ids = mx.array([[9], [10]])
-    second = model.batch_decode(second_ids, [actual[1], actual[2]], capacity=16)
-    second_expected = model(second_ids, batch([expected[1], expected[2]]))
+    second = batch_rows(model, second_ids, [actual[1], actual[2]], capacity=16)
+    second_expected = model(second_ids, batch([expected[1], expected[2]]))[:, -1, :]
     mx.eval(second, second_expected)
     assert bool(mx.allclose(second, second_expected, rtol=1e-4, atol=1e-5))
 
@@ -238,8 +270,8 @@ def test_compiled_batch_can_grow_from_b2_to_b4() -> None:
     for cache in caches:
         model(mx.array([[1, 2]]), cache)
 
-    model.batch_greedy(mx.full((2, 1), 7), caches[:2], capacity=16)
-    model.batch_greedy(mx.full((4, 1), 8), caches, capacity=16)
+    batch_tokens(model, mx.full((2, 1), 7), caches[:2], capacity=16)
+    batch_tokens(model, mx.full((4, 1), 8), caches, capacity=16)
 
     assert all(
         isinstance(layer, (FixedKVCache, RingKVCache))
@@ -260,8 +292,8 @@ def test_batch_of_three_pads_to_the_four_bucket_and_matches_eager() -> None:
         model(prompt, two)
 
     ids = mx.array([[7], [8], [9]])
-    padded = model.batch_decode(ids, actual, capacity=16)
-    eager = model(ids, batch(expected))
+    padded = batch_rows(model, ids, actual, capacity=16)
+    eager = model(ids, batch(expected))[:, -1, :]
     mx.eval(padded, eager)
     assert padded.shape[0] == 3
     assert bool(mx.allclose(padded, eager, rtol=1e-4, atol=1e-5))
@@ -273,14 +305,14 @@ def test_compiled_b2_reuses_one_graph_for_256_steps() -> None:
     for cache in caches:
         model(mx.array([[1, 2]]), cache)
 
-    logits = model.batch_decode(mx.full((2, 1), 7), caches, capacity=512)
-    decoder = next(iter(model._batch_buckets._buckets.values()))
+    logits = batch_rows(model, mx.full((2, 1), 7), caches, capacity=512)
+    decoder = next(iter(_generic_state(model).buckets._buckets.values()))
     for token in range(255):
-        logits = model.batch_decode(mx.full((2, 1), token % 32), caches, capacity=512)
+        logits = batch_rows(model, mx.full((2, 1), token % 32), caches, capacity=512)
     mx.eval(logits)
 
-    assert len(model._batch_buckets._buckets) == 1
-    assert next(iter(model._batch_buckets._buckets.values())) is decoder
+    assert len(_generic_state(model).buckets._buckets) == 1
+    assert next(iter(_generic_state(model).buckets._buckets.values())) is decoder
 
 
 @pytest.mark.parametrize("length", [511, 512, 513])
@@ -296,8 +328,8 @@ def test_compiled_b2_matches_eager_across_the_sliding_window(length: int) -> Non
         model(prompt, compiled)
 
     ids = mx.array([[7], [8]])
-    expected = model(ids, batch(expected_caches))
-    actual = model.batch_decode(ids, compiled_caches, capacity=1024)
+    expected = model(ids, batch(expected_caches))[:, -1, :]
+    actual = batch_rows(model, ids, compiled_caches, capacity=1024)
     mx.eval(expected, actual)
 
     assert bool(mx.allclose(actual, expected, rtol=1e-4, atol=1e-5))

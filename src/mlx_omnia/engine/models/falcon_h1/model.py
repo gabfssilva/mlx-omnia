@@ -5,7 +5,7 @@ from typing import NamedTuple
 import mlx.core as mx
 import mlx.nn as nn
 
-from mlx_omnia.engine.core.attend import Attending
+from mlx_omnia.engine.core.api import LanguageModel
 from mlx_omnia.engine.core.cache import DeltaCache, KVCache, LayerCache
 from mlx_omnia.engine.models.falcon_h1.config import FalconH1Config
 from mlx_omnia.engine.models.falcon_h1.layers.block import FalconH1Layer, FalconH1Trunk
@@ -19,8 +19,7 @@ class FalconH1Activations(NamedTuple):
     logits: mx.array
 
 
-class FalconH1(nn.Module):
-    continuous_batching = True
+class FalconH1(nn.Module, LanguageModel[LayerCache]):
 
     def __init__(self, config: FalconH1Config) -> None:
         super().__init__()
@@ -50,7 +49,7 @@ class FalconH1(nn.Module):
             self.model.layers, itertools.batched(layers, 2, strict=True), strict=True
         ):
             assert isinstance(mamba_cache, Recurring)
-            assert isinstance(kv_cache, KVCache | Attending)
+            assert isinstance(kv_cache, LayerCache)
             x = block(x, mamba_cache, kv_cache)
             blocks.append(x)
         normed = self.model.norm(x)

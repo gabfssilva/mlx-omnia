@@ -33,7 +33,7 @@ from typing import Literal, NamedTuple, Protocol, assert_never, runtime_checkabl
 
 import mlx.core as mx
 
-from mlx_omnia.engine.core.cache import LayerCache, Layout, Layouts, Rows, Snapshot
+from mlx_omnia.engine.core.cache import LayerCache, Layout, Rows, Snapshot
 from mlx_omnia.engine.core.cache_file import IDS, digest, policy, weight
 
 type Key = str
@@ -187,13 +187,13 @@ class PrefixStore:
         self._vault = vault
 
     def begin(
-        self, model: str, stamp: str, caches: Sequence[LayerCache], trunk: object
+        self, model: str, stamp: str, caches: Sequence[LayerCache]
     ) -> "Prefix | None":
-        """This request's view of the store, or `None` when the ceiling is off or the trunk
-        declares a cache no span can cut."""
+        """This request's view of the store, or `None` when the ceiling is off or the layers
+        hold a shape no span can cut."""
         if self._ceiling <= 0:
             return None
-        resolved = _resolve(caches, trunk, self._span)
+        resolved = _resolve(caches, self._span)
         if resolved is None:
             return None
         span, layouts = resolved
@@ -499,18 +499,18 @@ class Prefixes:
     model: str
     stamp: str
 
-    def begin(self, caches: Sequence[LayerCache], trunk: object) -> "Prefix | None":
-        return self.store.begin(self.model, self.stamp, caches, trunk)
+    def begin(self, caches: Sequence[LayerCache]) -> "Prefix | None":
+        return self.store.begin(self.model, self.stamp, caches)
 
 
 def _resolve(
-    caches: Sequence[LayerCache], trunk: object, span: int
+    caches: Sequence[LayerCache], span: int
 ) -> tuple[int, tuple[Mapping[str, Layout], ...]] | None:
-    """The layouts this trunk composes under and the span they all admit, or `None`.
+    """The layouts these layers compose under and the span they all admit, or `None`.
 
-    The trunk speaks first when it has something to say: `laguna` builds every layer as a
-    plain `KVCache` and the sliding window lives in its config, so the class cannot answer
-    `keep` and the family can.
+    Each layer answers for itself, including the sliding ones: a `KVCache` built with a
+    window says so in its own `layout`, which is what a family used to declare on the
+    trunk's behalf.
 
     Two constraints, both resolved by degrading and never by being wrong. A pooled cache
     writes one row per `ratio` tokens, so a span that is not a multiple of the widest ratio
@@ -519,10 +519,7 @@ def _resolve(
     down to the narrowest window. A trunk where the two cannot be satisfied at once keeps no
     prefix at all, which is the honest answer and not a silently different one.
     """
-    declared = trunk.cache_layouts() if isinstance(trunk, Layouts) else None
-    layouts = tuple(declared) if declared is not None else tuple(layer.layout for layer in caches)
-    if len(layouts) != len(caches):
-        raise ValueError(f"a trunk of {len(caches)} layers declared {len(layouts)} layouts")
+    layouts = tuple(layer.layout for layer in caches)
     strides = [
         kind.stride for layer in layouts for kind in layer.values() if isinstance(kind, Rows)
     ]

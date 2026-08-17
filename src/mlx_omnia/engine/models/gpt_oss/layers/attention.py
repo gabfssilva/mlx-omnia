@@ -3,8 +3,8 @@ import math
 import mlx.core as mx
 import mlx.nn as nn
 
-from mlx_omnia.engine.core.attend import AttentionMask, KVStore, attend
-from mlx_omnia.engine.core.cache import KVCache
+from mlx_omnia.engine.core.attend import AttentionMask, attend
+from mlx_omnia.engine.core.cache import KVCache, LayerCache
 from mlx_omnia.engine.core.kernels.attention import (
     AttentionStep,
     AttentionStepStrategy,
@@ -37,7 +37,7 @@ class GPTOSSAttention(nn.Module):
         self._step_cache: KVCache | None = None
         self._step_sink = flags.USE_SINK_ATTENTION
 
-    def __call__(self, x: mx.array, mask: AttentionMask, cache: KVStore) -> mx.array:
+    def __call__(self, x: mx.array, mask: AttentionMask, cache: LayerCache) -> mx.array:
         batch, length = x.shape[0], x.shape[1]
         query_width = self.heads * self.head_dim
         key_value_width = self.kv_heads * self.head_dim
@@ -56,7 +56,7 @@ class GPTOSSAttention(nn.Module):
         k: mx.array,
         v: mx.array,
         mask: AttentionMask,
-        cache: KVStore,
+        cache: LayerCache,
         batch: int,
         length: int,
     ) -> mx.array:

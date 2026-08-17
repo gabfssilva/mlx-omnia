@@ -3,7 +3,7 @@ from typing import NamedTuple
 import mlx.core as mx
 import mlx.nn as nn
 
-from mlx_omnia.engine.core.attend import KVStore
+from mlx_omnia.engine.core.cache import LayerCache
 from mlx_omnia.engine.core.kernels.add_norm import AddRmsNorm
 from mlx_omnia.engine.core.kernels.mlp import Mlp
 from mlx_omnia.engine.core.kernels.route.residual import (
@@ -50,7 +50,7 @@ class LagunaBlock(nn.Module):
         self,
         x: mx.array,
         mask: mx.array | str | None,
-        cache: KVStore,
+        cache: LayerCache,
     ) -> mx.array:
         branch = self.self_attn(self.input_layernorm(x), mask, cache)
         kernels = self.kernels()

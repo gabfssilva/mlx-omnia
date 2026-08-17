@@ -1,9 +1,11 @@
-from collections.abc import Iterator
+from collections.abc import Iterator, Sequence
 from dataclasses import dataclass
 
 import mlx.core as mx
 
 from mlx_omnia import GPT2Tokenizer, KVCache, greedy, stream_generate
+from mlx_omnia.engine.core.attend import attend
+from mlx_omnia.engine.core.cache import LayerCache
 from mlx_omnia.engine.core.prefix import Prefixes, PrefixStore
 from mlx_omnia.engine.language import (
     GenerationOptions,
@@ -39,6 +41,19 @@ class Tokenizer:
         return b"".join(self.pieces[token] for token in ids)
 
 
+class ScriptCache(KVCache):
+    """A growing KV buffer that declines a fixed shape, so this double stays on the eager
+    path it is written against.
+
+    Truthful and not a trick: the script advances a Python counter on every call and
+    answers for one row, and a traced graph runs that counter once and feeds it as many
+    rows as the bucket is wide. A real trunk reads its cache and not an interpreter."""
+
+    @property
+    def is_fixable(self) -> bool:
+        return False
+
+
 class ScriptedLM:
     def __init__(self, ids: list[int], vocab: int = 256) -> None:
         self.ids = ids
@@ -46,20 +61,22 @@ class ScriptedLM:
         self.step = 0
 
     def make_cache(self) -> list[KVCache]:
-        return [KVCache()]
+        return [ScriptCache()]
 
-    def __call__(self, ids: mx.array, cache: list[KVCache] | None = None) -> mx.array:
+    def __call__(self, ids: mx.array, cache: Sequence[LayerCache] | None = None) -> mx.array:
         token = self.ids[min(self.step, len(self.ids) - 1)]
         self.step += 1
         if cache is not None:
             # Rows the script does not read, and has to write all the same: a span *is* the
             # rows a forward produced, so a trunk that fills no cache has nothing to store —
             # which is the right answer and not the one these tests are about.
-            rows = mx.ones((1, 1, ids.shape[1], 4), dtype=mx.float32)
+            rows = mx.ones((ids.shape[0], 1, ids.shape[1], 4), dtype=mx.float32)
             for layer in cache:
-                layer.update_and_fetch(rows, rows)
+                # Through the door a trunk uses, so the same double serves a lone cache and
+                # a ragged batch's adapter.
+                attend(layer, rows, keys=rows, values=rows, scale=1.0, mask=None)
         row = -mx.abs(mx.arange(self.vocab) - token).astype(mx.float32)
-        return mx.broadcast_to(row, (1, ids.shape[1], self.vocab))
+        return mx.broadcast_to(row, (ids.shape[0], ids.shape[1], self.vocab))
 
 
 def require_language_model(model: LanguageModel[Text]) -> ModelSignature:
@@ -270,7 +287,7 @@ class _Watched(ScriptedLM):
         self.forwards: list[int] = []
         self.rows: list[int] = []
 
-    def __call__(self, ids: mx.array, cache: list[KVCache] | None = None) -> mx.array:
+    def __call__(self, ids: mx.array, cache: Sequence[LayerCache] | None = None) -> mx.array:
         self.forwards.append(self.clock.tick())
         self.rows.append(int(ids.shape[1]))
         return super().__call__(ids, cache)

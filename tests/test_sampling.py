@@ -7,6 +7,7 @@ by a whole token, not by an ulp.
 """
 
 import math
+from collections.abc import Sequence
 
 import mlx.core as mx
 import pytest
@@ -22,6 +23,7 @@ from mlx_omnia import (
     top_k,
     top_p,
 )
+from mlx_omnia.engine.core.cache import LayerCache
 
 LOGITS = mx.array([[3.0, 1.0, 2.5, -1.0, 0.5]])
 
@@ -49,7 +51,7 @@ class ConstantLM:
     def make_cache(self) -> list[KVCache]:
         return []
 
-    def __call__(self, ids: mx.array, cache: list[KVCache] | None = None) -> mx.array:
+    def __call__(self, ids: mx.array, cache: Sequence[LayerCache] | None = None) -> mx.array:
         return mx.broadcast_to(self.logits, (ids.shape[0], ids.shape[1], self.logits.size))
 
 

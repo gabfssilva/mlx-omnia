@@ -5,8 +5,8 @@ from typing import NamedTuple
 import mlx.core as mx
 import mlx.nn as nn
 
-from mlx_omnia.engine.core.attend import KVStore
-from mlx_omnia.engine.core.cache import KVCache
+from mlx_omnia.engine.core.api import LanguageModel
+from mlx_omnia.engine.core.cache import KVCache, LayerCache
 from mlx_omnia.engine.models.gemma2.config import Gemma2Config
 from mlx_omnia.engine.models.gemma2.layers.attention import softcap
 from mlx_omnia.engine.models.gemma2.layers.block import Gemma2Block
@@ -27,8 +27,7 @@ class Gemma2Trunk(nn.Module):
         self.norm = nn.RMSNorm(config.hidden_size, eps=config.rms_norm_eps)
 
 
-class Gemma2(nn.Module):
-    continuous_batching = True
+class Gemma2(nn.Module, LanguageModel[LayerCache]):
 
     def __init__(self, config: Gemma2Config) -> None:
         super().__init__()
@@ -47,7 +46,7 @@ class Gemma2(nn.Module):
         return softcap(self.model.embed_tokens.as_linear(normed), self.config.final_cap)
 
     def activations(
-        self, ids: mx.array, cache: Sequence[KVStore] | None = None
+        self, ids: mx.array, cache: Sequence[LayerCache] | None = None
     ) -> Gemma2Activations:
         cache = cache if cache is not None else self.make_cache()
         x = self.embed(ids)
@@ -59,5 +58,5 @@ class Gemma2(nn.Module):
         normed = self.model.norm(x)
         return Gemma2Activations(embeddings, blocks, normed, self.head(normed))
 
-    def __call__(self, ids: mx.array, cache: Sequence[KVStore] | None = None) -> mx.array:
+    def __call__(self, ids: mx.array, cache: Sequence[LayerCache] | None = None) -> mx.array:
         return self.activations(ids, cache).logits

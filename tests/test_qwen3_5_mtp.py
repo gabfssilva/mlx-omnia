@@ -13,6 +13,7 @@ happened. Random fp32 weights put no near-ties in the way, so `==` means what it
 """
 
 import json
+from collections.abc import Sequence
 from pathlib import Path
 
 import mlx.core as mx
@@ -22,7 +23,8 @@ from mlx.utils import tree_flatten, tree_unflatten
 
 import mlx_omnia.engine.task as task
 from mlx_omnia import CompositeModel, load
-from mlx_omnia.engine.core.cache import DeltaCache, KVCache
+from mlx_omnia.engine.core.cache import DeltaCache, KVCache, LayerCache
+from mlx_omnia.engine.core.decode import compiled_verify
 from mlx_omnia.engine.generate import stream_ids
 from mlx_omnia.engine.models.qwen3_5.config import (
     Qwen35Config,
@@ -137,42 +139,6 @@ def test_the_trunk_needs_both_rewinds(trunk: Qwen35) -> None:
     assert [type(layer) for layer in cache] == [DeltaCache, DeltaCache, DeltaCache, KVCache]
     assert not all(layer.is_trimmable for layer in cache)
     assert all(layer.is_replayable for layer in cache)
-
-
-@pytest.mark.parametrize("kept", [0, 1, 2])
-def test_verify_rewinds_the_recurrent_state_to_the_rows_that_were_kept(
-    trunk: Qwen35, kept: int
-) -> None:
-    """What the ids cannot see. A rewind that keeps a rejected row, or forgets to replay,
-    or moves the wrong offset, leaves a cache that still decodes fluently — so the state is
-    compared directly, against a run that only ever saw the rows that were kept."""
-    prefix, rows = mx.array([PROMPT]), mx.array([[1, 2, 3]])
-
-    cache = trunk.make_cache()
-    trunk(prefix, cache)
-    _, _, rewind = trunk.verify(rows, cache, at=(-1,))
-    rewind(kept)
-
-    stepwise = trunk.make_cache()
-    trunk(prefix, stepwise)
-    if kept:
-        trunk(rows[:, :kept], stepwise)
-    whole = trunk.make_cache()
-    trunk(mx.concatenate([prefix, rows[:, :kept]], axis=1), whole)
-
-    assert [layer.offset for layer in cache] == [layer.offset for layer in stepwise]
-    kinds = trunk.config.text_config.layer_types
-    recurrent = [index for index, kind in enumerate(kinds) if kind == "linear_attention"]
-    assert recurrent, "the point of this trunk is the layers that cannot trim"
-    for index in recurrent:
-        got, want, other = cache[index], stepwise[index], whole[index]
-        assert isinstance(got, DeltaCache)
-        assert isinstance(want, DeltaCache) and isinstance(other, DeltaCache)
-        assert got.state is not None and want.state is not None and other.state is not None
-        floor = relative_diff(want.state, other.state)
-        assert relative_diff(got.state, want.state) <= max(3 * floor, 1e-6)
-        assert got.window is not None and want.window is not None
-        assert relative_diff(got.window, want.window) <= 1e-6
 
 
 def test_the_step_fuses_before_it_concatenates(trunk: Qwen35, step: Qwen35MTP) -> None:
@@ -294,19 +260,30 @@ def wide_step(wide_trunk: Qwen35) -> Qwen35MTP:
     return head
 
 
+class _Unfixable(KVCache):
+    """A KV cache that will not present a fixed shape, whatever it holds."""
+
+    @property
+    def is_fixable(self) -> bool:
+        return False
+
+
 class _Eager:
-    """A `speculative.Step` shim that hides `compile_chain`, so a `Chained` over it walks
-    the eager path — the reference the compiled chain is compared against."""
+    """A `speculative.Step` shim whose caches decline promotion, so a `Chained` over it
+    keeps walking the eager links — the reference the compiled chain is compared against.
+    What decides now is the cache and not a method on the step: the chain compiles over
+    whatever `LayerCache.fixed` hands back, and a step that cannot supply one keeps the
+    links it already has."""
 
     def __init__(self, inner: Qwen35MTP) -> None:
         self.inner = inner
         self.block = inner.block
 
     def make_cache(self) -> list[KVCache]:
-        return self.inner.make_cache()
+        return [_Unfixable()]
 
     def __call__(
-        self, embeddings: mx.array, hidden: mx.array, cache: list[KVCache] | None = None
+        self, embeddings: mx.array, hidden: mx.array, cache: Sequence[LayerCache] | None = None
     ) -> mx.array:
         return self.inner(embeddings, hidden, cache)
 
@@ -347,11 +324,11 @@ def test_compiled_verify_rewinds_to_the_rows_that_were_kept(
 
     cache = wide_trunk.make_cache()
     wide_trunk(prefix, cache)
-    compiled = wide_trunk.compile_verify(cache, width=2, at=(-1,))
+    compiled = compiled_verify(wide_trunk, cache, rows=3, taps=(-1,))
     assert compiled is not None, "the wide shapes are exactly what the kernel tiles"
     verify, rewind = compiled
     verify(rows)
-    rewind(kept)
+    rewind(kept, len(PROMPT) + kept)
 
     stepwise = wide_trunk.make_cache()
     wide_trunk(prefix, stepwise)
@@ -396,7 +373,7 @@ def test_the_compiled_verify_forward_is_the_eager_forward(
 
     cache = wide_trunk.make_cache()
     wide_trunk(prefix, cache)
-    compiled = wide_trunk.compile_verify(cache, width=2, at=(-1,))
+    compiled = compiled_verify(wide_trunk, cache, rows=3, taps=(-1,))
     assert compiled is not None
     verify, _ = compiled
     logits, features = verify(rows)
@@ -541,7 +518,7 @@ def test_the_ops_trunk_refuses_the_compiled_verify(trunk: Qwen35) -> None:
     replay round — `None`, not a wrong number."""
     cache = trunk.make_cache()
     trunk(mx.array([PROMPT]), cache)
-    assert trunk.compile_verify(cache, width=2, at=(-1,)) is None
+    assert compiled_verify(trunk, cache, rows=3, taps=(-1,)) is None
 
 
 # The four bytes `VOCAB` allows, in the byte-level alphabet `ByteLevelBPE` decodes through.

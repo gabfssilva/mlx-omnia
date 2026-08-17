@@ -49,7 +49,7 @@ class Parallel(nn.Module):
         return x + (self.self_attn(normed) + self.mamba(normed))
 
 
-class Trunk(nn.Module):
+class LanguageModel(nn.Module):
     def __init__(self, blocks: list[nn.Module], width: int, vocab: int) -> None:
         super().__init__()
         self.embed_tokens = nn.Embedding(vocab, width)
@@ -60,7 +60,7 @@ class Trunk(nn.Module):
 class Model(nn.Module):
     def __init__(self, blocks: list[nn.Module], width: int = 8, vocab: int = 16) -> None:
         super().__init__()
-        self.model = Trunk(blocks, width, vocab)
+        self.model = LanguageModel(blocks, width, vocab)
         self.lm_head = nn.Linear(width, vocab, bias=False)
 
     def make_cache(self) -> list[None]:

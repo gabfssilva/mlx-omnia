@@ -51,6 +51,7 @@ class Result(TypedDict):
     samples: list[dict[str, float | int]]
     clocks: list[int | None]
     modules: dict[str, str]
+    executed: list[str]
 
 
 LOADED = 0.5
@@ -143,6 +144,7 @@ def measure(arm: Arm, payload: Payload) -> Result:
         "samples": [sample.as_dict() for sample in samples],
         "clocks": measured,
         "modules": {},
+        "executed": [],
     }
 
 
@@ -158,7 +160,18 @@ def main(argv: Sequence[str]) -> None:
         raise TypeError(f"{payload['build']} returned {type(arm).__name__}, not an Arm")
     result = measure(arm, payload)
     result["modules"] = modules
+    result["executed"] = _executed(payload["build"])
     Path(payload["out"]).write_text(json.dumps(result))
+
+
+def _executed(build: str) -> list[str]:
+    """What this side's run depended on, asked of the adapter that built the arm — the
+    harness itself knows nothing about the code under test, so an adapter without the hook
+    simply reports nothing."""
+    module = importlib.import_module(build.partition(":")[0])
+    hook = getattr(module, "executed", None)
+    found = hook() if callable(hook) else None
+    return [str(one) for one in found] if isinstance(found, list) else []
 
 
 if __name__ == "__main__":

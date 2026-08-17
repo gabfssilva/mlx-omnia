@@ -3,8 +3,8 @@ from typing import assert_never
 import mlx.core as mx
 import mlx.nn as nn
 
-from mlx_omnia.engine.core.attend import Attending, AttentionMask, KVStore
-from mlx_omnia.engine.core.cache import FixedKVCache, KVCache, LayerCache
+from mlx_omnia.engine.core.attend import AttentionMask, KVStore
+from mlx_omnia.engine.core.cache import LayerCache
 from mlx_omnia.engine.models.nemotron_h.config import BlockKind, NemotronHConfig
 from mlx_omnia.engine.models.nemotron_h.layers.attention import NemotronHAttention
 from mlx_omnia.engine.models.nemotron_h.layers.mamba import NemotronHMamba, Recurring
@@ -56,7 +56,7 @@ class NemotronHBlock(nn.Module):
             case "*":
                 attention = self.mixer
                 assert isinstance(attention, NemotronHAttention) and isinstance(
-                    cache, KVCache | FixedKVCache | Attending
+                    cache, LayerCache
                 )
                 return attention(normed, cache, mask)
             case "E" | "-":

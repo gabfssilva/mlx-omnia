@@ -9,11 +9,13 @@ three reading a trunk that says one thing and holds another, and the first sympt
 stops working rather than a failure anybody can see.
 """
 
+from collections.abc import Sequence
+
 import mlx.core as mx
 
+from mlx_omnia.engine.core.api import LanguageModel
 from mlx_omnia.engine.core.cache import KVCache, LayerCache
 from mlx_omnia.engine.core.quantized_cache import QuantizedKVCache
-from mlx_omnia.engine.generate import CausalLM
 from mlx_omnia.engine.quant.quantization import Quantization
 from mlx_omnia.engine.quant.quantization import admits as _fits
 
@@ -49,7 +51,7 @@ class Quantizing:
     untouched, in place: a hybrid compresses its attention and keeps its recurrence, and a
     ring's rotation is a shape decision the policy has no say in.
 
-    **It deliberately declares neither `BlockOutputs` nor `CompiledDecode`.** Both are
+    **It deliberately declares neither `Draftable` nor `Tracing`.** Both are
     `runtime_checkable`, so a wrapped model stops matching them and `stream_ids` falls back
     to the plain decode while a block-conditioned proposer refuses to read the trunk. That is
     a real loss of speed, taken on purpose: a compiled decode traces a fixed buffer and a
@@ -62,7 +64,7 @@ class Quantizing:
 
     def __init__(
         self,
-        model: CausalLM[LayerCache],
+        model: LanguageModel[LayerCache],
         k_format: Quantization,
         v_format: Quantization,
         *,
@@ -81,5 +83,5 @@ class Quantizing:
             for layer in self.model.make_cache()
         ]
 
-    def __call__(self, ids: mx.array, cache: list[LayerCache] | None = None) -> mx.array:
+    def __call__(self, ids: mx.array, cache: Sequence[LayerCache]) -> mx.array:
         return self.model(ids, cache)

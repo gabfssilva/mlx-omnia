@@ -35,10 +35,10 @@ from fastapi import APIRouter, HTTPException
 from pydantic import BaseModel, ConfigDict, Field, field_validator, model_validator
 
 from mlx_omnia import load_drafter
+from mlx_omnia.engine.core.api import Drafting
 from mlx_omnia.engine.footprint import checkpoint_bytes
 from mlx_omnia.engine.model import Wrapping
 from mlx_omnia.engine.quant.quantization import MXFP, NVFP, Affine, Quantization
-from mlx_omnia.engine.speculative import Drafting
 from mlx_omnia.engine.task import MTP_PREFIX, has_mtp, mtp_head
 from mlx_omnia.server import catalog
 from mlx_omnia.server.deps import EngineDep, StoreDep

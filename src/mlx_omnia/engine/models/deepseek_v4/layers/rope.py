@@ -19,7 +19,12 @@ class Rotary:
     forward: mx.array
     inverse: mx.array
 
-    def __call__(self, x: mx.array, offset: int, *, inverse: bool = False) -> mx.array:
+    def __call__(
+        self, x: mx.array, offset: int | mx.array, *, inverse: bool = False
+    ) -> mx.array:
+        """`offset` is an array wherever the caller's position lives in a graph. `mx.fast.rope`
+        takes either and the two are bit-identical, which is what lets one traced step rotate
+        by a position no host read ever settles."""
         return mx.fast.rope(
             x,
             x.shape[-1],

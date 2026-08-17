@@ -1,7 +1,7 @@
 import mlx.core as mx
 import mlx.nn as nn
 
-from mlx_omnia.engine.core.attend import KVStore
+from mlx_omnia.engine.core.cache import LayerCache
 from mlx_omnia.engine.core.kernels.down_combine import DownCombine
 from mlx_omnia.engine.core.kernels.gate_up import GateUp
 from mlx_omnia.engine.core.layers import SwiGLU
@@ -41,7 +41,7 @@ class Llama4Block(nn.Module):
     def _fused_step_applies(self) -> bool:
         return isinstance(self.mlp, Llama4MoE)
 
-    def __call__(self, x: mx.array, mask: mx.array | str | None, cache: KVStore) -> mx.array:
+    def __call__(self, x: mx.array, mask: mx.array | str | None, cache: LayerCache) -> mx.array:
         attended = x + self.self_attn(self.input_layernorm(x), mask, cache)
         h = self.post_attention_layernorm(attended)
         if x.shape[1] == 1 and x.shape[0] == 1 and self._fused_step_applies():

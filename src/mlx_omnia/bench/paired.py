@@ -81,6 +81,9 @@ class Paired:
     clocks: dict[str, list[int]]
     floor: float
     drift: Drift | None
+    executed: list[str] = field(default_factory=list)
+    """The files the *candidate* side reported depending on, for the results store. The
+    baseline's list would name files inside a worktree that is already gone."""
 
     def _axis(self, of: Callable[[Sample], float]) -> Axis:
         return axis(
@@ -165,7 +168,7 @@ def run_side(
     floor_mhz: int,
     max_throttled_retries: int,
     log: Callable[[str], None],
-) -> tuple[list[Sample], list[int], list[int]]:
+) -> tuple[list[Sample], list[int], list[int], list[str]]:
     log(f"--- {side.label}: {side.tree or 'this environment'}")
     with tempfile.TemporaryDirectory() as scratch:
         payload = Path(scratch) / "payload.json"
@@ -210,9 +213,12 @@ def run_side(
         )
         for one in result["samples"]
     ]
-    return samples, [int(one) for one in result["stream"]], [
-        int(one) for one in result["clocks"] if one is not None
-    ]
+    return (
+        samples,
+        [int(one) for one in result["stream"]],
+        [int(one) for one in result["clocks"] if one is not None],
+        [str(one) for one in result.get("executed", [])],
+    )
 
 
 def paired(
@@ -234,7 +240,7 @@ def paired(
     between them hides it completely; the stored number is the only thing that notices."""
     if baseline.label == candidate.label:
         raise ValueError(f"both sides are labelled {baseline.label!r}")
-    base_samples, base_stream, base_clocks = run_side(
+    base_samples, base_stream, base_clocks, _ = run_side(
         baseline,
         prompt,
         None,
@@ -244,7 +250,7 @@ def paired(
         max_throttled_retries=max_throttled_retries,
         log=log,
     )
-    cand_samples, cand_stream, cand_clocks = run_side(
+    cand_samples, cand_stream, cand_clocks, cand_executed = run_side(
         candidate,
         prompt,
         base_stream,
@@ -266,4 +272,5 @@ def paired(
         {baseline.label: base_clocks, candidate.label: cand_clocks},
         floor,
         drift,
+        cand_executed,
     )

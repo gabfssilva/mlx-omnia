@@ -17,7 +17,7 @@ from mlx_omnia.engine.batching import (
     step,
 )
 from mlx_omnia.engine.core.attend import KVStore
-from mlx_omnia.engine.core.cache import KVCache
+from mlx_omnia.engine.core.cache import KVCache, LayerCache
 from mlx_omnia.engine.generate import Meter, greedy
 from mlx_omnia.engine.speculative import Autoregressive, Proposer
 
@@ -30,9 +30,16 @@ LOOKAHEAD = 2
 
 
 class ScriptCache(KVCache):
-    """A plain growing KV buffer the generic compiled bucket will not promote: promotion is
-    keyed on the exact class, and these doubles must stay on the eager path they are written
-    against."""
+    """A growing KV buffer that declines a fixed shape, so these doubles stay on the eager
+    path they are written against.
+
+    Truthful and not a trick: the double picks its logits from the host-side offset of the
+    row it is answering for, which is a read a traced graph cannot make. A real trunk reads
+    its cache through the graph and promotes."""
+
+    @property
+    def is_fixable(self) -> bool:
+        return False
 
 
 class DraftLM:
@@ -45,7 +52,7 @@ class DraftLM:
     def make_cache(self) -> list[KVCache]:
         return [KVCache()]
 
-    def __call__(self, ids: mx.array, cache: list[KVCache] | None = None) -> mx.array:
+    def __call__(self, ids: mx.array, cache: Sequence[LayerCache] | None = None) -> mx.array:
         assert cache is not None, "the round always carries a cache"
         offset = cache[0].offset
         length = ids.shape[-1]
@@ -61,7 +68,6 @@ class ScriptedBatchLM:
     """The target, readable through both shapes the batched path hands it: a slot's own cache
     list on the drafting round, and the ragged adapter on the shared forward."""
 
-    continuous_batching = True
 
     def __init__(self, script: list[int], vocab: int) -> None:
         self.script = script

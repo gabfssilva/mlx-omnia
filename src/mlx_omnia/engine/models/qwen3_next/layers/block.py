@@ -1,8 +1,8 @@
 import mlx.core as mx
 import mlx.nn as nn
 
-from mlx_omnia.engine.core.attend import Attending, KVStore
-from mlx_omnia.engine.core.cache import KVCache, LayerCache
+from mlx_omnia.engine.core.attend import KVStore
+from mlx_omnia.engine.core.cache import LayerCache
 from mlx_omnia.engine.core.layers import SwiGLU
 from mlx_omnia.engine.models.qwen3_next.config import Qwen3NextConfig
 from mlx_omnia.engine.models.qwen3_next.layers.attention import Qwen3NextAttention
@@ -36,7 +36,7 @@ class Qwen3NextBlock(nn.Module):
         if self.attends:
             attention = self.self_attn
             assert isinstance(attention, Qwen3NextAttention)
-            assert isinstance(cache, KVCache | Attending)
+            assert isinstance(cache, LayerCache)
             mixed = x + attention(normed, cache)
         else:
             linear = self.linear_attn

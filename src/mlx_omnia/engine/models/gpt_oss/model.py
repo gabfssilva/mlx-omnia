@@ -4,9 +4,10 @@ from typing import NamedTuple
 import mlx.core as mx
 import mlx.nn as nn
 
-from mlx_omnia.engine.core.attend import AttentionMask, KVStore
-from mlx_omnia.engine.core.attention import Spanned, ragged_mask
-from mlx_omnia.engine.core.cache import KVCache
+from mlx_omnia.engine.core.api import LanguageModel
+from mlx_omnia.engine.core.attend import AttentionMask
+from mlx_omnia.engine.core.attention import ragged_mask
+from mlx_omnia.engine.core.cache import KVCache, LayerCache
 from mlx_omnia.engine.models.gpt_oss.config import GPTOSSConfig
 from mlx_omnia.engine.models.gpt_oss.layers.block import GPTOSSBlock
 from mlx_omnia.engine.models.gpt_oss.layers.rope import yarn_rope
@@ -27,8 +28,7 @@ class GPTOSSActivations(NamedTuple):
     logits: mx.array
 
 
-class GPTOSS(nn.Module):
-    continuous_batching = True
+class GPTOSS(nn.Module, LanguageModel[LayerCache]):
 
     def __init__(self, config: GPTOSSConfig) -> None:
         super().__init__()
@@ -44,7 +44,7 @@ class GPTOSS(nn.Module):
         return [KVCache() for _ in self.model.layers]
 
     def activations(
-        self, ids: mx.array, cache: Sequence[KVStore] | None = None
+        self, ids: mx.array, cache: Sequence[LayerCache] | None = None
     ) -> GPTOSSActivations:
         cache = cache if cache is not None else self.make_cache()
         x = self.model.embed_tokens(ids)
@@ -53,7 +53,7 @@ class GPTOSS(nn.Module):
         full: AttentionMask = None if length == 1 else "causal"
         sliding: AttentionMask = None
         if "sliding_attention" in self.config.layer_types:
-            span = cache[0].span if isinstance(cache[0], Spanned) else None
+            span = cache[0].span
             sliding = self._sliding_mask(length, offset, span)
 
         blocks: list[mx.array] = []
@@ -64,7 +64,7 @@ class GPTOSS(nn.Module):
             blocks.append(x)
         return GPTOSSActivations(blocks, self.lm_head(self.model.norm(x)))
 
-    def __call__(self, ids: mx.array, cache: Sequence[KVStore] | None = None) -> mx.array:
+    def __call__(self, ids: mx.array, cache: Sequence[LayerCache] | None = None) -> mx.array:
         return self.activations(ids, cache).logits
 
     def _sliding_mask(

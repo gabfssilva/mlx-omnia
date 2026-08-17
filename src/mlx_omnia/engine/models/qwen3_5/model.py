@@ -1,20 +1,16 @@
-from collections.abc import Callable, Collection, Iterator, Sequence
+from collections.abc import Collection, Iterator, Sequence
 from typing import NamedTuple, TypeIs, assert_never
 
 import mlx.core as mx
 import mlx.nn as nn
 import numpy as np
 
+from mlx_omnia.engine.core.api import Draftable, Step, Tracing
 from mlx_omnia.engine.core.cache import (
     DeltaCache,
-    FixedDeltaCache,
-    FixedKVCache,
     KVCache,
     LayerCache,
-    fit,
-    regrow,
 )
-from mlx_omnia.engine.core.decode import DecodePlan, compiled_decode
 from mlx_omnia.engine.core.prefill import prefill
 from mlx_omnia.engine.generate import (
     Meter,
@@ -42,7 +38,7 @@ from mlx_omnia.engine.models.qwen3_5.vision import (
     process_image,
 )
 from mlx_omnia.engine.parsers import Parser, Segment
-from mlx_omnia.engine.speculative import Persistent, Speculable, Step
+from mlx_omnia.engine.speculative import Persistent
 from mlx_omnia.engine.vision import RGB_IMAGE, Image
 
 
@@ -53,8 +49,7 @@ class Qwen35Activations(NamedTuple):
     logits: mx.array
 
 
-class Qwen35(nn.Module):
-    continuous_batching = True
+class Qwen35(nn.Module, Draftable[LayerCache], Tracing[LayerCache]):
 
     def __init__(self, config: Qwen35Config) -> None:
         super().__init__()
@@ -72,103 +67,42 @@ class Qwen35(nn.Module):
             for kind in self.config.text_config.layer_types
         ]
 
-    def compile_decode(
-        self,
-        cache: list[LayerCache],
-        capacity: int | None = None,
-        *,
-        rope_delta: int | None = None,
-    ) -> Callable[[mx.array], mx.array]:
-        """Promote a completed prefill cache and compile one-token forwards.
+    def before_trace(self, cache: Sequence[LayerCache]) -> Sequence[object]:
+        """`core.api.Tracing`. Every delegator the trunk's graph will bake, resolved outside
+        it — a strategy inspects the checkpoint's tensors to decide applicability, and an
+        array read inside `mx.compile` raises. The blocks also drop whatever their *own*
+        traces resolved: those hold that trace's tracers as their weight fields, and a graph
+        reading them a second time is the uncaptured-input error.
 
-        Per-block traces already collapse the elementwise work around each mixer, but the
-        trunk between them stays interpreted: forty round trips through Python per token,
-        forty offsets read as constants, and a growing KV buffer whose shape changes under
-        the tracer. Here the whole trunk is one trace. The 10 full-attention layers get a
-        fixed buffer with a graph-visible position, the 30 DeltaNet ones get their window
-        and state moved into a graph-visible container, and the attention mask is the
-        buffer's own fill — every column up to and including the row this step writes.
+        Nothing is captured. The delegators hold the leaves they resolved against, so an
+        array that is both a declared input and a strategy's field is exactly what the
+        compile rejects; left out they bake in as constants.
 
-        Nothing about the arithmetic moves. `mx.fast.rope` takes the position as an array
-        and returns the same bits it returns for the equivalent int, which is what makes
-        the projections traceable at all; the mixers call the same closures the per-block
-        traces compile.
-
-        `rope_delta` is the multimodal clock: after an image the position resumes at
-        `pos + max(grid)/merge` rather than at `pos + image_tokens`, so a decode that
-        followed a picture rotates by `row + delta` on all three MRoPE sections. Left
-        `None` the trunk runs the text rotation, which is the same partial rope.
+        Both halves of the claim hold. Every position this trunk rotates by is
+        `FixedKVCache.position` — a graph tensor, read in `Qwen35Attention.__call__` before
+        the update moves it — and the columns a promoted buffer has not written are cut by
+        `FixedKVCache.readable` inside `core.attend`.
         """
-        text = self.config.text_config
-        blocks = self.model.layers
-        kinds = text.layer_types
-        attends = [kind == "full_attention" for kind in kinds]
-        if not any(attends):
-            raise ValueError("decode compilation needs at least one attention layer to anchor")
+        del cache
+        for block in self.model.layers:
+            assert isinstance(block, Qwen35Block)
+            block.prepare_decode()
+        return ()
 
-        def promote(layers: list[LayerCache], fitting: int) -> list[LayerCache]:
-            promoted: list[LayerCache] = []
-            for layer, full in zip(layers, attends, strict=True):
-                if full:
-                    assert isinstance(layer, KVCache | FixedKVCache)
-                    if isinstance(layer, FixedKVCache):
-                        # A rebuild that is not a growth (the delegators moved under the
-                        # graph, not the buffer) keeps the buffer it already has.
-                        promoted.append(
-                            layer if layer.state[0].shape[2] >= fitting else regrow(layer, fitting)
-                        )
-                    else:
-                        promoted.append(FixedKVCache.promote(layer, fitting))
-                else:
-                    assert isinstance(layer, DeltaCache)
-                    promoted.append(
-                        layer
-                        if isinstance(layer, FixedDeltaCache)
-                        else FixedDeltaCache.promote(layer)
-                    )
-            return promoted
-
-        def prepare(_: Sequence[LayerCache]) -> None:
-            for block in blocks:
-                assert isinstance(block, Qwen35Block)
-                block.prepare_decode()
-
-        def epochs() -> tuple[int, ...]:
-            """The delegators this graph baked. A per-block step run in between re-resolves
-            them: streaming with a prefix cache takes that path and streaming without takes
-            this one, so the same resident model alternates."""
-            return tuple(block.epoch for block in blocks)
-
-        def step(ids: mx.array, slots: Sequence[LayerCache], mask: mx.array | None) -> mx.array:
-            anchor = next(layer for layer in slots if isinstance(layer, FixedKVCache))
-            positions = (
-                None
-                if rope_delta is None
-                else mx.broadcast_to(anchor.position + rope_delta, (3, 1))
-            )
-            x = self.model.embed_tokens(ids[None])
-            for block, layer_cache in zip(blocks, slots, strict=True):
-                assert isinstance(block, Qwen35Block)
-                assert isinstance(layer_cache, FixedKVCache | FixedDeltaCache)
-                x = block.graph_step(x, layer_cache, positions, mask)
-            normed = self.model.norm(x)
-            logits = (
-                self.model.embed_tokens.as_linear(normed)
-                if self.config.tied
-                else self.lm_head(normed)
-            )
-            return logits[:, -1, :]
-
-        plan = DecodePlan(step=step, promote=promote, prepare=prepare, epochs=epochs)
-        return compiled_decode(plan, cache, capacity)
+    @property
+    def trace_epoch(self) -> tuple[int, ...]:
+        """`core.api.Tracing`. The delegators a graph baked. A per-block step run in between
+        re-resolves them: streaming with a prefix cache takes that path and streaming
+        without takes this one, so the same resident model alternates."""
+        return tuple(block.epoch for block in self.model.layers)
 
     def raw_embed(self, ids: mx.array) -> mx.array:
-        """`speculative.Speculable`. The trunk puts nothing over the lookup, so the raw
+        """`core.api.Draftable`. The trunk puts nothing over the lookup, so the raw
         embedding and the cooked one are the same tensor."""
         return self.model.embed_tokens(ids)
 
     def raw_logits(self, hidden: mx.array) -> mx.array:
-        """`speculative.Speculable`. `model.norm` is *not* applied: the rows an MTP step
+        """`core.api.Draftable`. `model.norm` is *not* applied: the rows an MTP step
         returns already went through the step's own final norm, and normalizing twice is a
         different model. The trunk's own path applies `model.norm` before calling this."""
         if self.config.tied:
@@ -190,213 +124,36 @@ class Qwen35(nn.Module):
         )
 
     def block_outputs(
-        self, ids: mx.array, cache: list[LayerCache], *, at: Sequence[int]
+        self, ids: mx.array, cache: Sequence[LayerCache], *, at: Sequence[int]
     ) -> tuple[mx.array, mx.array]:
-        """`generate.BlockOutputs`: the same forward, plus the rows `at` names concatenated
+        """`core.api.Draftable`: the same forward, plus the rows `at` names concatenated
         on the last dim. What reads it is an MTP step, which asks for one — the last."""
         activations = self.activations(ids, cache)
         return activations.logits, self._tapped(activations, at)
 
-    def verify(
-        self, ids: mx.array, cache: list[LayerCache], *, at: Sequence[int]
-    ) -> tuple[mx.array, mx.array, Callable[[int], None]]:
-        """`speculative.Verifiable`: `block_outputs`, plus a cheap way back.
+    def checkpoints(self, cache: Sequence[LayerCache], rows: int) -> bool:
+        """`core.api.Draftable`. Yes, when every DeltaNet layer's rule is the fused one:
+        that is the kernel `Qwen35DeltaNet.verify_rows` writes the per-row states out of,
+        and the shapes it declines are shapes it cannot tile. Both of its routes are held
+        to it — the unrolled walk stores the same slots, and the A/B flag between them can
+        move under a running generation, so the answer cannot depend on which is live.
 
-        Three of every four layers are DeltaNet and keep state a rewind cannot subtract.
-        The attention layers hold keys, which are dropped by moving the offset; the
-        recurrent ones restore the state the round checkpointed and replay only the rows
-        that were kept — the inputs the replay needs are the previous block's outputs,
-        which `activations` already collected.
+        Three of every four layers here are DeltaNet and none of them can be trimmed, so
+        without this a rejected round is a second forward of the whole trunk.
         """
-        kinds = self.config.text_config.layer_types
-        # Before the forward, which is the only moment a restore point means anything: by
-        # the time `rewind` is called the recurrent layers have already taken every row,
-        # including the ones about to be thrown away.
-        restores = [
-            layer.checkpoint()
-            for layer, kind in zip(cache, kinds, strict=True)
-            if kind == "linear_attention"
-        ]
-        activations = self.activations(ids, cache)
-        inputs = [activations.embeddings, *activations.blocks[:-1]]
-
-        def rewind(kept: int) -> None:
-            for restore in restores:
-                restore()
-            for index, kind in enumerate(kinds):
-                if kind == "linear_attention":
-                    self.model.layers[index](inputs[index][:, :kept], cache[index])
-                else:
-                    # The keys of a rejected row stay in the buffer and are overwritten by
-                    # the next update, exactly as `KVCache.trim` leaves them; a layer
-                    # holding only a count needs only the count.
-                    cache[index].offset += kept - ids.shape[1]
-
-        return activations.logits, self._tapped(activations, at), rewind
-
-    def compile_verify(
-        self, cache: list[LayerCache], *, width: int, at: Sequence[int]
-    ) -> (
-        tuple[
-            Callable[[mx.array], tuple[mx.array, mx.array]],
-            Callable[[int], None],
-        ]
-        | None
-    ):
-        """The speculative round's fixed-shape half, compiled: one forward over the
-        `width + 1` rows a round always verifies, and a rewind that costs no forward.
-
-        The DeltaNet layers write the state after every row to a slot
-        (`Qwen35DeltaNet.verify_rows`), and the conv windows are raw projection rows, so
-        keeping `kept` rows is picking a slot and a slice. The attention layers' fixed
-        buffers rewind by moving the graph-visible position back — the rows past it are
-        stale and overwritten by the next round.
-
-        Refusals fall back to the replay round, which is correct everywhere: a sparse
-        trunk (the fused MoE step is a T=1 shape), a delta rule the fused kernel does not
-        tile (`verify_rows`' checkpoints are the kernel's), and a tap that is not the
-        normed stream (`_tapped` says why the last one is).
-        """
-        rows = width + 1
-        text = self.config.text_config
-        kinds = text.layer_types
-        if text.num_experts:
-            return None
-        if "full_attention" not in kinds:
-            return None
-        if tuple(at) not in ((-1,), (len(kinds) - 1,)):
-            return None
+        del cache, rows
         from mlx_omnia.engine.core.kernels.gated_delta import FusedGatedDelta, GatedDelta
 
-        blocks = self.model.layers
-        for block, kind in zip(blocks, kinds, strict=True):
+        for block, kind in zip(
+            self.model.layers, self.config.text_config.layer_types, strict=True
+        ):
             if kind == "full_attention":
                 continue
             assert isinstance(block, Qwen35Block)
             rule = block.linear_attn.rule()
             if not isinstance(rule, GatedDelta) or not isinstance(rule.strategy, FusedGatedDelta):
-                return None
-
-        offset = cache[0].offset
-        promoted: list[LayerCache] = []
-        for layer, kind in zip(cache, kinds, strict=True):
-            if kind == "full_attention":
-                assert isinstance(layer, KVCache)
-                promoted.append(FixedKVCache.promote(layer, fit(offset)))
-            else:
-                assert isinstance(layer, DeltaCache)
-                fixed = FixedDeltaCache.promote(layer)
-                window, state = fixed.graph
-                fixed.graph.extend(
-                    [
-                        mx.zeros((rows, *state.shape[1:]), dtype=state.dtype),
-                        mx.zeros((rows, window.shape[-1]), dtype=window.dtype),
-                        mx.zeros_like(window),
-                    ]
-                )
-                promoted.append(fixed)
-        cache[:] = promoted
-        steps = mx.arange(rows)
-
-        def build(fitting: int) -> tuple[
-            Callable[[mx.array], tuple[mx.array, mx.array]], int, list[int]
-        ]:
-            # A generation that outgrows the fixed attention buffers promotes again into
-            # larger ones and recompiles — the delta containers are size-free and stay.
-            for index, kind in enumerate(kinds):
-                if kind != "full_attention":
-                    continue
-                layer = promoted[index]
-                assert isinstance(layer, FixedKVCache)
-                if layer.state[0].shape[2] < fitting:
-                    promoted[index] = regrow(layer, fitting)
-            cache[:] = promoted
-            state_containers = [
-                layer.state if isinstance(layer, FixedKVCache) else layer.graph
-                for layer in promoted
-                if isinstance(layer, FixedKVCache | FixedDeltaCache)
-            ]
-            anchor = next(layer for layer in promoted if isinstance(layer, FixedKVCache))
-            columns = mx.arange(fitting)
-            for block in blocks:
-                assert isinstance(block, Qwen35Block)
-                block.prepare_decode()
-
-            def forward(ids: mx.array) -> tuple[mx.array, mx.array]:
-                # Fill and causal in one mask: row j attends every column up to the
-                # position it writes, `position + j`.
-                mask = (columns[None, :] <= anchor.position + steps[:, None]).reshape(
-                    1, 1, rows, fitting
-                )
-                x = self.model.embed_tokens(ids[None])
-                for block, layer_cache, kind in zip(blocks, promoted, kinds, strict=True):
-                    assert isinstance(block, Qwen35Block)
-                    if kind == "full_attention":
-                        assert isinstance(layer_cache, FixedKVCache)
-                        projected = block.self_attn(
-                            block.input_layernorm(x), layer_cache, None, mask
-                        )
-                    else:
-                        assert isinstance(layer_cache, FixedDeltaCache)
-                        projected = block.linear_attn.verify_rows(
-                            block.input_layernorm(x), layer_cache
-                        )
-                    attended = x + projected
-                    x = attended + block.mlp(block.post_attention_layernorm(attended))
-                normed = self.model.norm(x)
-                logits = (
-                    self.model.embed_tokens.as_linear(normed)
-                    if self.config.tied
-                    else self.lm_head(normed)
-                )
-                assert isinstance(normed, mx.array) and isinstance(logits, mx.array)
-                return logits[0], normed
-
-            epochs = [block.epoch for block in blocks]
-            return (
-                mx.compile(forward, inputs=state_containers, outputs=state_containers),
-                fitting,
-                epochs,
-            )
-
-        compiled, room, epochs = build(fit(offset))
-        current = offset
-        before = offset
-
-        def stale() -> bool:
-            currently = [block.epoch for block in blocks]
-            return currently != epochs
-
-        def verify(ids: mx.array) -> tuple[mx.array, mx.array]:
-            nonlocal current, before, compiled, room, epochs
-            if current + rows > room:
-                compiled, room, epochs = build(fit(current))
-            elif stale():
-                compiled, room, epochs = build(room)
-            before = current
-            logits, features = compiled(ids)
-            current = before + rows
-            for layer in promoted:
-                layer.offset = current
-            return logits, features
-
-        def rewind(kept: int) -> None:
-            nonlocal current
-            current = before + kept
-            tail = text.linear_conv_kernel_dim - 1
-            for layer in promoted:
-                if isinstance(layer, FixedKVCache):
-                    layer.state[2] = mx.array([current], dtype=mx.int32)
-                elif isinstance(layer, FixedDeltaCache):
-                    window_before = layer.graph[4][0]
-                    conv_rows = layer.graph[3][:kept]
-                    layer.graph[0] = mx.concatenate([window_before, conv_rows], axis=0)[
-                        None, -tail:
-                    ]
-                    layer.graph[1] = layer.graph[2][kept - 1][None]
-                layer.offset = current
-
-        return verify, rewind
+                return False
+        return True
 
     def activations(
         self,
@@ -584,7 +341,7 @@ def sees(config: Qwen35Config, processor: ProcessorConfig | None) -> bool:
     )
 
 
-class Qwen35LanguageModel(TextLanguageModel[LayerCache, Qwen35Input]):
+class Qwen35LanguageModel(TextLanguageModel[Qwen35Input]):
     """The chassis with the vision path over it: everything a text request needs — the trie,
     the MTP door, continuous batching — is `language.TextLanguageModel`'s, and what is the
     family's is the picture."""
@@ -619,7 +376,7 @@ class Qwen35LanguageModel(TextLanguageModel[LayerCache, Qwen35Input]):
         if options.constraint is not None or options.reasoning_budget is not None:
             return None
         assert isinstance(drafter, Step)
-        assert isinstance(self.model, Speculable)
+        assert isinstance(self.model, Draftable)
         return Persistent(self.model, drafter, block=self._block, tap=-1)
 
     @property

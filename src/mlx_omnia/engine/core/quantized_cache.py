@@ -98,6 +98,31 @@ class QuantizedKVCache(LayerCache, Attending):
         return True
 
     @property
+    def is_fixable(self) -> bool:
+        """Once it holds a row. The fixed form takes its shapes from what is already there —
+        the code width of a format is not a thing to guess at, and a prefill that never ran
+        has nothing worth compiling over."""
+        return self.offset > 0
+
+    def fixed(self, capacity: int) -> "LayerCache":
+        """Copy a completed prefill into fixed buffers. No row is quantized again: the codes
+        are already the state, and re-rounding them would be a second loss the format never
+        asked for."""
+        if capacity < self.offset:
+            raise ValueError(f"capacity {capacity} is below cache length {self.offset}")
+        return _fitted(
+            self.k_format,
+            self.v_format,
+            start_tokens=self.start_tokens,
+            capacity=capacity,
+            rows=self.offset,
+            dense_keys=self._dense_keys,
+            dense_values=self._dense_values,
+            k_parts=None if self._keys is None else self._keys.tensors,
+            v_parts=None if self._values is None else self._values.tensors,
+        )
+
+    @property
     def nbytes(self) -> int:
         """Where the saving shows. Counting the dense buffer here would be a cache that
         compresses and reports the figure the trie budgets against unchanged — which moves no
@@ -210,14 +235,12 @@ class QuantizedKVCache(LayerCache, Attending):
             raise TypeError("a compressed cache cannot attend with a softcap")
         first = self.offset
         self._write(keys, values)
-        return _blocked(
-            queries,
-            self._regions(),
-            scale=scale,
-            mask=mask,
-            query_offset=first,
-            length=self.offset,
-        )
+        rows, length = queries.shape[2], self.offset
+
+        def additive(start: int, size: int) -> mx.array:
+            return _mask(mask, start, size, first, rows, length)
+
+        return _blocked(queries, self._regions(), scale=scale, mask_at=additive)
 
     def _write(self, keys: mx.array, values: mx.array) -> None:
         """The rows this step produced, into whichever region they belong to. The split is by
@@ -263,6 +286,378 @@ class QuantizedKVCache(LayerCache, Attending):
         return regions
 
 
+class FixedQuantizedKVCache(LayerCache, Attending):
+    """`QuantizedKVCache` in the shape a traced decode can hold.
+
+    Everything that moved per step in the growing form is a tensor here: the position lives
+    in `graph` and the step's row is packed by `mx.quantize` and written with
+    `mx.slice_update` at that tensor index. The packing is what made this possible at all —
+    the formats quantize along `head_dim`, never along tokens, so one row packed inside the
+    graph is byte-for-byte the row the growing writer would have appended.
+
+    The two regions are split **statically**, at promotion: a dense pair of
+    `min(start_tokens, capacity)` rows and packed triples for the rest, one of which is
+    empty whenever the policy says so. Both writes then run every step, unconditionally,
+    and the one that does not belong to this row lands where no read covers it — the dense
+    buffer's one extra slot, or packed slot 0 while the head is still filling, which the
+    step that reaches it overwrites. A branch instead would be a branch on a value the
+    graph owns.
+
+    The read is the same blocked softmax over a capacity that is now static, so its loop
+    unrolls at trace. Blocks past the position score `-inf` and contribute exactly zero
+    through the running maximum; the first block always holds column 0, which is written
+    before any read, so the running maximum is never `-inf` against `-inf`.
+    """
+
+    offset: int
+
+    def __init__(
+        self,
+        k_format: Quantization,
+        v_format: Quantization,
+        *,
+        start_tokens: int,
+        capacity: int,
+        dense: tuple[mx.array, mx.array] | None,
+        keys: tuple[mx.array, ...],
+        values: tuple[mx.array, ...],
+        position: int,
+    ) -> None:
+        super().__init__()
+        self.k_format = k_format
+        self.v_format = v_format
+        self.start_tokens = start_tokens
+        self.capacity = capacity
+        self.dense_capacity = min(start_tokens, capacity)
+        self.packed_capacity = capacity - self.dense_capacity
+        self.offset = position
+        head: list[mx.array] = [] if dense is None else [dense[0], dense[1]]
+        self._keys_at = len(head)
+        self._values_at = self._keys_at + len(keys)
+        self.graph = [*head, *keys, *values, mx.array([position], dtype=mx.int32)]
+        """What the compiled decode passes as its inputs and outputs: the buffers, and the
+        position last. A list, updated functionally — `mx.compile` swaps the arrays inside
+        a captured container for tracers in place, so the container is what the graph and
+        the cache share."""
+
+    @property
+    def position(self) -> mx.array:
+        return self.graph[-1]
+
+    @property
+    def is_fixable(self) -> bool:
+        return True
+
+    def fixed(self, capacity: int) -> "LayerCache":
+        """Idempotent at the capacity it stands on, a copy into larger buffers below it —
+        what a generation that outgrows its room pays once per doubling."""
+        if capacity == self.capacity:
+            return self
+        dense, packed = self._dense(), self._packed()
+        return _fitted(
+            self.k_format,
+            self.v_format,
+            start_tokens=self.start_tokens,
+            capacity=capacity,
+            rows=self.rows,
+            dense_keys=None if dense is None else dense[0],
+            dense_values=None if dense is None else dense[1],
+            k_parts=None if packed is None else packed[0],
+            v_parts=None if packed is None else packed[1],
+        )
+
+    @property
+    def containers(self) -> list[mx.array] | None:
+        return self.graph
+
+    @property
+    def span(self) -> int:
+        return self.capacity
+
+    @property
+    def rows(self) -> int:
+        return int(self.position.item())
+
+    @property
+    def is_trimmable(self) -> bool:
+        return False
+
+    @property
+    def is_replayable(self) -> bool:
+        """No, for `FixedKVCache`'s reason: the position that moves is inside the graph, and
+        the base's `checkpoint()` captures the host-side `offset` the compiled decode never
+        touches."""
+        return False
+
+    @property
+    def nbytes(self) -> int:
+        return sum(held.nbytes for held in self.graph)
+
+    @property
+    def tensors(self) -> tuple[mx.array, ...]:
+        return tuple(self.graph)
+
+    def readable(self, mask: AttentionMask, queries: int, /) -> AttentionMask:
+        """`LayerCache.readable`: the band `column <= the position this row landed on`, over
+        the whole capacity. Unused by `attend` below, which masks its own blocks off the
+        same expression — it is here because the contract is what a reader asks, and a
+        reader that skipped it would attend the columns nothing has written yet."""
+        columns = mx.arange(self.capacity)
+        band = (columns[None, :] <= self._at(queries)).reshape(1, 1, queries, self.capacity)
+        return band if not isinstance(mask, mx.array) else band & mask
+
+    def attend(
+        self,
+        queries: mx.array,
+        *,
+        keys: mx.array,
+        values: mx.array,
+        scale: float,
+        mask: AttentionMask,
+        sinks: mx.array | None = None,
+        softcap: float | None = None,
+    ) -> mx.array:
+        if sinks is not None:
+            raise TypeError("a compressed cache cannot attend with sinks")
+        if softcap is not None:
+            raise TypeError("a compressed cache cannot attend with a softcap")
+        self._write(keys, values)
+        rows = queries.shape[2]
+
+        def additive(start: int, size: int) -> mx.array:
+            return self._band(mask, start, size, rows)
+
+        return _blocked(queries, self._regions(), scale=scale, mask_at=additive)
+
+    def _at(self, queries: int) -> mx.array:
+        """Where the `queries` rows just written sit, as a column vector: they end at the
+        position, so row *j* is at `position - queries + j`."""
+        return self.position - queries + mx.arange(queries)[:, None]
+
+    def _band(self, mask: AttentionMask, start: int, size: int, queries: int) -> mx.array:
+        """The block's additive term, off the position tensor.
+
+        Fill and causality in one expression, which is why a string mask is replaced rather
+        than intersected: `"causal"` aligns the queries to the end of the keys, and the end
+        of a fixed buffer is capacity and not position. An array mask is the boolean band a
+        fixed-shape decode builds, and it intersects.
+        """
+        columns = mx.arange(start, start + size)
+        visible = columns[None, :] <= self._at(queries)
+        term = visible.reshape(1, 1, queries, size)
+        if mask is not None and not isinstance(mask, str):
+            term = term & mask[..., start : start + size]
+        return mx.where(term, 0.0, -mx.inf).astype(mx.float32)
+
+    def _write(self, keys: mx.array, values: mx.array) -> None:
+        """This step's row into both regions, at indices clamped so that the one it does not
+        belong to writes where no read covers.
+
+        The dense pair carries one slot past its head for exactly that, and packed slot 0
+        takes the spurious rows of a still-filling head — every one of them absolute
+        position `dense_capacity`, which the mask hides until the step that writes it for
+        real arrives.
+        """
+        assert keys.shape[2] == 1, "the fixed form is the one-row decode step"
+        position = self.position
+        if self._keys_at:
+            at = mx.minimum(position, self.dense_capacity) if self.packed_capacity else position
+            self.graph[0] = mx.slice_update(self.graph[0], keys, at, axes=(2,))
+            self.graph[1] = mx.slice_update(self.graph[1], values, at, axes=(2,))
+        if self.packed_capacity:
+            at = mx.maximum(position - self.dense_capacity, 0) if self.dense_capacity else position
+            for first, rows, format in (
+                (self._keys_at, keys, self.k_format),
+                (self._values_at, values, self.v_format),
+            ):
+                for index, part in enumerate(_quantize(rows, format)):
+                    self.graph[first + index] = mx.slice_update(
+                        self.graph[first + index], part, at, axes=(2,)
+                    )
+        self.graph[-1] = position + 1
+
+    def _dense(self) -> tuple[mx.array, mx.array] | None:
+        return None if self._keys_at == 0 else (self.graph[0], self.graph[1])
+
+    def _packed(self) -> tuple[tuple[mx.array, ...], tuple[mx.array, ...]] | None:
+        if self._values_at == len(self.graph) - 1:
+            return None
+        return (
+            tuple(self.graph[self._keys_at : self._values_at]),
+            tuple(self.graph[self._values_at : -1]),
+        )
+
+    def _regions(self) -> list[tuple[int, Callable[[int, int], tuple[mx.array, mx.array]]]]:
+        """The capacity as `(rows, read)`, oldest first — the same shape the growing form
+        hands `_blocked`, with both counts static."""
+        regions: list[tuple[int, Callable[[int, int], tuple[mx.array, mx.array]]]] = []
+        dense = self._dense()
+        if dense is not None and self.dense_capacity:
+            dense_keys, dense_values = dense
+
+            def head(start: int, stop: int) -> tuple[mx.array, mx.array]:
+                return dense_keys[..., start:stop, :], dense_values[..., start:stop, :]
+
+            regions.append((self.dense_capacity, head))
+        packed = self._packed()
+        if packed is not None:
+            k_parts, v_parts = packed
+
+            def tail(start: int, stop: int) -> tuple[mx.array, mx.array]:
+                return (
+                    _dequantized(self.k_format, k_parts, start, stop),
+                    _dequantized(self.v_format, v_parts, start, stop),
+                )
+
+            regions.append((self.packed_capacity, tail))
+        return regions
+
+    @property
+    def signature(self) -> dict[str, object]:
+        return {
+            "k": _spelled(self.k_format),
+            "v": _spelled(self.v_format),
+            "start_tokens": self.start_tokens,
+        }
+
+    @property
+    def layout(self) -> Mapping[str, Layout]:
+        """The growing form's, unchanged: a decode that was compiled is the one conversation
+        that would otherwise keep nothing, and what it holds is the same two row spaces."""
+        held: dict[str, Layout] = {"dense_keys": Rows(), "dense_values": Rows()}
+        for side, format in (("keys", self.k_format), ("values", self.v_format)):
+            held[f"{side}.codes"] = Rows()
+            held[f"{side}.scales"] = Rows()
+            if isinstance(format, Affine):
+                held[f"{side}.biases"] = Rows()
+        return held
+
+    def stored(self, start: int, stop: int) -> dict[str, mx.array]:
+        """The two regions' share of `[start, stop)`. The caller cuts against `rows` and not
+        `offset`: the position moved inside the compiled decode and only the graph followed
+        it."""
+        held: dict[str, mx.array] = {}
+        dense = self._dense()
+        head, tail = min(start, self.dense_capacity), min(stop, self.dense_capacity)
+        if tail > head and dense is not None:
+            held["dense_keys"] = dense[0][..., head:tail, :]
+            held["dense_values"] = dense[1][..., head:tail, :]
+        packed = self._packed()
+        first = max(0, start - self.dense_capacity)
+        last = max(0, stop - self.dense_capacity)
+        if last > first and packed is not None:
+            for side, parts in (("keys", packed[0]), ("values", packed[1])):
+                for name, part in zip(("codes", "scales", "biases"), parts, strict=False):
+                    held[f"{side}.{name}"] = part[..., first:last, :]
+        return held
+
+    def restore(self, offset: int, tensors: Mapping[str, mx.array]) -> None:
+        """Into the buffers this cache was built with, which is where it differs from the
+        growing one: the capacity is fixed at promotion and the rows land inside it."""
+        dense = self._dense()
+        dense_keys, dense_values = tensors.get("dense_keys"), tensors.get("dense_values")
+        if dense is not None and dense_keys is not None and dense_values is not None:
+            dense[0][..., : dense_keys.shape[2], :] = dense_keys
+            dense[1][..., : dense_values.shape[2], :] = dense_values
+        packed = self._packed()
+        if packed is not None:
+            for side, parts in (("keys", packed[0]), ("values", packed[1])):
+                for name, part in zip(("codes", "scales", "biases"), parts, strict=False):
+                    held = tensors.get(f"{side}.{name}")
+                    if held is not None:
+                        part[..., : held.shape[2], :] = held
+        self.graph[-1] = mx.array([offset], dtype=mx.int32)
+        self.offset = offset
+
+    def trim(self, length: int) -> None:
+        raise NotImplementedError("a compiled cache cannot be rewound")
+
+    def rewind(self, kept: int, position: int) -> None:
+        """`LayerCache.rewind`. Both counters move — the graph's and the host's — and the
+        rows past the position are stale, which the next write covers."""
+        del kept
+        self.graph[-1] = mx.array([position], dtype=mx.int32)
+        self.offset = position
+
+
+def _fitted(
+    k_format: Quantization,
+    v_format: Quantization,
+    *,
+    start_tokens: int,
+    capacity: int,
+    rows: int,
+    dense_keys: mx.array | None,
+    dense_values: mx.array | None,
+    k_parts: tuple[mx.array, ...] | None,
+    v_parts: tuple[mx.array, ...] | None,
+) -> FixedQuantizedKVCache:
+    """Buffers of `capacity`, carrying `rows` over — the one builder both a promotion and a
+    regrow go through, because the split they compute is the same arithmetic over
+    `start_tokens` and neither is free to answer it differently."""
+    dense_capacity = min(start_tokens, capacity)
+    packed_capacity = capacity - dense_capacity
+    held = min(rows, dense_capacity)
+    tail = max(0, rows - dense_capacity)
+    dense: tuple[mx.array, mx.array] | None = None
+    if dense_capacity:
+        assert dense_keys is not None and dense_values is not None
+        # One slot past the head, and never read: it is where a step past the dense region
+        # puts the row it also writes packed.
+        slots = dense_capacity + (1 if packed_capacity else 0)
+        dense = (_carried(dense_keys, slots, held), _carried(dense_values, slots, held))
+    keys: tuple[mx.array, ...] = ()
+    values: tuple[mx.array, ...] = ()
+    if packed_capacity:
+        keys = _slots(k_format, k_parts, dense_keys, packed_capacity, tail)
+        values = _slots(v_format, v_parts, dense_values, packed_capacity, tail)
+    fixed = FixedQuantizedKVCache(
+        k_format,
+        v_format,
+        start_tokens=start_tokens,
+        capacity=capacity,
+        dense=dense,
+        keys=keys,
+        values=values,
+        position=rows,
+    )
+    mx.eval(*fixed.graph)
+    return fixed
+
+
+def _carried(source: mx.array, slots: int, rows: int) -> mx.array:
+    """`source`'s first `rows` rows in a buffer of `slots`, shaped and typed by the source —
+    each side from its own tensor, because keys and values are not always the same width."""
+    shape = list(source.shape)
+    shape[2] = slots
+    buffer = mx.zeros(shape, dtype=source.dtype)
+    if rows:
+        buffer[..., :rows, :] = source[..., :rows, :]
+    return buffer
+
+
+def _slots(
+    format: Quantization,
+    parts: tuple[mx.array, ...] | None,
+    like: mx.array | None,
+    slots: int,
+    rows: int,
+) -> tuple[mx.array, ...]:
+    """The format's parts as buffers of `slots`, carrying `rows` over.
+
+    A cache promoted before it packed anything has no parts to take the code shapes from,
+    so they come from quantizing one dense row — which is also where the shape refusal
+    lands, at promotion rather than at the first traced step.
+    """
+    if parts is None:
+        assert like is not None, "a cache with no rows at all has nothing to promote"
+        if not admits(like.shape, format):
+            raise _refuse(like.shape[-1], format)
+        parts = _quantize(like[..., :1, :], format)
+        rows = 0
+    return tuple(_carried(part, slots, rows) for part in parts)
+
+
 class _Packed:
     """One side of the cache, quantized along the last axis and grown in blocks.
 
@@ -303,21 +698,7 @@ class _Packed:
 
     def rows(self, start: int, stop: int) -> mx.array:
         assert self.codes is not None and self.scales is not None
-        arguments = {"group_size": self.format.group_size, "bits": self.format.bits}
-        if self.biases is None:
-            assert not isinstance(self.format, Affine)
-            return mx.dequantize(
-                self.codes[..., start:stop, :],
-                self.scales[..., start:stop, :],
-                mode=self.format.mode,
-                **arguments,
-            )
-        return mx.dequantize(
-            self.codes[..., start:stop, :],
-            self.scales[..., start:stop, :],
-            self.biases[..., start:stop, :],
-            **arguments,
-        )
+        return _dequantized(self.format, self.tensors, start, stop)
 
 
 def _restored(
@@ -346,24 +727,51 @@ def _name(format: Quantization) -> str:
     return "affine" if isinstance(format, Affine) else format.mode
 
 
-def _append(held: _Packed | None, rows: mx.array, format: Quantization) -> _Packed:
-    if not admits(rows.shape, format):
-        raise ShapeRefused(
-            f"a head of {rows.shape[-1]} does not close {_name(format)} groups of "
-            f"{format.group_size} at {format.bits} bits: a cache under this policy would be "
-            "quantizing a shape the format cannot describe"
-        )
-    packed = _Packed(format) if held is None else held
+def _quantize(rows: mx.array, format: Quantization) -> tuple[mx.array, ...]:
+    """The rows as the format's parts, codes first — two for the exponent formats and three
+    for `Affine`, which is the only one with a bias.
+
+    One quantizer for both forms of the cache, which is what makes the fixed form's claim
+    checkable rather than argued: the growing writer and the traced step call the same
+    call with the same arguments, so a row packed a step at a time is the bytes a prefill
+    would have written for it.
+    """
     arguments = {"group_size": format.group_size, "bits": format.bits}
-    biases: mx.array | None
     match format:
         case Affine():
-            # The only one with a bias: a scale and an offset per group, against one
-            # exponent for the other two.
             codes, scales, biases = mx.quantize(rows, **arguments)
+            return codes, scales, biases
         case MXFP() | NVFP():
             codes, scales = mx.quantize(rows, mode=format.mode, **arguments)
-            biases = None
+            return codes, scales
+
+
+def _dequantized(
+    format: Quantization, parts: tuple[mx.array, ...], start: int, stop: int
+) -> mx.array:
+    """The inverse, over the rows of `[start, stop)`."""
+    cut = [part[..., start:stop, :] for part in parts]
+    arguments = {"group_size": format.group_size, "bits": format.bits}
+    if isinstance(format, Affine):
+        return mx.dequantize(cut[0], cut[1], cut[2], **arguments)
+    return mx.dequantize(cut[0], cut[1], mode=format.mode, **arguments)
+
+
+def _refuse(width: int, format: Quantization) -> ShapeRefused:
+    return ShapeRefused(
+        f"a head of {width} does not close {_name(format)} groups of "
+        f"{format.group_size} at {format.bits} bits: a cache under this policy would be "
+        "quantizing a shape the format cannot describe"
+    )
+
+
+def _append(held: _Packed | None, rows: mx.array, format: Quantization) -> _Packed:
+    if not admits(rows.shape, format):
+        raise _refuse(rows.shape[-1], format)
+    packed = _Packed(format) if held is None else held
+    parts = _quantize(rows, format)
+    codes, scales = parts[0], parts[1]
+    biases = parts[2] if len(parts) == 3 else None
     needed = packed.rows_written + rows.shape[2]
     held_codes = reserve(packed.codes, needed, codes)
     held_scales = reserve(packed.scales, needed, scales)
@@ -383,11 +791,15 @@ def _blocked(
     regions: list[tuple[int, Callable[[int, int], tuple[mx.array, mx.array]]]],
     *,
     scale: float,
-    mask: AttentionMask,
-    query_offset: int,
-    length: int,
+    mask_at: Callable[[int, int], mx.array],
 ) -> mx.array:
     """Attention as a running softmax over blocks of keys.
+
+    `mask_at` is asked for the additive term of the block starting at absolute column
+    `start` and `size` wide. A callback and not the mask itself because the two forms of
+    this cache answer it differently: the growing one off a host-side query offset, the
+    fixed one off the position tensor its graph owns. The loop is the same either way, and
+    at a static capacity it unrolls at trace.
 
     The arithmetic is the standard online one: a running maximum, a running denominator and a
     running numerator, each block correcting what came before by `exp(m_old - m_new)`. What
@@ -401,7 +813,6 @@ def _blocked(
     """
     heads = queries.shape[1]
     q = queries.astype(mx.float32)
-    rows = q.shape[2]
     running_max = mx.full((*q.shape[:3], 1), -mx.inf, dtype=mx.float32)
     denominator = mx.zeros((*q.shape[:3], 1), dtype=mx.float32)
     numerator = mx.zeros((*q.shape[:3], q.shape[3]), dtype=mx.float32)
@@ -413,7 +824,7 @@ def _blocked(
             k = _expand(keys.astype(mx.float32), heads)
             v = _expand(values.astype(mx.float32), heads)
             scores = (q @ k.transpose(0, 1, 3, 2)) * scale
-            scores = scores + _mask(mask, at + start, stop - start, query_offset, rows, length)
+            scores = scores + mask_at(at + start, stop - start)
             block_max = mx.maximum(scores.max(axis=-1, keepdims=True), -mx.inf)
             new_max = mx.maximum(running_max, block_max)
             correction = mx.exp(running_max - new_max)

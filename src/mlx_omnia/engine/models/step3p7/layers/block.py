@@ -1,7 +1,7 @@
 import mlx.core as mx
 import mlx.nn as nn
 
-from mlx_omnia.engine.core.attend import KVStore
+from mlx_omnia.engine.core.cache import LayerCache
 from mlx_omnia.engine.models.step3p7.config import Step3p7TextConfig
 from mlx_omnia.engine.models.step3p7.layers.attention import Step3p7Attention
 from mlx_omnia.engine.models.step3p7.layers.mlp import Step3p7MLP
@@ -28,7 +28,7 @@ class Step3p7Block(nn.Module):
         )
 
     def __call__(
-        self, x: mx.array, mask: mx.array | str | None, cache: KVStore
+        self, x: mx.array, mask: mx.array | str | None, cache: LayerCache
     ) -> mx.array:
         attended = x + self.self_attn(self.input_layernorm(x), cache, mask)
         h = self.post_attention_layernorm(attended)

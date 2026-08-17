@@ -1,8 +1,10 @@
+from collections.abc import Sequence
+
 import mlx.core as mx
 import mlx.nn as nn
 import pytest
 
-from mlx_omnia.engine.core.cache import DeltaCache, KVCache
+from mlx_omnia.engine.core.cache import DeltaCache, KVCache, LayerCache
 from mlx_omnia.engine.models.gpt2 import GPT2, GPT2Config
 from mlx_omnia.engine.models.qwen3 import Qwen3, Qwen3Config
 from mlx_omnia.engine.quant.calibration import (
@@ -64,7 +66,7 @@ class _CachedTrunk(nn.Module):
     def make_cache(self) -> list[KVCache]:
         return [KVCache() for _ in self.layers]
 
-    def __call__(self, ids: mx.array, cache: list[KVCache] | None = None) -> mx.array:
+    def __call__(self, ids: mx.array, cache: Sequence[LayerCache] | None = None) -> mx.array:
         caches = cache if cache is not None else self.make_cache()
         x = self.embed(ids)
         for block, layer_cache in zip(self.layers, caches, strict=True):

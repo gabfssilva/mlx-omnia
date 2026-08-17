@@ -12,8 +12,9 @@ import dataclasses
 import mlx.core as mx
 import pytest
 
-import mlx_omnia.engine.models.nemotron_h.model as model_module
+import mlx_omnia.engine.core.decode as decode_module
 from mlx_omnia.engine.core.cache import FixedDeltaCache, FixedKVCache
+from mlx_omnia.engine.core.decode import compiled_decode, compiled_verify, plan_of
 from mlx_omnia.engine.models.nemotron_h.model import NemotronH
 from tests.conftest import relative_diff
 from tests.test_nemotron_h_mtp import PROMPT, config_of, spread
@@ -30,6 +31,37 @@ def model() -> NemotronH:
     return built
 
 
+def test_the_fused_joins_are_the_plain_chain() -> None:
+    """The trunk's residual add and the norm the next block reads it through, in one
+    kernel. It crosses a block boundary, so it cannot live inside a block — and it runs on
+    every shape this trunk runs in, prefill included, which is only safe because it is the
+    plain chain's arithmetic and not an approximation of it. Bit equality, not a tolerance.
+
+    The other configs here are `hidden_size=64`, which the rows kernel declines: without a
+    width it accepts, the fused chain is never the one under test.
+    """
+    mx.random.seed(7)
+    built = NemotronH(dataclasses.replace(config_of("M*EM*E-"), hidden_size=128))
+    spread(built)
+    mx.eval(built.parameters())
+    assert built.joins() is not None, "this width is what the rows kernel is for"
+
+    prompt = mx.array(PROMPT)[None]
+    fused_cache = built.make_cache()
+    fused = built(prompt, fused_cache)
+    fused_steps = [built(mx.array([[token]]), fused_cache)[:, -1, :] for token in TOKENS]
+
+    object.__setattr__(built, "_joins_cache", None)
+    assert built.joins() is None
+    plain_cache = built.make_cache()
+    plain = built(prompt, plain_cache)
+    plain_steps = [built(mx.array([[token]]), plain_cache)[:, -1, :] for token in TOKENS]
+
+    assert mx.array_equal(fused, plain).item()
+    for fused_row, plain_row in zip(fused_steps, plain_steps, strict=True):
+        assert mx.array_equal(fused_row, plain_row).item()
+
+
 def test_compiled_decode_matches_stepwise(model: NemotronH) -> None:
     prompt = mx.array(PROMPT)[None]
 
@@ -39,7 +71,7 @@ def test_compiled_decode_matches_stepwise(model: NemotronH) -> None:
 
     cache = model.make_cache()
     model(prompt, cache)
-    decode = model.compile_decode(cache, capacity=32)
+    decode = compiled_decode(plan_of(model), cache, capacity=32)
     produced = [decode(mx.array([token])) for token in TOKENS]
 
     for row, wanted in zip(produced, expected, strict=True):
@@ -49,7 +81,7 @@ def test_compiled_decode_matches_stepwise(model: NemotronH) -> None:
 def test_compiled_decode_promotes_and_counts(model: NemotronH) -> None:
     cache = model.make_cache()
     model(mx.array(PROMPT)[None], cache)
-    decode = model.compile_decode(cache, capacity=32)
+    decode = compiled_decode(plan_of(model), cache, capacity=32)
 
     kinds = {
         "*": FixedKVCache,
@@ -79,7 +111,7 @@ def test_compiled_decode_regrows_past_capacity(model: NemotronH) -> None:
 
     cache = model.make_cache()
     model(prompt, cache)
-    decode = model.compile_decode(cache, capacity=12)
+    decode = compiled_decode(plan_of(model), cache, capacity=12)
     produced = [decode(mx.array([token])) for token in tokens]
 
     for row, wanted in zip(produced, expected, strict=True):
@@ -97,12 +129,12 @@ def test_compiled_verify_regrows_past_capacity(monkeypatch: pytest.MonkeyPatch) 
     spread(model)
     mx.eval(model.parameters())
 
-    monkeypatch.setattr(model_module, "fit", lambda offset: (offset + 8 + 7) // 8 * 8)
+    monkeypatch.setattr(decode_module, "fit", lambda offset: (offset + 8 + 7) // 8 * 8)
 
     committed = [*PROMPT, 0]
     cache = model.make_cache()
     model(mx.array(committed[:-1])[None], cache)
-    compiled = model.compile_verify(cache, width=2, at=(len(config.pattern) - 1,))
+    compiled = compiled_verify(model, cache, rows=3, taps=(len(config.pattern) - 1,))
     assert compiled is not None
     verify, rewind = compiled
 
@@ -113,6 +145,6 @@ def test_compiled_verify_regrows_past_capacity(monkeypatch: pytest.MonkeyPatch) 
         assert relative_diff(logits, reference) < 1e-5
         accepted = 2 if round_index % 2 == 0 else 0
         if accepted < 2:
-            rewind(1 + accepted)
+            rewind(1 + accepted, len(committed) + accepted)
         committed += [*drafted[:accepted], (round_index * 3) % 4]
         assert cache[0].offset == len(committed) - 1

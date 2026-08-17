@@ -20,14 +20,14 @@ matching the markers a second time over text that already went through it.
 """
 
 import json
-from collections.abc import Callable, Iterator
+from collections.abc import Callable, Iterator, Sequence
 from pathlib import Path
 
 import mlx.core as mx
 import pytest
 
 from mlx_omnia.engine.chat import Chat, ChatCapability, ChatTemplate
-from mlx_omnia.engine.core.cache import KVCache
+from mlx_omnia.engine.core.cache import KVCache, LayerCache
 from mlx_omnia.engine.generate import Sampler, stream_generate
 from mlx_omnia.engine.language import GenerationOptions, Text, TextLanguageModel
 from mlx_omnia.engine.models.qwen3_5 import (
@@ -59,7 +59,7 @@ class ScriptedLM:
     def make_cache(self) -> list[KVCache]:
         return [KVCache()]
 
-    def __call__(self, ids: mx.array, cache: list[KVCache] | None = None) -> mx.array:
+    def __call__(self, ids: mx.array, cache: Sequence[LayerCache] | None = None) -> mx.array:
         token = self.ids[min(self.step, len(self.ids) - 1)]
         self.step += 1
         row = -mx.abs(mx.arange(self.vocab) - token).astype(mx.float32)

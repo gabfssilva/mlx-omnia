@@ -1,11 +1,11 @@
-from collections.abc import Callable, Sequence
+from collections.abc import Sequence
 from typing import NamedTuple
 
 import mlx.core as mx
 import mlx.nn as nn
 
-from mlx_omnia.engine.core.cache import DeltaCache, FixedDeltaCache, LayerCache
-from mlx_omnia.engine.core.decode import DecodePlan, compiled_decode
+from mlx_omnia.engine.core.api import Tracing
+from mlx_omnia.engine.core.cache import DeltaCache, LayerCache
 from mlx_omnia.engine.models.mamba2.config import Mamba2Config
 from mlx_omnia.engine.models.mamba2.layers.block import Mamba2Trunk
 from mlx_omnia.engine.models.mamba2.layers.ssd import Recurring
@@ -21,8 +21,7 @@ class Mamba2Activations(NamedTuple):
     logits: mx.array
 
 
-class Mamba2(nn.Module):
-    continuous_batching = True
+class Mamba2(nn.Module, Tracing[LayerCache]):
 
     def __init__(self, config: Mamba2Config) -> None:
         super().__init__()
@@ -34,32 +33,18 @@ class Mamba2(nn.Module):
     def make_cache(self) -> list[LayerCache]:
         return [DeltaCache() for _ in range(self.config.num_hidden_layers)]
 
-    def compile_decode(
-        self,
-        cache: list[LayerCache],
-        capacity: int | None = None,
-    ) -> Callable[[mx.array], mx.array]:
-        """Promote a completed prefill cache and compile one-token forwards.
+    def before_trace(self, cache: Sequence[LayerCache]) -> Sequence[object]:
+        """`core.api.Tracing`, and there is nothing to settle: the forward is ops all the way
+        down and resolves nothing host-side.
 
-        The trunk is all delta: the state is size-free, so the capacity the core threads
-        through promotion is ignored, and with no full-attention layer there is no anchor
-        and no validity mask to read.
+        What the claim buys here is the lease. The trunk is all delta — the state is
+        size-free, so the capacity the core threads through promotion is ignored, and with no
+        attention layer there is no buffer whose unwritten columns could need masking. Both
+        halves of `Tracing` are vacuously true, which is exactly the case that used to ship a
+        whole compiled decode to say so.
         """
-
-        def promote(layers: list[LayerCache], fitting: int) -> list[LayerCache]:
-            del fitting
-            return [
-                FixedDeltaCache.promote(layer)
-                if isinstance(layer, DeltaCache) and not isinstance(layer, FixedDeltaCache)
-                else layer
-                for layer in layers
-            ]
-
-        def step(ids: mx.array, slots: Sequence[LayerCache], mask: mx.array | None) -> mx.array:
-            del mask
-            return self.activations(ids[None], slots).logits[:, -1, :]
-
-        return compiled_decode(DecodePlan(step=step, promote=promote), cache, capacity)
+        del cache
+        return ()
 
     def activations(
         self,

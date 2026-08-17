@@ -22,8 +22,17 @@ class Builds[**P, S](Protocol):
     def build(self, *args: P.args, **kwargs: P.kwargs) -> S | None: ...
 
 
+RESOLVED: set[str] = set()
+"""Modules of the strategies that built in this process. Every strategy module is imported
+to form a `_STRATEGIES` tuple whether or not it ever builds, so imports alone cannot say
+which kernels a run executed — this can, and the bench's results store reads it to decide
+which files a stored measurement actually depends on."""
+
+
 def resolve[**P, S](strategies: Iterable[Builds[P, S]], /, *args: P.args, **kwargs: P.kwargs) -> S:
     """Order is preference: the first strategy that builds wins."""
-    return next(
+    built = next(
         built for strategy in strategies if (built := strategy.build(*args, **kwargs)) is not None
     )
+    RESOLVED.add(type(built).__module__)
+    return built

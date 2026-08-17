@@ -24,12 +24,12 @@ has to add it back before `final_layernorm` (`nemotron_h_mtp.py:117-122`). Here
 same sum and the end norm applies to it directly.
 """
 
-from collections.abc import Callable
+from collections.abc import Sequence
 
 import mlx.core as mx
 import mlx.nn as nn
 
-from mlx_omnia.engine.core.cache import FixedKVCache, KVCache, LayerCache
+from mlx_omnia.engine.core.cache import KVCache, LayerCache
 from mlx_omnia.engine.models.nemotron_h.config import ATTENTION, MAMBA, BlockKind, NemotronHConfig
 from mlx_omnia.engine.models.nemotron_h.layers.block import NemotronHBlock
 
@@ -136,69 +136,6 @@ class NemotronHMTP(nn.Module):
             for index, kind in enumerate(pattern)
         ]
 
-    def compile_chain(
-        self,
-        embed: Callable[[mx.array], mx.array],
-        head: Callable[[mx.array], mx.array],
-        width: int,
-    ) -> (
-        tuple[
-            Callable[[mx.array, mx.array], tuple[mx.array, mx.array]],
-            Callable[[], None],
-        ]
-        | None
-    ):
-        """One chained draft step, compiled: (token id [1], hidden [1,1,H]) -> (next id
-        [1], next hidden). The step's own KV lives in a fixed buffer of `width` rows
-        whose position the caller resets to zero each round — the same graph serves
-        every link of the chain, because the only thing that moves between links is
-        that position.
-
-        `embed` is the target's raw embedding table and `head` its raw logits
-        projection (`speculative.Speculable`); both bake into the trace as constants.
-        Returns None when the step holds an architecture the fixed-shape graph cannot
-        serve (none today: the pattern is attention plus stateless kinds by
-        construction)."""
-        config = self.config
-        kv_heads = config.num_key_value_heads
-        head_dim = config.attention_head_dim
-        first = self.layers[0]
-        assert isinstance(first, NemotronHMTPBlock)
-        dtype = first.norm.weight.dtype
-        caches: list[LayerCache] = []
-        for kind in self.pattern:
-            if kind == ATTENTION:
-                zeros = mx.zeros((1, kv_heads, width, head_dim), dtype=dtype)
-                caches.append(FixedKVCache(zeros, zeros, 0))
-            else:
-                caches.append(LayerCache())
-        fixed = [layer for layer in caches if isinstance(layer, FixedKVCache)]
-        state = [layer.state for layer in fixed]
-        columns = mx.arange(width)
-
-        def forward(token: mx.array, hidden: mx.array) -> tuple[mx.array, mx.array]:
-            anchor = fixed[0]
-            mask = (columns <= anchor.position).reshape(1, 1, 1, width)
-            first, *rest = self.layers
-            assert isinstance(first, NemotronHMTPBlock)
-            x = first(first.fuse(embed(token[None]), hidden), caches[0], mask)
-            for block, layer_cache in zip(rest, caches[1:], strict=True):
-                assert isinstance(block, NemotronHMTPBlock)
-                x = block(x, layer_cache, mask)
-            last = self.layers[-1]
-            assert isinstance(last, NemotronHMTPBlock)
-            out = last.finish(x)
-            logits = head(out)
-            return mx.argmax(logits[:, -1, :], axis=-1), out
-
-        compiled = mx.compile(forward, inputs=state, outputs=state)
-
-        def reset() -> None:
-            for layer in fixed:
-                layer.state[2] = mx.array([0], dtype=mx.int32)
-
-        return compiled, reset
-
     def make_cache(self) -> list[LayerCache]:
         """One per block, as the trunk does. The attention block is the only one with state,
         and a step that drafts a single token from a single position never grows it — but the
@@ -209,11 +146,11 @@ class NemotronHMTP(nn.Module):
         self,
         embeddings: mx.array,
         hidden: mx.array,
-        cache: list[LayerCache] | None = None,
+        cache: Sequence[LayerCache] | None = None,
     ) -> mx.array:
         """`[B, T, hidden]` in for both halves, `[B, T, hidden]` out — rows for the target's
         `lm_head`, not logits. `embeddings` is the *raw* lookup of the token after each of
-        `hidden`'s positions (`speculative.Speculable.raw_embed`)."""
+        `hidden`'s positions (`core.api.Draftable.raw_embed`)."""
         cache = cache if cache is not None else self.make_cache()
         first, *rest = self.layers
         assert isinstance(first, NemotronHMTPBlock)
