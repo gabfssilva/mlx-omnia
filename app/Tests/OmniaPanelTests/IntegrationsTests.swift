@@ -32,6 +32,8 @@ final class IntegrationsTests: XCTestCase {
             line,
             "ANTHROPIC_BASE_URL='http://127.0.0.1:8642/api/anthropic'"
                 + " ANTHROPIC_AUTH_TOKEN='omnia'"
+                + " API_TIMEOUT_MS=3000000"
+                + " CLAUDE_CODE_DISABLE_NONESSENTIAL_TRAFFIC=1"
                 + " ANTHROPIC_DEFAULT_HAIKU_MODEL='mlx-community/Qwen3-0.6B-4bit'"
                 + " ANTHROPIC_DEFAULT_SONNET_MODEL='mlx-community/Qwen3-8B-4bit'"
                 + " ANTHROPIC_DEFAULT_OPUS_MODEL='mlx-community/Qwen3-30B-A3B-4bit'"
@@ -113,10 +115,11 @@ final class IntegrationsTests: XCTestCase {
         XCTAssertEqual((provider["models"] as? [String: Any])?.count, 1)
     }
 
-    // ── pi ───────────────────────────────────────────────────────────────
+    // ── pi and Prime Agent ───────────────────────────────────────────────
 
     func testPiMergesAProviderAndStartsOnTheDefaultTier() throws {
         let line = try XCTUnwrap(Recipes.pi.line(wiring(four)))
+        XCTAssertTrue(line.contains("pathlib.Path.home()/\".pi/agent/models.json\""))
         XCTAssertTrue(line.contains("d.setdefault(\"providers\",{})[\"omnia\"]"))
         XCTAssertTrue(line.contains("pi --model 'omnia/mlx-community/Qwen3-30B-A3B-4bit'"))
         // Every tier is declared, smallest first, because Ctrl+P cycles what `--models` names.
@@ -131,9 +134,6 @@ final class IntegrationsTests: XCTestCase {
         XCTAssertEqual(provider["baseUrl"] as? String, "http://127.0.0.1:8642/api/openai/v1")
         XCTAssertEqual(provider["api"] as? String, "openai-completions")
         XCTAssertEqual(provider["apiKey"] as? String, "omnia")
-        XCTAssertEqual(
-            (provider["compat"] as? [String: Any])?["supportsDeveloperRole"] as? Bool, false
-        )
         XCTAssertEqual((provider["models"] as? [[String: String]])?.count, 4)
     }
 
@@ -141,6 +141,30 @@ final class IntegrationsTests: XCTestCase {
         let line = try XCTUnwrap(Recipes.pi.line(wiring([.big: "a"])))
         XCTAssertTrue(line.contains("pi --model 'omnia/a'"))
         XCTAssertFalse(line.contains("--models"))
+    }
+
+    func testPrimeWritesItsOwnDirectoryAndStartsItsOwnBinary() throws {
+        let line = try XCTUnwrap(Recipes.prime.line(wiring(four)))
+        XCTAssertTrue(line.contains("pathlib.Path.home()/\".prime/agent/models.json\""))
+        XCTAssertFalse(line.contains(".pi/agent"))
+        XCTAssertTrue(
+            line.contains("prime-agent --model 'omnia/mlx-community/Qwen3-30B-A3B-4bit'")
+        )
+    }
+
+    /// Every one of these refuses a field the daemon's OpenAI route does not declare, and that
+    /// route forbids extras: a missing one is a 422 on the first request that carries it.
+    func testTheModelsJsonProvidersTurnOffWhatTheRouteWouldReject() throws {
+        for recipe in [Recipes.pi, Recipes.prime] {
+            let line = try XCTUnwrap(recipe.line(wiring(four)))
+            let provider = try json(after: "))' ", in: line, ending: " && ")
+            let compat = try XCTUnwrap(provider["compat"] as? [String: Any], recipe.name)
+            XCTAssertEqual(compat["maxTokensField"] as? String, "max_tokens", recipe.name)
+            XCTAssertEqual(compat["supportsDeveloperRole"] as? Bool, false, recipe.name)
+            XCTAssertEqual(compat["supportsLongCacheRetention"] as? Bool, false, recipe.name)
+            XCTAssertEqual(compat["supportsStore"] as? Bool, false, recipe.name)
+            XCTAssertEqual(compat["supportsStrictMode"] as? Bool, false, recipe.name)
+        }
     }
 
     // ── nothing set, and the quoting ─────────────────────────────────────

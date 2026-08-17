@@ -7,8 +7,9 @@
 // The shape of each line is the client's and not this app's preference. Claude Code reads
 // its models out of the environment; opencode reads a whole config out of
 // OPENCODE_CONFIG_CONTENT, merged over the ones on disk; Codex reads neither and takes
-// `-c` overrides on the command line; pi reads only `~/.pi/agent/models.json`, so its line
-// writes that file — merging one provider into it, never replacing what is there.
+// `-c` overrides on the command line; pi and Prime Agent read providers only out of their
+// own `models.json`, so those lines write that file — merging one provider into it, never
+// replacing what is there.
 //
 // A tier nobody set is a tier the line leaves out, and the client keeps whatever it had
 // for that slot.
@@ -97,7 +98,7 @@ struct Recipe: Identifiable {
 }
 
 enum Recipes {
-    static let all: [Recipe] = [claude, codex, opencode, pi]
+    static let all: [Recipe] = [claude, codex, opencode, pi, prime]
 
     // ── Claude Code: four slots, all of them environment ──────────────────
 
@@ -187,39 +188,55 @@ enum Recipes {
         }
     )
 
-    // ── pi: one slot, and a file that has to exist first ──────────────────
+    // ── pi and Prime Agent: one slot, and a file that has to exist first ──
 
-    static let pi = Recipe(
-        id: "pi",
-        name: "pi",
-        slots: [(.default, "--model")],
-        line: { wiring in
-            let declared = wiring.named(Tier.allCases)
-            guard let chosen = wiring.model(.default) ?? declared.first else { return nil }
-            let provider = PiProvider(
-                baseUrl: wiring.openai,
-                apiKey: wiring.token,
-                models: declared.map { ["id": $0] }
-            )
-            guard let json = encoded(provider) else { return nil }
-            // Merged into the file rather than written over it: `models.json` is where every
-            // other local provider this reader has is declared.
-            let merge = """
-                python3 -c 'import json,pathlib,sys;p=pathlib.Path.home()/".pi/agent/models.json";\
-                d=json.loads(p.read_text()) if p.exists() else {};\
-                d.setdefault("providers",{})["omnia"]=json.loads(sys.argv[1]);\
-                p.parent.mkdir(parents=True,exist_ok=True);p.write_text(json.dumps(d,indent=2))' \
-                \(shell(json))
-                """
-            var start = ["pi", "--model", shell("omnia/\(chosen)")]
-            // Ctrl+P cycles what `--models` names, which is how the other tiers are reachable
-            // from a client with one slot.
-            if declared.count > 1 {
-                start += ["--models", shell(declared.map { "omnia/\($0)" }.joined(separator: ","))]
-            }
-            return "\(merge) && \(start.joined(separator: " "))"
-        }
+    static let pi = modelsJSON(id: "pi", name: "pi", command: "pi", file: ".pi/agent/models.json")
+
+    static let prime = modelsJSON(
+        id: "prime", name: "Prime Agent", command: "prime-agent",
+        file: ".prime/agent/models.json"
     )
+
+    /// The same file read by two clients: pi, and the Prime Intellect fork that renamed the
+    /// binary and the directory under it. Neither takes a provider from anywhere else, and
+    /// the schema they validate it against is the same one.
+    private static func modelsJSON(
+        id: String, name: String, command: String, file: String
+    ) -> Recipe {
+        Recipe(
+            id: id,
+            name: name,
+            slots: [(.default, "--model")],
+            line: { wiring in
+                let declared = wiring.named(Tier.allCases)
+                guard let chosen = wiring.model(.default) ?? declared.first else { return nil }
+                let provider = ModelsJSONProvider(
+                    baseUrl: wiring.openai,
+                    apiKey: wiring.token,
+                    models: declared.map { ["id": $0] }
+                )
+                guard let json = encoded(provider) else { return nil }
+                // Merged into the file rather than written over it: `models.json` is where every
+                // other local provider this reader has is declared.
+                let merge = """
+                    python3 -c 'import json,pathlib,sys;p=pathlib.Path.home()/"\(file)";\
+                    d=json.loads(p.read_text()) if p.exists() else {};\
+                    d.setdefault("providers",{})["omnia"]=json.loads(sys.argv[1]);\
+                    p.parent.mkdir(parents=True,exist_ok=True);p.write_text(json.dumps(d,indent=2))' \
+                    \(shell(json))
+                    """
+                var start = [command, "--model", shell("omnia/\(chosen)")]
+                // Ctrl+P cycles what `--models` names, which is how the other tiers are reachable
+                // from a client with one slot.
+                if declared.count > 1 {
+                    start += [
+                        "--models", shell(declared.map { "omnia/\($0)" }.joined(separator: ",")),
+                    ]
+                }
+                return "\(merge) && \(start.joined(separator: " "))"
+            }
+        )
+    }
 }
 
 // ── the two payloads, spelled by the client that reads them ──────────────
@@ -247,12 +264,27 @@ private struct OpencodeConfig: Encodable {
     }
 }
 
-private struct PiProvider: Encodable {
-    /// The daemon's OpenAI dialect takes the four roles the API documents and `developer` is
-    /// not one of them, so pi is told to send the system prompt as `system`. Reasoning effort
-    /// it does take, which is why nothing here turns that off.
+private struct ModelsJSONProvider: Encodable {
+    /// Every field the daemon's OpenAI dialect does not declare is a 422, so each of these
+    /// turns off something the client would otherwise send by default:
+    ///
+    /// - `developer` is not one of the four roles that route takes, so the system prompt goes
+    ///   as `system`;
+    /// - `max_completion_tokens` is the default field name for a base URL the client does not
+    ///   recognize, and the route reads `max_tokens`;
+    /// - `store: false` is sent to any base URL the client considers standard, which a
+    ///   localhost one is;
+    /// - `strict` rides along in every tool definition unless it is refused here;
+    /// - `prompt_cache_key` and `prompt_cache_retention` appear once cache retention is long,
+    ///   which is one environment variable away.
+    ///
+    /// Reasoning effort the route does take, which is why nothing here turns that off.
     struct Compat: Encodable {
+        let maxTokensField = "max_tokens"
         let supportsDeveloperRole = false
+        let supportsLongCacheRetention = false
+        let supportsStore = false
+        let supportsStrictMode = false
     }
 
     let baseUrl: String
