@@ -123,7 +123,12 @@ class Vault(Protocol):
 
     def read(self, key: Slot) -> Payload | None: ...
 
-    def write(self, key: Slot, payload: Payload, nbytes: int) -> None: ...
+    def write(self, key: Slot, payload: Payload, nbytes: int) -> bool:
+        """Whether the span will reach disk. `False` is a refusal — no budget, no
+        directory — and the caller must forget the span rather than index it: an entry
+        that says *filed* over bytes that were never going to land is a hole the next
+        resume walks into."""
+        ...
 
     def forget(self, key: Slot) -> None: ...
 
@@ -187,19 +192,32 @@ class PrefixStore:
         self._vault = vault
 
     def begin(
-        self, model: str, stamp: str, caches: Sequence[LayerCache]
+        self,
+        model: str,
+        stamp: str,
+        caches: Sequence[LayerCache],
+        drafted: Sequence[LayerCache] = (),
     ) -> "Prefix | None":
         """This request's view of the store, or `None` when the ceiling is off or the layers
-        hold a shape no span can cut."""
+        hold a shape no span can cut.
+
+        `drafted` is what a speculative proposer adds to the walk: its per-position layers,
+        held here rather than passed per call because the caller never holds them — the
+        trunk's list is the one that gets promoted in place and re-passed, and the drafter's
+        never is. They join the chain the way any layer does, so their signatures fold into
+        the seed and a span written with a drafter's rows never matches a chain built
+        without them.
+        """
         if self._ceiling <= 0:
             return None
-        resolved = _resolve(caches, self._span)
+        joined = (*caches, *drafted)
+        resolved = _resolve(joined, self._span)
         if resolved is None:
             return None
         span, layouts = resolved
         anchored = any(isinstance(kind, Snapshot) for layer in layouts for kind in layer.values())
-        seed = digest([model, stamp, sorted(policy(caches).items()), span, LAYOUT_VERSION])
-        return Prefix(self, Chain(span, layouts, anchored, seed))
+        seed = digest([model, stamp, sorted(policy(joined).items()), span, LAYOUT_VERSION])
+        return Prefix(self, Chain(span, layouts, anchored, seed), drafted=tuple(drafted))
 
     def fetch(self, slot: Slot, ids: Sequence[int]) -> Fetched | None:
         """What is stored under `slot`, from wherever it is, or `None`.
@@ -317,8 +335,13 @@ class PrefixStore:
             if self._vault is None:
                 self._drop(slot)
                 continue
-            if not residency.filed:
-                self._vault.write(slot, residency.payload, residency.nbytes)
+            if not residency.filed and not self._vault.write(
+                slot, residency.payload, residency.nbytes
+            ):
+                # The vault refused, so there is nothing on disk to point at. An honest
+                # miss and a prefill beat an index entry over bytes that never landed.
+                self._drop(slot)
+                continue
             self._held[slot] = Filed(residency.nbytes)
             self._held.move_to_end(slot)
             self._nbytes -= residency.nbytes
@@ -344,6 +367,9 @@ class Prefix:
 
     store: PrefixStore
     chain: Chain
+    drafted: tuple[LayerCache, ...] = ()
+    """The proposer's layers, walked behind whatever list the caller passes. See
+    `PrefixStore.begin`."""
     prompt: int = 0
     """The prompt's length in ids, which is what separates the two anchors. Set by `resume`,
     and 0 for a request that never called it — then every anchor is a decode anchor, which is
@@ -357,6 +383,10 @@ class Prefix:
     _resumed: Key | None = None
     _prompt_anchor: Key | None = None
     _decode_anchor: Key | None = None
+    _owed: tuple[Key, int] | None = None
+    """An anchor stored ahead of its span's rows, its supersession deferred until they land.
+    Dropping the predecessor on the spot would leave the conversation with an anchor no rows
+    reach — exactly the state a request that ends mid-lag must not leave behind."""
 
     def resume(self, tokens: Sequence[int], into: Sequence[LayerCache]) -> int:
         """Fill `into` from the longest stored run of this conversation's spans; answer how
@@ -366,6 +396,7 @@ class Prefix:
         offset, and a trunk whose layers disagree about how much they have seen is a decode
         running fluently off a sequence that never happened.
         """
+        into = [*into, *self.drafted]
         self.prompt = len(tokens)
         keys = self._extend(tokens, self.chain.reach(len(tokens)))
         payloads: list[Payload] = []
@@ -417,22 +448,32 @@ class Prefix:
                 f"a cache of {rows} rows against {len(tokens)} settled ids: a speculative "
                 "round is mid-flight, and its rows are not this conversation's"
             )
+        layers = [*cache, *self.drafted]
         span = self.chain.span
         closed = rows // span
         if closed == 0:
             return
         keys = self._extend(tokens, closed)
         for index in range(self.covered // span, closed):
-            payload = _cut(self.chain, cache, index * span, (index + 1) * span, Rows)
+            payload = _cut(self.chain, layers, index * span, (index + 1) * span, Rows)
             if payload is None:
-                # The trunk has not written this span yet. Storing nothing and keeping the
-                # cursor is what makes that a lost turn of reuse instead of a wrong cache.
-                return
+                # A layer has not written this span yet — the trunk mid-prompt, or a
+                # drafter whose pairs materialize only at its first proposal. Keeping the
+                # cursor is what makes that a span the next commit stores instead of a
+                # wrong cache; the anchor below still lands, because rows can be cut out
+                # of the buffers on any later call and a boundary's snapshot cannot — the
+                # state it captures exists only while the trunk is standing here.
+                break
             self.reuse.stored_bytes += weight(payload)
             self.store.keep(("rows", keys[index]), payload, self._span_ids(tokens, index))
             self.covered = (index + 1) * span
+        if self._owed is not None and self.covered >= self._owed[1]:
+            key, boundary = self._owed
+            self._owed = None
+            self._supersede(key, boundary)
         if self.chain.anchored and rows % span == 0:
-            self._anchor(keys[closed - 1], closed * span, cache, self._span_ids(tokens, closed - 1))
+            boundary = closed * span
+            self._anchor(keys[closed - 1], boundary, layers, self._span_ids(tokens, closed - 1))
 
     def _anchor(
         self, key: Key, boundary: int, cache: Sequence[LayerCache], ids: Sequence[int]
@@ -449,6 +490,22 @@ class Prefix:
             return
         self.reuse.anchor_bytes += weight(payload)
         self.store.keep(("anchor", key), payload, ids)
+        if self.covered >= boundary:
+            self._supersede(key, boundary)
+            return
+        # The rows of this boundary's span are not stored yet — a drafter's pairs
+        # materialize a round behind the trunk. The predecessor stays until they land
+        # (`commit` resolves it): dropped now, a request ending mid-lag would leave the
+        # conversation one anchor no rows reach, which is no resume point at all. An
+        # anchor already owed is a different matter: its own rows have not landed either,
+        # so it protects nothing the survivor does not, and a prefill that owes one per
+        # block would otherwise keep them all — the leak is gigabytes per block at 27B.
+        if self._owed is not None and self._owed[0] != key:
+            self.store.drop(("anchor", self._owed[0]))
+        self._owed = (key, boundary)
+
+    def _supersede(self, key: Key, boundary: int) -> None:
+        """The anchor at `boundary` replaces its own kind, now that its span is backed."""
         if boundary <= self.prompt:
             for stale in (self._resumed, self._prompt_anchor):
                 if stale is not None and stale != key:
@@ -499,8 +556,10 @@ class Prefixes:
     model: str
     stamp: str
 
-    def begin(self, caches: Sequence[LayerCache]) -> "Prefix | None":
-        return self.store.begin(self.model, self.stamp, caches)
+    def begin(
+        self, caches: Sequence[LayerCache], drafted: Sequence[LayerCache] = ()
+    ) -> "Prefix | None":
+        return self.store.begin(self.model, self.stamp, caches, drafted)
 
 
 def _resolve(
@@ -545,11 +604,14 @@ def _cut(
 ) -> Payload | None:
     """One payload: the tensors of `[start, stop)` whose layout is the kind asked for.
 
-    `Rows` are views into the live buffers, so they are made contiguous — a retained view
-    holds the whole request's buffer alive, and in a compiled decode it also stops the graph
-    from donating it. `Snapshot` is the layer's own tensor, reassigned rather than written
-    into, so retaining the reference is the capture and costs nothing; an anchor asks for the
-    empty range at the boundary, which is exactly where such a state is valid at all.
+    Everything taken is made contiguous, `Snapshot` included. A snapshot is reassigned
+    rather than written into, but what gets reassigned is routinely a *view* — a DeltaNet
+    window is a slice of the whole block's conv input, a drafter's seed a slice of every
+    absorbed feature — and a retained view holds the parent buffer alive: at 27B scale that
+    is gigabytes per anchor, unseen by `weight`, which counts a view's own bytes. The copy
+    is the true state and nothing else, and it is what the ceiling then honestly counts.
+    An anchor asks for the empty range at the boundary, which is exactly where such a
+    state is valid at all.
 
     The `mx.eval` is on the thread that generated the rows, which is the only thread that can
     evaluate them: a payload written out later — by an eviction, by a drain on the way down —
@@ -565,7 +627,7 @@ def _cut(
             kind = layout.get(name)
             if not isinstance(kind, wanted):
                 continue
-            payload[f"{index}.{name}"] = mx.contiguous(tensor) if isinstance(kind, Rows) else tensor
+            payload[f"{index}.{name}"] = mx.contiguous(tensor)
             taken += 1
         if taken == 0:
             # A layer that declares tensors of this kind and hands over none has not run, so

@@ -9,15 +9,15 @@ list column and a struct — which is the three layouts the definitions in circu
 import json
 from collections.abc import Generator
 from pathlib import Path
+from typing import NoReturn
 
 import pyarrow as arrow
 import pyarrow.parquet as parquet
 import pytest
-from fastapi import FastAPI
 from fastapi.testclient import TestClient
 
-from mlx_omnia.server import datasets
-from mlx_omnia.server.store import Store
+from mlx_omnia.server.services import datasets
+from tests.server.conftest import wired
 
 FILES = [
     "README.md",
@@ -40,6 +40,10 @@ ARC_LIKE = {
 }
 
 
+def _no_model(model_id: str) -> NoReturn:
+    raise AssertionError(f"this suite loads nothing, and something asked for {model_id!r}")
+
+
 @pytest.fixture
 def client(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> Generator[TestClient]:
     written = tmp_path / "test-00000-of-00001.parquet"
@@ -53,10 +57,7 @@ def client(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> Generator[TestCli
 
     monkeypatch.setattr(datasets, "hf_hub_download", download)
     monkeypatch.setattr(datasets, "_files", lambda _repo: FILES)
-    app = FastAPI()
-    app.state.store = Store(tmp_path / "server.db")
-    app.include_router(datasets.router)
-    with TestClient(app) as opened:
+    with TestClient(wired(_no_model)) as opened:
         yield opened
 
 
@@ -200,12 +201,14 @@ def test_a_split_the_repository_does_not_ship_is_named(client: TestClient) -> No
     assert "train" in response.json()["detail"]
 
 
-def test_the_columns_column_is_json_text_in_the_row(client: TestClient, tmp_path: Path) -> None:
+def test_the_columns_column_is_json_text_in_the_row(client: TestClient) -> None:
     """It is a mapping whose keys are the scoring's vocabulary; a table under it would make
     every new role a migration."""
     client.post("/admin/benchmarks/datasets", json=MMLU_BODY)
 
-    stored = Store(tmp_path / "server.db").dataset("mine")
+    portal = client.portal
+    assert portal is not None
+    stored = portal.call(lambda: datasets.one("mine"))
 
     assert stored is not None
     assert json.loads(stored.columns)["choices"] == "choices"

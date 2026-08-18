@@ -32,7 +32,17 @@ dependencies = [
 # which is the honest error. The app is not among them: it is `app/`, a Swift bundle that
 # reaches this distribution over HTTP and takes nothing from it at import time.
 [project.optional-dependencies]
-server = ["fastapi>=0.115", "uvicorn>=0.30", "pyarrow>=17", "watchdog>=4"]
+server = [
+    "fastapi>=0.115",
+    "uvicorn>=0.30",
+    "pyarrow>=17",
+    "watchdog>=4",
+    # 0.21 dropped the `databases` package for a connection layer of its own; the older
+    # line pins pydantic below 2.9, which cannot build a schema for a PEP 695 alias.
+    "ormar>=0.26",
+    "alembic>=1.13",
+    "aiosqlite>=0.20",
+]
 cli = ["httpx>=0.27"]
 # The harness runs an arm; `mlx-lm` is the one arm that is not this engine.
 mlx-lm = ["mlx-lm"]
@@ -159,6 +169,37 @@ forbidden_modules = [
 ]
 allow_indirect_imports = true
 
+# The server's own direction: a dialect renders events and calls services, a service knows
+# rows and the engine, and the two at the bottom know neither.
+[[tool.importlinter.contracts]]
+name = "the server flows one way"
+type = "layers"
+layers = [
+    "mlx_omnia.server.api",
+    "mlx_omnia.server.generation",
+    "mlx_omnia.server.services",
+    "mlx_omnia.server.runtime",
+    "mlx_omnia.server.db",
+]
+
+[[tool.importlinter.contracts]]
+name = "the api layer knows no SQL"
+type = "forbidden"
+source_modules = ["mlx_omnia.server.api"]
+forbidden_modules = ["mlx_omnia.server.db"]
+# A service reaching its own rows is the point; what is forbidden is a route naming one.
+allow_indirect_imports = true
+
+[[tool.importlinter.contracts]]
+name = "rows and runtime are leaves"
+type = "forbidden"
+source_modules = ["mlx_omnia.server.db", "mlx_omnia.server.runtime"]
+forbidden_modules = [
+    "mlx_omnia.server.api",
+    "mlx_omnia.server.generation",
+    "mlx_omnia.server.services",
+]
+
 [tool.pyright]
 typeCheckingMode = "strict"
 # mlx ships incomplete stubs (mlx.nn has none; array methods take Unknown varargs).
@@ -169,10 +210,13 @@ reportUnknownVariableType = false
 reportUnknownArgumentType = false
 reportUnknownParameterType = false
 reportUnknownLambdaType = false
-# pytest-describe collects nested functions by name; strict counts every one as unused.
-reportUnusedFunction = false
 pythonVersion = "3.13"
-include = ["src", "tests"]
+# `tests` is out of the checked set: strict typing is a contract about the code that ships,
+# and the suite pays it in annotations that describe the double rather than the model —
+# every stand, every monkeypatched attribute, every partial config a test builds on purpose.
+# What it costs to keep them in is a gate that goes red for the fixtures whenever an engine
+# protocol moves, which is exactly when the suite has to be free to move with it.
+include = ["src"]
 exclude = [
     "**/__pycache__",
     ".venv",
@@ -196,21 +240,6 @@ reportUnknownVariableType = false
 [[tool.pyright.executionEnvironments]]
 root = "src/mlx_omnia/server"
 reportUnknownVariableType = false
-
-# transformers/huggingface_hub (dev-deps de fixture) expõem Unknown; só nos testes.
-[[tool.pyright.executionEnvironments]]
-root = "tests/server"
-reportUnknownMemberType = false
-reportUnknownVariableType = false
-reportUnknownArgumentType = false
-reportPrivateUsage = false
-
-[[tool.pyright.executionEnvironments]]
-root = "tests"
-reportUnknownMemberType = false
-reportUnknownVariableType = false
-reportUnknownArgumentType = false
-reportPrivateUsage = false
 
 [tool.pytest.ini_options]
 testpaths = ["tests"]

@@ -159,10 +159,16 @@ def _peak_bytes(directory: Path, blocks: int) -> int:
 
     mx.clear_cache()
     mx.reset_peak_memory()
+    # Against what was already live, not against zero: the meter is the process's, so a model
+    # another file left resident sits under every reading — and it sits *over* them too, since
+    # a peak below it is the peak it already was. Measured absolutely, the three readings came
+    # back equal to that model's bytes and the second assertion failed on a number this
+    # transformation never allocated.
+    resident = mx.get_active_memory()
     weights = mx.load(str(file))
     assert isinstance(weights, dict)
     quantize_weights(weights, plan)
-    return mx.get_peak_memory()
+    return mx.get_peak_memory() - resident
 
 
 def test_the_peak_of_the_transformation_does_not_grow_with_the_trunk(tmp_path: Path) -> None:

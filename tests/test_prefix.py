@@ -52,9 +52,10 @@ class Memory(Vault):
     def read(self, key: Slot) -> Payload | None:
         return self._held.get(key)
 
-    def write(self, key: Slot, payload: Payload, nbytes: int) -> None:
+    def write(self, key: Slot, payload: Payload, nbytes: int) -> bool:
         self.written.append(key)
         self._held[key] = dict(payload)
+        return True
 
     def forget(self, key: Slot) -> None:
         self._held.pop(key, None)
@@ -651,3 +652,190 @@ def _quantize(cache: QuantizedKVCache, tokens: int) -> None:
 def _array(value: mx.array | None) -> mx.array:
     assert value is not None
     return value
+
+
+def describe_a_drafted_walk():
+    """A proposer's layers ride behind whatever list the caller passes — `begin(drafted=)`.
+    The wrapper under test is `speculative.Contributed`; `_Paired`'s shift is exercised
+    end to end in `test_qwen3_5_mtp.py`."""
+
+    def describe_when_a_proposer_contributes_a_layer():
+        def it_is_stored_and_resumed_beside_the_target():
+            from mlx_omnia.engine.speculative import Contributed
+
+            caches: list[LayerCache] = [KVCache()]
+            inner = KVCache()
+            prefixes = store()
+            writing = prefixes.begin(
+                "a-model", "a-stamp", caches, (Contributed(inner, "AStep"),)
+            )
+            assert writing is not None
+            fill([*caches, inner], 8)
+            writing.commit(IDS_OF[:9], caches, 8)
+
+            fresh: list[LayerCache] = [KVCache()]
+            fresh_inner = KVCache()
+            second = prefixes.begin(
+                "a-model", "a-stamp", fresh, (Contributed(fresh_inner, "AStep"),)
+            )
+            assert second is not None
+            assert second.resume(IDS_OF[:9], fresh) == 8
+            assert fresh_inner.offset == 8
+            keys, values = fresh_inner.fetch()
+            assert relative_diff(keys, block(0, 8, 1)) == 0.0
+            assert relative_diff(values, block(0, 8, 1)) == 0.0
+
+        def it_never_matches_a_chain_built_without_the_drafter():
+            # Both directions: the drafter's brand is in the seed, so a span written either
+            # way is invisible to the other chain — never a payload short of one layer.
+            from mlx_omnia.engine.speculative import Contributed
+
+            caches: list[LayerCache] = [KVCache()]
+            inner = KVCache()
+            prefixes = store()
+            writing = prefixes.begin(
+                "a-model", "a-stamp", caches, (Contributed(inner, "AStep"),)
+            )
+            assert writing is not None
+            fill([*caches, inner], 8)
+            writing.commit(IDS_OF[:9], caches, 8)
+
+            bare: list[LayerCache] = [KVCache()]
+            without = walk(prefixes, bare)
+            assert without.resume(IDS_OF[:9], bare) == 0
+            fill(bare, 8)
+            without.commit(IDS_OF[:9], bare, 8)
+
+            fresh: list[LayerCache] = [KVCache()]
+            fresh_inner = KVCache()
+            second = prefixes.begin(
+                "a-model", "a-stamp", fresh, (Contributed(fresh_inner, "AStep"),)
+            )
+            assert second is not None
+            assert second.resume(IDS_OF[:9], fresh) == 8
+
+    def describe_when_the_drafted_rows_lag_the_trunk():
+        def it_defers_the_supersession_until_the_span_lands():
+            # The anchor is cut while the trunk stands on the boundary — the one moment the
+            # snapshot exists — but the predecessor is dropped only once the boundary's rows
+            # are stored: a request ending mid-lag must not leave an anchor no rows reach.
+            from mlx_omnia.engine.speculative import Contributed
+
+            caches: list[LayerCache] = [DeltaCache()]
+            inner = KVCache()
+            prefixes = store()
+            writing = prefixes.begin(
+                "a-model", "a-stamp", caches, (Contributed(inner, "AStep"),)
+            )
+            assert writing is not None
+            fill(caches, 4)
+            fill([inner], 2)
+            writing.commit(IDS_OF[:5], caches, 4)
+
+            behind: list[LayerCache] = [DeltaCache()]
+            behind_inner = KVCache()
+            early = prefixes.begin(
+                "a-model", "a-stamp", behind, (Contributed(behind_inner, "AStep"),)
+            )
+            assert early is not None
+            assert early.resume(IDS_OF[:5], behind) == 0, "the span is not stored yet"
+
+            fill([inner], 2, 2)
+            writing.commit(IDS_OF[:5], caches, 4)
+
+            fresh: list[LayerCache] = [DeltaCache()]
+            fresh_inner = KVCache()
+            second = prefixes.begin(
+                "a-model", "a-stamp", fresh, (Contributed(fresh_inner, "AStep"),)
+            )
+            assert second is not None
+            assert second.resume(IDS_OF[:5], fresh) == 4
+            assert fresh_inner.offset == 4
+
+        def it_keeps_the_predecessor_alive_until_then():
+            # Two boundaries: the first fully backed, the second's rows still lagging when
+            # the request ends. Superseding on the spot would drop the one anchor a resume
+            # can still stand on.
+            from mlx_omnia.engine.speculative import Contributed
+
+            caches: list[LayerCache] = [DeltaCache()]
+            inner = KVCache()
+            prefixes = store()
+            writing = prefixes.begin(
+                "a-model", "a-stamp", caches, (Contributed(inner, "AStep"),)
+            )
+            assert writing is not None
+            fill(caches, 4)
+            fill([inner], 4)
+            writing.commit(IDS_OF[:5], caches, 4)
+            fill(caches, 4, 4)
+            writing.commit(IDS_OF[:9], caches, 8)
+
+            fresh: list[LayerCache] = [DeltaCache()]
+            fresh_inner = KVCache()
+            second = prefixes.begin(
+                "a-model", "a-stamp", fresh, (Contributed(fresh_inner, "AStep"),)
+            )
+            assert second is not None
+            assert second.resume(IDS_OF[:9], fresh) == 4
+
+        def it_keeps_at_most_one_owed_anchor():
+            # A prefill with a lagging drafter crosses a boundary per block and owes an
+            # anchor at each. Only the newest owed one protects anything — the ones before
+            # it have no rows either — and at 27B an anchor is ~150 MB of recurrent state:
+            # kept per block, a 40k prompt leaks the machine.
+            from mlx_omnia.engine.speculative import Contributed
+
+            caches: list[LayerCache] = [DeltaCache()]
+            inner = KVCache()
+            prefixes = store()
+            writing = prefixes.begin(
+                "a-model", "a-stamp", caches, (Contributed(inner, "AStep"),)
+            )
+            assert writing is not None
+            for boundary in (4, 8, 12):
+                fill(caches, 4, boundary - 4)
+                writing.commit(IDS_OF[:13], caches, boundary)
+            anchors = [slot for slot in prefixes._held if slot[0] == "anchor"]
+            assert len(anchors) == 1, "every owed anchor but the newest is dropped"
+
+            fill([inner], 12)
+            writing.commit(IDS_OF[:13], caches, 12)
+            fresh: list[LayerCache] = [DeltaCache()]
+            fresh_inner = KVCache()
+            second = prefixes.begin(
+                "a-model", "a-stamp", fresh, (Contributed(fresh_inner, "AStep"),)
+            )
+            assert second is not None
+            assert second.resume(IDS_OF[:13], fresh) == 12
+
+
+def describe_what_an_anchor_captures():
+    def it_copies_a_snapshot_rather_than_retaining_its_parent():
+        # A snapshot is reassigned, and what gets reassigned is routinely a view — a
+        # DeltaNet window is a slice of the whole block's conv input. Retaining the
+        # reference retains the parent buffer, invisibly to `weight`: gigabytes per
+        # anchor at 27B scale. The cut must copy.
+        import gc
+
+        caches: list[LayerCache] = [DeltaCache()]
+        prefixes = store()
+        writing = walk(prefixes, caches)
+        fill(caches, 4)
+        mx.clear_cache()
+        base = mx.get_active_memory()
+        parent = mx.zeros((1, 1 << 20, 16))  # 64 MB
+        mx.eval(parent)
+        layer = caches[0]
+        assert isinstance(layer, DeltaCache)
+        layer.window = parent[:, -3:]
+        layer.state = parent[:, -1:]
+        writing.commit(IDS_OF[:5], caches, 4)
+        layer.restore(4, {})
+        del parent
+        gc.collect()
+        mx.clear_cache()
+        retained = mx.get_active_memory() - base
+        assert retained < 32 << 20, (
+            f"the anchor retained its snapshot's 64 MB parent buffer ({retained >> 20} MB)"
+        )

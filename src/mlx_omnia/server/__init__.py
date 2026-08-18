@@ -1,4 +1,4 @@
-from mlx_omnia.server.app import create_app
-from mlx_omnia.server.engine import Engine
+from mlx_omnia.server.main import create_app
+from mlx_omnia.server.runtime.engine import Engine
 
 __all__ = ["Engine", "create_app"]

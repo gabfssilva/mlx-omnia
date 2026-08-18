@@ -33,9 +33,9 @@ from mlx_omnia import (
 )
 from mlx_omnia.engine.core.cache import LayerCache
 from mlx_omnia.engine.parsers import Segment
-from mlx_omnia.server import catalog
-from mlx_omnia.server.engine import Engine
-from mlx_omnia.server.tokenization import router
+from mlx_omnia.server.api import management
+from mlx_omnia.server.api.management.checkpoints import router
+from mlx_omnia.server.runtime.engine import Engine
 
 TEMPLATE = "{% for message in messages %}{{ message['content'] }}{% endfor %}"
 
@@ -192,9 +192,11 @@ def test_an_id_with_a_slash_reaches_the_route_and_not_the_catalogs_model_path() 
     async def run() -> httpx.Response:
         engine = Engine(lambda _: resident(CharTokenizer()))
         await engine.resolve(SLASHED)
-        app = application(engine)
-        # The order `create_app` has to register them in, which is the one this asserts.
-        app.include_router(catalog.router)
+        # The whole `/admin` router, whose own declaration order is the one this asserts:
+        # the catalog's `{model_id:path}` is mounted after this route, not before it.
+        app = FastAPI()
+        app.state.engine = engine
+        app.include_router(management.router)
         return await post(app, SLASHED, "hi")
 
     response = asyncio.run(run())

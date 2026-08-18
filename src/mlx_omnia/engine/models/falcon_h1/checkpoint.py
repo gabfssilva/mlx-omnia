@@ -38,10 +38,29 @@ def weights(
     if config.tie_word_embeddings:
         drop_tied_head(loaded)
 
+    loaded = _renamed(loaded)
     loaded = _fold_mup(loaded, config)
-    loaded = _transpose_conv1d(loaded, config)
+    loaded = _squeeze_conv(loaded)
     loaded = fuse_qkv(loaded, config.num_hidden_layers)
     return concat_gate_up(loaded, config.num_hidden_layers)
+
+
+def _renamed(weights: dict[str, mx.array]) -> dict[str, mx.array]:
+    """The two names this checkpoint spells differently from the tree.
+
+    `feed_forward` → `mlp`, and only the MLP: the block keeps `pre_ff_layernorm` as the
+    checkpoint has it. Both steps after this one are already written against `mlp` — the μP fold
+    matches `mlp.gate_proj`/`mlp.down_proj`, and `concat_gate_up`'s prefix defaults to it — so
+    without the rename neither matched anything: the two multipliers silently went unapplied and
+    the gate/up pair reached `SwiGLU` unfused, under names it does not declare.
+
+    `final_layernorm` → `norm`, which is the trunk's own name for the last one.
+    """
+    renamed: dict[str, mx.array] = {}
+    for name, param in weights.items():
+        moved = name.replace(".feed_forward.", ".mlp.")
+        renamed[moved.replace("model.final_layernorm.", "model.norm.")] = param
+    return renamed
 
 
 def _compute_mup_vector(config: FalconH1Config) -> mx.array:
@@ -99,13 +118,17 @@ def _fold_mup(weights: dict[str, mx.array], config: FalconH1Config) -> dict[str,
     return weights
 
 
-def _transpose_conv1d(weights: dict[str, mx.array], config: FalconH1Config) -> dict[str, mx.array]:
-    """torch ships conv1d as ``[conv_dim, 1, kernel]``; the house layout is
-    ``[conv_dim, kernel]`` (squeezed). Apply the transform the reference
-    implementation's sanitize does: ``transpose(0, 2, 1)`` then squeeze the middle axis."""
+def _squeeze_conv(weights: dict[str, mx.array]) -> dict[str, mx.array]:
+    """``[conv_dim, 1, kernel]`` — torch's depthwise layout — or its mlx-converted transpose
+    ``[conv_dim, kernel, 1]``, down to the house layout ``[conv_dim, kernel]``.
+
+    The flatten answers both, and in the same order: the axis being dropped has extent one
+    either way, so which side of the kernel it sat on never reaches the result. It is what
+    `mamba2`, `jamba`, `qwen3_next` and `nemotron_h` do with the same tensor.
+    """
     for name, param in list(weights.items()):
         if "conv1d.weight" in name and param.ndim == 3:
-            weights[name] = param.transpose(0, 2, 1).squeeze(1)
+            weights[name] = param.reshape(param.shape[0], -1)
     return weights
 
 

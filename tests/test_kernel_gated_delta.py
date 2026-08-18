@@ -26,7 +26,7 @@ from mlx_omnia.engine.core.kernels.gated_delta import (
     gated_delta,
     gated_delta_applies,
 )
-from mlx_omnia.engine.core.kernels.gated_delta.fused import _KERNEL, _SOURCE
+from mlx_omnia.engine.core.kernels.gated_delta.fused import _KERNEL, _PER_HEAD_SOURCE
 from mlx_omnia.engine.core.layers import l2norm
 from mlx_omnia.engine.core.mxcompat import metal_kernel
 from tests.conftest import relative_diff
@@ -275,12 +275,12 @@ def test_mutation_breaks_parity(name: str) -> None:
     """Break the kernel, confirm the failure. The ratio-3 shape is what makes the
     broadcast mutation visible at all — on the 0.8B (ratio 1) it is a no-op."""
     old, new = MUTATIONS[name]
-    assert old in _SOURCE
+    assert old in _PER_HEAD_SOURCE
     mutated = metal_kernel(
         name=f"gated_delta_mut_{name}",
         input_names=["q", "k", "v", "g", "beta", "state_in", "T"],
         output_names=["y", "state_out"],
-        source=_SOURCE.replace(old, new),
+        source=_PER_HEAD_SOURCE.replace(old, new),
     )
     inputs = Inputs(8, BROADCAST, mx.float32)
     y, _state = dispatch(mutated, inputs.kernel_args())

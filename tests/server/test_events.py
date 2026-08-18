@@ -17,6 +17,7 @@ import socket
 import threading
 import time
 from collections.abc import AsyncIterator, Iterator
+from importlib import import_module
 from pathlib import Path
 
 import httpx
@@ -28,9 +29,9 @@ from fastapi.testclient import TestClient
 
 from mlx_omnia import CompositeModel, GenerationOptions, Text
 from mlx_omnia.engine.parsers import Segment
-from mlx_omnia.server import catalog, create_app, events
-from mlx_omnia.server.engine import Engine
-from mlx_omnia.server.store import Store
+from mlx_omnia.server import events
+from mlx_omnia.server.services import catalog
+from tests.server.conftest import wired
 
 _DEADLINE_SECONDS = 20.0
 """How long any one frame is waited for. Generous on purpose: FSEvents runs on a clock of
@@ -78,15 +79,18 @@ def caches(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> Path:
     that does not exist yet is one `observe` does not schedule."""
     hub = tmp_path / "hub"
     hub.mkdir()
-    monkeypatch.setattr(catalog, "HUB_CACHE", hub)
-    monkeypatch.setattr(catalog, "QUANTIZED_CACHE", tmp_path / "quantized")
+    # Both names: `catalog` re-exports the constants by value, so the package attribute the
+    # app hands the watcher and the module attribute the scan reads are two objects.
+    for module in (catalog, import_module("mlx_omnia.server.services.catalog.scan")):
+        monkeypatch.setattr(module, "HUB_CACHE", hub)
+        monkeypatch.setattr(module, "QUANTIZED_CACHE", tmp_path / "quantized")
     return hub
 
 
 @pytest.fixture
-def base_url(caches: Path, tmp_path: Path) -> Iterator[str]:
+def base_url(caches: Path) -> Iterator[str]:
     del caches
-    app = create_app(Engine(loader), Store(tmp_path / "server.db"))
+    app = wired(loader)
     with socket.socket() as probe:
         probe.bind(("127.0.0.1", 0))
         port = probe.getsockname()[1]
@@ -159,9 +163,7 @@ def test_a_checkpoint_appearing_on_disk_reaches_a_client_that_never_asked(
         assert listed(until(stream, "models")) == ["Qwen/Qwen3-0.6B"]
 
 
-def test_a_checkpoint_deleted_off_disk_leaves_the_stream_too(
-    base_url: str, caches: Path
-) -> None:
+def test_a_checkpoint_deleted_off_disk_leaves_the_stream_too(base_url: str, caches: Path) -> None:
     """The other direction, which a cache keyed by what it saw last would get wrong: the
     entry has to leave, and the scan behind the frame has to be the one that notices."""
     _checkpoint(caches, "Qwen/Qwen3-0.6B")
@@ -198,9 +200,7 @@ def test_a_config_patch_comes_back_as_config_and_does_not_resend_the_catalog(
     assert value["idle_ttl_seconds"]["value"] == 123
 
 
-def test_a_burst_of_writes_is_one_frame_and_not_one_per_file(
-    base_url: str, caches: Path
-) -> None:
+def test_a_burst_of_writes_is_one_frame_and_not_one_per_file(base_url: str, caches: Path) -> None:
     """What keeps the push cheaper than the poll it replaces. A download is thousands of
     FSEvents and one change; a frame per event would rebuild the catalog per chunk, which
     is worse than the two-second poll this exists to remove.

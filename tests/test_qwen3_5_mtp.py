@@ -25,7 +25,8 @@ import mlx_omnia.engine.task as task
 from mlx_omnia import CompositeModel, load
 from mlx_omnia.engine.core.cache import DeltaCache, KVCache, LayerCache
 from mlx_omnia.engine.core.decode import compiled_verify
-from mlx_omnia.engine.generate import stream_ids
+from mlx_omnia.engine.core.prefix import Prefixes, PrefixStore
+from mlx_omnia.engine.generate import Meter, stream_ids
 from mlx_omnia.engine.models.qwen3_5.config import (
     Qwen35Config,
     Qwen35RoPEParameters,
@@ -640,3 +641,143 @@ def test_an_entry_written_without_a_head_says_so(
     assert not task.has_mtp(entry)
     with pytest.raises(ValueError, match="no MTP head"):
         task.mtp_head(entry)
+
+
+def test_a_resumed_prompt_resumes_the_drafter_beside_the_target(
+    trunk: Qwen35, step: Qwen35MTP
+) -> None:
+    """Two turns through the prefix store. The second turn's resume must bring the
+    drafter's pairs back bit for bit and seed the boundary hidden — the one pair the tail's
+    own forward can never rebuild — and the stream that follows is still the target's own
+    greedy script, reused rows and all."""
+    prefixes = Prefixes(PrefixStore(1 << 30, span=8), "a-model", "a-stamp")
+    first = Persistent(trunk, step, block=3, tap=-1)
+    opening = list(stream_speculative_ids(trunk, first, PROMPT, max_tokens=24, prefix=prefixes))
+    assert opening, "the first turn must generate for the second to extend"
+    conversation = [*PROMPT, *opening, 2, 0, 1]
+
+    # The resume, held still: the walk restores the drafter's inner rows and its seed.
+    resumed_cache = list(trunk.make_cache())
+    second = Persistent(trunk, step, block=3, tap=-1)
+    walk = prefixes.begin(resumed_cache, second.caches)
+    assert walk is not None
+    reach = walk.resume(conversation, resumed_cache)
+    assert reach >= 8 and reach % 8 == 0
+    was = first._cache[0].stored(0, reach - 1)
+    now = second._cache[0].stored(0, reach - 1)
+    assert was and now
+    for name, tensor in was.items():
+        assert mx.array_equal(tensor, now[name]), name
+    assert second._cache[0].offset == reach - 1
+    seeded = second._pending
+    assert seeded is not None and seeded.shape[1] == 1
+
+    # The stream, end to end: rows reused and the ids byte-identical to the plain run.
+    plain = list(stream_ids(trunk, conversation, max_tokens=16))
+    meter = Meter()
+    drafted = list(
+        stream_speculative_ids(
+            trunk,
+            Persistent(trunk, step, block=3, tap=-1),
+            conversation,
+            max_tokens=16,
+            prefix=prefixes,
+            meter=meter,
+        )
+    )
+    assert drafted == plain
+    assert meter.reused_tokens == reach
+
+
+def test_a_divergent_continuation_never_inherits_the_boundary_pair(
+    trunk: Qwen35, step: Qwen35MTP
+) -> None:
+    """A span's key is taken over the span's own ids and nothing past them. The pair that
+    closes on a boundary is built from the id *after* it, so it must not ride the span:
+    two conversations that share the span and part at the next id would otherwise trade
+    pairs under one key, and the resumed drafter would propose conditioned on the other
+    conversation's token. The boundary pair therefore travels as the seed's hidden half
+    and is rebuilt from the tail's own first id."""
+    prefixes = Prefixes(PrefixStore(1 << 30, span=8), "a-model", "a-stamp")
+    first = Persistent(trunk, step, block=3, tap=-1)
+    a_ids = list(stream_speculative_ids(trunk, first, PROMPT, max_tokens=24, prefix=prefixes))
+    shared = [*PROMPT, *a_ids]
+
+    probe_cache = list(trunk.make_cache())
+    probe = prefixes.begin(probe_cache, Persistent(trunk, step, block=3, tap=-1).caches)
+    assert probe is not None
+    boundary = probe.resume(shared, probe_cache)
+    assert boundary >= 8
+
+    # B shares every id of the resumable run and parts exactly on its boundary.
+    divergent = [*shared[:boundary], (shared[boundary] + 1) % VOCAB, 2, 0, 1]
+    resumed = Persistent(trunk, step, block=3, tap=-1)
+    meter = Meter()
+    replayed = list(
+        stream_speculative_ids(
+            trunk, resumed, divergent, max_tokens=8, prefix=prefixes, meter=meter
+        )
+    )
+    assert meter.reused_tokens == boundary
+    fresh = Persistent(trunk, step, block=3, tap=-1)
+    cold = list(stream_speculative_ids(trunk, fresh, divergent, max_tokens=8))
+    assert replayed == cold
+
+    # The pair on the boundary: built from B's own id on both paths, so the two agree to
+    # numerical noise — a pair inherited from A's continuation differs by a whole token.
+    was = resumed._cache[0].stored(boundary - 1, boundary)
+    now = fresh._cache[0].stored(boundary - 1, boundary)
+    assert was and now
+    for name, tensor in was.items():
+        assert relative_diff(tensor, now[name]) < 1e-4, name
+
+
+def test_the_walked_pair_layer_is_shifted_one_row(trunk: Qwen35, step: Qwen35MTP) -> None:
+    """`_Paired`'s contract, pinned by shape: walk rows `[a, b)` are pairs `[a-1, b-1)`, so
+    every stored row is a function of the span's own ids and row 0 holds nothing. Unshifted
+    rows would still decode — the restore offset masks the one foreign row — but they break
+    the store's immutability: two conversations sharing a span and parting at the next id
+    would write different bytes under one key."""
+    prefixes = Prefixes(PrefixStore(1 << 30, span=8), "a-model", "a-stamp")
+    first = Persistent(trunk, step, block=3, tap=-1)
+    list(stream_speculative_ids(trunk, first, PROMPT, max_tokens=24, prefix=prefixes))
+
+    walked = first.caches[0]
+    inner = first._cache[0]
+    assert inner.rows >= 15, "the turn must close two spans for the shapes to mean anything"
+    span0 = walked.stored(0, 8)
+    span1 = walked.stored(8, 16)
+    assert span0 and span1
+    assert span0["keys"].shape[2] == 7
+    assert mx.array_equal(span0["keys"], inner.stored(0, 7)["keys"])
+    assert span1["keys"].shape[2] == 8
+    assert mx.array_equal(span1["keys"], inner.stored(7, 15)["keys"])
+
+
+def test_the_blocked_catch_up_matches_the_one_shot(trunk: Qwen35, step: Qwen35MTP) -> None:
+    """The first proposal after a whole prompt was absorbed runs the step over every
+    missing pair. Fed in one forward, that is the step's attention materialized over the
+    full square — ~127 GB at 40k on the 27B — so it goes through `core.prefill.prefill`
+    in blocks. Blocking is a memory shape and not a semantic one, and acceptance cannot
+    police it — a wrong proposal only costs speed — so the guard is direct: the pairs the
+    catch-up writes and the token it proposes against the same one-shot forward, by hand."""
+    prompt = [(i * 7 + 3) % VOCAB for i in range(2300)]  # > one 2048-row block
+    ids = mx.array(prompt)[None]
+    trunk_cache = trunk.make_cache()
+    _, features = trunk.block_outputs(ids, trunk_cache, at=(-1,))
+    assert features is not None
+
+    proposer = Persistent(trunk, step, block=3, tap=-1)
+    proposer.absorb(features)
+    drafted = proposer.propose([*prompt, 1])
+
+    reference = step.make_cache()
+    tokens = mx.array([*prompt[1:], 1])[None]
+    out = step(trunk.raw_embed(tokens), features, reference)
+    first = mx.argmax(trunk.raw_logits(out[:, -1:])[:, -1, :], axis=-1)
+    assert int(drafted[0]) == int(first.item())
+    ours = proposer._cache[0].stored(0, len(prompt))
+    theirs = reference[0].stored(0, len(prompt))
+    assert ours and theirs
+    for name, tensor in theirs.items():
+        assert relative_diff(ours[name], tensor) < 1e-5, name

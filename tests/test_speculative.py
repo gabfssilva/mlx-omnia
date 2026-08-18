@@ -442,10 +442,10 @@ class BlockProposer:
         return self._width
 
     @property
-    def resumes(self) -> bool:
-        """No, and for the reason `Persistent` says no: it keeps a row per position, and a
-        resumed prompt produced none of them."""
-        return False
+    def caches(self) -> Sequence[LayerCache]:
+        """Nothing on the walk: the scripted rows are a list of ints, not layers, and no
+        test here resumes a prefix through this double."""
+        return ()
 
     def absorb(self, features: mx.array) -> None:
         assert features.shape[-1] == len(self._taps)

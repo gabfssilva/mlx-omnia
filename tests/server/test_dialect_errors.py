@@ -13,131 +13,27 @@ client's own error mapping reads; Gemini's *parses* the body, and an envelope wi
 what a client is left holding when it gets somebody else's shape.
 """
 
-import json
-import socket
-import threading
-import time
-from collections.abc import Iterator
-from dataclasses import dataclass
-from typing import TypeIs
-
 import anthropic
 import httpx
 import pytest
-import uvicorn
 from google import genai
 from google.genai import errors, types
 from openai import AuthenticationError, BadRequestError, NotFoundError, OpenAI
 
-from mlx_omnia import (
-    TEXT,
-    ChatCapability,
-    ChatTemplate,
-    CompositeModel,
-    GenerationOptions,
-    LanguageModel,
-    ModelInput,
-    ModelSignature,
-    Text,
+from tests.server.conftest import seed_config
+from tests.server.dialect_errors_stand import (
+    KEY,
+    MODEL,
+    Stand,
+    claude,
+    fresh_state,
+    gemini,
+    openai,
+    stand,
 )
-from mlx_omnia.engine.parsers import Segment
-from mlx_omnia.server import Engine, catalog, create_app
-from mlx_omnia.server.store import Store
 
-MODEL = "stand/echo"
-"""A `/` in the id like every Hub repository: the Gemini route matches a tail that carries
-slashes, and the error tests below name a model that resolves."""
-
-KEY = "sk-mlx_omnia-37-1"
-
-SOURCE = "{% for message in messages %}<{{ message['role'] }}>{{ message['content'] }}{% endfor %}"
-
-TEMPLATE = ChatTemplate.from_source(SOURCE)
-
-
-@dataclass(frozen=True)
-class Echo:
-    """Answers with the prompt it was handed. Nothing here is about the generation — what is
-    under test is what comes back when the request never becomes one — but a model that
-    answers keeps the "this one works" half of every test honest."""
-
-    @property
-    def native_signature(self) -> ModelSignature:
-        return ModelSignature(frozenset({TEXT}), frozenset({TEXT}))
-
-    def accepts(self, input: ModelInput) -> TypeIs[Text]:
-        return isinstance(input, Text)
-
-    def stream(self, input: Text, options: GenerationOptions) -> Iterator[Segment]:
-        meter = options.meter
-        assert meter is not None, "the engine hands every job's meter to the model"
-        meter.prefill(len(input.value))
-        meter.token()
-        yield Segment("content", input.value)
-
-
-def loader(model_id: str) -> LanguageModel[ModelInput]:
-    if model_id != MODEL:
-        raise ValueError(f"no model {model_id!r} in this stand")
-    return CompositeModel(Echo(), [ChatCapability(TEMPLATE)])
-
-
-@dataclass(frozen=True)
-class Stand:
-    base_url: str
-    store: Store
-
-
-@pytest.fixture(scope="module")
-def stand(tmp_path_factory: pytest.TempPathFactory) -> Iterator[Stand]:
-    root = tmp_path_factory.mktemp("dialect-errors")
-    store = Store(root / "server.db")
-    app = create_app(Engine(loader), store)
-
-    with socket.socket() as probe:
-        probe.bind(("127.0.0.1", 0))
-        port = probe.getsockname()[1]
-
-    # The catalog reads the machine's real Hugging Face cache, and `create_app` mounts it:
-    # patched for the whole module so nothing here can touch what the user has downloaded.
-    with pytest.MonkeyPatch.context() as patched:
-        patched.setattr(catalog, "HUB_CACHE", root / "hub")
-        patched.setattr(catalog, "QUANTIZED_CACHE", root / "quantized")
-        config = uvicorn.Config(app, host="127.0.0.1", port=port, log_level="warning")
-        server = uvicorn.Server(config)
-        thread = threading.Thread(target=server.run, daemon=True)
-        thread.start()
-        deadline = time.time() + 10
-        while not server.started:
-            assert time.time() < deadline, "server did not start"
-            time.sleep(0.02)
-        yield Stand(base_url=f"http://127.0.0.1:{port}", store=store)
-        server.should_exit = True
-        thread.join(timeout=5)
-        assert not thread.is_alive(), "the stand's server did not shut down"
-
-
-@pytest.fixture(scope="module")
-def openai(stand: Stand) -> OpenAI:
-    return OpenAI(base_url=f"{stand.base_url}/api/openai/v1", api_key="unused", max_retries=0)
-
-
-@pytest.fixture(scope="module")
-def claude(stand: Stand) -> anthropic.Anthropic:
-    return anthropic.Anthropic(
-        base_url=f"{stand.base_url}/api/anthropic", api_key="unused", max_retries=0, timeout=60
-    )
-
-
-@pytest.fixture(scope="module")
-def gemini(stand: Stand) -> genai.Client:
-    """`vertexai=False` and an explicit key so the environment cannot decide: this SDK reads
-    `GOOGLE_GENAI_USE_VERTEXAI` and two key variables when it is left to guess."""
-    return genai.Client(
-        api_key="unused",
-        vertexai=False,
-        http_options=types.HttpOptions(base_url=f"{stand.base_url}/api/gemini"),
-    )
+__all__ = ["claude", "fresh_state", "gemini", "openai", "stand"]
+"""The fixtures live in the stand module and are imported for pytest to find them here."""
 
 
 def envelope(body: object) -> dict[str, object]:
@@ -275,7 +171,7 @@ def test_a_wrong_api_key_is_refused_in_each_dialect(
     here over the real app, where the key is read from the store per request. Configured after
     the clients were built and cleared again at the end, so the rest of the module keeps
     talking to an open daemon."""
-    stand.store.set_config({"api_key": json.dumps(KEY)})
+    seed_config({"api_key": KEY})
     try:
         with pytest.raises(AuthenticationError) as by_openai:
             openai.models.list()
@@ -293,7 +189,7 @@ def test_a_wrong_api_key_is_refused_in_each_dialect(
         assert by_gemini.value.status == "UNAUTHENTICATED"
         assert "None None" not in str(by_gemini.value)
     finally:
-        stand.store.set_config({"api_key": json.dumps(None)})
+        seed_config({"api_key": None})
 
     assert [model.id for model in openai.models.list()] == []
 

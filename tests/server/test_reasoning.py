@@ -11,11 +11,10 @@ is where the two halves meet. The Anthropic half is tested next to that dialect,
 import pytest
 from pydantic import ValidationError
 
-from mlx_omnia.server import gemini
-from mlx_omnia.server.app import ChatRequest
-from mlx_omnia.server.gemini import GenerationConfig
-from mlx_omnia.server.profiles import Sampling
-from mlx_omnia.server.responses import (
+from mlx_omnia.server.api.gemini import GenerationConfig
+from mlx_omnia.server.api.gemini import codec as gemini
+from mlx_omnia.server.api.openai_chat.models import ChatRequest
+from mlx_omnia.server.api.responses import (
     PROFILE_ONLY,
     OpenAIEffort,
     ResponsesRequest,
@@ -23,6 +22,7 @@ from mlx_omnia.server.responses import (
     options,
     preset_of,
 )
+from mlx_omnia.server.services.profiles import Sampling
 
 
 def chat(**fields: object) -> ChatRequest:
@@ -112,10 +112,10 @@ def test_gemini_reads_the_switch_and_the_length_off_one_number() -> None:
     and never a rung — turning one into `medium` would write a level into the prompt that no
     client asked for."""
     empty = Sampling()
-    assert gemini._thinks(generation(), empty) == "auto"
-    assert gemini._thinks(generation(thinkingConfig={"thinkingBudget": -1}), empty) == "auto"
-    assert gemini._thinks(generation(thinkingConfig={"thinkingBudget": 0}), empty) == "off"
-    assert gemini._thinks(generation(thinkingConfig={"thinkingBudget": 512}), empty) == "on"
+    assert gemini.effort_of(generation(), empty) == "auto"
+    assert gemini.effort_of(generation(thinkingConfig={"thinkingBudget": -1}), empty) == "auto"
+    assert gemini.effort_of(generation(thinkingConfig={"thinkingBudget": 0}), empty) == "off"
+    assert gemini.effort_of(generation(thinkingConfig={"thinkingBudget": 512}), empty) == "on"
 
     assert gemini._budget(generation(), empty) is None
     assert gemini._budget(generation(thinkingConfig={"thinkingBudget": -1}), empty) is None
@@ -125,10 +125,10 @@ def test_gemini_reads_the_switch_and_the_length_off_one_number() -> None:
 
 def test_a_gemini_profile_fills_what_the_request_left_out_and_not_what_it_named() -> None:
     preset = Sampling(reasoning_effort="high", reasoning_budget=64)
-    assert gemini._thinks(generation(), preset) == "high"
+    assert gemini.effort_of(generation(), preset) == "high"
     assert gemini._budget(generation(), preset) == 64
     named = generation(thinkingConfig={"thinkingBudget": 0})
-    assert gemini._thinks(named, preset) == "off"
+    assert gemini.effort_of(named, preset) == "off"
     assert gemini._budget(named, preset) is None
 
 

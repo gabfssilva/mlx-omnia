@@ -41,7 +41,8 @@ def _ops_path_step(
     """Pure-mlx reference: the SSD recurrence written as a per-token loop in
     fp32, matching what the kernel computes."""
     batch, _, heads, head_dim = hidden.shape
-    _, groups, d_state = B.shape
+    # `[B, 1, G, Ds]`, the shape the kernel documents and `mamba2/layers/block.py` feeds it.
+    _, _, groups, d_state = B.shape
 
     A = -mx.exp(A_log.astype(mx.float32))
     dt_f = mx.clip(
@@ -62,11 +63,11 @@ def _ops_path_step(
                 dBx = (
                     hidden[:, 0, h, d].astype(mx.float32)
                     * dt_f[:, h]
-                    * B[:, g, s].astype(mx.float32)
+                    * B[:, 0, g, s].astype(mx.float32)
                 )
                 st = dA * state[:, h, d, s] + dBx
                 new_state[:, h, d, s] = st
-                acc = acc + st * C[:, g, s].astype(mx.float32)
+                acc = acc + st * C[:, 0, g, s].astype(mx.float32)
             out[:, 0, h, d] = (
                 acc + hidden[:, 0, h, d].astype(mx.float32) * D[h]
             ).astype(hidden.dtype)
@@ -97,7 +98,10 @@ def _make_replica(dtype: mx.Dtype) -> tuple:
     A_log = mx.log(mx.arange(1, heads + 1, dtype=mx.float32))
     dt_bias = mx.ones((heads,), dtype=mx.float32)
     D = mx.ones((heads,), dtype=mx.float32)
-    state = mx.zeros((1, heads, head_dim, d_state), dtype=mx.float32)
+    # Not zeros: one step out of an empty state is `dA * 0 + dBx`, which A never reaches — the
+    # decay is the half of the recurrence that only a state carried in can show, and with zeros
+    # the mutation below perturbed `A_log` and read back a difference of exactly nothing.
+    state = mx.random.normal((1, heads, head_dim, d_state), dtype=mx.float32) * 0.1
 
     return (
         in_proj_w, x, conv_w, conv_b, A_log, dt_bias, D, state,
@@ -125,8 +129,8 @@ def _run_mamba_step(
         axis=-1,
     )
     hidden_r = hidden.reshape(1, 1, heads, head_dim)
-    B_r = B.reshape(1, groups, d_state)
-    C_r = C.reshape(1, groups, d_state)
+    B_r = B.reshape(1, 1, groups, d_state)
+    C_r = C.reshape(1, 1, groups, d_state)
 
     # dt stays pre-softplus — the kernel/reference apply softplus(dt + dt_bias)
     # internally (ssm.py's `_compute_dt`), so the replica feeds the raw projection.
@@ -187,12 +191,15 @@ def test_ssm_attn_chunked_prefill_parity() -> None:
     ref_outs: list[mx.array] = []
     for t in range(length):
         h_t = x[:, t : t + 1, :, :]
-        B_t = B[:, t : t + 1, :, :].reshape(batch, groups, d_state)
-        C_t = C[:, t : t + 1, :, :].reshape(batch, groups, d_state)
-        dt_t = dt[:, t : t + 1, :].reshape(batch, 1, heads)
+        # One token of the sequence keeps its time axis: `[B, 1, G, Ds]` is the shape.
+        B_t = B[:, t : t + 1, :, :]
+        C_t = C[:, t : t + 1, :, :]
+        dt_t = dt[:, t : t + 1, :]
         out_t, ref_state = ssm_step(h_t, A_log, B_t, C_t, D, dt_t, dt_bias, ref_state)
         ref_outs.append(out_t)
-    ref_out = mx.concatenate(ref_outs, axis=1) + x * D.reshape(1, 1, heads, 1)
+    # No `+ x * D` on top: `ssm_step` carries the skip term itself, once per token, and
+    # `ssm_attn` adds it once over the whole sequence. Adding it here counted it twice.
+    ref_out = mx.concatenate(ref_outs, axis=1)
     mx.eval(ref_out, ref_state)
 
     diff = float(mx.abs(chunked_out.astype(mx.float32) - ref_out.astype(mx.float32)).max().item())
@@ -231,8 +238,8 @@ def test_mutation_conv1d_breaks_parity() -> None:
         axis=-1,
     )
     hidden_b = hidden_b.reshape(1, 1, heads, head_dim)
-    B_b = B_b.reshape(1, groups, d_state)
-    C_b = C_b.reshape(1, groups, d_state)
+    B_b = B_b.reshape(1, 1, groups, d_state)
+    C_b = C_b.reshape(1, 1, groups, d_state)
 
     broken_out, _ = ssm_step(hidden_b, A_log, B_b, C_b, D_arr, dt, dt_bias, state)
     mx.eval(broken_out)

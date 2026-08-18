@@ -15,9 +15,10 @@ from pathlib import Path
 import pytest
 from fastapi import FastAPI
 from fastapi.testclient import TestClient
-from huggingface_hub.constants import HF_HUB_CACHE
 
-from mlx_omnia.server.system import _free_bytes, router
+from mlx_omnia.server.api.management.config import router
+from mlx_omnia.server.services import catalog
+from mlx_omnia.server.services.system import free_bytes
 
 
 @pytest.fixture(scope="module")
@@ -94,15 +95,15 @@ def test_the_free_space_is_the_catalog_volume_s(client: TestClient) -> None:
     """`HF_HOME` can point at an external volume, so the boot volume's free space is the
     wrong number to report. Bracketing the request between two readings is exact where a
     tolerance would be guessed: another process writing into the cache moves the figure."""
-    catalog = Path(HF_HUB_CACHE)
-    before = shutil.disk_usage(catalog).free
+    checkpoints = catalog.HUB_CACHE
+    before = shutil.disk_usage(checkpoints).free
     body = client.get("/admin/system").json()
-    after = shutil.disk_usage(catalog).free
-    assert body["catalog"] == str(catalog)
+    after = shutil.disk_usage(checkpoints).free
+    assert body["catalog"] == str(checkpoints)
     assert min(before, after) <= body["disk_free_bytes"] <= max(before, after)
 
 
 def test_a_catalog_that_does_not_exist_yet_reports_its_volume(tmp_path: Path) -> None:
     """Before the first download the catalog directory is absent, which is precisely when
     the app asks how much room there is."""
-    assert _free_bytes(tmp_path / "not" / "there") == shutil.disk_usage(tmp_path).free
+    assert free_bytes(tmp_path / "not" / "there") == shutil.disk_usage(tmp_path).free

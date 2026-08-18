@@ -11,25 +11,25 @@ from pathlib import Path
 import mlx.core as mx
 import numpy as np
 import pytest
-from huggingface_hub import snapshot_download
 
 from mlx_omnia import stream_ids
 from mlx_omnia.engine.core.cache import DeltaCache
 from mlx_omnia.engine.core.kernels.ssm.step import ssm_step
 from mlx_omnia.engine.models.mamba2 import CHECKPOINT, Mamba2, Mamba2Activations
 from mlx_omnia.engine.models.mamba2.layers import flags, ssd
-from tests.conftest import floor, load_golden, relative_diff
+from tests.conftest import checkpoint_dir, floor, load_golden, relative_diff, requires_checkpoint
 from tests.mutation import mutated
 
 FIXTURE = Path(__file__).parent / "fixtures" / "mamba2_forward.safetensors"
+REPO = "state-spaces/mamba2-2.8b-hf"
 N_LAYER = 64
 LAYER = 0
 
-PATTERNS = ["config.json", "*.safetensors", "*.json"]
-
-
-def mamba2_dir() -> Path:
-    return Path(snapshot_download("state-spaces/mamba2-2.8b-hf", allow_patterns=PATTERNS))
+pytestmark = requires_checkpoint(REPO)
+"""Read from the local cache and never fetched, like every other family here. Fetching left
+this file erroring 77 times on a machine that does not hold the checkpoint — and erroring
+rather than skipping, because the fetch is the fixture: the repository under this name is not
+on the Hub any more, so the 404 arrived before any assertion could."""
 
 
 @pytest.fixture(scope="module")
@@ -39,7 +39,7 @@ def golden() -> dict[str, mx.array]:
 
 @pytest.fixture(scope="module")
 def model() -> Mamba2:
-    return CHECKPOINT.load(mamba2_dir(), mx.float32)
+    return CHECKPOINT.load(checkpoint_dir(REPO), mx.float32)
 
 
 @pytest.fixture(scope="module")

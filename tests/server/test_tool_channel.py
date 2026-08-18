@@ -16,7 +16,7 @@ import json
 
 from mlx_omnia.engine.parsers import Segment, ToolCall
 from mlx_omnia.engine.parsers.qwen import PARSER
-from mlx_omnia.server.responses import Calls
+from mlx_omnia.server.generation.calls import Calls
 
 assert PARSER.tools is not None
 QWEN = PARSER.tools

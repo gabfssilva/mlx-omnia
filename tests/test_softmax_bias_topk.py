@@ -62,7 +62,9 @@ def op_chain(
     scores_t_np = np.array(scores_t.astype(mx.float32))
     corrected = scores_t_np + np.array(bias)
     chosen = np.argsort(corrected, kind="stable")[::-1][:k]
-    weights = np.array(scores_t)[chosen] * scale
+    # Off `scores_t_np` and not off `scores_t`: numpy has no bfloat16, and MLX's buffer export
+    # refuses one outright. Same values either way — it is the rounded score, read as fp32.
+    weights = scores_t_np[chosen] * scale
     return mx.array(chosen.astype(np.uint32)), mx.array(weights.astype(np.float32))
 
 

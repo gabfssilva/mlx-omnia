@@ -307,8 +307,9 @@ class _Files(Vault):
         self.reads += 1
         return load(path)
 
-    def write(self, key: Slot, payload: Payload, nbytes: int) -> None:
+    def write(self, key: Slot, payload: Payload, nbytes: int) -> bool:
         dump(payload, self._path(key))
+        return True
 
     def forget(self, key: Slot) -> None:
         self._path(key).unlink(missing_ok=True)

@@ -7,6 +7,7 @@ Shapes are the Codestral-Mamba-7B's: 128 heads, 64 head_dim, 128 state, 8 groups
 out of the conv split, dt pre-softplus, A_log and D in fp32.
 """
 
+from collections.abc import Callable
 from typing import TYPE_CHECKING
 
 import mlx.core as mx
@@ -98,6 +99,34 @@ def run(args: SSMArgs) -> tuple[mx.array, mx.array]:
     return dispatch(_KERNEL, args)
 
 
+def stepped(
+    inputs: SSMInputs, call: Callable[[SSMArgs], tuple[mx.array, mx.array]]
+) -> tuple[mx.array, mx.array]:
+    """A whole sequence through the kernel, one token per dispatch.
+
+    This is the only way a sequence reaches it, and the way the decode loop feeds it: the
+    dispatch is one token by construction — the grid is `(32, Dh, B*H)` with no time in it and
+    the source indexes `X + n * Dh` — so handing it `[B, T, H, Dh]` reads the second token's
+    rows as the first token's heads. What compares against a `T`-long reference is `T` steps
+    with the state threaded through them, which is also what makes the state output part of the
+    assertion rather than a value nobody reads back.
+
+    A sequence in *one* dispatch is `ssm_attn`, a different function with a different shape
+    contract, and `tests/test_ssm.py` is where the two are held against each other.
+    """
+    x, A_log, B, C, D, dt, dt_bias, state, limit = inputs.kernel_args()
+    outs: list[mx.array] = []
+    for t in range(x.shape[1]):
+        y, state = call(
+            (
+                x[:, t : t + 1], A_log, B[:, t : t + 1], C[:, t : t + 1],
+                D, dt[:, t : t + 1], dt_bias, state, limit,
+            )
+        )
+        outs.append(y)
+    return mx.concatenate(outs, axis=1), state
+
+
 def test_applies_predicate() -> None:
     assert ssm_step_applies(STATE, HEADS, GROUPS)
     assert not ssm_step_applies(100, HEADS, GROUPS)
@@ -109,7 +138,7 @@ def test_fp32_parity(length: int) -> None:
     """fp32 template against the ops chain. Only the reduction order differs
     (per-lane accumulation + simd_sum vs mlx's tree sum), so the house 1e-5 holds."""
     inputs = SSMInputs(length, mx.float32)
-    y, state = run(inputs.kernel_args())
+    y, state = stepped(inputs, run)
     ref_y, ref_state = inputs.reference()
     assert relative_diff(y, ref_y) < 1e-5
     assert relative_diff(state, ref_state) < 1e-5
@@ -126,32 +155,31 @@ def test_bf16_within_measured_floor() -> None:
     floor_state = relative_diff(ops_state, ref_state)
     assert floor_y > 0.0
 
-    y, state = run(bf16.kernel_args())
+    y, state = stepped(bf16, run)
     assert relative_diff(y, ref_y) < 3 * floor_y
     assert relative_diff(state, ref_state) < 3 * floor_state
 
 
-def test_step_by_step_matches_one_dispatch() -> None:
-    """Feeding the tokens one at a time does the identical arithmetic in the
-    identical order, so this is bit-exact."""
+def test_the_state_one_step_returns_is_the_one_the_next_step_reads() -> None:
+    """Sixteen steps threaded through each other, against the reference's own sixteen.
+
+    It replaces a test that fed one dispatch the whole sequence and asserted the two agreed
+    bit-for-bit. That is not a property this kernel has and never was: one dispatch is one
+    token, so what the old test compared a stepped run against was a single step reading a
+    sequence's memory as if it were one token's. What is worth asserting is the half a
+    single-step parity check leaves out — that the state coming out is the state going in, over
+    a run long enough for a mistake in it to accumulate rather than round away.
+    """
     inputs = SSMInputs(16, mx.float32)
-    x, A_log, B, C, D, dt, dt_bias, state, limit = inputs.kernel_args()
-    steps: list[mx.array] = []
-    for t in range(16):
-        y, state = dispatch(
-            _KERNEL,
-            (x[:, t : t + 1], A_log, B[:, t : t + 1], C[:, t : t + 1],
-             D, dt[:, t : t + 1], dt_bias, state, limit),
-        )
-        steps.append(y)
-    whole_y, whole_state = run(inputs.kernel_args())
-    assert mx.array_equal(mx.concatenate(steps, axis=1), whole_y).item()
-    assert mx.array_equal(state, whole_state).item()
+    y, state = stepped(inputs, run)
+    ref_y, ref_state = inputs.reference()
+    assert relative_diff(y, ref_y) < 1e-5
+    assert relative_diff(state, ref_state) < 1e-5
 
 
 def test_public_entry_point_matches() -> None:
     inputs = SSMInputs(8, mx.float32)
-    y, state = ssm_step(*inputs.kernel_args())
+    y, state = stepped(inputs, lambda args: ssm_step(*args))
     ref_y, ref_state = inputs.reference()
     assert relative_diff(y, ref_y) < 1e-5
     assert relative_diff(state, ref_state) < 1e-5
@@ -188,6 +216,9 @@ def test_mutation_breaks_parity(name: str) -> None:
         source=_SOURCE.replace(old, new),
     )
     inputs = SSMInputs(8, mx.float32)
-    y, _state = dispatch(mutated, inputs.kernel_args())
+    # Stepped, like every parity check above: handing the whole sequence to one dispatch put a
+    # shape mismatch between the two sides, and the diff it produced was large enough that this
+    # assertion held with the mutation reverted — a red that was never about the mutation.
+    y, _state = stepped(inputs, lambda args: dispatch(mutated, args))
     ref_y, _ref_state = inputs.reference()
     assert relative_diff(y, ref_y) > 1e-3

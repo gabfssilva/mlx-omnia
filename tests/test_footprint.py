@@ -134,24 +134,24 @@ def test_a_dense_step_reads_every_weight() -> None:
 
 
 def test_a_tied_table_counts_once_as_the_head() -> None:
-    """Qwen3-0.6B in bf16: 1.192 GB/token, a 411 tok/s ceiling (docs/models/qwen3.md). The
+    """Qwen3-0.6B in bf16: 1.192 GB/token, a 512 tok/s ceiling (docs/models/qwen3.md). The
     checkpoint serializes `lm_head` even though it is tied and the loader drops it, so
     the table is resident once and read once."""
     model = QWEN3.load(Path(snapshot_download("Qwen/Qwen3-0.6B", allow_patterns=WEIGHTS)), None)
     active = active_bytes_per_token(model)
     assert active == resident_bytes(model)
     assert round(active / 1e9, 3) == 1.192
-    assert round(ceiling(active)) == 411
+    assert round(ceiling(active)) == 512
 
 
 @requires_checkpoint(MOE_REPO)
 def test_a_routed_step_reads_only_the_active_experts(moe: Qwen3MoE) -> None:
     """8 of 128 experts at 4 bits plus the whole untied lm_head: 1.711 GB/token and a
-    286 tok/s ceiling, the numbers CLAUDE.md and docs/models/qwen3_moe.md carry. The
+    356 tok/s ceiling, the numbers CLAUDE.md and docs/models/qwen3_moe.md carry. The
     0.175 GB embedding table stays out — a decode step gathers one row of it."""
     active = active_bytes_per_token(moe)
     assert round(active / 1e9, 3) == 1.711
-    assert round(ceiling(active)) == 286
+    assert round(ceiling(active)) == 356
 
 
 def test_a_slot_stacked_past_the_experts_is_read_whole_every_token() -> None:
@@ -170,22 +170,30 @@ def test_a_slot_stacked_past_the_experts_is_read_whole_every_token() -> None:
 
 def test_the_slots_of_a_stack_are_published_by_its_depth() -> None:
     """What prices a checkpoint nobody loaded: the catalog reads the bytes off the
-    safetensors headers and matches a stacked tensor to its stack by the one thing both
-    sides carry, its leading dimension. qwen3.5's gate‖up is `E + 1` rows deep and `k + 1`
-    of them are read; its down is `E` deep and `k` are."""
+    safetensors headers and matches a stacked tensor to its stack by the one thing both sides
+    carry, its leading dimension.
+
+    Both of qwen3.5's stacks are `E` deep and `k` of each are read — the shared expert is not
+    a row of either. It is `checkpoint.py`'s own rule ("the shared expert's pair stays a leaf
+    of its own rather than slot 256 of the routed stack"), and it is why the byte total below
+    comes out the same as it would from a stack one row deeper: what is read whole is read
+    whole wherever it is stored.
+    """
     experts, k = TINY_QWEN35.num_experts, TINY_QWEN35.num_experts_per_tok
-    assert expert_slots(Sparse()) == {experts + 1: k + 1, experts: k}
+    assert expert_slots(Sparse()) == {experts: k}
 
 
-def test_calling_the_shared_slot_a_candidate_undercharges_it_by_a_whole_row() -> None:
-    """The mutation the rule exists to survive. Declaring `E + 1` candidates puts the shared
-    row back on the `k / (E + 1)` fraction a routed slot pays, and the step loses a whole
-    gate‖up row — 1,179,648 bytes a layer on the 35B-A3B, 47,185,920 over its 40."""
+def test_one_more_routed_slot_costs_a_row_of_each_stack_and_nothing_of_the_shared_one() -> None:
+    """The mutation the rule exists to survive. `k` is what prices the two stacks, and the
+    shared expert is outside the fraction it sets: one more slot buys exactly one gate‖up row
+    plus one down row, and a walk that had folded the shared pair into a stack would move by a
+    different number — the row it charges would be one of `E + 1` rather than one of `E`.
+    """
     block = Sparse()
-    whole = active_bytes_per_token(block)
-    block.mlp.experts = TINY_QWEN35.num_experts + 1
-    row = 4 * 2 * TINY_QWEN35.moe_intermediate_size * TINY_QWEN35.hidden_size
-    assert whole - active_bytes_per_token(block) == row
+    before = active_bytes_per_token(block)
+    block.mlp.k += 1
+    hidden, inner = TINY_QWEN35.hidden_size, TINY_QWEN35.moe_intermediate_size
+    assert active_bytes_per_token(block) - before == 4 * (2 * inner * hidden + inner * hidden)
 
 
 def test_a_block_diagonal_stack_is_read_whole_every_token() -> None:
@@ -233,14 +241,14 @@ def test_the_headers_size_a_checkpoint_without_loading_it(moe: Qwen3MoE) -> None
 @requires_checkpoint(MOE_REPO)
 def test_counting_every_expert_breaks_the_moe_ceiling(moe: Qwen3MoE) -> None:
     """The mutation the count exists to survive. Routing to all 128 experts puts the
-    whole 17 GB stack on the step and collapses the ceiling to 29 tok/s — and it is the
+    whole 17 GB stack on the step and collapses the ceiling to 36 tok/s — and it is the
     routing module, not the block above it, that the stack takes its `k` from."""
     layers = moe.model.layers
     routed = [layer.mlp.k for layer in layers]
     try:
         for layer in layers:
             layer.mlp.k = 128
-        assert round(ceiling(active_bytes_per_token(moe))) == 29
+        assert round(ceiling(active_bytes_per_token(moe))) == 36
     finally:
         for layer, k in zip(layers, routed, strict=True):
             layer.mlp.k = k

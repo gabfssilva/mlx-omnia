@@ -292,6 +292,16 @@ class _Restatement:
         self._held = ""
         return candidate[cut:] if len(candidate[:cut].strip()) >= _RESTATEMENT_FLOOR else candidate
 
+    def close(self, text: str) -> str:
+        """The channel closing, which is the last moment the copy can still be running.
+
+        `take` alone would carry a candidate to the end of the generation, and everything the
+        model wrote after the block would leave in front of it. A channel that has closed has
+        no more top to it, so what is still held is decided here, on `rest`'s own rule.
+        """
+        taken = self.take(text)
+        return taken if self._settled else self.rest()
+
     def rest(self) -> str:
         """The end of the generation with the copy never having broken off: the whole
         reasoning was the prompt written back, and it goes — or it was too short to have
@@ -351,34 +361,39 @@ class Segmenter:
                 routed = self._route(held, out)
                 if routed is None:
                     self._held = held
-                    return self._filtered(out)
+                    return tuple(out)
                 held = routed
                 continue
             closing = held.find(self._closer)
             if closing < 0:
                 break
             cut = closing + len(self._closer)
-            out.append(Segment(self._channel, held[:cut]))
+            self._emit(out, held[:cut], closed=True)
             held, self._channel, self._closer = held[cut:], "content", ""
         keep = len(held) - self._ambiguous(held)
         self._held = held[keep:]
         if keep > 0:
-            out.append(Segment(self._channel, held[:keep]))
-        return self._filtered(out)
+            self._emit(out, held[:keep], closed=False)
+        return tuple(out)
 
-    def _filtered(self, out: list[Segment]) -> tuple[Segment, ...]:
-        """The reasoning channel with the prompt's own words taken back out of the top of it,
-        and every other channel untouched. A segment left empty by it does not leave: an
-        empty delta is a frame that says a model wrote nothing."""
-        kept: list[Segment] = []
-        for segment in out:
-            if segment.channel != "reasoning":
-                kept.append(segment)
-                continue
-            text = self._restatement.take(segment.text)
-            if text:
-                kept.append(Segment("reasoning", text))
-        return tuple(kept)
+    def _emit(self, out: list[Segment], text: str, *, closed: bool) -> None:
+        """One segment out, with the prompt's own words taken back out of the top of a reasoning
+        one. Every other channel is untouched.
+
+        `closed` is the difference between holding the copy and deciding on it, and it is what
+        keeps a reasoning block in front of the content that followed it: settling only at the
+        end of the generation once delivered a whole `thinking` block *after* the answer, because
+        the content behind it left on the pushes in between.
+
+        A segment the restatement leaves empty does not leave: an empty delta is a frame that
+        says a model wrote nothing.
+        """
+        if self._channel != "reasoning":
+            out.append(Segment(self._channel, text))
+            return
+        kept = self._restatement.close(text) if closed else self._restatement.take(text)
+        if kept:
+            out.append(Segment("reasoning", kept))
 
     def flush(self) -> tuple[Segment, ...]:
         """What is still held when the generation ends: a prefix that never resolved, an
@@ -392,9 +407,11 @@ class Segmenter:
         out: list[Segment] = []
         if self._held:
             held, self._held = self._held, ""
-            # Through the filter first, because it came *after* whatever the restatement is
-            # still holding: settling on it and then emitting this would invert the two.
-            out.extend(self._filtered([Segment(self._channel, held)]))
+            # The end of the generation closes whatever was open, so the tail is settled and not
+            # held — a block the budget cut in half still leaves ahead of nothing.
+            self._emit(out, held, closed=True)
+        # Non-empty only for a reasoning block that never closed — one that did settled its copy
+        # where it closed. It came before whatever the tail above is, so it goes in front of it.
         rest = self._restatement.rest()
         if rest:
             out.insert(0, Segment("reasoning", rest))

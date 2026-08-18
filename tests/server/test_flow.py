@@ -10,7 +10,7 @@ import threading
 from collections.abc import Sequence
 from concurrent.futures import ThreadPoolExecutor
 
-from mlx_omnia.server.flow import Clock, Emission, Member, Outlet
+from mlx_omnia.server.runtime.flow import Clock, Emission, Member, Outlet
 
 
 def member(loop: asyncio.AbstractEventLoop) -> Member[list[int], int]:

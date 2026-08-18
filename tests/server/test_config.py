@@ -7,30 +7,27 @@ other is the one the API must not get backwards: `max_concurrent_requests` is st
 says it changes nothing, because the queue it configures has effective depth 1 until
 continuous batching, which is what the Server screen already tells the user.
 
-The app here is the router on a bare `FastAPI` plus the one thing `create_app` adds that
-these routes lean on — the handler that turns FastAPI's own 422 into the named 400 every
-other route answers with.
+The two claims that need a real socket or a second app live in `test_config_binding.py`.
+
+The app is the daemon's own, built through `create_app`: the routes read the one database
+`mlx_omnia.paths` names, and the handler that turns FastAPI's own 422 into the named 400 is
+part of that wiring.
 """
 
-import socket
 import subprocess
-import threading
-import time
-from collections.abc import Generator, Iterator
-from contextlib import contextmanager
+from collections.abc import Iterator
 from pathlib import Path
 
-import httpx
 import pytest
-import uvicorn
 from fastapi import FastAPI
-from fastapi.exceptions import RequestValidationError
 from fastapi.testclient import TestClient
 
-from mlx_omnia.server import catalog
-from mlx_omnia.server.app import _invalid_request
-from mlx_omnia.server.config import current, router
-from mlx_omnia.server.store import Store
+from mlx_omnia import LanguageModel, ModelInput
+from mlx_omnia.server.db import sync_reads
+from mlx_omnia.server.main import create_app
+from mlx_omnia.server.services import catalog
+
+from .conftest import engine_of, wired
 
 FIELDS = {
     "memory_limit_bytes",
@@ -48,26 +45,26 @@ FIELDS = {
 GB = 1024**3
 
 
-def build(store: Store, host: str = "127.0.0.1") -> FastAPI:
-    app = FastAPI()
-    app.state.store = store
-    app.state.host = host
+def _never(model_id: str) -> LanguageModel[ModelInput]:
+    """Nothing here reaches the engine: every route under test answers out of the config."""
+    raise AssertionError(f"loading {model_id!r}: /admin/config must not load a model")
+
+
+def build(host: str = "127.0.0.1") -> FastAPI:
     """What the daemon bound. Clearing the api key is refused off the loopback, so the route
     has to know which host it is answering on."""
-    app.include_router(router)
-    app.add_exception_handler(RequestValidationError, _invalid_request)
-    return app
+    return create_app(engine_of(_never), host=host)
 
 
 @pytest.fixture
-def store(tmp_path: Path) -> Store:
-    return Store(tmp_path / "server.db")
-
-
-@pytest.fixture
-def client(store: Store) -> Iterator[TestClient]:
-    with TestClient(build(store)) as running:
+def client() -> Iterator[TestClient]:
+    with TestClient(wired(_never)) as running:
         yield running
+
+
+def stored() -> dict[str, str]:
+    """The rows themselves, as the engine's sync reader sees them."""
+    return sync_reads.config_values()
 
 
 def read(client: TestClient) -> dict[str, object]:
@@ -92,27 +89,10 @@ def patch(client: TestClient, **fields: object) -> dict[str, object]:
     return body
 
 
-def free_port() -> int:
-    with socket.socket() as probe:
-        probe.bind(("127.0.0.1", 0))
-        return int(probe.getsockname()[1])
-
-
-@contextmanager
-def serving(app: FastAPI) -> Generator[str]:
-    port = free_port()
-    server = uvicorn.Server(uvicorn.Config(app, host="127.0.0.1", port=port, log_level="warning"))
-    thread = threading.Thread(target=server.run, daemon=True)
-    thread.start()
-    deadline = time.time() + 10
-    while not server.started:
-        assert time.time() < deadline, "server did not start"
-        time.sleep(0.02)
-    try:
-        yield f"http://127.0.0.1:{port}"
-    finally:
-        server.should_exit = True
-        thread.join(timeout=5)
+def current_of(client: TestClient, name: str) -> object:
+    """`current()` is async and the suite reads it the way every other caller does — through
+    the route that is nothing but a view over it."""
+    return setting(read(client), name)["value"]
 
 
 def test_the_memory_ceiling_defaults_to_this_machines_ram_minus_eight_gb(
@@ -148,7 +128,7 @@ def test_every_parameter_comes_back_with_its_named_default(client: TestClient) -
 
 
 def test_the_trie_budget_is_a_share_of_the_ceiling_it_is_counted_inside(
-    client: TestClient, store: Store
+    client: TestClient,
 ) -> None:
     """The trie's arrays live inside `memory_limit_bytes`, so the default that decides how
     big it may get follows that same number — a ceiling the user PATCHed down included. A
@@ -164,14 +144,12 @@ def test_the_trie_budget_is_a_share_of_the_ceiling_it_is_counted_inside(
     assert setting(read(client), "prefix_cache_bytes")["value"] == max(GB, ceiling // 32)
 
     patch(client, memory_limit_bytes=8 * GB)
-    assert current(store).prefix_cache_bytes == GB, "the floor, not a quarter of the limit"
+    assert current_of(client, "prefix_cache_bytes") == GB, "the floor, not a quarter of the limit"
     patch(client, memory_limit_bytes=320 * GB)
-    assert current(store).prefix_cache_bytes == 10 * GB
+    assert current_of(client, "prefix_cache_bytes") == 10 * GB
 
 
-def test_a_trie_budget_the_user_wrote_is_not_recomputed(
-    client: TestClient, store: Store
-) -> None:
+def test_a_trie_budget_the_user_wrote_is_not_recomputed(client: TestClient) -> None:
     """The share fills a field nobody wrote; a value that arrived is a value somebody chose.
     Zero is the case that has to survive — it is how the trie is turned off, and a default
     that overrode it would turn it back on at the next change of ceiling."""
@@ -179,21 +157,21 @@ def test_a_trie_budget_the_user_wrote_is_not_recomputed(
 
     patch(client, memory_limit_bytes=320 * GB)
 
-    assert current(store).prefix_cache_bytes == 0
+    assert current_of(client, "prefix_cache_bytes") == 0
 
 
 def test_a_default_is_never_written_down_and_a_patch_writes_only_what_it_carried(
-    client: TestClient, store: Store
+    client: TestClient,
 ) -> None:
     """Reading is not writing, and a PATCH of one field is not a snapshot of all of them: a
     database that froze the computed ceiling on first contact would carry this machine's
     RAM — and its hub cache path — into whatever machine the file is restored on."""
     read(client)
-    assert store.config() == {}
+    assert stored() == {}
 
     patch(client, port=9042)
 
-    assert set(store.config()) == {"port"}
+    assert set(stored()) == {"port"}
 
 
 def test_one_patch_answers_applied_for_the_ceiling_and_restart_for_the_port(
@@ -213,7 +191,7 @@ def test_one_patch_answers_applied_for_the_ceiling_and_restart_for_the_port(
 
 
 def test_a_patched_ceiling_is_what_the_next_reader_of_the_config_gets(
-    client: TestClient, store: Store
+    client: TestClient,
 ) -> None:
     """`applied` is a claim about caching, and this is the whole of the mechanism behind it:
     whatever decides admission reads the config through `current()`, so the value a PATCH
@@ -221,43 +199,20 @@ def test_a_patched_ceiling_is_what_the_next_reader_of_the_config_gets(
     test — the sweep does not exist yet."""
     patch(client, memory_limit_bytes=42 * GB)
 
-    assert current(store).memory_limit_bytes == 42 * GB
+    assert current_of(client, "memory_limit_bytes") == 42 * GB
 
 
-def test_patching_the_port_answers_restart_and_the_daemon_stays_on_the_port_it_bound(
-    store: Store,
-) -> None:
-    """`restart` against a real socket, which is the only place the word is falsifiable. A
-    daemon that moved on the PATCH would drop every client already pointed at it — and the
-    client that sent the PATCH would be the first.
-
-    The port to move to is chosen with the server already listening, so the ephemeral bind
-    that picks it cannot hand back the one the server is holding.
-    """
-    with serving(build(store)) as base_url:
-        moved = free_port()
-        response = httpx.patch(f"{base_url}/admin/config", json={"port": moved}, timeout=10)
-
-        assert response.status_code == 200, response.text
-        assert response.json()["port"] == {"value": moved, "effect": "restart", "note": None}
-        assert httpx.get(f"{base_url}/admin/config", timeout=10).status_code == 200
-        with pytest.raises(httpx.ConnectError):
-            httpx.get(f"http://127.0.0.1:{moved}/admin/config", timeout=10)
-
-
-def test_max_concurrent_requests_is_applied_to_the_scheduler(
-    client: TestClient, store: Store
-) -> None:
+def test_max_concurrent_requests_is_applied_to_the_scheduler(client: TestClient) -> None:
     entry = setting(patch(client, max_concurrent_requests=8), "max_concurrent_requests")
 
     assert entry["value"] == 8
     assert entry["effect"] == "applied"
     assert entry["note"] is None
-    assert store.config() == {"max_concurrent_requests": "8"}
+    assert stored() == {"max_concurrent_requests": "8"}
 
 
 def test_a_value_out_of_bounds_names_the_field_and_the_rest_of_the_patch_does_not_land(
-    client: TestClient, store: Store
+    client: TestClient,
 ) -> None:
     """Together or not at all. A body applied field by field would have written the TTL and
     only then refused the port, leaving a config nobody asked for."""
@@ -270,7 +225,7 @@ def test_a_value_out_of_bounds_names_the_field_and_the_rest_of_the_patch_does_no
     body = read(client)
     assert setting(body, "port")["value"] == 9042
     assert setting(body, "idle_ttl_seconds")["value"] == 1800
-    assert set(store.config()) == {"port"}
+    assert set(stored()) == {"port"}
 
 
 def test_a_field_the_config_does_not_have_is_refused_by_name(client: TestClient) -> None:
@@ -280,22 +235,6 @@ def test_a_field_the_config_does_not_have_is_refused_by_name(client: TestClient)
 
     assert response.status_code == 400, response.text
     assert "maxConcurrentRequests" in response.json()["error"]["message"]
-
-
-def test_what_a_patch_wrote_is_what_the_next_process_reads(tmp_path: Path) -> None:
-    """A restart, in a test: a second `Store` over the same file, behind an app that shares
-    nothing with the first. The `None` is half the point — stored as its own string it comes
-    back as `"None"`, which is a TTL of five characters."""
-    path = tmp_path / "server.db"
-    with TestClient(build(Store(path))) as first:
-        patch(first, idle_ttl_seconds=None, api_key="sk-local", not_resident="fail")
-
-    with TestClient(build(Store(path))) as second:
-        body = read(second)
-
-    assert setting(body, "idle_ttl_seconds")["value"] is None
-    assert setting(body, "api_key")["value"] == "sk-local"
-    assert setting(body, "not_resident")["value"] == "fail"
 
 
 def test_the_catalog_directory_is_the_one_the_scan_is_using(
@@ -320,26 +259,3 @@ def test_the_policy_for_a_model_that_is_not_resident_takes_only_the_two_words(
     assert response.status_code == 400, response.text
     assert "not_resident" in response.json()["error"]["message"]
     assert setting(read(client), "not_resident")["value"] == "fail"
-
-
-def test_the_key_cannot_be_cleared_out_from_under_a_daemon_on_the_network(
-    store: Store,
-) -> None:
-    """`auth.check_bind` refuses to *come up* off the loopback without a key, and that is
-    only the boot. Clearing it afterwards would leave every route but `/admin/health` open on
-    the network — the delete of a checkpoint among them — with no restart to notice it at.
-
-    On the loopback the same PATCH is fine: nothing outside the machine can reach it, which
-    is the whole of why the key is optional there."""
-    with TestClient(build(store, host="0.0.0.0")) as exposed:
-        set_key = exposed.patch("/admin/config", json={"api_key": "sk-open"})
-        assert set_key.status_code == 200, set_key.text
-
-        cleared = exposed.patch("/admin/config", json={"api_key": None})
-
-        assert cleared.status_code == 400
-        assert "api_key" in cleared.json()["detail"] and "0.0.0.0" in cleared.json()["detail"]
-        assert setting(read(exposed), "api_key")["value"] == "sk-open", "and nothing was written"
-
-    with TestClient(build(store)) as local:
-        assert local.patch("/admin/config", json={"api_key": None}).status_code == 200

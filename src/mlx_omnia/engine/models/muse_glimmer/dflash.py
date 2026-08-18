@@ -29,11 +29,11 @@ import mlx.core as mx
 import mlx.nn as nn
 
 from mlx_omnia.engine.core.api import Draftable
-from mlx_omnia.engine.core.cache import KVCache
+from mlx_omnia.engine.core.cache import KVCache, LayerCache
 from mlx_omnia.engine.core.layers import SwiGLU
 from mlx_omnia.engine.core.masks import SLIDING
 from mlx_omnia.engine.models.muse_glimmer.config import MuseGlimmerAssistantConfig
-from mlx_omnia.engine.speculative import SpeculationRefused
+from mlx_omnia.engine.speculative import Contributed, SpeculationRefused
 
 
 def sliding_mask(queries: int, keys: int, window: int) -> mx.array | None:
@@ -235,6 +235,7 @@ class MuseGlimmerDFlash:
         self._block = min(DEFAULT_BLOCK, config.block_size) if block_size is None else block_size
         self._noise = mx.array([config.mask_token_id] * (self._block - 1))
         self._taps = tuple(config.target_layer_ids)
+        self._walked = tuple(Contributed(layer, type(self).__name__) for layer in self._cache)
 
     @property
     def taps(self) -> Sequence[int]:
@@ -247,11 +248,13 @@ class MuseGlimmerDFlash:
         return self._block - 1
 
     @property
-    def resumes(self) -> bool:
-        """No: its own cache holds a row per position, written from the target's blocks at
-        that position, and a resumed prompt produced none of them. A drafter cache of its
-        own in the prefix store is what would change the answer."""
-        return False
+    def caches(self) -> Sequence[LayerCache]:
+        """Its layers, on the walk: one row per position, written from the target's blocks
+        at that position — which a resumed prompt never produces — already RoPE'd at the
+        absolute position it was absorbed at, so the rows compose along spans the way any
+        KV does. No shift and no seed: row *i* is a function of ids `..i`, all inside the
+        span's own key."""
+        return self._walked
 
     def absorb(self, features: mx.array) -> None:
         self._drafter.absorb(features, self._cache)

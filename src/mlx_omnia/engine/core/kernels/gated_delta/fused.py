@@ -104,11 +104,17 @@ def _source(setup: str, access: str, advance: str) -> str:
     )
 
 
+_PER_HEAD_SOURCE = _source("auto g_ = g + b_idx * T * Hv;", "g_[hv_idx]", "g_ += Hv;")
+"""The per-head variant with its three holes filled — the text this kernel is compiled from,
+and therefore the only text a source mutation can be written against. `_SOURCE` is the
+template: two of the fragments a mutation names appear only once the holes are closed, and a
+kernel built from the template itself does not compile at all."""
+
 _KERNEL = metal_kernel(
     name="gated_delta_step",
     input_names=["q", "k", "v", "g", "beta", "state_in", "T"],
     output_names=["y", "state_out"],
-    source=_source("auto g_ = g + b_idx * T * Hv;", "g_[hv_idx]", "g_ += Hv;"),
+    source=_PER_HEAD_SOURCE,
 )
 
 _KERNEL_PER_CHANNEL = metal_kernel(

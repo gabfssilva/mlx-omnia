@@ -1,257 +1,68 @@
-"""The disk catalog: what the scan accepts as a model, and how the routes name it.
+"""The disk catalog: what the scan accepts as a model, and what it prices a step at.
 
-The fake caches are built file by file rather than downloaded: the two cases that matter
-— a snapshot missing a shard of its `weight_map`, and an id carrying a `/` — are exactly
-the ones a real download never produces on demand. The shards are real safetensors all the
-same, because `bytes_per_token` is read out of their headers.
+`bytes_per_token` is checked where it can be: against `footprint.active_bytes_per_token` over
+a tree built and loaded here, which is the same walk the engine does once a model is resident,
+and against the 1.711 GB the house measured for the 30B MoE when that checkpoint happens to be
+on the machine.
 
-That number is checked where it can be: against `footprint.active_bytes_per_token` over a
-tree built and loaded here, which is the same walk the engine does once a model is
-resident, and against the 1.711 GB the house measured for the 30B MoE when that checkpoint
-happens to be on the machine.
+The routes over these entries are `test_catalog_routes.py`; the cache arithmetic per family
+shape is `test_catalog_kv.py`.
 """
 
 import json
-from collections.abc import Mapping, Sequence
-from dataclasses import asdict
 from pathlib import Path
-from tempfile import mkdtemp
-from urllib.parse import quote
 
-import mlx.core as mx
-import mlx.nn as nn
 import pytest
-from fastapi import FastAPI
-from fastapi.testclient import TestClient
-from mlx.utils import tree_flatten
 
 from mlx_omnia.engine.footprint import active_bytes_per_token, ceiling
 from mlx_omnia.engine.models.glm4_moe import CHECKPOINT as GLM4_MOE
 from mlx_omnia.engine.models.qwen3.moe import CHECKPOINT as QWEN3_MOE
-from mlx_omnia.engine.models.qwen3.moe import Qwen3MoE, Qwen3MoEConfig
-from mlx_omnia.engine.task import source
-from mlx_omnia.server import catalog
-from mlx_omnia.server.store import Store
+from mlx_omnia.server.services import catalog
+from mlx_omnia.server.services.catalog.config import TensorJson
 
-QUANTIZED = "mlx-community/Qwen3-0.6B-4bit"
-DENSE = "Qwen/Qwen3-0.6B"
-MOE = "mlx-community/Qwen3-30B-A3B-4bit"
-MOE_SHARED = "mlx-community/Qwen3.6-35B-A3B-4bit"
-MOE_TINY = "local/tiny-moe"
-
-TINY = Qwen3MoEConfig(
-    hidden_size=64,
-    num_hidden_layers=2,
-    num_attention_heads=4,
-    num_key_value_heads=2,
-    head_dim=16,
-    vocab_size=96,
-    rms_norm_eps=1e-6,
-    rope_theta=1000000.0,
-    tie_word_embeddings=False,
-    moe_intermediate_size=32,
-    num_experts=8,
-    num_experts_per_tok=2,
-    norm_topk_prob=True,
-    eos_token_id=(0,),
+from .catalog_stand import (
+    CONFIG,
+    DENSE,
+    DENSE_CONFIG,
+    GLM_CONFIG,
+    HEADERS,
+    MOE,
+    MOE_SHARED,
+    MOE_TINY,
+    QUANTIZED,
+    SHARD_BYTES,
+    checkpoint,
+    glm_checkpoint,
+    installed,
+    main,
+    moe_checkpoint,
+    repository,
+    shard,
+    use_caches,
 )
-"""Small enough to build, quantize and load inside a unit test, and shaped so that no
-projection's output width collides with the vocabulary — the only 2-D leaves of that height
-are the embedding table and the head, which is what tells them apart from each other."""
-
-GLM_LAYERS = 2
-GLM_CONFIG: dict[str, object] = {
-    "model_type": "glm4_moe",
-    "hidden_size": 64,
-    "num_hidden_layers": GLM_LAYERS,
-    "num_attention_heads": 4,
-    "num_key_value_heads": 2,
-    "head_dim": 16,
-    "vocab_size": 96,
-    "rms_norm_eps": 1e-6,
-    "rope_theta": 1000000.0,
-    "intermediate_size": 48,
-    "moe_intermediate_size": 32,
-    "n_routed_experts": 8,
-    "num_experts_per_tok": 2,
-    "n_group": 1,
-    "topk_group": 1,
-    "routed_scaling_factor": 1.0,
-    "norm_topk_prob": True,
-    "first_k_dense_replace": 0,
-    "n_shared_experts": 1,
-    "eos_token_id": 0,
-    "max_position_embeddings": 128,
-}
-"""A MoE that names its expert count `n_routed_experts` — no key the scan reads — and that
-ships an MTP block one layer past the trunk, which the loader drops. The two things a
-config alone cannot price."""
-
-CONFIG: dict[str, object] = {
-    "model_type": "qwen3",
-    "max_position_embeddings": 40960,
-    "torch_dtype": "bfloat16",
-    "quantization": {"group_size": 64, "bits": 4},
-}
-DENSE_CONFIG: dict[str, object] = {
-    "model_type": "qwen3",
-    "max_position_embeddings": 40960,
-    "torch_dtype": "bfloat16",
-}
 
 
 @pytest.fixture
 def caches(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> tuple[Path, Path]:
-    hub = tmp_path / "hub"
-    quantized = tmp_path / "quantized"
-    monkeypatch.setattr(catalog, "HUB_CACHE", hub)
-    monkeypatch.setattr(catalog, "QUANTIZED_CACHE", quantized)
-    return hub, quantized
-
-
-def _repository(hub: Path, model_id: str) -> Path:
-    return hub / f"models--{model_id.replace('/', '--')}"
-
-
-def _main(hub: Path, model_id: str, sha: str) -> None:
-    reference = _repository(hub, model_id) / "refs" / "main"
-    reference.parent.mkdir(parents=True, exist_ok=True)
-    reference.write_text(sha)
-
-
-SHARD_BYTES = 2048
-"""The payload of every fake shard below, and therefore what the scan prices each of them
-at: one bfloat16 vector that no rule excludes."""
-
-
-type Tensor = tuple[str, list[int], int]
-"""A tensor as a fake shard declares it: name, shape and the bytes it occupies."""
-
-
-def _shard(path: Path, extra: Sequence[Tensor] = ()) -> None:
-    """safetensors as the scan reads it: a little-endian u64 with the header's length, the
-    JSON header, then the payload the offsets describe. `extra` is written after the vector
-    every shard carries."""
-    tensors: dict[str, object] = {
-        "model.norm.weight": {"dtype": "BF16", "shape": [1024], "data_offsets": [0, SHARD_BYTES]}
-    }
-    offset = SHARD_BYTES
-    for name, shape, size in extra:
-        tensors[name] = {"dtype": "BF16", "shape": shape, "data_offsets": [offset, offset + size]}
-        offset += size
-    header = json.dumps(tensors).encode()
-    path.write_bytes(len(header).to_bytes(8, "little") + header + b"\0" * offset)
-
-
-def _checkpoint(
-    directory: Path,
-    config: Mapping[str, object],
-    shards: Sequence[str] = ("model.safetensors",),
-    missing: Sequence[str] = (),
-    extra: Sequence[Tensor] = (),
-) -> Path:
-    """The three things the scan reads: the config, the index naming every shard, and the
-    shards that were actually written — `missing` names the ones the download never got."""
-    directory.mkdir(parents=True, exist_ok=True)
-    (directory / "config.json").write_text(json.dumps(config))
-    weight_map = {f"weight.{i}": name for i, name in enumerate([*shards, *missing])}
-    (directory / "model.safetensors.index.json").write_text(json.dumps({"weight_map": weight_map}))
-    for name in shards:
-        _shard(directory / name, extra)
-    return directory
-
-
-def _moe_checkpoint(directory: Path, *, bits: int | None) -> Path:
-    """The tiny MoE on disk, written under the tree's own parameter names. Both of this
-    architecture's load-time fusions are no-ops when the pre-fusion tensors are absent, so
-    what is flattened out of the tree here is exactly what `load_weights(strict=True)` reads
-    back — no second name table, and the loaded tree is the one that was saved."""
-    mx.random.seed(0)
-    model = Qwen3MoE(TINY)
-    if bits is not None:
-        nn.quantize(model, group_size=32, bits=bits)
-    mx.eval(model.parameters())
-    directory.mkdir(parents=True, exist_ok=True)
-    (directory / "config.json").write_text(
-        json.dumps({**asdict(TINY), "model_type": "qwen3_moe", "max_position_embeddings": 128})
-    )
-    weights = dict(tree_flatten(model.parameters()))
-    mx.save_safetensors(str(directory / "model.safetensors"), weights)
-    return directory
-
-
-def _index(directory: Path) -> None:
-    """What the scan needs beside the weights to call a directory a model."""
-    (directory / "model.safetensors.index.json").write_text(
-        json.dumps({"weight_map": {"weight.0": "model.safetensors"}})
-    )
-
-
-def _glm_checkpoint(directory: Path) -> int:
-    """The tiny glm4_moe on disk, plus the MTP block GLM ships one layer past the trunk and
-    the loader drops. Answers with the bytes of that block, which is what the headers price
-    and the tree does not.
-
-    The tree it saves is the one the config builds — `source` stops the load exactly there —
-    so the names on disk are the ones `load_weights(strict=True)` asks for; this
-    architecture's fusions are all no-ops when the pre-fusion tensors are absent."""
-    directory.mkdir(parents=True, exist_ok=True)
-    (directory / "config.json").write_text(json.dumps(GLM_CONFIG))
-    mx.random.seed(0)
-    model = source(directory, local_files_only=True).pending.model
-    mx.eval(model.parameters())
-    extra = {
-        f"model.layers.{GLM_LAYERS}.mlp.gate_proj.weight": mx.zeros((32, 64)),
-        f"model.layers.{GLM_LAYERS}.input_layernorm.weight": mx.zeros((64,)),
-    }
-    weights = dict(tree_flatten(model.parameters()))
-    mx.save_safetensors(str(directory / "model.safetensors"), {**weights, **extra})
-    return sum(value.nbytes for value in extra.values())
-
-
-def _installed(hub: Path, model_id: str, config: Mapping[str, object] = CONFIG) -> Path:
-    """A repository at a single revision, which is what `refs/main` points at."""
-    snapshot = _checkpoint(_repository(hub, model_id) / "snapshots" / "head", config)
-    _main(hub, model_id, "head")
-    return snapshot
-
-
-_SPARE = Store(Path(mkdtemp()) / "server.db")
-"""One database for every client that does not ask for one. The delete handler reads a store —
-it forgets the prefixes spilled under the id it removes — and nothing else here does, so a
-file per client would be a temporary directory per test for a table none of them writes."""
-
-
-def _client(*resident: str, active: int | None = None, store: Store | None = None) -> TestClient:
-    """`active` is what the engine's own walk over the loaded tree says each of them reads —
-    `None` is a resident model with no tree under it, which is what a test double is.
-
-    The store is here because a delete has to forget what was spilled under the id it is
-    removing: a conversation keyed to a checkpoint that no longer exists is bytes nobody can
-    name. In memory when no test cares, which is every test but that one."""
-    app = FastAPI()
-    app.state.store = _SPARE if store is None else store
-    app.include_router(catalog.router)
-    app.dependency_overrides[catalog.resident_models] = lambda: dict.fromkeys(resident, active)
-    return TestClient(app)
+    return use_caches(tmp_path, monkeypatch)
 
 
 def test_a_repository_is_one_entry_at_the_revision_refs_main_names(
     caches: tuple[Path, Path],
 ) -> None:
     hub, _ = caches
-    _checkpoint(
-        _repository(hub, QUANTIZED) / "snapshots" / "stale",
+    checkpoint(
+        repository(hub, QUANTIZED) / "snapshots" / "stale",
         {**CONFIG, "max_position_embeddings": 1},
     )
-    head = _checkpoint(_repository(hub, QUANTIZED) / "snapshots" / "head", CONFIG)
-    _main(hub, QUANTIZED, "head")
+    head = checkpoint(repository(hub, QUANTIZED) / "snapshots" / "head", CONFIG)
+    main(hub, QUANTIZED, "head")
 
     entries = catalog.scan()
     assert [entry.id for entry in entries] == [QUANTIZED]
     entry = entries[0]
     assert entry.directory == head
-    assert entry.store == _repository(hub, QUANTIZED)
+    assert entry.store == repository(hub, QUANTIZED)
     assert entry.architecture == "qwen3"
     assert entry.quantization == "4-bit"
     assert entry.dtype == "bfloat16"
@@ -264,13 +75,13 @@ def test_a_snapshot_missing_a_shard_of_the_weight_map_is_not_an_entry(
     caches: tuple[Path, Path],
 ) -> None:
     hub, _ = caches
-    snapshot = _checkpoint(
-        _repository(hub, QUANTIZED) / "snapshots" / "head",
+    snapshot = checkpoint(
+        repository(hub, QUANTIZED) / "snapshots" / "head",
         CONFIG,
         shards=("model-00001-of-00002.safetensors",),
         missing=("model-00002-of-00002.safetensors",),
     )
-    _main(hub, QUANTIZED, "head")
+    main(hub, QUANTIZED, "head")
     assert catalog.scan() == []
 
     # And it is the shard that decides, not something else about this snapshot.
@@ -282,9 +93,9 @@ def test_a_shard_whose_blob_never_landed_is_not_an_entry(caches: tuple[Path, Pat
     """The hub stores a snapshot as symlinks into `blobs/`, so an incomplete download shows
     up as a link with nothing behind it rather than as a missing name."""
     hub, _ = caches
-    snapshot = _installed(hub, QUANTIZED)
+    snapshot = installed(hub, QUANTIZED)
     (snapshot / "model.safetensors").unlink()
-    (snapshot / "model.safetensors").symlink_to(_repository(hub, QUANTIZED) / "blobs" / "deadbeef")
+    (snapshot / "model.safetensors").symlink_to(repository(hub, QUANTIZED) / "blobs" / "deadbeef")
     assert catalog.scan() == []
 
 
@@ -293,8 +104,8 @@ def test_a_quantized_entry_is_named_by_its_directory_and_staging_is_not_listed(
 ) -> None:
     _, quantized = caches
     source = quantized / "mlx-community--Qwen3-0.6B"
-    entry_directory = _checkpoint(source / "0123456789abcdef", CONFIG)
-    _checkpoint(source / ".tmp-halfway", CONFIG)
+    entry_directory = checkpoint(source / "0123456789abcdef", CONFIG)
+    checkpoint(source / ".tmp-halfway", CONFIG)
 
     entries = catalog.scan()
     assert [entry.id for entry in entries] == [str(entry_directory)]
@@ -313,131 +124,16 @@ def test_a_per_leaf_plan_reports_the_width_its_leaves_agree_on(
     caches: tuple[Path, Path], leaves: dict[str, object], expected: str
 ) -> None:
     hub, _ = caches
-    _installed(hub, QUANTIZED, {**CONFIG, "quantization": {"leaves": leaves}})
+    installed(hub, QUANTIZED, {**CONFIG, "quantization": {"leaves": leaves}})
     assert catalog.scan()[0].quantization == expected
 
 
 def test_a_checkpoint_that_declares_no_quantization_is_dense(caches: tuple[Path, Path]) -> None:
     hub, _ = caches
-    _installed(hub, DENSE, DENSE_CONFIG)
+    installed(hub, DENSE, DENSE_CONFIG)
     entry = catalog.scan()[0]
     assert entry.quantization is None
     assert entry.dtype == "bfloat16"
-
-
-def test_an_id_with_a_slash_is_routed_raw_and_percent_encoded(
-    caches: tuple[Path, Path],
-) -> None:
-    hub, _ = caches
-    _installed(hub, QUANTIZED)
-    client = _client()
-
-    raw = client.get(f"/admin/models/{QUANTIZED}")
-    encoded = client.get(f"/admin/models/{quote(QUANTIZED, safe='')}")
-    assert raw.status_code == 200, raw.text
-    assert raw.json()["id"] == QUANTIZED
-    assert encoded.status_code == 200, encoded.text
-    assert encoded.json() == raw.json()
-
-
-def test_the_catalog_says_which_entry_is_resident_and_can_list_only_those(
-    caches: tuple[Path, Path],
-) -> None:
-    hub, _ = caches
-    _installed(hub, QUANTIZED)
-    _installed(hub, DENSE, DENSE_CONFIG)
-    client = _client(QUANTIZED)
-
-    everything = client.get("/admin/models").json()
-    assert {entry["id"]: entry["resident"] for entry in everything} == {
-        QUANTIZED: True,
-        DENSE: False,
-    }
-    only = client.get("/admin/models", params={"resident": "true"}).json()
-    assert [entry["id"] for entry in only] == [QUANTIZED]
-
-
-def test_deleting_a_resident_model_is_refused_and_says_why(caches: tuple[Path, Path]) -> None:
-    hub, _ = caches
-    _installed(hub, QUANTIZED)
-    response = _client(QUANTIZED).delete(f"/admin/models/{QUANTIZED}")
-    assert response.status_code == 409, response.text
-    assert "resident" in response.json()["detail"]
-    assert _repository(hub, QUANTIZED).is_dir()
-
-
-def test_deleting_a_model_that_is_not_resident_takes_its_blobs_with_it(
-    caches: tuple[Path, Path],
-) -> None:
-    """Removing the snapshot alone frees nothing: it is symlinks, and the bytes are in
-    `blobs/`."""
-    hub, _ = caches
-    _installed(hub, QUANTIZED)
-    blob = _repository(hub, QUANTIZED) / "blobs" / "deadbeef"
-    blob.parent.mkdir(parents=True)
-    blob.write_bytes(b"\0" * 2048)
-
-    response = _client().delete(f"/admin/models/{QUANTIZED}")
-    assert response.status_code == 204, response.text
-    assert not _repository(hub, QUANTIZED).exists()
-    assert catalog.scan() == []
-
-
-def test_a_model_that_is_not_on_disk_is_a_404(caches: tuple[Path, Path]) -> None:
-    client = _client()
-    assert client.get("/admin/models/nope").status_code == 404
-    assert client.delete("/admin/models/nope").status_code == 404
-
-
-def test_the_card_is_the_readme_raw_and_absent_is_a_404(caches: tuple[Path, Path]) -> None:
-    hub, _ = caches
-    snapshot = _installed(hub, QUANTIZED)
-    _installed(hub, DENSE)
-    (snapshot / "README.md").write_text("---\nlicense: mit\n---\n# hello\n")
-    client = _client()
-    answer = client.get(f"/admin/models/{quote(QUANTIZED, safe='')}/card")
-    assert answer.status_code == 200
-    assert answer.text == "---\nlicense: mit\n---\n# hello\n"
-    assert client.get(f"/admin/models/{quote(DENSE, safe='')}/card").status_code == 404
-
-
-def test_the_files_listing_prices_each_name_through_the_symlink(
-    caches: tuple[Path, Path],
-) -> None:
-    hub, _ = caches
-    snapshot = _installed(hub, QUANTIZED)
-    blob = snapshot.parent.parent / "blobs" / "cafe"
-    blob.parent.mkdir(parents=True)
-    blob.write_bytes(b"\x89PNG" + b"\0" * 96)
-    (snapshot / "ladder.png").symlink_to(blob)
-    client = _client()
-    answer = client.get(f"/admin/models/{quote(QUANTIZED, safe='')}/files")
-    assert answer.status_code == 200
-    listed = {entry["name"]: entry["size"] for entry in answer.json()}
-    assert listed["ladder.png"] == 100
-    assert set(listed) == {
-        "config.json",
-        "model.safetensors.index.json",
-        "model.safetensors",
-        "ladder.png",
-    }
-    assert [entry["name"] for entry in answer.json()] == sorted(listed)
-
-
-def test_an_asset_is_served_from_the_checkpoint_and_nowhere_else(
-    caches: tuple[Path, Path], tmp_path: Path
-) -> None:
-    hub, _ = caches
-    snapshot = _installed(hub, QUANTIZED)
-    (snapshot / "ladder.png").write_bytes(b"\x89PNG-bytes")
-    outside = tmp_path / "secret.txt"
-    outside.write_text("not yours")
-    client = _client()
-    base = f"/admin/models/{quote(QUANTIZED, safe='')}/assets"
-    assert client.get(f"{base}/ladder.png").content == b"\x89PNG-bytes"
-    assert client.get(f"{base}/missing.png").status_code == 404
-    assert client.get(f"{base}/{quote('../secret.txt', safe='')}").status_code == 404
-    assert client.get(f"{base}/{quote(str(outside), safe='')}").status_code == 404
 
 
 def test_a_shard_that_is_not_safetensors_leaves_the_entry_listed_without_a_price(
@@ -447,7 +143,7 @@ def test_a_shard_that_is_not_safetensors_leaves_the_entry_listed_without_a_price
     its id, its architecture and its bytes on disk are all true. What it loses is the one
     number that comes out of the shard itself."""
     hub, _ = caches
-    snapshot = _installed(hub, QUANTIZED)
+    snapshot = installed(hub, QUANTIZED)
     (snapshot / "model.safetensors").write_bytes(b"not safetensors at all")
 
     (entry,) = catalog.scan()
@@ -465,30 +161,37 @@ def test_a_second_scan_reads_no_header_and_a_shard_that_moves_is_repriced(
     are read once per state of the disk and not once per caller. What decides that state is
     the stamp: rewriting a shard reprices the entry even though its name never changed."""
     hub, _ = caches
-    snapshot = _installed(hub, DENSE)
+    snapshot = installed(hub, DENSE)
     reads: list[Path] = []
     inner = catalog._tensors
-    monkeypatch.setattr(catalog, "_tensors", lambda path: reads.append(path) or inner(path))
+
+    def counted(path: Path) -> list[tuple[str, TensorJson, int]] | None:
+        reads.append(path)
+        return inner(path)
+
+    monkeypatch.setattr(HEADERS, "tensors_of", counted)
 
     first = catalog.scan()
-    assert reads == [snapshot]
+    assert reads
+    assert set(reads) == {snapshot}
+    once = list(reads)
 
     assert catalog.scan() == first
-    assert reads == [snapshot]
+    assert reads == once
 
-    _shard(snapshot / "model.safetensors", extra=[("model.extra.weight", [512], SHARD_BYTES)])
+    shard(snapshot / "model.safetensors", extra=[("model.extra.weight", [512], SHARD_BYTES)])
     (second,) = catalog.scan()
 
-    assert reads == [snapshot, snapshot]
+    assert reads == once + once
     assert second.bytes_per_token == 2 * SHARD_BYTES
 
     # The same bytes at the same length, written again: only the clock moved, and a stamp
     # that cannot see it would answer a checkpoint that was rebuilt in place with the
     # numbers of the one it replaced.
-    _shard(snapshot / "model.safetensors", extra=[("model.extra.weight", [512], SHARD_BYTES)])
+    shard(snapshot / "model.safetensors", extra=[("model.extra.weight", [512], SHARD_BYTES)])
 
     assert catalog.scan() == [second]
-    assert reads == [snapshot, snapshot, snapshot]
+    assert reads == once + once + once
 
 
 @pytest.mark.parametrize("bits", [None, 4])
@@ -504,8 +207,8 @@ def test_the_scan_prices_a_step_at_what_the_loaded_tree_reads(
     checkpoint — 2 of 8 experts here, and reporting the whole stack would put it above.
     """
     hub, _ = caches
-    directory = _moe_checkpoint(_repository(hub, MOE_TINY) / "snapshots" / "head", bits=bits)
-    _main(hub, MOE_TINY, "head")
+    directory = moe_checkpoint(repository(hub, MOE_TINY) / "snapshots" / "head", bits=bits)
+    main(hub, MOE_TINY, "head")
 
     (entry,) = catalog.scan()
 
@@ -529,34 +232,15 @@ def test_the_rows_a_step_reads_come_off_the_tree_and_not_off_a_config_key(
     exactly that block and by nothing else.
     """
     hub, _ = caches
-    directory = _repository(hub, MOE_TINY) / "snapshots" / "head"
-    dropped = _glm_checkpoint(directory)
-    _main(hub, MOE_TINY, "head")
+    directory = repository(hub, MOE_TINY) / "snapshots" / "head"
+    dropped = glm_checkpoint(directory)
+    main(hub, MOE_TINY, "head")
 
     (entry,) = catalog.scan()
 
     assert entry.bytes_per_token == active_bytes_per_token(GLM4_MOE.load(directory, None)) + dropped
+    assert entry.bytes_per_token is not None
     assert entry.bytes_per_token * 2 < (directory / "model.safetensors").stat().st_size
-
-
-def test_a_resident_entry_is_priced_by_the_tree_that_is_answering_the_requests(
-    caches: tuple[Path, Path],
-) -> None:
-    """The estimate off the headers is what an entry carries until it is loaded; from then
-    on the number is the engine's walk over the real tree, which is the one that knows what
-    the loader dropped. A resident model with no tree under it keeps the estimate."""
-    hub, _ = caches
-    directory = _repository(hub, MOE_TINY) / "snapshots" / "head"
-    dropped = _glm_checkpoint(directory)
-    _main(hub, MOE_TINY, "head")
-    estimate = active_bytes_per_token(GLM4_MOE.load(directory, None)) + dropped
-
-    listed = _client(MOE_TINY, active=estimate - dropped).get("/admin/models").json()
-    assert [entry["bytes_per_token"] for entry in listed] == [estimate - dropped]
-
-    untreed = _client(MOE_TINY).get(f"/admin/models/{quote(MOE_TINY, safe='')}").json()
-    assert untreed["bytes_per_token"] == estimate
-    assert catalog.scan()[0].bytes_per_token == estimate
 
 
 def test_an_architecture_with_no_tree_leaves_a_stacked_checkpoint_unpriced(
@@ -566,10 +250,10 @@ def test_an_architecture_with_no_tree_leaves_a_stacked_checkpoint_unpriced(
     stacks — but how many of their rows a step reads is the tree's to say, and there is no
     tree. The entry reports no number rather than an invented one."""
     hub, _ = caches
-    directory = _repository(hub, MOE_TINY) / "snapshots" / "head"
-    _glm_checkpoint(directory)
+    directory = repository(hub, MOE_TINY) / "snapshots" / "head"
+    glm_checkpoint(directory)
     (directory / "config.json").write_text(json.dumps({**GLM_CONFIG, "model_type": "glm9_moe"}))
-    _main(hub, MOE_TINY, "head")
+    main(hub, MOE_TINY, "head")
 
     (entry,) = catalog.scan()
 
@@ -579,18 +263,18 @@ def test_an_architecture_with_no_tree_leaves_a_stacked_checkpoint_unpriced(
 
 
 def test_the_thirty_billion_moe_prices_at_the_gigabyte_the_house_measured() -> None:
-    """1.711 GB/token and a 286 tok/s ceiling — 8 of 128 experts at 4 bits plus the whole
+    """1.711 GB/token and a 356 tok/s ceiling — 8 of 128 experts at 4 bits plus the whole
     untied lm_head, with the 0.175 GB embedding table out because a step gathers one row of
     it. Read off the headers of a checkpoint this suite never opens, let alone loads;
     skipped rather than downloading 17 GB."""
-    if not _repository(catalog.HUB_CACHE, MOE).is_dir():
+    if not repository(catalog.HUB_CACHE, MOE).is_dir():
         pytest.skip(f"{MOE} is not in the hub cache")
 
     entry = {found.id: found for found in catalog.scan()}[MOE]
 
     assert entry.bytes_per_token is not None
     assert round(entry.bytes_per_token / 1e9, 3) == 1.711
-    assert round(ceiling(entry.bytes_per_token)) == 286
+    assert round(ceiling(entry.bytes_per_token)) == 356
 
 
 @pytest.mark.parametrize(
@@ -606,12 +290,12 @@ def test_the_vision_towers_position_table_is_not_priced_into_a_text_step(
     is what tells it apart; the tensor beside it, from the same tower, is still priced."""
     hub, _ = caches
     table = 2304 * 1152 * 2
-    _checkpoint(
-        _repository(hub, QUANTIZED) / "snapshots" / "head",
+    checkpoint(
+        repository(hub, QUANTIZED) / "snapshots" / "head",
         CONFIG,
         extra=((name, [2304, 1152], table),),
     )
-    _main(hub, QUANTIZED, "head")
+    main(hub, QUANTIZED, "head")
 
     (entry,) = catalog.scan()
 
@@ -625,7 +309,7 @@ def test_the_thirty_five_billion_moe_prices_the_shared_expert_whole() -> None:
     asserts over this checkpoint once loaded. That equality is what delta 0 means for the
     sixth family, and it is what this test is for; the number itself still carries the
     vision tower and still misses the recurrent state, which `test_footprint` spells out."""
-    if not _repository(catalog.HUB_CACHE, MOE_SHARED).is_dir():
+    if not repository(catalog.HUB_CACHE, MOE_SHARED).is_dir():
         pytest.skip(f"{MOE_SHARED} is not in the hub cache")
 
     entry = {found.id: found for found in catalog.scan()}[MOE_SHARED]
@@ -636,7 +320,7 @@ def test_the_thirty_five_billion_moe_prices_the_shared_expert_whole() -> None:
 def test_a_real_repository_from_the_hub_cache_reads_its_own_numbers() -> None:
     """The scan against the machine's cache, over the checkpoint the API gate already
     uses. Skipped rather than downloading: this suite is not what pulls 350 MB."""
-    if not _repository(catalog.HUB_CACHE, QUANTIZED).is_dir():
+    if not repository(catalog.HUB_CACHE, QUANTIZED).is_dir():
         pytest.skip(f"{QUANTIZED} is not in the hub cache")
 
     entries = {entry.id: entry for entry in catalog.scan()}
@@ -647,454 +331,3 @@ def test_a_real_repository_from_the_hub_cache_reads_its_own_numbers() -> None:
     assert entry.context == 40960
     assert (entry.directory / "model.safetensors").is_file()
     assert 0.30 < entry.bytes_on_disk / 1e9 < 0.45
-
-
-# The cache arithmetic, one entry per family shape the port covers. `kv` is elements per
-# token summed over the attending layers, worked out by hand from the config beside it;
-# the entry answers with those elements at the shards' float width (BF16, so two bytes).
-KV_FIXTURES: list[tuple[str, dict[str, object], int | None, int | None]] = [
-    (
-        "qwen3_moe: full attention, grouped keys — 2 · 4 kv heads · 128 · 48 layers",
-        {
-            "model_type": "qwen3_moe",
-            "num_hidden_layers": 48,
-            "num_attention_heads": 32,
-            "num_key_value_heads": 4,
-            "head_dim": 128,
-            "hidden_size": 2048,
-            "vocab_size": 151936,
-        },
-        2 * 4 * 128 * 48,
-        None,
-    ),
-    (
-        "llama dense: head_dim absent, so hidden_size ÷ heads",
-        {
-            "model_type": "llama",
-            "num_hidden_layers": 32,
-            "num_attention_heads": 32,
-            "num_key_value_heads": 8,
-            "hidden_size": 4096,
-            "vocab_size": 128256,
-        },
-        2 * 8 * 128 * 32,
-        None,
-    ),
-    (
-        "gpt_oss: half the layers slide and half do not, so every layer still caches and "
-        "no window is reported",
-        {
-            "model_type": "gpt_oss",
-            "num_hidden_layers": 4,
-            "num_attention_heads": 64,
-            "num_key_value_heads": 8,
-            "head_dim": 64,
-            "hidden_size": 2880,
-            "vocab_size": 201088,
-            "sliding_window": 128,
-            "layer_types": [
-                "sliding_attention",
-                "full_attention",
-                "sliding_attention",
-                "full_attention",
-            ],
-        },
-        2 * 8 * 64 * 4,
-        None,
-    ),
-    (
-        "a checkpoint that slides on every layer reports the window",
-        {
-            "model_type": "qwen3",
-            "num_hidden_layers": 2,
-            "num_attention_heads": 8,
-            "num_key_value_heads": 2,
-            "head_dim": 64,
-            "hidden_size": 512,
-            "vocab_size": 1024,
-            "sliding_window": 4096,
-            "layer_types": ["sliding_attention", "sliding_attention"],
-        },
-        2 * 2 * 64 * 2,
-        4096,
-    ),
-    (
-        "lfm2_moe: only the attention layers of a hybrid keep a growing cache",
-        {
-            "model_type": "lfm2_moe",
-            "num_hidden_layers": 6,
-            "num_attention_heads": 16,
-            "num_key_value_heads": 4,
-            "head_dim": 64,
-            "hidden_size": 1024,
-            "vocab_size": 65536,
-            "layer_types": ["conv", "conv", "full_attention", "conv", "conv", "full_attention"],
-        },
-        2 * 4 * 64 * 2,
-        None,
-    ),
-    (
-        "bailing_hybrid: a latent cache is the compressed vector plus the rotated key, "
-        "over the attending layers alone",
-        {
-            "model_type": "bailing_hybrid",
-            "num_hidden_layers": 4,
-            "num_attention_heads": 16,
-            "head_dim": 128,
-            "hidden_size": 2048,
-            "vocab_size": 157184,
-            "kv_lora_rank": 512,
-            "qk_rope_head_dim": 64,
-            "full_attn_idxs": [3],
-        },
-        (512 + 64) * 1,
-        None,
-    ),
-    (
-        "bailing_hybrid: the real Ling-3.0-flash layout, declared by group stride and by "
-        "neither of the two list forms",
-        {
-            "model_type": "bailing_hybrid",
-            "num_hidden_layers": 42,
-            "num_attention_heads": 32,
-            "head_dim": 128,
-            "hidden_size": 4096,
-            "vocab_size": 157184,
-            "kv_lora_rank": 512,
-            "qk_rope_head_dim": 64,
-            "layer_group_size": 6,
-        },
-        (512 + 64) * 7,
-        None,
-    ),
-    (
-        "a group stride the layer count does not fill: the trailing partial group attends "
-        "throughout",
-        {
-            "model_type": "bailing_hybrid",
-            "num_hidden_layers": 14,
-            "num_attention_heads": 32,
-            "head_dim": 128,
-            "hidden_size": 4096,
-            "vocab_size": 157184,
-            "kv_lora_rank": 512,
-            "qk_rope_head_dim": 64,
-            "layer_group_size": 6,
-        },
-        (512 + 64) * 4,
-        None,
-    ),
-    (
-        "a config that names no head count is not priced at all",
-        {"model_type": "mystery", "num_hidden_layers": 4, "vocab_size": 32},
-        None,
-        None,
-    ),
-]
-
-
-@pytest.mark.parametrize(
-    ("case", "config", "elements", "window"),
-    KV_FIXTURES,
-    ids=[case.split(":")[0] for case, _, _, _ in KV_FIXTURES],
-)
-def test_the_cache_cost_of_a_token_comes_off_the_config(
-    caches: tuple[Path, Path],
-    case: str,
-    config: dict[str, object],
-    elements: int | None,
-    window: int | None,
-) -> None:
-    hub, _ = caches
-    _main(hub, "house/kv", "sha")
-    _checkpoint(_repository(hub, "house/kv") / "snapshots" / "sha", config)
-
-    (entry,) = catalog.scan()
-
-    assert entry.kv_bytes_per_token == (None if elements is None else elements * 2), case
-    assert entry.attention_window == window, case
-
-
-def test_a_recurrent_layer_is_not_charged_for_a_cache_it_does_not_grow(
-    caches: tuple[Path, Path],
-) -> None:
-    """The mutation this guards: counting `num_hidden_layers` instead of the attending
-    ones charges a hybrid three times what its cache costs."""
-    hub, _ = caches
-    hybrid: dict[str, object] = {
-        "model_type": "lfm2_moe",
-        "num_hidden_layers": 6,
-        "num_attention_heads": 16,
-        "num_key_value_heads": 4,
-        "head_dim": 64,
-        "hidden_size": 1024,
-        "vocab_size": 65536,
-        "layer_types": ["conv", "conv", "full_attention", "conv", "conv", "full_attention"],
-    }
-    _main(hub, "house/hybrid", "sha")
-    _checkpoint(_repository(hub, "house/hybrid") / "snapshots" / "sha", hybrid)
-
-    (entry,) = catalog.scan()
-
-    dense = 2 * 4 * 64 * 6 * 2
-    assert entry.kv_bytes_per_token is not None
-    assert entry.kv_bytes_per_token * 3 == dense
-
-
-def test_a_named_layout_outranks_the_group_stride(caches: tuple[Path, Path]) -> None:
-    """The stride is the last of the three forms read, and it has to stay that way: it
-    describes a repeating group, and a config that also names its layers one by one has said
-    something more specific than the repeat. Here the two disagree on purpose — the list says
-    two of six attend, the stride would say one."""
-    hub, _ = caches
-    both: dict[str, object] = {
-        "model_type": "house/mixed",
-        "num_hidden_layers": 6,
-        "num_attention_heads": 16,
-        "num_key_value_heads": 4,
-        "head_dim": 64,
-        "hidden_size": 1024,
-        "vocab_size": 65536,
-        "layer_types": ["conv", "conv", "full_attention", "conv", "conv", "full_attention"],
-        "layer_group_size": 6,
-    }
-    _main(hub, "house/both", "sha")
-    _checkpoint(_repository(hub, "house/both") / "snapshots" / "sha", both)
-
-    (entry,) = catalog.scan()
-
-    assert entry.kv_bytes_per_token == 2 * 4 * 64 * 2 * 2
-
-
-def test_the_text_tower_of_a_nested_config_is_what_answers(caches: tuple[Path, Path]) -> None:
-    """qwen3.5 declares the shape under `text_config`, and the root describes the whole
-    multimodal thing."""
-    hub, _ = caches
-    nested: dict[str, object] = {
-        "model_type": "qwen3_5",
-        "text_config": {
-            "num_hidden_layers": 2,
-            "num_attention_heads": 8,
-            "num_key_value_heads": 2,
-            "head_dim": 64,
-            "hidden_size": 512,
-            "vocab_size": 4096,
-        },
-    }
-    _main(hub, "house/nested", "sha")
-    _checkpoint(_repository(hub, "house/nested") / "snapshots" / "sha", nested)
-
-    (entry,) = catalog.scan()
-
-    assert entry.kv_bytes_per_token == 2 * 2 * 64 * 2 * 2
-    assert entry.vocab_size == 4096
-    assert entry.shape == "qwen3_5/L2/H512/A8/V4096"
-
-
-def test_a_fine_tune_prints_the_same_shape_as_its_base(caches: tuple[Path, Path]) -> None:
-    """Which is why the print validates a declared pair and never proposes one."""
-    hub, _ = caches
-    base: dict[str, object] = {
-        "model_type": "qwen3",
-        "num_hidden_layers": 2,
-        "num_attention_heads": 8,
-        "hidden_size": 512,
-        "vocab_size": 1024,
-    }
-    for name in ("house/base", "house/tuned"):
-        _main(hub, name, "sha")
-        _checkpoint(_repository(hub, name) / "snapshots" / "sha", base)
-
-    prints = {entry.shape for entry in catalog.scan()}
-
-    assert prints == {"qwen3/L2/H512/A8/V1024"}
-
-
-def test_the_model_route_carries_the_cache_facts(caches: tuple[Path, Path]) -> None:
-    hub, _ = caches
-    _main(hub, "house/kv", "sha")
-    _checkpoint(_repository(hub, "house/kv") / "snapshots" / "sha", CONFIG)
-
-    body = _client().get("/admin/models").json()
-
-    assert body
-    for entry in body:
-        assert {"kv_bytes_per_token", "attention_window", "vocab_size", "shape"} <= set(entry)
-
-
-SEEING = "house/with-eyes"
-
-SEEING_CONFIG: dict[str, object] = {
-    "model_type": "qwen3_5",
-    "image_token_id": 100,
-    "vision_start_token_id": 101,
-    "vision_end_token_id": 102,
-    "vision_config": {
-        "depth": 2,
-        "hidden_size": 64,
-        "patch_size": 16,
-        "spatial_merge_size": 2,
-        "num_heads": 2,
-        "intermediate_size": 128,
-        "out_hidden_size": 64,
-        "in_channels": 3,
-        "temporal_patch_size": 2,
-        "num_position_embeddings": 64,
-        "deepstack_visual_indexes": [],
-        "hidden_act": "gelu_pytorch_tanh",
-    },
-    "text_config": {
-        "model_type": "qwen3_5",
-        "hidden_size": 64,
-        "num_hidden_layers": 2,
-        "num_attention_heads": 4,
-        "num_key_value_heads": 2,
-        "head_dim": 16,
-        "vocab_size": 128,
-        "rms_norm_eps": 1e-6,
-        "max_position_embeddings": 128,
-        "layer_types": ["full_attention", "linear_attention"],
-        "linear_num_key_heads": 2,
-        "linear_num_value_heads": 2,
-        "linear_key_head_dim": 16,
-        "linear_value_head_dim": 16,
-        "linear_conv_kernel_dim": 4,
-        "rope_parameters": {
-            "rope_type": "default",
-            "rope_theta": 10000.0,
-            "partial_rotary_factor": 0.25,
-            "mrope_section": [8, 4, 4],
-        },
-    },
-}
-"""A checkpoint of a family that has eyes. Every field is one the family's own config mirror
-requires — the scan does not read a single one of them, but `sight` parses the mirror, and a
-config it cannot parse is a model this catalog reports as taking no image."""
-
-PROCESSOR = {
-    "patch_size": 16,
-    "temporal_patch_size": 2,
-    "merge_size": 2,
-    "size": {"shortest_edge": 65536, "longest_edge": 16777216},
-    "image_mean": [0.5, 0.5, 0.5],
-    "image_std": [0.5, 0.5, 0.5],
-}
-"""qwen3.5's real geometry: patches of 16 folded 2x2, and an area window wide enough that
-neither bound moves the sizes below."""
-
-
-def _seeing(hub: Path, *, processor: bool = True) -> None:
-    snapshot = _installed(hub, SEEING, SEEING_CONFIG)
-    if processor:
-        (snapshot / "preprocessor_config.json").write_text(json.dumps(PROCESSOR))
-
-
-def test_a_checkpoint_with_a_tower_says_it_takes_an_image(caches: tuple[Path, Path]) -> None:
-    hub, _ = caches
-    _seeing(hub)
-    _installed(hub, QUANTIZED)
-
-    assert {entry.id: entry.sees for entry in catalog.scan()} == {SEEING: True, QUANTIZED: False}
-
-
-def test_the_same_tower_without_its_processor_takes_none(caches: tuple[Path, Path]) -> None:
-    """The truth is per checkpoint and not per architecture: the config declares the tower,
-    the file that says how to cut an image for it never landed, and the model the loader
-    builds refuses pictures. Reported on the family's name it would be offered one."""
-    hub, _ = caches
-    _seeing(hub, processor=False)
-
-    assert [entry.sees for entry in catalog.scan()] == [False]
-
-
-def test_an_image_is_priced_before_it_is_sent(caches: tuple[Path, Path]) -> None:
-    hub, _ = caches
-    _seeing(hub)
-
-    body = _client().get(f"/admin/models/{SEEING}/image", params={"height": 712, "width": 1236})
-
-    assert body.status_code == 200, body.text
-    # 1236x712 rounded to the patch block is 1248x704 — 78x44 patches, folded 2x2.
-    assert body.json() == {"height": 704, "width": 1248, "tokens": 858}
-
-
-def test_a_model_that_takes_no_image_says_so_rather_than_pricing_one(
-    caches: tuple[Path, Path],
-) -> None:
-    hub, _ = caches
-    _installed(hub, QUANTIZED)
-
-    refusal = _client().get(f"/admin/models/{QUANTIZED}/image", params={"height": 8, "width": 8})
-
-    assert refusal.status_code == 409, refusal.text
-    assert "takes no image" in refusal.json()["detail"]
-
-
-def test_an_image_with_no_size_is_refused(caches: tuple[Path, Path]) -> None:
-    hub, _ = caches
-    _seeing(hub)
-    client = _client()
-
-    size = {"height": 8, "width": 8}
-    flat = client.get(f"/admin/models/{SEEING}/image", params={**size, "height": 0})
-    assert flat.status_code == 422
-    assert client.get(f"/admin/models/{SEEING}/image").status_code == 422
-    assert client.get("/admin/models/house/nobody/image", params=size).status_code == 404
-
-
-# ── the blueprint ────────────────────────────────────────────────────────
-
-
-def test_the_blueprint_traces_the_step_without_loading_the_checkpoint(
-    caches: tuple[Path, Path],
-) -> None:
-    """The route builds the tree to answer, and building it reads no weight. What that has to
-    hold is both halves: the graph arrives, and MLX's live footprint does not move — a route
-    that quietly loaded 17 GB to draw a picture would answer the same and cost the machine
-    the model."""
-    hub, _ = caches
-    directory = _moe_checkpoint(_repository(hub, MOE_TINY) / "snapshots" / "head", bits=4)
-    _index(directory)
-    _main(hub, MOE_TINY, "head")
-    client = _client()
-
-    mx.clear_cache()
-    before = mx.get_active_memory()
-    answer = client.get(f"/admin/models/{quote(MOE_TINY, safe='')}/blueprint")
-    assert answer.status_code == 200, answer.json()
-    assert mx.get_active_memory() - before < 4096, "the route read a tensor"
-
-    drawn = answer.json()
-    assert [node["role"] for node in drawn["spine"]][:2] == ["embedding", "stack"]
-    (block,) = drawn["blocks"]
-    assert block["layers"] == list(range(TINY.num_hidden_layers))
-    # The wiring, which is the thing no config carries: the block's input is one side of the
-    # first sum, and the norm before the mixer reads the same input.
-    edges = {(edge["source"], edge["target"]) for edge in block["edges"] if edge["observed"]}
-    # One join and not two: this architecture's step hands the residual to the routed mixer
-    # and adds it in there, so only the attention sum is a `+` of its own. Which is the sort
-    # of thing the drawing exists to show and no config says.
-    (join,) = [node["id"] for node in block["nodes"] if node["role"] == "join"]
-    assert ("in", "input_layernorm") in edges
-    assert ("in", join) in edges
-    assert (join, "mlp") in edges
-    # And the kernel the routed mixer resolved to, which is what a dense tree would not have
-    # picked: the route decides on the config, and it had one to read.
-    routed = [node for node in block["nodes"] if node["kernels"]]
-    assert routed, "no operation reported which implementation ran"
-    assert any("Route" in name for node in routed for name in node["kernels"])
-
-
-def test_an_architecture_with_no_loader_is_refused_rather_than_drawn(
-    caches: tuple[Path, Path],
-) -> None:
-    hub, _ = caches
-    directory = _moe_checkpoint(_repository(hub, MOE_TINY) / "snapshots" / "head", bits=4)
-    _index(directory)
-    (directory / "config.json").write_text(json.dumps({**asdict(TINY), "model_type": "qwen9"}))
-    _main(hub, MOE_TINY, "head")
-
-    answer = _client().get(f"/admin/models/{quote(MOE_TINY, safe='')}/blueprint")
-
-    assert answer.status_code == 409
-    assert "qwen9" in answer.json()["detail"]

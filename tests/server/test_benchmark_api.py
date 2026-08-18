@@ -7,8 +7,8 @@ from pathlib import Path
 from fastapi.testclient import TestClient
 
 from mlx_omnia import GenerationOptions, Text
-from mlx_omnia.server import benchmarks
-from mlx_omnia.server.engine import Engine
+from mlx_omnia.server.runtime.engine import Engine
+from mlx_omnia.server.services import benchmarks
 from tests.server.benchmark_stand import (
     HUGE,
     SMALL,
@@ -198,7 +198,7 @@ def test_the_reservation_makes_everybody_else_wait_at_the_door(tmp_path: Path) -
         order.append("benchmark")
         await engine.release_queue(token)
         await asyncio.wait_for(waiting, 10)
-        engine.stop()
+        await engine.stop()
         return order
 
     assert asyncio.run(run()) == ["benchmark", "chat"]

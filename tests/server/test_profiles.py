@@ -1,151 +1,37 @@
 """Profiles: `model:profile` as a served id, and what naming one changes in a request.
 
-No checkpoint is loaded here. What a profile has to reach is the sampler and the chat
-template, and both run for real — `mlx_omnia.sampler` over a model whose logits are a fixed
-table, and the checkpoint-side `ChatCapability` over a ChatML template — which is what
-makes these assertions statements about the wiring rather than about a small model's
-willingness to obey an instruction.
-
-The rendered prompt is otherwise unobservable from outside: it is built inside the model,
-behind `stream`. `Echo` hands it back, so the system prompt a profile carries can be read
-where it actually lands.
+The stand every assertion here generates through — the tiny model, the echoing one, the
+template and the fake hub — is `profile_stand.py`'s. The model's own sampling row, the level
+under every profile, is `test_profiles_sampling.py`'s.
 """
 
 import json
-import threading
-from collections.abc import Iterator, Mapping, Sequence
-from dataclasses import dataclass, field
+from collections.abc import Iterator
 from pathlib import Path
-from typing import TypeIs
 
-import httpx
-import mlx.core as mx
-import mlx.nn as nn
 import pytest
 from fastapi.testclient import TestClient
 
-from mlx_omnia import (
-    TEXT,
-    Chat,
-    ChatCapability,
-    ChatTemplate,
-    CompositeModel,
-    GenerationOptions,
-    KVCache,
-    LanguageModel,
-    ModelInput,
-    ModelSignature,
-    Text,
-    TextLanguageModel,
+from mlx_omnia import Chat
+from mlx_omnia.server.services import catalog
+
+from .conftest import wired
+from .profile_stand import (
+    DENSE,
+    ECHO,
+    MODEL,
+    SCANNER,
+    SYSTEM,
+    TINY,
+    Loader,
+    ask,
+    echo,
+    installed,
+    profile_row,
+    put,
+    template,
+    tiny,
 )
-from mlx_omnia.engine.core.cache import LayerCache
-from mlx_omnia.engine.parsers import Segment
-from mlx_omnia.server import Engine, catalog, create_app
-from mlx_omnia.server.store import Store
-
-MODEL = "mlx-community/Qwen3-0.6B-4bit"
-DENSE = "Qwen/Qwen3-0.6B"
-"""Ids of the catalog fixture: what they name is never downloaded, and what the tests read
-off them is that an id carrying a `/` survives the route's path converter."""
-
-TINY = "test/tiny"
-ECHO = "test/echo"
-
-SYSTEM = "Answer only with the word BANANA."
-
-VOCAB = 8
-
-TEMPLATE = (
-    r"{% for message in messages %}"
-    r"{{ '<|im_start|>' + message.role + '\n' + message.content + '<|im_end|>\n' }}"
-    r"{% endfor %}"
-    r"{% if add_generation_prompt %}{{ '<|im_start|>assistant\n' }}{% endif %}"
-)
-"""ChatML, which is the shape of the template every checkpoint in the suite ships. Raw:
-the `\\n` is Jinja's escape inside a Jinja string, the way a checkpoint writes it."""
-
-CONFIG: dict[str, object] = {"model_type": "qwen3", "max_position_embeddings": 4096}
-
-
-class TinyLM(nn.Module):
-    """Logits from a fixed table, one row per token. Greedy over it is a fixed cycle and a
-    draw at temperature 2 is not, which is the whole difference the sampling test reads —
-    the spread is deliberately small so no token dominates the flattened distribution."""
-
-    def __init__(self) -> None:
-        super().__init__()
-        self.table = mx.array(
-            [
-                [((row * 3 + column * 5) % 7) * 0.25 for column in range(VOCAB)]
-                for row in range(VOCAB)
-            ]
-        )
-
-    def make_cache(self) -> list[KVCache]:
-        return [KVCache()]
-
-    def __call__(self, ids: mx.array, cache: Sequence[LayerCache] | None = None) -> mx.array:
-        return self.table[ids]
-
-
-class TinyTokenizer:
-    def encode(self, text: str | Iterator[str]) -> Iterator[int]:
-        whole = text if isinstance(text, str) else "".join(text)
-        return iter([sum(whole.encode()) % VOCAB])
-
-    def decode_bytes(self, ids: list[int]) -> bytes:
-        return bytes(ord("a") + token for token in ids)
-
-
-class Echo:
-    """A model whose answer is the prompt it was handed."""
-
-    @property
-    def native_signature(self) -> ModelSignature:
-        return ModelSignature(frozenset({TEXT}), frozenset({TEXT}))
-
-    def accepts(self, input: ModelInput) -> TypeIs[Text]:
-        return isinstance(input, Text)
-
-    def stream(self, input: Text, options: GenerationOptions) -> Iterator[Segment]:
-        yield Segment("content", input.value)
-
-
-def template() -> ChatTemplate:
-    return ChatTemplate.from_source(TEMPLATE)
-
-
-def tiny() -> CompositeModel[Text, Segment, GenerationOptions]:
-    """The production chain: a conversation enters through `ChatCapability`, which renders
-    it, and the text goes to the model the way a checkpoint's would."""
-    return CompositeModel(
-        TextLanguageModel(TinyLM(), TinyTokenizer()), [ChatCapability(template())]
-    )
-
-
-def echo() -> CompositeModel[Text, Segment, GenerationOptions]:
-    return CompositeModel(Echo(), [ChatCapability(template())])
-
-
-@dataclass
-class Loader:
-    """Records every id it is asked for: which name reached the loader is the whole claim
-    of the resolution rule, and a 200 by itself does not say which one did."""
-
-    models: Mapping[str, LanguageModel[ModelInput]]
-    asked: list[str] = field(default_factory=list)
-
-    def __call__(self, model_id: str) -> LanguageModel[ModelInput]:
-        self.asked.append(model_id)
-        model = self.models.get(model_id)
-        if model is None:
-            raise FileNotFoundError(model_id)
-        return model
-
-
-@pytest.fixture
-def store(tmp_path: Path) -> Store:
-    return Store(tmp_path / "server.db")
 
 
 @pytest.fixture
@@ -163,10 +49,10 @@ def loader(local: str) -> Loader:
 
 
 @pytest.fixture
-def client(store: Store, loader: Loader) -> Iterator[TestClient]:
+def client(loader: Loader) -> Iterator[TestClient]:
     """The app the daemon serves, not a router mounted on a throwaway `FastAPI`: what the
     profile routes have to survive is sharing `/admin/models` with the catalog's."""
-    with TestClient(create_app(Engine(loader), store)) as running:
+    with TestClient(wired(loader)) as running:
         yield running
 
 
@@ -174,8 +60,8 @@ def client(store: Store, loader: Loader) -> Iterator[TestClient]:
 def hub(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> Path:
     """The scan reads two module constants; the user's own caches are never touched."""
     root = tmp_path / "hub"
-    monkeypatch.setattr(catalog, "HUB_CACHE", root)
-    monkeypatch.setattr(catalog, "QUANTIZED_CACHE", tmp_path / "quantized")
+    monkeypatch.setattr(SCANNER, "HUB_CACHE", root)
+    monkeypatch.setattr(SCANNER, "QUANTIZED_CACHE", tmp_path / "quantized")
     # Both caches are keyed by id and the ids here repeat across tests, each over its own
     # `tmp_path`: without this, the second test to ask reads the first one's disk.
     catalog.context_of.cache_clear()
@@ -183,53 +69,8 @@ def hub(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> Path:
     return root
 
 
-def installed(hub: Path, model_id: str, generation: Mapping[str, object] | None = None) -> None:
-    repository = hub / f"models--{model_id.replace('/', '--')}"
-    snapshot = repository / "snapshots" / "head"
-    snapshot.mkdir(parents=True)
-    (snapshot / "config.json").write_text(json.dumps(CONFIG))
-    if generation is not None:
-        (snapshot / "generation_config.json").write_text(json.dumps(generation))
-    (snapshot / "model.safetensors").write_bytes(b"\0" * 64)
-    (repository / "refs").mkdir(parents=True)
-    (repository / "refs" / "main").write_text("head")
-
-
-def put(client: TestClient, model: str, name: str, **body: object) -> None:
-    response = client.put(f"/admin/models/{model}/profiles/{name}", json=body)
-    assert response.status_code == 200, response.text
-
-
-_DEADLINE = 30.0
-"""A deadline that holds, unlike the `timeout=` the `TestClient` accepts and ignores. Only the
-chat request needs one: it waits on the engine's queue from inside the handler, so a worker
-that never answers hangs the session instead of failing this test."""
-
-
-def ask(client: TestClient, model: str, **fields: object) -> str:
-    body: dict[str, object] = {
-        "model": model,
-        "messages": [{"role": "user", "content": "Hi"}],
-        "max_tokens": 32,
-    }
-    answered: list[httpx.Response] = []
-
-    def post() -> None:
-        answered.append(client.post("/api/openai/v1/chat/completions", json=body | fields))
-
-    thread = threading.Thread(target=post, daemon=True)
-    thread.start()
-    thread.join(_DEADLINE)
-    assert answered, f"the request did not answer within {_DEADLINE}s"
-    response = answered[0]
-    assert response.status_code == 200, response.text
-    content = response.json()["choices"][0]["message"]["content"]
-    assert isinstance(content, str)
-    return content
-
-
 def test_a_profile_is_written_read_replaced_and_deleted_under_its_model(
-    client: TestClient, store: Store
+    client: TestClient,
 ) -> None:
     """The sub-resource of a model, on the path it shares with the catalog's
     `{model_id:path}` — that one matches slashes, so mounted in the wrong order it answers
@@ -263,9 +104,9 @@ def test_a_profile_is_written_read_replaced_and_deleted_under_its_model(
     }
     assert client.get(url).json() == created.json()
 
-    row = store.profile(MODEL, "code")
+    row = profile_row(MODEL, "code")
     assert row is not None
-    assert json.loads(row.sampling) == {"temperature": 0.2, "top_k": 5}
+    assert json.loads(row[0]) == {"temperature": 0.2, "top_k": 5}
 
     assert client.put(url, json={"sampling": {"seed": 3}}).status_code == 200
     replaced = client.get(url).json()
@@ -471,104 +312,3 @@ def test_a_profile_that_does_not_exist_is_refused_instead_of_the_bare_model(
     assert loader.asked == [f"{TINY}:typo"]
     # And the model under the name is available, so the refusal is about the suffix.
     assert len(ask(client, TINY, max_tokens=4)) == 4
-
-
-def sample(client: TestClient, model: str, **knobs: object) -> None:
-    response = client.put(f"/admin/models/{model}/sampling", json=knobs)
-    assert response.status_code == 200, response.text
-
-
-def test_a_models_sampling_is_written_read_and_replaced(
-    client: TestClient, store: Store
-) -> None:
-    """The level under every profile of a model, on its own sub-resource. A `PUT` replaces
-    rather than patches, like a profile's: what the second body omits is a knob this daemon
-    no longer opines on, which is the only reading under which the body is the setting."""
-    url = f"/admin/models/{MODEL}/sampling"
-    assert client.get(url).json()["temperature"] is None
-
-    written = client.put(url, json={"temperature": 0.2, "top_k": 5})
-    assert written.status_code == 200, written.text
-    assert client.get(url).json() == written.json()
-    assert json.loads(store.model_settings(MODEL).sampling) == {"temperature": 0.2, "top_k": 5}
-
-    assert client.put(url, json={"seed": 3}).status_code == 200
-    replaced = client.get(url).json()
-    assert replaced["seed"] == 3
-    assert replaced["temperature"] is None
-
-
-def test_a_models_sampling_wins_over_what_the_checkpoint_declares(
-    client: TestClient, hub: Path
-) -> None:
-    """`generation_config.json` says how the people who trained it meant it to be sampled;
-    this row says how the person running it wants it sampled here, and the second is the more
-    specific of the two. Seeded, so the answer repeating says the row was read and the
-    greedy answer it is not says the file was outranked."""
-    installed(hub, TINY, generation={"do_sample": False, "temperature": 0.6})
-
-    greedy = ask(client, TINY)
-    sample(client, TINY, temperature=2, seed=7)
-    hot = ask(client, TINY)
-    assert hot != greedy
-    assert hot == ask(client, TINY)
-
-
-def test_a_profile_wins_over_the_models_sampling_and_fills_only_what_it_left_unset(
-    client: TestClient,
-) -> None:
-    """Two levels between the request and the checkpoint, and the profile is the upper one:
-    a preset written for a job outranks what the model says in general. What the profile does
-    not name is not overridden, though — the seed below is the model's, and it is what makes
-    the sampled answer repeat."""
-    sample(client, TINY, temperature=2, seed=7)
-    put(client, TINY, "cold", sampling={"temperature": 0})
-    put(client, TINY, "hot", sampling={"top_k": 3})
-
-    cold = ask(client, f"{TINY}:cold")
-    assert cold == ask(client, f"{TINY}:cold")
-    hot = ask(client, f"{TINY}:hot")
-    assert hot != cold
-    assert hot == ask(client, f"{TINY}:hot"), "the seed the profile never named is the model's"
-
-
-def test_a_knob_the_request_sends_wins_over_the_models_sampling(client: TestClient) -> None:
-    """The top of the four levels is still the request: a client that names a temperature
-    means it, whatever this daemon was told about the model."""
-    sample(client, TINY, temperature=2, seed=7)
-
-    hot = ask(client, TINY)
-    greedy = ask(client, TINY, temperature=0)
-    assert greedy != hot
-    assert greedy == ask(client, TINY, temperature=0)
-
-
-def test_a_models_sampling_and_its_features_are_kept_in_the_same_row_without_erasing_each_other(
-    client: TestClient, store: Store, hub: Path
-) -> None:
-    """Two routes write one row. A settings `PUT` that dropped the sampling — or a sampling
-    `PUT` that dropped the batch limit — would be a switch the reader set and cannot see."""
-    installed(hub, TINY)
-    sample(client, TINY, temperature=0.3)
-    settings = client.put(
-        f"/admin/models/{TINY}/settings", json={"features": {}, "max_concurrent_requests": 2}
-    )
-    assert settings.status_code == 200, settings.text
-    assert client.get(f"/admin/models/{TINY}/sampling").json()["temperature"] == 0.3
-
-    sample(client, TINY, temperature=0.4)
-    assert store.model_settings(TINY).max_concurrent_requests == 2
-
-
-def test_a_profile_called_sampling_is_not_read_as_the_models_own_row(
-    client: TestClient, store: Store
-) -> None:
-    """`{model_id:path}` matches slashes, so the model's sampling route registered above the
-    profiles would answer this `PUT` as the model `test/tiny/profiles`. The name is not
-    reserved and nothing says it should be — what says the order is right is the profile
-    coming back from its own `GET`."""
-    put(client, TINY, "sampling", sampling={"temperature": 0.5})
-
-    assert client.get(f"/admin/models/{TINY}/profiles/sampling").json()["name"] == "sampling"
-    assert client.get(f"/admin/models/{TINY}/sampling").json()["temperature"] is None
-    assert store.model_settings(f"{TINY}/profiles").sampling == "{}"

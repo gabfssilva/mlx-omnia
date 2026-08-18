@@ -409,12 +409,13 @@ class TextLanguageModel[I: ModelInput = Text]:
             budget = min(budget, max(0, options.context_limit - len(encoded)))
         proposer = self._proposer(options)
         cache = _batch_cache(model)
-        # A proposer that keeps a row per position of the prompt cannot start from one that
-        # was resumed — it says so itself — and then the round wins: a prefix saves one
-        # turn's prefill, a round saves a read of the weights on every token of every turn.
+        # A proposer that keeps a row per position contributes those layers to the walk
+        # (`Proposer.caches`), so the spans carry the drafter's rows beside the target's
+        # and a resumed prompt resumes both — the round and the prefix compose instead of
+        # one dropping the other.
         walk = (
-            options.prefix.begin(cache)
-            if options.prefix is not None and (proposer is None or proposer.resumes)
+            options.prefix.begin(cache, () if proposer is None else proposer.caches)
+            if options.prefix is not None
             else None
         )
         reused = 0 if walk is None else walk.resume(encoded, cache)

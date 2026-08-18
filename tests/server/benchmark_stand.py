@@ -1,19 +1,28 @@
 """The stand the three benchmark suites share: a fake hub with two checkpoints on it, an
-engine over a scripted model, and the routers wired by hand.
+engine over a scripted model, and the daemon's own app around them.
 
-The app is assembled here rather than through `create_app` for the reason `test_bench.py`
-gives: the wiring is the orchestrator's, and these suites have to be able to run before it
-lands.
+The app is the real one — `create_app` through the suite's harness — so what these suites
+exercise is the wiring a request actually goes through. Only the hub caches and the model are
+doubles: the checkpoints are directories this file writes, and the generation reports numbers
+that were chosen instead of clocked.
 """
 
 import json
-from collections.abc import AsyncGenerator, Generator, Iterator, Mapping, Sequence
-from contextlib import asynccontextmanager, contextmanager
+import sys
+from collections.abc import (
+    Awaitable,
+    Callable,
+    Generator,
+    Iterator,
+    Mapping,
+    Sequence,
+)
+from contextlib import contextmanager
 from dataclasses import dataclass
 from pathlib import Path
-from typing import TypeIs
+from typing import TypeIs, TypeVar
 
-from fastapi import FastAPI
+import pytest
 from fastapi.testclient import TestClient
 
 from mlx_omnia import (
@@ -26,11 +35,19 @@ from mlx_omnia import (
     Text,
 )
 from mlx_omnia.engine.parsers import Segment
-from mlx_omnia.server import benchmarks, catalog, jobs
-from mlx_omnia.server.engine import Engine
-from mlx_omnia.server.store import Store
+from mlx_omnia.server.daemon import Daemon
+from mlx_omnia.server.metrics import Metrics
+from mlx_omnia.server.runtime.engine import Engine
+from mlx_omnia.server.services import catalog
+from tests.server.conftest import app_of
+
+_SCAN = sys.modules["mlx_omnia.server.services.catalog.scan"]
+"""The module and not `catalog.scan`, which is the function of that name: the walk reads its
+own globals, so the caches have to be moved where they are declared."""
 
 SHARD_BYTES = 2048
+
+T = TypeVar("T")
 
 SMALL: dict[str, object] = {
     "model_type": "qwen3",
@@ -124,9 +141,15 @@ def composite(
 @dataclass
 class Stand:
     client: TestClient
-    store: Store
     engine: Engine
     model: Scripted
+
+    def run(self, work: Callable[[], Awaitable[T]]) -> T:
+        """A service call on the app's own loop, which is where the database is connected —
+        the direct-write half the old `Store` handle used to give these suites."""
+        portal = self.client.portal
+        assert portal is not None, "the stand is only usable inside the client's context"
+        return portal.call(work)
 
 
 @contextmanager
@@ -137,29 +160,17 @@ def stand(tmp_path: Path, models: Sequence[tuple[str, Mapping[str, object]]]) ->
     quantized.mkdir()
     for model_id, config in models:
         checkpoint(hub, model_id, config)
-    previous = (catalog.HUB_CACHE, catalog.QUANTIZED_CACHE)
-    catalog.HUB_CACHE, catalog.QUANTIZED_CACHE = hub, quantized
     scripted = Scripted()
-    engine = Engine(lambda _model_id: composite(scripted))
-
-    @asynccontextmanager
-    async def lifespan(_app: FastAPI) -> AsyncGenerator[None]:
-        engine.start()
-        yield
-        engine.stop()
-
-    store = Store(tmp_path / "server.db")
-    app = FastAPI(lifespan=lifespan)
-    app.state.engine = engine
-    app.state.store = store
-    app.state.jobs = jobs.Jobs(store)
-    app.include_router(benchmarks.router)
-    app.include_router(jobs.router)
-    try:
-        with TestClient(app) as client:
-            yield Stand(client=client, store=store, engine=engine, model=scripted)
-    finally:
-        catalog.HUB_CACHE, catalog.QUANTIZED_CACHE = previous
+    daemon = Daemon()
+    engine = Engine(lambda _model_id: composite(scripted), daemon, Metrics())
+    with pytest.MonkeyPatch.context() as patched:
+        patched.setattr(_SCAN, "HUB_CACHE", hub)
+        patched.setattr(_SCAN, "QUANTIZED_CACHE", quantized)
+        # What the lifespan hands the directory watcher, which is the package's own copy.
+        patched.setattr(catalog, "HUB_CACHE", hub)
+        patched.setattr(catalog, "QUANTIZED_CACHE", quantized)
+        with TestClient(app_of(engine, daemon)) as client:
+            yield Stand(client=client, engine=engine, model=scripted)
 
 
 SPEED_BODY: dict[str, object] = {

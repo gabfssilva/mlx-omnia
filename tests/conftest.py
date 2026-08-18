@@ -12,7 +12,11 @@ from collections.abc import Callable, Sequence
 from pathlib import Path
 
 import mlx.core as mx
+import mlx.nn as nn
 import pytest
+
+from mlx_omnia.engine.core import attention as attention_module
+from mlx_omnia.engine.core.attention import NormalizedFusedQKVAttention
 
 FP32_EPS = 2.0**-23
 
@@ -122,8 +126,22 @@ def local_snapshot(repo: str, revision: str | None = None) -> Path | None:
 
 
 def requires_checkpoint(repo: str, revision: str | None = None) -> pytest.MarkDecorator:
+    """Skip unless this repository is in the cache *with weights in it*.
+
+    The directory is not the answer on its own: an interrupted pull leaves the small files
+    behind — config, tokenizer, template, all of them kilobytes — and `local_snapshot` then
+    hands back a path a loader cannot read. What that produced was one fixture error per test
+    in the family (`Missing 435 parameters`, a `KeyError` on the first expert) where a skip is
+    what a checkpoint nobody finished pulling deserves. `local_snapshot` itself stays as it is:
+    the template sweep reads exactly those small files, and for it a snapshot without weights
+    is the whole point.
+    """
+    directory = local_snapshot(repo, revision)
+    if directory is None:
+        return pytest.mark.skipif(True, reason=f"{repo} not in the local HF cache")
     return pytest.mark.skipif(
-        local_snapshot(repo, revision) is None, reason=f"{repo} not in the local HF cache"
+        not any(directory.glob("*.safetensors")),
+        reason=f"{repo} is in the local HF cache without its weights",
     )
 
 
@@ -132,3 +150,49 @@ def checkpoint_dir(repo: str, revision: str | None = None) -> Path:
     directory = local_snapshot(repo, revision)
     assert directory is not None
     return directory
+
+
+def without_the_fused_step(monkeypatch: pytest.MonkeyPatch) -> None:
+    """Take the fused normalized-RoPE decode off, so a `T=1` step falls to the op chain.
+
+    The A/B switch used to be a predicate the model's own attention module named
+    (`rope_epilogue_applies`); models declare operations and not kernels now, so what decides
+    is `NormalizedFusedQKVAttention.step_applies` — read per call, which is what lets one
+    stepwise run be compared against another inside a single test.
+    """
+    monkeypatch.setattr(
+        NormalizedFusedQKVAttention, "step_applies", lambda self, length: False
+    )
+
+
+def with_the_fused_step(model: nn.Module, monkeypatch: pytest.MonkeyPatch) -> None:
+    """Put the fused normalized-RoPE decode on, whatever the family's flag says.
+
+    `ROPE_EPILOGUE_KERNEL` defaults off on the sparse qwen3 trunk — measured, it loses decode
+    there — and it is read once, at construction. So a test about the fused path has to turn it
+    on where it now lives: `_fused_decode`, on every attention module of a model already built.
+    """
+    for module in model.modules():
+        if isinstance(module, NormalizedFusedQKVAttention):
+            monkeypatch.setattr(module, "_fused_decode", True)
+
+
+def with_the_step_norms_swapped(model: nn.Module, monkeypatch: pytest.MonkeyPatch) -> None:
+    """Hand the fused decode prologue each norm on the wrong side.
+
+    The seam moved with the kernel: `step_heads` resolves a `QkvRope` over the projection and
+    the two norm weights, once, and caches it per attention module. So the patch goes on the
+    name the resolution reads, and every prologue already built is dropped for it to take —
+    through `monkeypatch`, so the correct ones come back at teardown rather than leaking a
+    swapped kernel into whatever runs next off the same module-scoped model.
+    """
+    original = attention_module.QkvRope
+
+    def swapped(projection: object, **rest: object) -> object:
+        rest["q_norm"], rest["k_norm"] = rest["k_norm"], rest["q_norm"]
+        return original(projection, **rest)  # pyright: ignore[reportArgumentType]
+
+    monkeypatch.setattr(attention_module, "QkvRope", swapped)
+    for module in model.modules():
+        if isinstance(module, NormalizedFusedQKVAttention):
+            monkeypatch.setattr(module, "_prologue_kernel", None)

@@ -32,6 +32,7 @@ from mlx_omnia.engine.core.api import Draftable, Proposer
 from mlx_omnia.engine.core.masks import FULL
 from mlx_omnia.engine.models.muse_glimmer import CHECKPOINT, MuseGlimmer, load_assistant
 from mlx_omnia.engine.models.muse_glimmer.config import (
+    MuseGlimmerAssistantConfig,
     MuseGlimmerConfig,
     MuseGlimmerRoPE,
     MuseGlimmerTextConfig,
@@ -327,3 +328,68 @@ def test_a_tree_that_is_not_a_drafter_is_refused_by_name(drafter: MuseGlimmerAss
     with pytest.raises(TypeError, match="not a Muse-Glimmer DFlash drafter"):
         facade.speculate_with(nn.Linear(4, 4))
     assert facade.drafter is None
+
+
+def test_a_resumed_prompt_resumes_the_dflash_rows(lender: MuseGlimmer) -> None:
+    """Two turns through the prefix store on a synthetic pair. DFlash's rows are one per
+    committed position, written from the target's blocks — the thing a resumed prompt never
+    produces — so the walk must bring them back, absolute positions and all, and the stream
+    must still be the target's own greedy script."""
+    from mlx_omnia.engine.core.prefix import Prefixes, PrefixStore
+    from mlx_omnia.engine.generate import Meter
+    from mlx_omnia.engine.generate import stream_ids as stream
+
+    drafter = MuseGlimmerAssistant(
+        MuseGlimmerAssistantConfig(
+            hidden_size=HIDDEN,
+            intermediate_size=2 * HIDDEN,
+            num_hidden_layers=1,
+            num_attention_heads=2,
+            num_key_value_heads=1,
+            head_dim=HIDDEN // 2,
+            rms_norm_eps=1e-6,
+            sliding_window=8,
+            layer_types=(FULL,),
+            rope_parameters=MuseGlimmerRoPE(rope_theta=10000.0),
+            block_size=3,
+            mask_token_id=0,
+            target_layer_ids=(0,),
+        )
+    )
+    mx.eval(drafter.parameters())
+    prompt = [3, 1, 2, 1, 0, 3, 2, 1, 4, 5]
+    prefixes = Prefixes(PrefixStore(1 << 30, span=8), "a-model", "a-stamp")
+    first = MuseGlimmerDFlash(lender, drafter)
+    opening = list(stream(lender, prompt, max_tokens=24, draft=first, prefix=prefixes))
+    assert opening
+    conversation = [*prompt, *opening, 2, 0, 1]
+
+    # The resume, held still: the drafter's rows come back bit for bit.
+    resumed_cache = list(lender.make_cache())
+    second = MuseGlimmerDFlash(lender, drafter)
+    walk = prefixes.begin(resumed_cache, second.caches)
+    assert walk is not None
+    reach = walk.resume(conversation, resumed_cache)
+    assert reach >= 8 and reach % 8 == 0
+    was = first._cache[0].stored(0, reach)
+    now = second._cache[0].stored(0, reach)
+    assert was and now
+    for name, tensor in was.items():
+        assert mx.array_equal(tensor, now[name]), name
+    assert second._cache[0].offset == reach
+
+    # The stream, end to end: rows reused, ids byte-identical to the plain greedy run.
+    plain = list(stream(lender, conversation, max_tokens=12))
+    meter = Meter()
+    drafted = list(
+        stream(
+            lender,
+            conversation,
+            max_tokens=12,
+            draft=MuseGlimmerDFlash(lender, drafter),
+            prefix=prefixes,
+            meter=meter,
+        )
+    )
+    assert drafted == plain
+    assert meter.reused_tokens == reach

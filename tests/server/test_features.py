@@ -1,8 +1,9 @@
-"""Per-model feature switches, and the profile's override of them.
+"""Per-model feature switches over `/admin/models/{id}/settings`.
 
 No checkpoint is loaded and nothing decodes here: what these assertions are about is where
-a switch is stored, what it resolves to for a request, and what the daemon refuses to store
-in the first place. Whether the engine then speculates is the engine's test, not this one.
+a switch is stored, what the daemon refuses to store in the first place, and what a `PUT`
+does to the model that is holding the old one. Whether the engine then speculates is the
+engine's test, not this one; how the two levels resolve is `test_features_pairing.py`'s.
 
 The catalog is a temporary hub, as everywhere else: availability is derived from what is
 installed, so a drafter has to be on the fake disk for the switch to be settable.
@@ -10,38 +11,72 @@ installed, so a drafter has to be on the fake disk for the switch to be settable
 
 import json
 from collections.abc import Iterator, Mapping
+from importlib import import_module
 from pathlib import Path
+from typing import NoReturn, TypeIs
 
 import pytest
 from fastapi.testclient import TestClient
 
-from mlx_omnia.server import Engine, catalog, create_app, features
-from mlx_omnia.server.engine import Residency
-from mlx_omnia.server.features import Features, Speculation, resolve
-from mlx_omnia.server.profiles import ProfileView, Sampling, speculating, switches
-from mlx_omnia.server.store import ModelSettings, Store
+from mlx_omnia import TEXT, GenerationOptions, ModelInput, ModelSignature, Text
+from mlx_omnia.engine.parsers import Segment
+from mlx_omnia.server.daemon import Daemon
+from mlx_omnia.server.metrics import Metrics
+from mlx_omnia.server.runtime.engine import Engine, Residency
+from mlx_omnia.server.services import catalog, features
+
+from .conftest import app_of, wired
+
+SCANNER = import_module("mlx_omnia.server.services.catalog.scan")
+"""The module holding the two cache constants the scan reads. Reached by name because the
+package re-exports a `scan` *function* under that same attribute, so `catalog.scan` is not
+the module and rebinding a constant on the package would leave the scan on the real cache."""
 
 TARGET = "meta-models/Muse-Glimmer-30B"
 DRAFTER = "meta-models/Muse-Glimmer-30B-assistant"
 OTHER = "mlx-community/Qwen3-0.6B-4bit"
 
+NEMOTRON = "nvidia/NVIDIA-Nemotron-3.5-Lightning-30B-A3B-BF16"
+
+
+def _unloadable(model_id: str) -> NoReturn:
+    """Nothing here is loaded: a settings route reads the disk and the row, never a tree."""
+    raise FileNotFoundError(model_id)
+
+
+class Mute:
+    """A resident model with nothing under it — the smallest thing an engine can hold."""
+
+    @property
+    def native_signature(self) -> ModelSignature:
+        return ModelSignature(frozenset({TEXT}), frozenset({TEXT}))
+
+    def accepts(self, input: ModelInput) -> TypeIs[Text]:
+        return isinstance(input, Text)
+
+    def stream(self, input: Text, options: GenerationOptions) -> Iterator[Segment]:
+        yield Segment("content", input.value)
+
+
+class Held(Engine):
+    """An engine already holding an id, without the load that would normally put it there."""
+
+    def hold(self, model_id: str) -> None:
+        self._models[model_id] = Mute()
+        self._residency[model_id] = Residency(weights_bytes=0, loaded_at=0.0)
+
 
 @pytest.fixture
-def store(tmp_path: Path) -> Store:
-    return Store(tmp_path / "server.db")
-
-
-@pytest.fixture
-def client(store: Store) -> Iterator[TestClient]:
-    with TestClient(create_app(Engine({}), store)) as running:
+def client() -> Iterator[TestClient]:
+    with TestClient(wired(_unloadable)) as running:
         yield running
 
 
 @pytest.fixture
 def hub(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> Path:
     root = tmp_path / "hub"
-    monkeypatch.setattr(catalog, "HUB_CACHE", root)
-    monkeypatch.setattr(catalog, "QUANTIZED_CACHE", tmp_path / "quantized")
+    monkeypatch.setattr(SCANNER, "HUB_CACHE", root)
+    monkeypatch.setattr(SCANNER, "QUANTIZED_CACHE", tmp_path / "quantized")
     catalog.context_of.cache_clear()
     catalog.defaults_of.cache_clear()
     return root
@@ -182,130 +217,7 @@ def test_the_model_concurrency_override_is_stored(client: TestClient, hub: Path)
 
     assert response.status_code == 200, response.text
     assert response.json()["max_concurrent_requests"] == 3
-    assert (
-        client.get(f"/admin/models/{TARGET}/settings").json()["max_concurrent_requests"]
-        == 3
-    )
-
-
-def on(block_size: int | None = None) -> str:
-    paired = Speculation(kind="dflash", drafter=DRAFTER, block_size=block_size)
-    return Features(speculation=paired).model_dump_json()
-
-
-def test_a_profile_overrides_the_models_setting(store: Store) -> None:
-    store.save_model_settings(ModelSettings(TARGET, on()))
-    off = Features(speculation=Speculation())
-    careful = ProfileView(TARGET, "careful", Sampling(), features=off)
-    resolved = switches(store, TARGET, careful)
-    assert resolved.speculation is not None and resolved.speculation.drafter is None
-
-
-def test_a_profile_may_override_only_the_block_length(store: Store) -> None:
-    """A whole `dflash` replaces a whole `dflash`: a preset that wants shorter rounds names
-    the drafter again, because half a feature resolved from two levels is a setting nobody
-    can read off the screen."""
-    store.save_model_settings(ModelSettings(TARGET, on()))
-    short = Features(speculation=Speculation(kind="dflash", drafter=DRAFTER, block_size=8))
-    resolved = switches(store, TARGET, ProfileView(TARGET, "short", Sampling(), features=short))
-    assert resolved.speculation == Speculation(kind="dflash", drafter=DRAFTER, block_size=8)
-
-
-def test_a_profile_that_says_nothing_inherits(store: Store) -> None:
-    store.save_model_settings(ModelSettings(TARGET, on()))
-    quiet = ProfileView(TARGET, "quiet", Sampling())
-    resolved = switches(store, TARGET, quiet)
-    assert resolved.speculation is not None and resolved.speculation.drafter == DRAFTER
-
-
-def test_no_profile_is_the_models_own_setting(store: Store) -> None:
-    store.save_model_settings(ModelSettings(TARGET, on(block_size=8)))
-    resolved = switches(store, TARGET, None)
-    assert resolved.speculation == Speculation(kind="dflash", drafter=DRAFTER, block_size=8)
-
-
-def test_unset_is_not_off() -> None:
-    """The distinction the whole two-level shape rests on: a profile that leaves a feature
-    unset inherits it, and one that turns it off keeps it off when the model changes."""
-    enabled = Features(speculation=Speculation(kind="dflash", drafter=DRAFTER))
-    assert resolve(enabled, Features()).speculation == Speculation(kind="dflash", drafter=DRAFTER)
-    assert resolve(enabled, Features(speculation=Speculation())).speculation == Speculation()
-
-
-class Facade:
-    """What `speculative.Drafting` asks for, and nothing else: the walk has to find this
-    under the wrappers and hand it a tree."""
-
-    def __init__(self) -> None:
-        self.drafter: object | None = None
-        self.block: int | None = None
-
-    def speculate_with(self, drafter: object, *, block_size: int | None = None) -> None:
-        self.drafter = drafter
-        self.block = block_size
-
-
-class Wrapper:
-    def __init__(self, model: object) -> None:
-        self.model = model
-
-
-def test_a_model_whose_settings_name_a_drafter_is_paired_at_load(
-    hub: Path, monkeypatch: pytest.MonkeyPatch
-) -> None:
-    """What the loader does with the row. The tree is whatever `load_drafter` returns —
-    which architecture answers to a directory is `mlx_omnia.engine.task`'s to say, not
-    this one's."""
-    installed(hub, DRAFTER, "muse_glimmer_assistant", block_size=16)
-    loaded: list[Path] = []
-    monkeypatch.setattr(features, "load_drafter", lambda directory: loaded.append(directory))
-    facade = Facade()
-
-    paired = Speculation(kind="dflash", drafter=DRAFTER, block_size=4)
-    features.pair(TARGET, Wrapper(facade), paired)
-
-    assert len(loaded) == 1 and loaded[0].name == "head"
-    assert facade.block == 4
-
-
-def test_a_model_with_the_feature_off_is_left_alone(monkeypatch: pytest.MonkeyPatch) -> None:
-    monkeypatch.setattr(features, "load_drafter", lambda directory: pytest.fail("loaded"))
-    facade = Facade()
-
-    features.pair(TARGET, Wrapper(facade), None)
-    features.pair(TARGET, Wrapper(facade), Speculation())
-
-    assert facade.drafter is None
-
-
-def test_pairing_a_drafter_that_left_the_disk_fails_the_load(hub: Path) -> None:
-    """Named here rather than surviving as a model that answers at the speed the switch says
-    it does not have. The row outlives the file: a drafter deleted from disk turns the
-    setting into a load that stops."""
-    del hub
-    with pytest.raises(ValueError, match="not in the catalog"):
-        features.pair(TARGET, Wrapper(Facade()), Speculation(kind="dflash", drafter=DRAFTER))
-
-
-def test_a_model_that_takes_no_drafter_fails_the_load(hub: Path) -> None:
-    installed(hub, DRAFTER, "muse_glimmer_assistant")
-    with pytest.raises(ValueError, match="takes a drafter"):
-        features.pair(TARGET, object(), Speculation(kind="dflash", drafter=DRAFTER))
-
-
-def test_the_drafter_counts_towards_what_the_load_is_admitted_for(hub: Path, store: Store) -> None:
-    """Admission decides before the load, and what lands is two checkpoints."""
-    installed(hub, DRAFTER, "muse_glimmer_assistant")
-    assert features.drafter_bytes(TARGET, store) == 0
-
-    store.save_model_settings(
-        ModelSettings(
-            TARGET,
-            Features(speculation=Speculation(kind="dflash", drafter=DRAFTER)).model_dump_json(),
-        )
-    )
-
-    assert features.drafter_bytes(TARGET, store) > 0
+    assert client.get(f"/admin/models/{TARGET}/settings").json()["max_concurrent_requests"] == 3
 
 
 def test_a_profile_may_turn_dflash_off_but_not_name_another_drafter(
@@ -335,28 +247,15 @@ def test_a_profile_may_turn_dflash_off_but_not_name_another_drafter(
     assert DRAFTER in other.json()["detail"]
 
 
-def test_speculating_reads_the_two_levels(store: Store) -> None:
-    store.save_model_settings(ModelSettings(TARGET, on()))
-    off = ProfileView(TARGET, "careful", Sampling(), features=Features(speculation=Speculation()))
-
-    assert speculating(store, TARGET, None) is True
-    assert speculating(store, TARGET, ProfileView(TARGET, "quiet", Sampling())) is True
-    assert speculating(store, TARGET, off) is False
-
-
-def test_changing_the_switch_lets_go_of_the_model_holding_the_old_one(
-    hub: Path, store: Store
-) -> None:
+def test_changing_the_switch_lets_go_of_the_model_holding_the_old_one(hub: Path) -> None:
     """The pairing happens at load, so a resident model is decoding under the settings it
     was loaded with. The `PUT` is what makes the switch mean something now."""
     installed(hub, TARGET, "muse_glimmer")
     installed(hub, DRAFTER, "muse_glimmer_assistant")
-    engine = Engine(lambda _: object())  # pyright: ignore[reportArgumentType]
-    with TestClient(create_app(engine, store)) as client:
-        engine._models[TARGET] = object()  # pyright: ignore[reportArgumentType, reportPrivateUsage]
-        engine._residency[TARGET] = Residency(  # pyright: ignore[reportPrivateUsage]
-            weights_bytes=0, loaded_at=0.0
-        )
+    daemon = Daemon()
+    engine = Held(_unloadable, daemon, Metrics())
+    with TestClient(app_of(engine, daemon)) as client:
+        engine.hold(TARGET)
 
         response = client.put(
             f"/admin/models/{TARGET}/settings",
@@ -365,9 +264,6 @@ def test_changing_the_switch_lets_go_of_the_model_holding_the_old_one(
 
         assert response.status_code == 200, response.text
         assert engine.resident == []
-
-
-NEMOTRON = "nvidia/NVIDIA-Nemotron-3.5-Lightning-30B-A3B-BF16"
 
 
 def test_a_row_written_as_dflash_still_reads(client: TestClient, hub: Path) -> None:
@@ -383,7 +279,7 @@ def test_a_row_written_as_dflash_still_reads(client: TestClient, hub: Path) -> N
     assert parsed.speculation.block_size == 4
 
     # And off stays off: a row that named nothing was off, and off has no kind.
-    assert features.parse('{"dflash": {"drafter": null}}').speculation == Speculation()
+    assert features.parse('{"dflash": {"drafter": null}}').speculation == features.Speculation()
     assert features.parse('{"dflash": null}').speculation is None
     with pytest.raises(ValueError, match="both"):
         features.parse('{"dflash": {}, "speculation": {}}')
@@ -437,39 +333,3 @@ def test_naming_a_drafter_for_mtp_is_refused_by_the_shape(client: TestClient, hu
     )
     assert response.status_code == 400, response.text
     assert "own head" in response.text
-
-
-def test_the_mtp_head_counts_towards_what_the_load_is_admitted_for(
-    hub: Path, store: Store
-) -> None:
-    """It downloads nothing and it is still resident. `_checkpoint_size` takes `mtp.*` off
-    the trunk — the loader drops it — so this is what puts it back, and only when on."""
-    installed(hub, NEMOTRON, "nemotron_h", mtp=True)
-    store.save_model_settings(ModelSettings(NEMOTRON, Features().model_dump_json()))
-    assert features.drafter_bytes(NEMOTRON, store) == 0
-
-    store.save_model_settings(
-        ModelSettings(NEMOTRON, Features(speculation=Speculation(kind="mtp")).model_dump_json())
-    )
-    assert features.drafter_bytes(NEMOTRON, store) == 32
-
-
-def test_pairing_mtp_loads_the_head_out_of_the_model_itself(
-    hub: Path, monkeypatch: pytest.MonkeyPatch
-) -> None:
-    """No id is looked up: the directory the head comes from is the model's own."""
-    installed(hub, NEMOTRON, "nemotron_h", mtp=True)
-    loaded: list[Path] = []
-    monkeypatch.setattr(features, "mtp_head", lambda directory: loaded.append(directory))
-    facade = Facade()
-
-    features.pair(NEMOTRON, Wrapper(facade), Speculation(kind="mtp", block_size=3))
-
-    assert len(loaded) == 1 and loaded[0].name == "head"
-    assert facade.block == 3
-
-
-def test_pairing_mtp_on_a_checkpoint_without_a_head_fails_the_load(hub: Path) -> None:
-    installed(hub, "local/nemotron-no-head", "nemotron_h")
-    with pytest.raises(ValueError, match="no MTP head"):
-        features.pair("local/nemotron-no-head", Wrapper(Facade()), Speculation(kind="mtp"))

@@ -14,10 +14,16 @@ from huggingface_hub import snapshot_download
 from pytest_describe import behaves_like
 
 from mlx_omnia import KVCache
-from mlx_omnia.engine.core.kernels.qkv_rope.epilogue import rope_epilogue
 from mlx_omnia.engine.models.qwen3.dense import CHECKPOINT
 from mlx_omnia.engine.models.qwen3.model import Qwen3, Qwen3Activations
-from tests.conftest import floor, load_golden, relative_diff
+from tests.conftest import (
+    floor,
+    load_golden,
+    relative_diff,
+    with_the_fused_step,
+    with_the_step_norms_swapped,
+    without_the_fused_step,
+)
 from tests.mutation import mutated
 from tests.parity.definition import (
     a_faithful_cache,
@@ -39,11 +45,6 @@ def stepwise(model: Qwen3, ids: mx.array) -> mx.array:
     cache = model.make_cache()
     return mx.concatenate([model(ids[None, i : i + 1], cache) for i in range(ids.shape[0])], axis=1)
 
-
-def never(head_dim: int) -> bool:
-    """The A/B switch: monkeypatching the predicate to False puts the step back on the
-    op chain without touching the model file."""
-    return False
 
 
 @behaves_like(a_parity_trunk, an_exact_embedding_lookup, a_faithful_cache)
@@ -118,11 +119,10 @@ def describe_qwen3():
         ) -> None:
             """The T=1 step runs the fused kernel by default; the op chain stays reachable
             by falsifying the predicate (that is also the A/B switch for the bench)."""
+            with_the_fused_step(model, monkeypatch)
             ids = golden["greedy_ids"]
             fused = stepwise(model, ids)
-            monkeypatch.setattr(
-                "mlx_omnia.engine.models.qwen3.layers.attention.rope_epilogue_applies", never
-            )
+            without_the_fused_step(monkeypatch)
             assert relative_diff(fused, stepwise(model, ids)) < 1e-5
 
         def it_fails_stepwise_when_the_norms_are_swapped(
@@ -132,27 +132,7 @@ def describe_qwen3():
             and k_norm breaks the step-vs-prefill agreement it otherwise holds. (Shifting
             `offset` is not a valid mutation here — the step rotates q and k by the same
             amount, and rope is relative, so a uniform shift is invisible by construction.)"""
-            original = rope_epilogue
-
-            def swapped(
-                fused: mx.array,
-                *,
-                query_heads: int,
-                kv_heads: int,
-                head_dim: int,
-                q_norm: mx.array,
-                k_norm: mx.array,
-                offset: int,
-                base: float,
-                eps: float,
-            ) -> tuple[mx.array, mx.array]:
-                return original(
-                    fused, query_heads=query_heads, kv_heads=kv_heads, head_dim=head_dim,
-                    q_norm=k_norm, k_norm=q_norm, offset=offset, base=base, eps=eps,
-                )
-
-            monkeypatch.setattr(
-                "mlx_omnia.engine.models.qwen3.layers.attention.rope_epilogue", swapped
-            )
+            with_the_fused_step(model, monkeypatch)
+            with_the_step_norms_swapped(model, monkeypatch)
             ids = golden["greedy_ids"]
             assert relative_diff(stepwise(model, ids), model(ids[None])) > 1e-5

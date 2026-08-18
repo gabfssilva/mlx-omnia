@@ -16,7 +16,6 @@ from mlx_omnia import KVCache, stream_ids
 from mlx_omnia.engine.core.kernels.add_norm import AddRmsNorm
 from mlx_omnia.engine.core.kernels.down_combine.affine import AffineDownCombine
 from mlx_omnia.engine.core.kernels.gate_up.affine import AffineGateUp
-from mlx_omnia.engine.core.kernels.qkv_rope.epilogue import rope_epilogue
 from mlx_omnia.engine.core.kernels.route.softmax_topk import softmax_topk, softmax_topk_applies
 from mlx_omnia.engine.core.mxcompat import softmax
 from mlx_omnia.engine.models.qwen3.model import Qwen3MoE
@@ -27,6 +26,9 @@ from tests.conftest import (
     load_golden,
     relative_diff,
     requires_checkpoint,
+    with_the_fused_step,
+    with_the_step_norms_swapped,
+    without_the_fused_step,
 )
 from tests.mutation import mutated
 
@@ -163,10 +165,6 @@ def test_moe_gemv_matches_op_chain_fp32() -> None:
     assert (mx.abs(out - reference).max() / mx.abs(reference).max()).item() < 1e-5
 
 
-def never_head_dim(head_dim: int) -> bool:
-    """A/B switch for rope_epilogue: falsify the predicate, the step takes the op chain."""
-    return False
-
 
 class WithoutResidual:
     """Mutation seam: the facade the block resolves, with `x` dropped from the join."""
@@ -190,13 +188,11 @@ def test_step_kernels_match_op_path(
     """Both kernels on against both switched off. Same path, same
     inputs, only the rounding of the fused arithmetic differs — bounded by the
     fixture's own measured batching floor, which is the same kind of bf16 reordering."""
-    monkeypatch.setattr("mlx_omnia.engine.models.qwen3.layers.flags.ROPE_EPILOGUE_KERNEL", True)
+    with_the_fused_step(model, monkeypatch)
     monkeypatch.setattr("mlx_omnia.engine.models.qwen3.layers.flags.ADD_RMS_NORM_KERNEL", True)
     ids = golden["greedy_ids"]
     fused = stepwise(model, ids)
-    monkeypatch.setattr(
-        "mlx_omnia.engine.models.qwen3.layers.attention.rope_epilogue_applies", never_head_dim
-    )
+    without_the_fused_step(monkeypatch)
     monkeypatch.setattr("mlx_omnia.engine.models.qwen3.layers.flags.ADD_RMS_NORM_KERNEL", False)
     assert relative_diff(fused, stepwise(model, ids)) < 3 * golden["noise.batching"].item()
 
@@ -208,27 +204,8 @@ def test_rope_epilogue_mutation_breaks_stepwise(
     """The seam hands the kernel one norm per side; swapping them must break the
     step-vs-prefill agreement. (Shifting `offset` is not a valid mutation: q and k are
     rotated by the same amount and rope is relative, so a uniform shift is invisible.)"""
-    original = rope_epilogue
-
-    def swapped(
-        fused: mx.array,
-        *,
-        query_heads: int,
-        kv_heads: int,
-        head_dim: int,
-        q_norm: mx.array,
-        k_norm: mx.array,
-        offset: int,
-        base: float,
-        eps: float,
-    ) -> tuple[mx.array, mx.array]:
-        return original(
-            fused, query_heads=query_heads, kv_heads=kv_heads, head_dim=head_dim,
-            q_norm=k_norm, k_norm=q_norm, offset=offset, base=base, eps=eps,
-        )
-
-    monkeypatch.setattr("mlx_omnia.engine.models.qwen3.layers.flags.ROPE_EPILOGUE_KERNEL", True)
-    monkeypatch.setattr("mlx_omnia.engine.models.qwen3.layers.attention.rope_epilogue", swapped)
+    with_the_fused_step(model, monkeypatch)
+    with_the_step_norms_swapped(model, monkeypatch)
     ids = golden["greedy_ids"]
     gap = relative_diff(stepwise(model, ids), model(ids[None]))
     assert gap > 3 * golden["noise.batching"].item()

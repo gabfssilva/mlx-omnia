@@ -20,10 +20,12 @@ from pathlib import Path
 import mlx.core as mx
 import pytest
 from huggingface_hub import snapshot_download
+from mlx.utils import tree_flatten
 from pytest_describe import behaves_like
 
+from mlx_omnia.engine.checkpoint import dormant
 from mlx_omnia.engine.models.falcon_h1 import CHECKPOINT, FalconH1, FalconH1Activations
-from tests.conftest import floor, load_golden, relative_diff
+from tests.conftest import checkpoint_dir, floor, load_golden, relative_diff, requires_checkpoint
 from tests.mutation import mutated
 from tests.parity.definition import a_faithful_cache, a_parity_trunk
 
@@ -40,6 +42,32 @@ four, and the spine's per-block test is parametrized off this."""
 
 def falcon_h1_dir() -> Path:
     return Path(snapshot_download(MODEL_REPO, allow_patterns=PATTERNS))
+
+
+@requires_checkpoint(MODEL_REPO)
+def test_the_checkpoints_own_names_reach_the_tree() -> None:
+    """Every rename and reshape the loader owes this checkpoint, checked without reading a
+    weight — the strict load is the assertion, because a name the tree does not declare is what
+    it raises on.
+
+    It is separate from everything below because it needs no fixture: the parity tensors are
+    generated from transformers and a machine without PyTorch has none, which is exactly the
+    state in which this family's loader was left broken in three places at once — the conv
+    squeezing the kernel axis, `feed_forward` never becoming `mlp` (so the two μP multipliers
+    went unapplied and the gate/up pair reached `SwiGLU` under names it does not declare), and
+    `final_layernorm` never becoming `norm`. All three are structural, and all three are visible
+    here, in two seconds, on any machine that holds the checkpoint.
+
+    `dormant` is what keeps it cheap: the tree is built and the tensors are attached, and not
+    one of the fifteen gigabytes behind them is faulted in.
+    """
+    with dormant():
+        model = CHECKPOINT.load(checkpoint_dir(MODEL_REPO), None)
+    names = dict(tree_flatten(model.parameters()))
+
+    assert "model.norm.weight" in names, "the last norm kept the checkpoint's own name"
+    assert "model.layers.0.mlp.gate_up_proj.weight" in names, "gate and up never fused"
+    assert names["model.layers.0.mamba.conv1d.weight"].ndim == 2, "the conv kept its unit axis"
 
 
 @behaves_like(a_parity_trunk, a_faithful_cache)

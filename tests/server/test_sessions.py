@@ -6,24 +6,23 @@ interprets a message — the column holds the JSON whole. The other is the order
 the sidebar, and what puts a conversation at the top of it is the last write, not the
 creation, which is why appending to the oldest one moves it.
 
-The app here is the router on a bare `FastAPI` plus the handler `create_app` adds, which is
-what turns FastAPI's own 422 into the named 400 the rest of the API answers with.
+The app here is the daemon's own, which is where the handler that turns FastAPI's 422 into
+the named 400 the rest of the API answers with lives.
 """
 
+import json
 import sqlite3
 from collections.abc import Iterator
 from contextlib import closing
-from pathlib import Path
+from typing import NoReturn
 
 import pytest
-from fastapi import FastAPI
-from fastapi.exceptions import RequestValidationError
 from fastapi.testclient import TestClient
 
-from mlx_omnia.server import store as store_module
-from mlx_omnia.server.app import _invalid_request
-from mlx_omnia.server.sessions import router
-from mlx_omnia.server.store import SCHEMA_VERSION, Profile, Store
+from mlx_omnia import paths
+from mlx_omnia.server.services.sessions import SessionView
+
+from .conftest import wired
 
 CONVERSATION: list[dict[str, object]] = [
     {"role": "system", "content": "Answer with code and nothing else."},
@@ -46,23 +45,36 @@ inside one: a content part list, a null content beside a tool call, a tool resul
 round trip asserts is that none of it is normalised on the way through."""
 
 
-def build(store: Store) -> FastAPI:
-    app = FastAPI()
-    app.state.store = store
-    app.include_router(router)
-    app.add_exception_handler(RequestValidationError, _invalid_request)
-    return app
+def _unloadable(model_id: str) -> NoReturn:
+    """Nothing here names a model: no route under `/admin/sessions` reaches the engine."""
+    raise FileNotFoundError(model_id)
 
 
 @pytest.fixture
-def store(tmp_path: Path) -> Store:
-    return Store(tmp_path / "server.db")
-
-
-@pytest.fixture
-def client(store: Store) -> Iterator[TestClient]:
-    with TestClient(build(store)) as running:
+def client() -> Iterator[TestClient]:
+    with TestClient(wired(_unloadable)) as running:
         yield running
+
+
+def stored(session_id: str) -> SessionView | None:
+    """The row itself, read straight out of the file the daemon writes — not through the
+    route that wrote it."""
+    with closing(sqlite3.connect(paths.server_db())) as connection:
+        row = connection.execute(
+            "SELECT id, title, model, created_at, updated_at, messages FROM sessions WHERE id = ?",
+            (session_id,),
+        ).fetchone()
+    if row is None:
+        return None
+    identifier, title, model, created_at, updated_at, messages = row
+    return SessionView(
+        id=str(identifier),
+        title=str(title),
+        model=str(model),
+        created_at=float(created_at),
+        updated_at=float(updated_at),
+        messages=json.loads(str(messages)),
+    )
 
 
 def body(response: object) -> dict[str, object]:
@@ -103,13 +115,6 @@ def real(value: object) -> float:
     return value
 
 
-def user_version(path: Path) -> int:
-    with closing(sqlite3.connect(path)) as connection:
-        version = connection.execute("PRAGMA user_version").fetchone()[0]
-    assert isinstance(version, int)
-    return version
-
-
 def test_a_created_session_starts_empty_and_carries_a_server_side_id(client: TestClient) -> None:
     created = create(client, title="Ports", model="qwen3.6-35b")
 
@@ -130,17 +135,17 @@ def test_a_body_may_name_neither_field(client: TestClient) -> None:
     assert created["model"] == ""
 
 
-def test_a_session_written_here_is_in_the_file(store: Store, client: TestClient) -> None:
-    """Straight through the store, not the route that wrote it: nothing is cached on either
+def test_a_session_written_here_is_in_the_file(client: TestClient) -> None:
+    """Straight out of the file, not the route that wrote it: nothing is cached on either
     side, so what the daemon restarts on is this row."""
     created = create(client, title="Ports")
     put(client, str(created["id"]), CONVERSATION)
 
-    stored = store.session(str(created["id"]))
+    row = stored(str(created["id"]))
 
-    assert stored is not None
-    assert stored.title == "Ports"
-    assert '"get_weather"' in stored.messages
+    assert row is not None
+    assert row.title == "Ports"
+    assert row.messages == CONVERSATION
 
 
 def test_the_conversation_comes_back_as_it_was_sent(client: TestClient) -> None:
@@ -242,30 +247,3 @@ def test_an_unknown_field_is_refused_rather_than_dropped(client: TestClient) -> 
     response = client.post("/admin/sessions", json={"title": "Ports", "messages": []})
 
     assert response.status_code == 400, response.text
-
-
-def test_the_sessions_table_lands_on_a_database_left_at_v1(
-    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
-) -> None:
-    """The migration this feature is: a file the last release wrote is at v1, and it has to
-    reach the head running only the step it misses, with the rows v1 already held intact."""
-    path = tmp_path / "server.db"
-    profile = Profile("qwen3.6-35b", "code", '{"temperature": 0.2}')
-    monkeypatch.setattr(store_module, "_MIGRATIONS", (store_module._SCHEMA_V1,))
-    Store(path)
-    # v1's own INSERT, not the head's: a release that wrote this file had no `features`
-    # column to write, which is exactly what the migration has to survive.
-    with closing(sqlite3.connect(path)) as connection:
-        connection.execute(
-            "INSERT INTO profiles (model, name, sampling) VALUES (?, ?, ?)",
-            (profile.model, profile.name, profile.sampling),
-        )
-        connection.commit()
-    assert user_version(path) == 1
-    monkeypatch.undo()
-
-    upgraded = Store(path)
-
-    assert user_version(path) == SCHEMA_VERSION
-    assert upgraded.profile("qwen3.6-35b", "code") == profile
-    assert upgraded.sessions() == []

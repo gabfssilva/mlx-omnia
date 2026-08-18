@@ -20,14 +20,14 @@ nothing samples here yet — not because token equality would bias the output, w
 this said and is false. `high-temp-draft.md` carries the argument and the path.
 """
 
-from collections.abc import Callable, Collection, Iterable, Iterator, Sequence
+from collections.abc import Callable, Collection, Iterable, Iterator, Mapping, Sequence
 from dataclasses import dataclass
 from typing import TYPE_CHECKING, Never
 
 import mlx.core as mx
 
 from mlx_omnia.engine.core.api import Draftable, LanguageModel, Proposer, Step
-from mlx_omnia.engine.core.cache import LayerCache
+from mlx_omnia.engine.core.cache import LayerCache, Layout, Rows, Snapshot
 from mlx_omnia.engine.core.decode import compiled_verify, state_of
 from mlx_omnia.engine.core.prefill import landing, prefill
 from mlx_omnia.engine.core.prefix import Prefix, Prefixes
@@ -76,6 +76,86 @@ class Acceptance:
         return None if self.proposed == 0 else self.accepted / self.proposed
 
 
+class Contributed(LayerCache):
+    """One drafter layer as the prefix walk sees it: the inner rows, branded.
+
+    The wrapper exists for the seed. A span written with a drafter's rows must never match
+    a chain built without them — or built over another drafter — and `signature` is what
+    `core.cache_file.policy` folds into the chain's seed; a plain KV buffer's own is empty.
+    The brand is the step's class name, which moves when the head's shape does; which
+    *checkpoint* trained it is already in the seed as the model and its stamp.
+
+    `stored` refuses a range past what the inner layer holds, where a plain buffer would
+    hand back stale rows: the drafter's rows lag the trunk's, and a short answer here is
+    the walk's own "not written yet" — the span waits for the next commit.
+    """
+
+    def __init__(self, inner: LayerCache, brand: str) -> None:
+        super().__init__()
+        self._inner = inner
+        self._brand = brand
+
+    @property
+    def layout(self) -> Mapping[str, Layout]:
+        return self._inner.layout
+
+    @property
+    def signature(self) -> dict[str, object]:
+        return {"drafter": self._brand, **self._inner.signature}
+
+    def stored(self, start: int, stop: int) -> dict[str, mx.array]:
+        if self._inner.rows < stop:
+            return {}
+        return self._inner.stored(start, stop)
+
+    def restore(self, offset: int, tensors: Mapping[str, mx.array]) -> None:
+        self._inner.restore(offset, tensors)
+
+
+class _Paired[S: LayerCache](Contributed):
+    """`Persistent`'s layer on the walk, shifted one row so every span is a function of its
+    own ids.
+
+    The inner cache holds pair *i* — the target's hidden at *i* with the id at *i + 1* — at
+    row *i*, so an unshifted span's last pair would depend on the first id past the span,
+    which is one id more than the span's key is taken over. Walk row *j* is therefore pair
+    *j - 1*: a function of ids `..j`, all inside the key. The pair that closes on a boundary
+    is not stored as rows at all — the boundary's `seed` snapshot is its hidden half, and
+    the resumed run builds the pair in its first catch-up from the tail's first id. Row 0
+    holds nothing, which is right: no pair ends at the first token.
+    """
+
+    def __init__(
+        self, proposer: "Persistent[S]", inner: LayerCache, brand: str, *, seeded: bool
+    ) -> None:
+        super().__init__(inner, brand)
+        self._proposer = proposer
+        self._seeded = seeded
+
+    @property
+    def layout(self) -> Mapping[str, Layout]:
+        inner = self._inner.layout
+        return {**inner, "seed": Snapshot()} if self._seeded else inner
+
+    def stored(self, start: int, stop: int) -> dict[str, mx.array]:
+        held: dict[str, mx.array] = {}
+        if start < stop:
+            if self._inner.rows < stop - 1:
+                return {}
+            held.update(self._inner.stored(max(start - 1, 0), stop - 1))
+        if self._seeded:
+            hidden = self._proposer.hidden_at(stop)
+            if hidden is not None:
+                held["seed"] = hidden
+        return held
+
+    def restore(self, offset: int, tensors: Mapping[str, mx.array]) -> None:
+        rows = {name: held for name, held in tensors.items() if name != "seed"}
+        self._inner.restore(offset - 1, rows)
+        if self._seeded:
+            self._proposer.seed(tensors.get("seed"))
+
+
 class Autoregressive[D: LayerCache]:
     """A small language model as a proposer: `width` steps, each one conditioned on the id
     the last one drew. It reads no blocks of the target — its whole input is the ids — so
@@ -103,11 +183,12 @@ class Autoregressive[D: LayerCache]:
         return self._width
 
     @property
-    def resumes(self) -> bool:
-        """Yes: its whole input is ids, and round one feeds it whatever the target's cache
-        already covers. That catch-up is a prefill of the draft's own small checkpoint, and
-        it happens after the first token — outside the TTFT the prefix exists to cut."""
-        return True
+    def caches(self) -> Sequence[LayerCache]:
+        """Nothing: its whole input is ids, and round one feeds it whatever the target's
+        cache already covers. That catch-up is a prefill of the draft's own small
+        checkpoint, and it happens after the first token — outside the TTFT the prefix
+        exists to cut."""
+        return ()
 
     def absorb(self, features: mx.array) -> None:
         raise AssertionError("an autoregressive draft reads no blocks of the target")
@@ -184,11 +265,11 @@ class Chained:
         return self._width
 
     @property
-    def resumes(self) -> bool:
-        """Yes: the one row it carries is the target's reading of the last position, and a
-        resumed prompt still runs a forward over its tail — one row is the least that
-        forward can produce."""
-        return True
+    def caches(self) -> Sequence[LayerCache]:
+        """Nothing: the one row it carries is the target's reading of the last position,
+        and a resumed prompt still runs a forward over its tail — one row is the least
+        that forward can produce."""
+        return ()
 
     def absorb(self, features: mx.array) -> None:
         """Only the last row is kept. The step conditions on the position right before the
@@ -292,6 +373,21 @@ class Persistent[S: LayerCache]:
         self._pending: mx.array | None = None
         self._anchor = 0
         """Rows of the cache built from the target's hidden — where `settle` trims to."""
+        for layer in self._cache:
+            kinds = layer.layout.values()
+            if not kinds or any(
+                not isinstance(kind, Rows) or kind.stride != 1 or kind.keep is not None
+                for kind in kinds
+            ):
+                raise SpeculationRefused(
+                    f"{type(layer).__name__} does not hold one plain row per pair, and "
+                    "`_Paired`'s one-row shift is written against exactly that: a step "
+                    "whose cache pools, slides or snapshots needs its own walk adapter"
+                )
+        self._walked = tuple(
+            _Paired(self, layer, type(step).__name__, seeded=index == 0)
+            for index, layer in enumerate(self._cache)
+        )
 
     @property
     def taps(self) -> Sequence[int]:
@@ -302,14 +398,32 @@ class Persistent[S: LayerCache]:
         return self._width
 
     @property
-    def resumes(self) -> bool:
-        """No. Its cache holds one pair per committed position and every one of them is built
-        from the target's hidden at that position — which a resumed prompt never produced.
-        The way out is a chain of its own, keyed on the target's plus this head's: one layer
-        against the target's dozens, resumed beside it, with `absorb` then handed only the
-        tail. Until that exists the assert in `propose` is the guard, and this is what keeps
-        it from ever being reached."""
-        return False
+    def caches(self) -> Sequence[LayerCache]:
+        """Its layers, on the walk. Every pair is built from the target's hidden at that
+        position — which a resumed prompt never produces — so the pairs ride the
+        conversation's spans instead of being rebuilt: one layer against the target's
+        dozens, and `absorb` is then handed only the tail."""
+        return self._walked
+
+    def seed(self, hidden: mx.array | None) -> None:
+        """The boundary pair's hidden half, restored: the target's reading of the last
+        resumed position, which the tail's forward will never produce. It lands in
+        `_pending` ahead of the tail's own rows, so the first catch-up builds the boundary
+        pair from it and the tail's first id — the same arithmetic as any other pair."""
+        assert self._pending is None, "seeded after features already arrived"
+        assert hidden is not None, "an anchored resume always carries the boundary hidden"
+        self._pending = hidden
+
+    def hidden_at(self, boundary: int) -> mx.array | None:
+        """The target's reading of `boundary - 1`, when the absorbed rows reach exactly
+        there — which is the only moment the walk asks: a snapshot is cut while the trunk
+        stands on the boundary, and standing there means everything before it was fed and
+        absorbed."""
+        held = self._pending
+        if held is None:
+            return None
+        covered = self._cache[0].rows + held.shape[1]
+        return held[:, -1:, :] if covered == boundary else None
 
     def absorb(self, features: mx.array) -> None:
         """Every row is kept, not the last one: each is the hidden half of a pair the
@@ -328,8 +442,22 @@ class Persistent[S: LayerCache]:
             f"the cache holds {offset} pairs and {self._pending.shape[1]} rows arrived: "
             f"together they must reach position {len(committed) - 1} exactly"
         )
+        # Blocked like any prefill, and for the same reason: after a whole prompt was
+        # absorbed, the catch-up is the step's attention over every pair at once, and fed
+        # whole that materializes scores over the full square — ~127 GB at 40k on the 27B.
+        # `prefill` feeds all but the last block and the last one's output is the proposal's.
         tokens = mx.array(committed[offset + 1 :])[None]
-        out = self._step(self._target.raw_embed(tokens), self._pending, self._cache)
+        pending = self._pending
+        window = prefill(
+            lambda block: self._step(
+                self._target.raw_embed(tokens[:, block]), pending[:, block], self._cache
+            ),
+            pairs,
+            self._cache,
+        )
+        out = self._step(
+            self._target.raw_embed(tokens[:, window]), pending[:, window], self._cache
+        )
         self._pending = None
         self._anchor = offset + pairs
         hidden = out[:, -1:, :]
@@ -373,8 +501,9 @@ def stream_speculative_ids[D: LayerCache](
     proposal, so the spans a boundary closes are this conversation's. Nothing is ever stored
     inside a round — the verification forward writes `width + 1` rows before it knows how
     many survive — and a round that would step over a boundary the anchor needs is shortened
-    to stop on it. A proposer that cannot start from a resumed target says so itself
-    (`Proposer.resumes`) and the caller drops the prefix instead of the draft.
+    to stop on it. A proposer whose state is per position contributes its layers to the walk
+    (`Proposer.caches`), so the spans carry the drafter's rows beside the target's and a
+    resumed prompt resumes both.
     """
     proposer: Proposer = draft if isinstance(draft, Proposer) else Autoregressive(draft, lookahead)
     taps = proposer.taps
@@ -387,11 +516,7 @@ def stream_speculative_ids[D: LayerCache](
     # step, so this loop needs the whole prompt before its first forward whatever shape it
     # arrived in — there is no block for a lazy one to overlap against.
     committed = list(prompt)
-    walk = (
-        prefix.begin(target_cache)
-        if prefix is not None and proposer.resumes
-        else None
-    )
+    walk = prefix.begin(target_cache, proposer.caches) if prefix is not None else None
     reused = 0 if walk is None else walk.resume(committed, target_cache)
     if meter is not None:
         meter.prefill(len(committed), reused)

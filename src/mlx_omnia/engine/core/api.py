@@ -387,18 +387,19 @@ class Proposer(Protocol):
         ...
 
     @property
-    def resumes(self) -> bool:
-        """Whether this can start against a target whose prompt came from the prefix
-        store instead of having been prefilled.
+    def caches(self) -> Sequence[LayerCache]:
+        """The layers this one adds to the request's prefix walk, so a resumed target
+        arrives with the drafter resumed beside it.
 
         The question is what this one needed from the prefill. Something that reads no
-        block needed nothing; something that keeps only the target's last row catches up
-        on the tail a resumed prompt still runs. Something that accumulates one row per
-        *position* does not: the resumed positions never produced features and will not
-        without a forward over them, which is exactly the prefill the resume avoided.
-        That one answers ``False``, and the caller drops the prefix rather than the draft
-        — a round saves one read of the weights on every token of every turn, and a
-        prefix saves one turn's prefill.
+        block needed nothing, and something that keeps only the target's last row catches
+        up on the tail a resumed prompt still runs — both answer with the empty tuple.
+        Something that accumulates one row per *position* must contribute those layers
+        instead: the resumed positions never produced features and never will without a
+        forward over them, which is exactly the prefill the resume avoided — so the rows
+        ride the conversation's spans and come back restored, and ``absorb`` is handed
+        only the tail. There is no veto: a proposer either needs nothing back or says
+        where its state lives.
         """
         ...
 
